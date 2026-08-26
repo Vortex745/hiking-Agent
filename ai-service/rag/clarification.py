@@ -211,10 +211,15 @@ class ClarificationStore:
         questions: list[str],
         ttl_seconds: int = DEFAULT_CLARIFICATION_TTL_SECONDS,
     ) -> ClarificationStatus:
-        """创建澄清记录（幂等）。
+        """创建澄清记录（仅对进行中的记录幂等）。
 
-        同 chat_id + 同 question 重复调用 → 返回同 clarification_id 的已有记录
-        （不重新计算 expires_at，保留首次创建时间）。
+        同 chat_id + 同 question 且已有 **active 且未超时** 的记录 → 返回同
+        clarification_id 的已有记录（不重新计算 expires_at，保留首次创建时间）。
+
+        已有记录处于终态（cancelled / expired / resumed，或 active 但已超时）
+        → 重置为全新 active 记录并刷新 expires_at。否则重复提问会带着过期
+        expires_at 或已取消状态再次下发 clarification_needed，之后每次
+        resume 都命中 410 / already_resumed，该问题永久死锁，用户只能换措辞。
 
         Args:
             chat_id: 聊天会话标识
@@ -228,8 +233,12 @@ class ClarificationStore:
         cid = clarification_id_for(chat_id, question)
         with self._lock:
             existing = self._store.get(cid)
-            if existing is not None:
-                # 幂等：返回已有记录（不更新 expires_at）
+            if (
+                existing is not None
+                and existing.status == "active"
+                and not existing.is_expired()
+            ):
+                # 幂等：返回进行中的记录（不更新 expires_at）
                 return existing
             now = _now()
             expires_at = _to_iso8601(now + timedelta(seconds=ttl_seconds))

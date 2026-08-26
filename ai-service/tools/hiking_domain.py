@@ -22,7 +22,10 @@ WORKSPACE_DIR = runtime_dir("WORKSPACE_DIR", "workspace")
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    # UTC、微秒精度——与其余 16 处 _now_iso 副本保持同一时区基准。
+    # 原实现的 astimezone() 会转成本地时间,导致 queried_at 等
+    # 时间戳字段与其他模块混用两种时区,排序/比较错乱。
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _safe_filename(value: str, suffix: str) -> str:

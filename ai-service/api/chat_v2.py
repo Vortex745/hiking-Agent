@@ -58,6 +58,7 @@ Ticket 09 adds the ``artifact`` profile contract:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -179,6 +180,116 @@ def _artifacts_dir() -> str:
 def _now_iso() -> str:
     """UTC ISO 8601 timestamp with timezone suffix."""
     return datetime.now(timezone.utc).isoformat()
+
+
+_EFFECT_INFLIGHT_GRACE_SECONDS = 300
+
+
+def _effect_executor_is_live(all_events: list[dict[str, Any]], tool_name: str) -> bool:
+    """判断处于 ``executing`` 状态的 effect 是否仍有存活执行者。
+
+    双击恢复时，后到的请求会在入口看到另一请求留下的 EXECUTING effect。
+    若该工具的 tool_call 事件已持久化且距 now 不足宽限期，认定执行者
+    仍在飞行：不得改动 effect，也不得销毁其沙箱（CAS-loser 语义，
+    Ticket 12 review H1 同源）。tool_call 缺失或已过时则按崩溃处理
+    （spec AC3 outcome_unknown）。
+
+    宽限期 300s 远大于 Bash/PDF 的 30s 沙箱超时，兜住慢执行；
+    过时阈值同时保证崩溃执行者最终仍会被 outcome_unknown 收敛。
+    """
+    from datetime import timedelta
+
+    latest_call: datetime | None = None
+    for evt in all_events:
+        if evt.get("type") != "tool_call":
+            continue
+        if evt.get("payload", {}).get("tool") != tool_name:
+            continue
+        ts = evt.get("timestamp") or ""
+        try:
+            called_at = datetime.fromisoformat(ts)
+        except ValueError:
+            continue
+        if called_at.tzinfo is None:
+            called_at = called_at.replace(tzinfo=timezone.utc)
+        if latest_call is None or called_at > latest_call:
+            latest_call = called_at
+    if latest_call is None:
+        return False
+    return (datetime.now(timezone.utc) - latest_call).total_seconds() < _EFFECT_INFLIGHT_GRACE_SECONDS
+
+
+# ---- Paused-run janitor -----------------------------------------------------
+#
+# 审批暂停的 run 在流结束时保留 CapacityGuard 沙箱槽位等待用户决策
+# （guarded_stream 的 keep_reserved 分支）。用户弃用后没有任何正常路径
+# 释放该槽位（只有 cancel 和 resume 会释放），``max_sandboxes=10`` 会被
+# 逐渐耗尽直到持续 503。janitor 周期回收暂停超过 TTL 的 run。
+
+_PAUSED_RUN_TTL_SECONDS = 24 * 3600
+_PAUSED_RUN_SWEEP_INTERVAL_SECONDS = 600
+
+
+def _sweep_expired_paused_runs(runtime: Any) -> int:
+    """回收超时暂停 run 的沙箱租约与容量槽位，返回回收数量。"""
+    runs_repo = getattr(runtime, "runs", None)
+    capacity = getattr(runtime, "capacity", None)
+    if runs_repo is None:
+        return 0
+    from datetime import timedelta
+
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(seconds=_PAUSED_RUN_TTL_SECONDS)
+    ).isoformat()
+    reclaimed = 0
+    for run in runs_repo.list_paused_runs_updated_before(cutoff):
+        # 复核状态：sweep 与用户决策/resume 并发时跳过已不处于 paused 的 run。
+        current = runs_repo.get_run(run.run_id)
+        if current is None or current.status != "paused":
+            continue
+        sandbox = runs_repo.get_sandbox_lease(run.run_id)
+        if sandbox is not None and sandbox.status == "active":
+            try:
+                runs_repo.destroy_sandbox_lease(
+                    run_id=run.run_id,
+                    failure_reason="paused run expired (approval abandoned)",
+                )
+            except Exception:
+                logger.exception(
+                    "chat_v2: paused-run sweep failed to destroy lease for run_id=%s",
+                    run.run_id,
+                )
+                continue
+        try:
+            runs_repo.mark_run_error(run.run_id)
+        except Exception:
+            logger.exception(
+                "chat_v2: paused-run sweep failed to mark run_id=%s terminal",
+                run.run_id,
+            )
+            continue
+        if capacity is not None:
+            capacity.release_sandbox(run.request_id)
+        reclaimed += 1
+        logger.warning(
+            "chat_v2: reclaimed expired paused run run_id=%s (sandbox slot released)",
+            run.run_id,
+        )
+    return reclaimed
+
+
+def start_paused_run_sweeper(runtime: Any) -> "asyncio.Task[None]":
+    """启动暂停超时回收周期任务（lifespan 装配后调用，关停时 cancel）。"""
+
+    async def _loop() -> None:
+        while True:
+            await asyncio.sleep(_PAUSED_RUN_SWEEP_INTERVAL_SECONDS)
+            try:
+                _sweep_expired_paused_runs(runtime)
+            except Exception:
+                logger.exception("chat_v2: paused-run sweep iteration failed")
+
+    return asyncio.create_task(_loop(), name="paused-run-sweeper")
 
 
 def _expires_at_iso(created_at: str) -> str:
@@ -2909,8 +3020,17 @@ async def _resume_cowork_bash_steps(
     )
     existing_effect = runs_repo.get_effect(effect_key)
 
-    # Crash recovery: ``executing`` → outcome_unknown (spec AC3).
+    # Effect 处于 ``executing``：区分并发在飞与已崩溃（spec AC3 的并发盲区）。
     if existing_effect is not None and existing_effect.status == EffectStatus.EXECUTING.value:
+        if _effect_executor_is_live(all_events, "sandbox_bash"):
+            # 双击恢复：另一执行者仍在飞行。不改动 effect（Ticket 12 H1
+            # 同源）；沙箱由调用方在消费完本生成器后检查 effect 状态并保留
+            # （见 _stream_resume_flow 中 preserve_sandbox 的赋值）。
+            yield emit("error", {
+                "code": "effect_in_flight",
+                "message": "Bash 正在被其他执行者处理，请稍后重试查看结果。",
+            })
+            return
         runs_repo.mark_effect_outcome_unknown(
             effect_key,
             reason="恢复时发现 effect 处于 executing 状态",
@@ -3127,6 +3247,15 @@ async def _resume_cowork_bash_steps(
                 "truncated": bash_result.truncated,
                 "content": bash_result.stdout,
             })
+            # 供 Step 3 的 text 回复使用：fresh 执行路径此前从不给
+            # recovered_result 赋值，导致回复里的 stdout 恒为空。
+            recovered_result = {
+                "exit_code": bash_result.exit_code,
+                "stdout": bash_result.stdout,
+                "stderr": bash_result.stderr,
+                "duration_ms": bash_result.duration_ms,
+                "truncated": bash_result.truncated,
+            }
     else:
         # Tool already executed in a prior resume — recover the result
         # from the stored tool_result event for the text response.
@@ -3459,6 +3588,18 @@ async def _stream_resume_flow(
                 snapshot=snapshot,
             ):
                 yield frame
+            # 助手因"并发在飞"退出时 effect 仍为 executing —— 保留沙箱与
+            # 租约，避免销毁胜者正在使用的运行环境（双击恢复互删修复）。
+            _bash_effect = runs_repo.get_effect(
+                compute_effect_key(
+                    run_id=run_id, tool_name="sandbox_bash", args=approved_args
+                )
+            )
+            if (
+                _bash_effect is not None
+                and _bash_effect.status == EffectStatus.EXECUTING.value
+            ):
+                preserve_sandbox = True
             return
 
         # Step 2: execute tool (skip if tool_result ok already persisted).
@@ -3481,11 +3622,19 @@ async def _stream_resume_flow(
         )
         existing_effect = runs_repo.get_effect(effect_key)
 
-        # Crash recovery: ``executing`` means a prior attempt crashed
-        # mid-flight. The side effect may or may not have completed, so
-        # transition to ``outcome_unknown`` and terminate — NO auto-retry
-        # (spec AC3).
+        # Effect 处于 ``executing``：区分并发在飞与已崩溃（spec AC3 的
+        # 并发盲区，与 sandbox_bash 入口检查同源）。
         if existing_effect is not None and existing_effect.status == EffectStatus.EXECUTING.value:
+            if _effect_executor_is_live(all_events, "generate_pdf"):
+                # 双击恢复：另一执行者仍在飞行。不改动 effect，保留沙箱。
+                yield emit("error", {
+                    "code": "effect_in_flight",
+                    "message": "工具正在被其他执行者处理，请稍后重试查看结果。",
+                })
+                preserve_sandbox = True
+                return
+            # 崩溃语义：副作用可能已完成也可能没有，转 outcome_unknown
+            # 并终止 —— 不自动重试（spec AC3）。
             runs_repo.mark_effect_outcome_unknown(
                 effect_key,
                 reason="恢复时发现 effect 处于 executing 状态",
@@ -3633,6 +3782,9 @@ async def _stream_resume_flow(
                         "code": "effect_in_flight",
                         "message": "工具正在被其他执行者处理，请稍后重试查看结果。",
                     })
+                    # 胜者仍在该沙箱内执行 —— 保留沙箱与租约，仅终止本
+                    # 流（双击恢复互删修复）。
+                    preserve_sandbox = True
                     return
             else:
                 # We won the CAS — execute the tool.

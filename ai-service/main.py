@@ -37,6 +37,13 @@ async def lifespan(app: FastAPI):
             app.state.agent_v2_runtime = assemble_v2_runtime(settings)
             if app.state.agent_v2_runtime is not None:
                 logger.info("✓ Chat v2 runtime assembled (Ticket 06: persistence + writer lock active)")
+                # 暂停超时回收：弃用的审批暂停 run 会一直占住 CapacityGuard
+                # 沙箱槽位，周期 sweep 到期释放（见 api/chat_v2.py janitor）。
+                from api.chat_v2 import start_paused_run_sweeper
+
+                app.state.paused_run_sweeper = start_paused_run_sweeper(
+                    app.state.agent_v2_runtime
+                )
             else:
                 logger.error("✗ Chat v2 enabled but assembly returned None")
         except V2StartupError as exc:
@@ -139,6 +146,10 @@ async def lifespan(app: FastAPI):
 
     # Ticket 06：释放 v2 runtime（SQLite stores + writer lock）
     from agent_v2.startup import release_v2_runtime
+
+    paused_run_sweeper = getattr(app.state, "paused_run_sweeper", None)
+    if paused_run_sweeper is not None:
+        paused_run_sweeper.cancel()
 
     v2_runtime = getattr(app.state, "agent_v2_runtime", None)
     try:

@@ -507,6 +507,28 @@ def summarize_retrieved_documents(docs: list) -> dict:
     }
 
 
+async def _hybrid_retrieve(retriever, queries: list, status_filter) -> list:
+    """在 worker 线程执行混合检索。
+
+    ``hybrid_search`` / ``similarity_search`` 内部是同步的 embedding API
+    与 BM25 查询，直接在 async 生成器里调用会阻塞事件循环、冻结所有
+    并发 SSE 流。三个调用点（首检 + 两次默认配置重试）共用本封装。
+    """
+    hybrid_search = getattr(retriever, "hybrid_search", None)
+    if callable(hybrid_search):
+        return await asyncio.to_thread(
+            hybrid_search, queries, k=4, status_filter=status_filter
+        )
+    docs: list = []
+    for q in queries:
+        docs.extend(
+            await asyncio.to_thread(
+                retriever.similarity_search, q, k=2, status_filter=status_filter
+            )
+        )
+    return _dedupe_documents(docs)
+
+
 def _dedupe_documents(docs: list) -> list:
     seen_keys: set[str] = set()
     deduped_docs = []
@@ -1321,14 +1343,19 @@ async def rag_query(
                             store=sqlite_store,
                             embedding_provider=embedding_provider,
                         )
-                        raw_docs = cloud_loader.load_raw_docs(settings.rag_docs_api_url)
+                        # to_thread：load_raw_docs / ingest_content 均为同步
+                        # 网络调用，直接执行会阻塞事件循环、冻结所有并发流。
+                        raw_docs = await asyncio.to_thread(
+                            cloud_loader.load_raw_docs, settings.rag_docs_api_url
+                        )
                         failed_docs: list[dict] = []
                         successful_count = 0
                         for raw in raw_docs:
                             name = raw.get("name", "unknown")
                             content = raw.get("content", "")
                             try:
-                                report = pipeline.ingest_content(
+                                report = await asyncio.to_thread(
+                                    pipeline.ingest_content,
                                     markdown=content,
                                     source=f"cloud_docs:{name}",
                                     file_name=name,
@@ -1432,7 +1459,8 @@ async def rag_query(
                     )
                     _, loader_cls = _get_feishu_classes()
                     loader = loader_cls()
-                    summaries, failed_docs = _sync_feishu_links_canonical(
+                    summaries, failed_docs = await asyncio.to_thread(
+                        _sync_feishu_links_canonical,
                         question_for_retrieval, pipeline, loader
                     )
                     sync_summary = _summarize_feishu_sync(summaries + failed_docs)
@@ -1440,8 +1468,8 @@ async def rag_query(
                     feishu_synced = bool(summaries)
                 else:
                     # legacy 后端（pgvector/memory，零回归）
-                    feishu_docs, summaries = _sync_feishu_links(
-                        question_for_retrieval, retriever
+                    feishu_docs, summaries = await asyncio.to_thread(
+                        _sync_feishu_links, question_for_retrieval, retriever
                     )
                     sync_summary = _summarize_feishu_sync(summaries)
                     feishu_synced = bool(feishu_docs)
@@ -1485,15 +1513,17 @@ async def rag_query(
                     )
                     _, loader_cls = _get_feishu_classes()
                     loader = loader_cls()
-                    summaries, failed_docs = _sync_default_feishu_knowledge_canonical(
-                        pipeline, loader
+                    summaries, failed_docs = await asyncio.to_thread(
+                        _sync_default_feishu_knowledge_canonical, pipeline, loader
                     )
                     sync_summary = _summarize_feishu_sync(summaries + failed_docs)
                     # SQLite 后端：feishu_docs 保持 []（验收 6：通过检索获取结果）
                     feishu_synced = bool(summaries)
                 else:
                     # legacy 后端（pgvector/memory，零回归）
-                    feishu_docs, summaries = _sync_default_feishu_knowledge(retriever)
+                    feishu_docs, summaries = await asyncio.to_thread(
+                        _sync_default_feishu_knowledge, retriever
+                    )
                     sync_summary = _summarize_feishu_sync(summaries)
                     feishu_synced = bool(feishu_docs)
                 yield _sse_event(
@@ -1527,7 +1557,9 @@ async def rag_query(
 
             contextualize = getattr(rewriter, "contextualize", None)
             contextual_question = (
-                contextualize(question_for_retrieval, history_messages)
+                await asyncio.to_thread(
+                    contextualize, question_for_retrieval, history_messages
+                )
                 if callable(contextualize)
                 else question_for_retrieval
             )
@@ -1539,7 +1571,7 @@ async def rag_query(
                 )
                 await asyncio.sleep(0.2)
 
-            queries = rewriter.rewrite(contextual_question)
+            queries = await asyncio.to_thread(rewriter.rewrite, contextual_question)
             yield _sse_event(
                 "process",
                 "调用查询改写模块生成检索查询：用户提问进入 query 改写",
@@ -1564,13 +1596,7 @@ async def rag_query(
             all_docs = []
             retrieval_error = ""
             try:
-                hybrid_search = getattr(retriever, "hybrid_search", None)
-                if callable(hybrid_search):
-                    all_docs = hybrid_search(queries, k=4, status_filter=req.status)
-                else:
-                    for q in queries:
-                        all_docs.extend(retriever.similarity_search(q, k=2, status_filter=req.status))
-                    all_docs = _dedupe_documents(all_docs)
+                all_docs = await _hybrid_retrieve(retriever, queries, req.status)
             except Exception as e:
                 retrieval_error = str(e)
                 logger.warning("混合检索失败: %s", e)
@@ -1586,13 +1612,7 @@ async def rag_query(
                 try:
                     retriever_cls = _get_vector_store_retriever_class()
                     retriever = retriever_cls()
-                    hybrid_search = getattr(retriever, "hybrid_search", None)
-                    if callable(hybrid_search):
-                        all_docs = hybrid_search(queries, k=4, status_filter=req.status)
-                    else:
-                        for q in queries:
-                            all_docs.extend(retriever.similarity_search(q, k=2, status_filter=req.status))
-                        all_docs = _dedupe_documents(all_docs)
+                    all_docs = await _hybrid_retrieve(retriever, queries, req.status)
                     retrieval_error = ""
                 except Exception as e:
                     retrieval_error = str(e)
@@ -1608,13 +1628,7 @@ async def rag_query(
                 try:
                     retriever_cls = _get_vector_store_retriever_class()
                     retriever = retriever_cls()
-                    hybrid_search = getattr(retriever, "hybrid_search", None)
-                    if callable(hybrid_search):
-                        all_docs = hybrid_search(queries, k=4, status_filter=req.status)
-                    else:
-                        for q in queries:
-                            all_docs.extend(retriever.similarity_search(q, k=2, status_filter=req.status))
-                        all_docs = _dedupe_documents(all_docs)
+                    all_docs = await _hybrid_retrieve(retriever, queries, req.status)
                 except Exception as e:
                     retrieval_error = str(e)
                     logger.warning("默认 Embedding 混合检索失败: %s", e)
@@ -1642,13 +1656,15 @@ async def rag_query(
             if reranker.enabled and all_docs:
                 yield _sse_event("process", "调用 Rerank 模型重排候选片段")
                 await asyncio.sleep(0.2)
-                all_docs = reranker.rerank(contextual_question, all_docs)
+                all_docs = await asyncio.to_thread(
+                    reranker.rerank, contextual_question, all_docs
+                )
                 yield _sse_event("process", f"Rerank 返回 {len(all_docs)} 个高相关片段")
                 await asyncio.sleep(0.2)
 
             humanize_for_answer = getattr(rewriter, "humanize_for_answer", None)
             humanized_question = (
-                humanize_for_answer(contextual_question)
+                await asyncio.to_thread(humanize_for_answer, contextual_question)
                 if callable(humanize_for_answer)
                 else contextual_question
             )
@@ -1690,7 +1706,9 @@ async def rag_query(
                         yield _sse_event("text", chunk)
                         has_streamed = True
                 if not has_streamed:
-                    augmented = augmenter.augment(humanized_question, all_docs)
+                    augmented = await asyncio.to_thread(
+                        augmenter.augment, humanized_question, all_docs
+                    )
                     assistant_parts.append(augmented)
                     yield _sse_event("text", augmented)
             except Exception as e:

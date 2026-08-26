@@ -137,6 +137,13 @@ class RunRepository:
     def get_run(self, run_id: str) -> RunRecord | None:
         return self.control.get_run(run_id)
 
+    def list_paused_runs_updated_before(self, updated_before: str) -> list[RunRecord]:
+        """List abandoned paused runs — paused-run janitor support.
+
+        See :meth:`ControlStore.list_paused_runs_updated_before`.
+        """
+        return self.control.list_paused_runs_updated_before(updated_before)
+
     def resolve_run_id(self, identifier: str) -> str | None:
         """Resolve an identifier to a real run_id.
 

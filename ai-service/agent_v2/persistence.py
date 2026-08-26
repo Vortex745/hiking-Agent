@@ -555,6 +555,20 @@ class ControlStore:
             return None
         return self._row_to_record(row)
 
+    def list_paused_runs_updated_before(self, updated_before: str) -> list[RunRecord]:
+        """List paused runs whose ``updated_at`` predates ``updated_before``.
+
+        Used by the paused-run janitor: an approval-paused run holds a
+        CapacityGuard sandbox slot until the user decides (or the resume
+        stream releases it). Abandoned pauses must be reclaimed or the
+        in-process slot leaks until restart.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM runs WHERE status = 'paused' AND updated_at < ?",
+            (updated_before,),
+        ).fetchall()
+        return [self._row_to_record(row) for row in rows]
+
     def update_run_status(
         self,
         *,
