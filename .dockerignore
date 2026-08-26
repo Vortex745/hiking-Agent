@@ -1,0 +1,41 @@
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+.conda*/
+
+# Node
+node_modules/
+frontend/dist/
+
+# Go
+gateway/gateway
+
+# 环境变量
+.env
+ai-service/.env
+
+# 运行时数据
+memory_store/
+memory_data/
+rag_docs/
+workspace/
+
+# Docker
+.dockerignore
+
+# 其他
+*.md
+!README.md
+.git/
+.gitignore

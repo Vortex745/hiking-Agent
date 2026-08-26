@@ -1,0 +1,83 @@
+{
+  "timestamp": "2026-07-26T09:12:59.455161+00:00",
+  "ac_results": [
+    {
+      "ac_id": "AC1",
+      "title": "迁移可中断、恢复和幂等重跑，计数可解释",
+      "passed": false,
+      "evidence": "迁移失败: no pq wrapper available.\nAttempts made:\n- couldn't import psycopg 'c' implementation: No module named 'psycopg_c'\n- couldn't import psycopg 'binary' implementation: cannot import name 'pq' from 'psycopg_binary' (E:\\miniconda3\\Lib\\site-packages\\psycopg_binary\\__init__.py)\n- couldn't import psycopg 'python' implementation: libpq library not found",
+      "skipped": true,
+      "skip_reason": "pgvector 不可连接"
+    },
+    {
+      "ac_id": "AC2",
+      "title": "代表性查询在新旧后端使用等价检索语义比较，记录结果差异与接受阈值",
+      "passed": false,
+      "evidence": "验证失败: no pq wrapper available.\nAttempts made:\n- couldn't import psycopg 'c' implementation: No module named 'psycopg_c'\n- couldn't import psycopg 'binary' implementation: cannot import name 'pq' from 'psycopg_binary' (E:\\miniconda3\\Lib\\site-packages\\psycopg_binary\\__init__.py)\n- couldn't import psycopg 'python' implementation: libpq library not found",
+      "skipped": true,
+      "skip_reason": "pgvector 不可连接"
+    },
+    {
+      "ac_id": "AC3",
+      "title": "cutover 后实际生产 runtime 解析为目标 adapter，上传/同步内容可检索",
+      "passed": false,
+      "evidence": "迁移进度文件不存在: data\\migration-progress.json",
+      "skipped": false,
+      "skip_reason": ""
+    },
+    {
+      "ac_id": "AC4",
+      "title": "直接回答/清晰单问题/澄清恢复/并行多问题/无证据/错误终止回归全部通过",
+      "passed": true,
+      "evidence": "exit=0 passed=True\n           [100%]\n============================== warnings summary ===============================\nE:\\miniconda3\\Lib\\site-packages\\fastapi\\testclient.py:1\n  E:\\miniconda3\\Lib\\site-packages\\fastapi\\testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.\n    from starlette.testclient import TestClient as TestClient  # noqa\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n162 passed, 1 warning in 16.57s\n",
+      "skipped": false,
+      "skip_reason": ""
+    },
+    {
+      "ac_id": "AC5",
+      "title": "回滚后 runtime 实际恢复旧 adapter，可读取旧库并完成代表性查询",
+      "passed": false,
+      "evidence": "resolver.backend=pgvector marker_deleted=True old_backend_readable=False (pgvector 不可连接: no pq wrapper available.\nAttempts made:\n- couldn't import psycopg 'c' implementation: No module named 'psycopg_c'\n- couldn't import psycopg 'binary' implementation: cannot import name 'pq' from 'psycopg_binary' (E:\\miniconda3\\Lib\\site-packages\\psycopg_binary\\__init__.py)\n- couldn't import psycopg 'python' implementation: libpq library not found)",
+      "skipped": true,
+      "skip_reason": "pgvector 不可连接"
+    },
+    {
+      "ac_id": "AC6",
+      "title": "HikingManus、Gateway 转发和前端既有 SSE 消费回归通过",
+      "passed": false,
+      "evidence": "",
+      "skipped": true,
+      "skip_reason": "skip_llm_dependent=True（CI 无 LLM 凭证）"
+    },
+    {
+      "ac_id": "AC7",
+      "title": "记录环境、语料规模、端到端延迟、首字延迟、检索耗时、模型/工具调用数、token 估算",
+      "passed": false,
+      "evidence": "environment=unknown corpus_scale=False latencies=True retrieval_calls=True tokens=True backend=memory timestamp=2026-07-26T09:13:19.583844+00:00",
+      "skipped": false,
+      "skip_reason": ""
+    },
+    {
+      "ac_id": "AC8",
+      "title": "验收证据包含执行命令、结果摘要、失败/跳过项和残余风险",
+      "passed": true,
+      "evidence": "structure_ok=True (ac_ids=['AC1', 'AC2', 'AC3', 'AC4', 'AC5', 'AC6', 'AC7']) commands_recorded=6 residual_risks=1",
+      "skipped": false,
+      "skip_reason": ""
+    }
+  ],
+  "overall_pass": false,
+  "executed_commands": [
+    "migrate(pgvector_url=postgresql://ai_hiking:ai_hiking@localhost:5432/ai_hiking, sqlite_db_path=./data/rag.sqlite, progress_path=data\\migration-progress.json)",
+    "verify(pgvector_url=postgresql://ai_hiking:ai_hiking@localhost:5432/ai_hiking, sqlite_db_path=./data/rag.sqlite, queries=3, overlap_threshold=0.5)",
+    "cutover(operator=ticket15-acceptance, marker_path=data\\cutover-marker.json)",
+    "pytest tests/test_rag_direct_answer.py tests/test_rag_clarification.py tests/test_rag_clarification_api.py tests/test_rag_graph_clarification_api.py tests/test_rag_graph_parallel_api.py tests/test_rag_parallel_aggregation.py tests/test_rag_graph_runtime_api.py tests/test_rag_retrieve_and_output.py",
+    "rollback(operator=ticket15-acceptance, marker_path=data\\cutover-marker.json)",
+    "measure(sqlite_db_path=./data/rag.sqlite, queries=3)"
+  ],
+  "residual_risks": [
+    "AC6 跳过：生产 cutover 前需在具备 LLM 凭证的环境补测 test_chat_memory_integration.py",
+    "以下 AC 被跳过：AC1, AC2, AC5, AC6；生产 cutover 前需补测",
+    "以下 AC 未通过：AC3, AC7；禁止标记完成"
+  ]
+}

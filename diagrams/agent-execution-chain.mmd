@@ -1,0 +1,101 @@
+%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "primaryTextColor": "#0f172a", "lineColor": "#64748b", "fontFamily": "Arial"}}}%%
+flowchart TD
+    subgraph STARTUP["Agent v2 启动装配 · main.py lifespan"]
+        FLAG{"AGENT_V2_ENABLED?"}
+        GUARD["check_v2_startup_guard<br/>Vercel / 配置 fail-fast"]
+        LOCK["OS WriterLock<br/>单写者"]
+        DBS["三份 SQLite<br/>agent_control / chat_checkpoints / agent_memory"]
+        COMPONENTS["RunRepository + MemoryService<br/>Telemetry + CapacityGuard"]
+        FACTORY["create_agent()<br/>AgentContext：工具组 / 权限 gate / 审批 callback"]
+        V2RT["app.state.agent_v2_runtime<br/>V2Runtime"]
+        FLAG -->|true| GUARD --> LOCK --> DBS --> COMPONENTS --> FACTORY --> V2RT
+        FLAG -->|false：默认| V1ONLY["不装配 v2<br/>v1 链路保持可用"]
+    end
+
+    subgraph V2["Agent v2 · /api/v2/chat/sse"]
+        UI2["Frontend SuperAgent<br/>chatV2.ts"]
+        GW2["Gateway<br/>POST /api/v2/chat/sse"]
+        ENTRY2["api/chat_v2.py<br/>chat_v2_sse"]
+        CAP["CapacityGuard<br/>run / sandbox lease"]
+        STREAM["_stream_chat_v2<br/>EventStream 初始化"]
+        RUN["RunRepository.create_run_idempotent<br/>request_id 幂等"]
+        GATE["前置 gate<br/>conversation / v2 enabled / profile / API key"]
+        PROFILE{"resolve_profile"}
+        EMIT["emit 闭包<br/>build sequence → persist_event → telemetry → SSE"]
+        REPLAY["重复 request_id<br/>重放存储事件，不重跑工具"]
+
+        CHAT["chat profile<br/>memory consent / search / save<br/>text → done"]
+        ROUTE["route_plan profile<br/>分类 → amap_map / amap_weather MCP<br/>tool_call → tool_result → text → done"]
+        ART["artifact profile<br/>sandbox 创建 → PermissionGate<br/>approval.required / run.paused"]
+        ART_RESUME["批准后 resume<br/>generate_pdf → artifact_candidate<br/>主机校验 → artifact.available → text → done"]
+        COWORK["cowork profile<br/>授权 gate → sandbox_bash<br/>PermissionGate + effect ledger<br/>approval.required / run.paused"]
+        COWORK_RESUME["批准后 resume<br/>sandbox_bash → tool_result<br/>text → done"]
+
+        UI2 --> GW2 --> ENTRY2 --> CAP --> STREAM --> RUN --> GATE --> PROFILE
+        RUN -->|created=false| REPLAY --> EMIT
+        PROFILE -->|chat| CHAT --> EMIT
+        PROFILE -->|route_plan| ROUTE --> EMIT
+        PROFILE -->|artifact| ART --> ART_RESUME --> EMIT
+        PROFILE -->|cowork| COWORK --> COWORK_RESUME --> EMIT
+    end
+
+    subgraph SUPPORT["v2 支撑端点"]
+        SNAP["GET /snapshot/:run_id<br/>运行状态与快照"]
+        EVENTS["GET /events/:run_id?from_seq=N<br/>断线事件重放"]
+        CANCEL["POST /cancel/:run_id<br/>流间歇轮询后发 cancelled"]
+        APPROVE["POST /approvals/:id/decision<br/>恢复 paused run"]
+        ARTIFACTS["GET /artifacts/:artifact_id<br/>opaque id 下载"]
+    end
+
+    subgraph CONTRACT["UniHarness 扩展接口（当前 v2 API 的独立契约 seam）"]
+        CONTEXT["AgentContext<br/>profile 工具可见性"]
+        RUNTIME["AgentRuntime.invoke_tool<br/>PermissionGate → approval → ToolInvocation"]
+        SUBAGENT["create_subagent guard<br/>Task group + 单层限制"]
+        CONTEXT --> RUNTIME --> SUBAGENT
+    end
+
+    subgraph V1["Agent v1 · 默认实际执行链"]
+        UI1["Frontend SuperAgent / Chat UI"]
+        GW1["Gateway<br/>POST /api/v1/chat/sse"]
+        ENTRY1["api/chat.py<br/>chat_sse + event_stream"]
+        AIA["AIAgent.aexecute_stream<br/>understand_request + memory context"]
+        CREATE["HikingManus.create<br/>ToolCollection + MCP 初始化"]
+        LOOP{"ReAct loop<br/>think() → tool_calls?"}
+        TOOLS["工具执行<br/>web_search / route_research<br/>hiking_knowledge_search / MCP / terminate"]
+        RAGTOOL["hiking_knowledge_search<br/>VectorStoreRetriever.hybrid_search<br/>进入 RAG 检索后端"]
+        RESULT["tool_result → ToolMessage<br/>repeat/stuck detector"]
+        EXIT{"退出条件"}
+        TERMINAL["text / error / approval_required<br/>done metadata：exit_reason / step_count / tool_count"]
+        MEMORY["assistant 回复写入 ChatMemory<br/>可选 memory_manager commit"]
+
+        UI1 --> GW1 --> ENTRY1 --> AIA --> CREATE --> LOOP
+        LOOP -->|有工具调用| TOOLS --> RESULT --> EXIT
+        LOOP -->|无工具调用| EXIT
+        TOOLS --> RAGTOOL
+        EXIT -->|继续| LOOP
+        EXIT -->|natural_end / terminate / budget / error / stuck / waiting_for_user| TERMINAL --> MEMORY --> UI1
+    end
+
+    V2RT -.-> UI2
+    FACTORY -.-> CONTEXT
+    ART -.-> APPROVE
+    COWORK -.-> APPROVE
+    APPROVE -.-> ART_RESUME
+    APPROVE -.-> COWORK_RESUME
+    SNAP -.-> RUN
+    EVENTS -.-> EMIT
+    CANCEL -.-> STREAM
+    ART_RESUME -.-> ARTIFACTS
+
+    classDef entry fill:#e8f1ff,stroke:#2563eb,color:#0f172a;
+    classDef decision fill:#fff7ed,stroke:#ea580c,color:#431407;
+    classDef process fill:#f8fafc,stroke:#64748b,color:#0f172a;
+    classDef v2 fill:#f0fdfa,stroke:#0f766e,color:#134e4a;
+    classDef v1 fill:#fdf2f8,stroke:#be185d,color:#500724;
+    classDef support fill:#fefce8,stroke:#a16207,color:#422006;
+    class UI2,GW2,ENTRY2,UI1,GW1,ENTRY1 entry;
+    class FLAG,PROFILE,LOOP,EXIT decision;
+    class GUARD,LOCK,DBS,COMPONENTS,FACTORY,V2RT,ENTRY2,CAP,STREAM,RUN,GATE,EMIT,REPLAY,CHAT,ROUTE,ART,ART_RESUME,COWORK,COWORK_RESUME,CONTEXT,RUNTIME,SUBAGENT,AIA,CREATE,TOOLS,RAGTOOL,RESULT,TERMINAL,MEMORY process;
+    class UI2,GW2,ENTRY2,CAP,STREAM,RUN,GATE,PROFILE,CHAT,ROUTE,ART,ART_RESUME,COWORK,COWORK_RESUME,CONTEXT,RUNTIME,SUBAGENT v2;
+    class UI1,GW1,ENTRY1,AIA,CREATE,LOOP,TOOLS,RAGTOOL,RESULT,EXIT,TERMINAL,MEMORY v1;
+    class SNAP,EVENTS,CANCEL,APPROVE,ARTIFACTS support;

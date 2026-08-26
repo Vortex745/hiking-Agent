@@ -1,0 +1,189 @@
+{
+  "summary": {
+    "projectName": "hiking-ai-main",
+    "locale": "zh-CN",
+    "modelId": "agent-work-loop-v4",
+    "reportContractVersion": 25,
+    "overview": "项目拥有丰富的规划、交接与验收脚本体系，但验证记录与文件系统分叉、托管 CI 仅做语法级验证、声明的部署流水线在仓库中不存在，且会话源根缺失使学习与循环证据无法判定。",
+    "strengths": [
+      "规划-执行-记录循环完整：ticket 化地图、逐会话交接文档、可恢复归档与领域级验收脚本",
+      "本地一次性验证有记录：verify.json 记录了 pytest 21 passed 与浏览器端到端检查",
+      "方案文档定义了切换硬门、灰度与回滚设计，脚本层验收协调器质量较高"
+    ],
+    "aiAgentPractice": {
+      "inspectedSurfaces": [
+        "Workflows"
+      ],
+      "coverageRows": [
+        {
+          "surface": "Workflows",
+          "scopes": [
+            "Project"
+          ],
+          "count": 1,
+          "paths": [
+            ".github/workflows/deploy.yml"
+          ]
+        },
+        {
+          "surface": "Custom Agents",
+          "scopes": [
+            "Project"
+          ],
+          "count": 0
+        }
+      ]
+    },
+    "assignmentSummaries": [],
+    "dimensions": [
+      {
+        "id": "task-understanding",
+        "label": "任务理解",
+        "score": 62,
+        "summary": "交接与规划机制存在（handoff、ticket 地图、术语文档），但权威上下文源曾被证伪且使用未被会话证据验证。",
+        "findingRefs": []
+      },
+      {
+        "id": "controlled-execution",
+        "label": "可控执行",
+        "score": 56,
+        "summary": "启动机制存在（镜像、compose、环境样例），但生产与开发依赖分叉破坏可复现性，无命令或技能路由。",
+        "findingRefs": [
+          "prod-dev-dependency-fork"
+        ]
+      },
+      {
+        "id": "change-validation",
+        "label": "改动验证",
+        "score": 52,
+        "summary": "存在本地验证记录，但声称的测试套件在文件系统中不存在，托管 CI 仅做语法编译。",
+        "findingRefs": [
+          "phantom-test-suite",
+          "ci-ai-service-compile-only"
+        ]
+      },
+      {
+        "id": "reliable-delivery",
+        "label": "可靠交付",
+        "score": 42,
+        "summary": "声明的部署流水线在仓库中不存在，无 Git 基线、无合并接受路径，交付治理缺口明确。",
+        "findingRefs": [
+          "missing-deploy-pipeline",
+          "completed-without-baseline"
+        ]
+      },
+      {
+        "id": "learning-capture",
+        "label": "经验沉淀",
+        "score": 38,
+        "summary": "会话源根缺失使重复工作与维护漂移无法判定，Memory 资产状态不可判定，本次仅完成有界审查。",
+        "findingRefs": [
+          "session-source-unavailable",
+          "memory-count-conflict"
+        ]
+      }
+    ]
+  },
+  "findings": [
+    {
+      "id": "phantom-test-suite",
+      "title": "声称的测试套件在文件系统中不存在，验证记录不可信",
+      "severity": "Medium",
+      "reason": "MEMORY.md 与 progress.md 声称存在 17 个以上测试文件并记录了全绿结果（RAG 594 项、v1/v2 71 passed、全量 531 passed 等互相矛盾的数字），UNIHARNESS_ADAPTATION_PLAN.md 指向 ai-service/tests/ 下的测试路径；实际文件系统中只有 ai-service 下两个测试文件，ai-service/tests/ 目录不存在，且 MEMORY.md 已自证上一轮 71 passed 记录实际不存在。后果：验证记录通道被污染，后续会话按状态文件复现会失败，曾被声称覆盖 531 项的回归保护无法审计。",
+      "expectedOutput": [
+        "让声称的测试套件真实存在并可通过项目命令执行",
+        "修正 MEMORY.md 与 progress.md 中与文件系统不符的测试结果记录"
+      ],
+      "expectedArtifact": "Test suite and verification records",
+      "aiFixPrompt": "/better-harness fix this issue\n\n修复测试套件记录与文件系统不符的问题：核对 MEMORY.md、progress.md 与 UNIHARNESS_ADAPTATION_PLAN.md 中声称的测试文件与结果，恢复或创建与记录一致的测试套件，并只保留与实际执行结果一致的验证记录。\n\n范围：只修改 ai-service 测试资产与相关验证记录文档。\n\n## 验证\n\n- 运行 python -m pytest 并按修复后路径执行测试，确认测试文件存在且结果与记录一致\n- 确认文档中不再出现与实际文件系统不符的测试结果数字",
+      "dimensionRefs": [
+        "change-validation"
+      ]
+    },
+    {
+      "id": "missing-deploy-pipeline",
+      "title": "README 声明的生产部署流水线在仓库中不存在",
+      "severity": "Medium",
+      "reason": "README 部署章节声称 main 推送会触发构建三镜像、推送镜像仓库、SSH 上传 compose 与环境文件、服务器拉取镜像重启的六步流水线；仓库中唯一 workflow 只有前端测试构建、网关测试与 Python 语法编译三步轻量验证，无镜像构建、无 SSH 部署、无 compose 配置校验。生产发布路径无法从仓库内复现，容器与回滚能力只有方案文档中的设计声明，无托管接受路径。",
+      "expectedOutput": [
+        "让仓库内 workflow 与声明的部署流水线一致，或修正 README 使文档与实际接受路径一致"
+      ],
+      "expectedArtifact": "Deployment workflow and README",
+      "aiFixPrompt": "/better-harness fix this issue\n\n修复部署声明与仓库实际配置不符的问题：比对 README 部署章节与 .github/workflows/deploy.yml，补齐缺失的流水线步骤（镜像构建、部署、compose 配置校验），或将 README 声明修正为仓库内真实存在的接受路径。\n\n范围：仅修改部署配置与相关文档声明。\n\n## 验证\n\n- 运行 docker compose -f docker-compose.prod.yml config 校验配置有效\n- 确认 README 部署描述与 workflow 实际步骤一致",
+      "dimensionRefs": [
+        "reliable-delivery"
+      ]
+    },
+    {
+      "id": "prod-dev-dependency-fork",
+      "title": "生产容器与开发环境依赖分叉，核心 RAG 路径版本约束矛盾",
+      "severity": "Medium",
+      "reason": "ai-service/Dockerfile 安装 requirements-minimal.txt，该文件声明 langgraph>=0.2.0 且不含 sqlite-vec、pymupdf4llm、langgraph-checkpoint-sqlite；而 README 本地安装命令指向的 requirements.txt 声明 langgraph==1.2.6 并包含上述包。同一依赖两套版本约束互相矛盾，声称已实现的核心路径（SQLite 向量检索、PDF 层级摄入、checkpointer）在生产镜像中缺失或版本漂移，本地与容器行为差异造成不可忽略的调试成本。",
+      "expectedOutput": [
+        "让生产镜像与本地开发安装同一组受约束依赖，核心 RAG 路径在容器内可用"
+      ],
+      "expectedArtifact": "Unified dependency manifest",
+      "aiFixPrompt": "/better-harness fix this issue\n\n修复生产与开发依赖分叉的问题：统一 ai-service 的 requirements.txt 与 requirements-minimal.txt，使容器构建与本地安装使用一致的版本约束，并确认核心包在镜像中可用。\n\n范围：仅修改 ai-service 的依赖声明与 Dockerfile 安装步骤。\n\n## 验证\n\n- 构建镜像或运行容器内依赖解析，确认 sqlite-vec、pymupdf4llm、langgraph-checkpoint-sqlite 可用\n- 确认两套依赖文件对 langgraph 的版本约束一致",
+      "dimensionRefs": [
+        "controlled-execution"
+      ]
+    },
+    {
+      "id": "completed-without-baseline",
+      "title": "Git 基线前置未满足即标记全部 tickets 完成，无合并接受路径",
+      "severity": "Medium",
+      "reason": "UNIHARNESS_ADAPTATION_PLAN.md 明确要求实施前恢复完整 Git 历史并在非 main 分支工作，三项环境输入（Git 历史、fork、TLS 凭据）均未满足；fork 差异文档承认 Ticket 01 被项目所有者推迟，用仓库内 stub 替代。progress.md 与实施目录标记其余 tickets 全部完成。后果：这些代码无基线可比、无差异可审、无托管回滚机制，切流与删除旧版的准入判断全部依赖本地脚本与手工操作，与方案宣称的硬门放行之间没有可验证的连接。",
+      "expectedOutput": [
+        "建立最小可审计接受路径：恢复 Git 基线或显式记录偏离决定并建立等价验收边界"
+      ],
+      "expectedArtifact": "Git baseline and acceptance route",
+      "aiFixPrompt": "/better-harness fix this issue\n\n修复实施完成标记缺乏可审计基线的问题：恢复项目 Git 基线使已完成 tickets 的变更可比可审，或由项目所有者显式记录跳过前置的决定并建立等效的替代接受路径。\n\n范围：仅涉及版本控制基线与接受路径的建立，不改动业务代码。\n\n## 验证\n\n- 确认基线存在且已完成 tickets 的变更可进行差异审查\n- 或确认偏离决定与替代接受路径已被显式记录",
+      "dimensionRefs": [
+        "reliable-delivery"
+      ]
+    },
+    {
+      "id": "ci-ai-service-compile-only",
+      "title": "托管 CI 对 AI service 仅做语法编译，无行为验证",
+      "severity": "Medium",
+      "reason": "唯一 workflow 对 AI service 只运行 Python 语法编译，没有 pytest、没有静态与密钥扫描、没有镜像构建、没有路径过滤。被测对象（RAG、Agent、v2 runtime）的全部行为验证没有任何托管执行路径，方案中定义的切换硬门与验收脚本未接入任何自动强制执行；改动只能依赖本地验证，CI 无法阻止破坏性回归合入。",
+      "expectedOutput": [
+        "在 CI 中为 AI service 增加最小测试执行并保留结果",
+        "让验收脚本与切换硬门接入托管执行路径"
+      ],
+      "expectedArtifact": "CI workflow",
+      "aiFixPrompt": "/better-harness fix this issue\n\n修复 AI service 无托管行为验证的问题：在 workflow 中为 ai-service 增加最小测试执行（与修复后的测试套件一致），并接入可用的验收脚本。\n\n范围：仅修改 .github/workflows/deploy.yml 的验证步骤。\n\n## 验证\n\n- 推送后确认 workflow 执行了 AI service 测试并保留可读结果\n- 确认 CI 失败能阻止变更合入",
+      "dimensionRefs": [
+        "change-validation"
+      ]
+    },
+    {
+      "id": "session-source-unavailable",
+      "title": "会话采集源根未配置，窗口内无可审查会话",
+      "severity": "Low",
+      "reason": "30 天窗口内 5 个已启用源根中 0 个存在（源根缺失与禁用警告），会话事实包中合格会话为 0，各学习相关覆盖面均无法评估。后果：无法区分重复工作或确认维护漂移，也无法把已验证需求路由到可复用改进路径；任何无重复工作、无学习需求的结论都超出证据支持范围。",
+      "expectedOutput": [
+        "配置并启用工作区会话采集源根，使后续审查有可评估的会话证据"
+      ],
+      "expectedArtifact": "Session source configuration",
+      "aiFixPrompt": "/better-harness fix this issue\n\n修复会话采集源根缺失的问题：配置并启用工作区的会话源根，使后续有界审查能采集合格会话。\n\n范围：仅修改会话采集源根配置。\n\n## 验证\n\n- 重新运行会话事实采集，确认合格会话数大于 0 且无源根警告",
+      "dimensionRefs": [
+        "learning-capture"
+      ]
+    },
+    {
+      "id": "memory-count-conflict",
+      "title": "Memory 清单计数与标题级记录矛盾，治理状态不可判定",
+      "severity": "Low",
+      "reason": "资产基线中清单汇总声称 2 条 Memory，但清单与完整性两处标题级计数均为 0、审查 finding 为 0。信封内部计数矛盾，这 2 条 Memory 既不能被认定为干净，也不能被认定为已审查，学习相关资产处于未建立状态；后续报告不能为该清单中的任何字段背书。",
+      "expectedOutput": [
+        "诊断清单计数与标题级记录不一致的来源，使 Memory 治理状态可判定"
+      ],
+      "expectedArtifact": "Memory inventory diagnosis",
+      "aiFixPrompt": "/better-harness fix this issue\n\n修复 Memory 清单计数矛盾的问题：诊断资产清单汇总计数与标题级记录不一致的来源，使这些 Memory 的治理状态可判定。\n\n范围：仅诊断与修正 Memory 清单统计逻辑或记忆源配置。\n\n## 验证\n\n- 重新运行资产基线，确认清单汇总与标题级计数一致",
+      "dimensionRefs": [
+        "learning-capture"
+      ]
+    }
+  ]
+}

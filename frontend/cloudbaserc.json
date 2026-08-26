@@ -1,0 +1,6 @@
+{
+  "envId": "ai-hiking-d4gf29b4zcebc048d",
+  "cloudrun": {
+    "name": "frontend"
+  }
+}

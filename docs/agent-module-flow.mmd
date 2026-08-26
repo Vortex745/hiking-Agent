@@ -1,0 +1,65 @@
+flowchart TD
+    subgraph A0["启动装配 (main.py lifespan)"]
+        A1["check_v2_startup_guard<br/>(Vercel 守护: v2 需持久卷)"] --> A2["assemble_v2_runtime<br/>(agent_v2/startup.py)"]
+        A2 --> A3["state_dir + OS WriterLock<br/>(单写者 AC7)"]
+        A3 --> A4["SQLite stores<br/>agent_control + chat_checkpoints + agent_memory"]
+        A4 --> A5["RunRepository + MemoryService<br/>+ Telemetry + Capacity"]
+        A5 --> A6["V2Runtime → app.state.agent_v2_runtime"]
+    end
+
+    subgraph A7["请求入口 POST /api/v2/chat/sse"]
+        B1["chat_v2_sse<br/>(api/chat_v2.py:2058)"] --> B2["Capacity.acquire_run<br/>(artifact/cowork 再 acquire_sandbox)"]
+        B2 -->|"CapacityExceeded"| B3["503 retryable"]
+        B2 --> B4["guarded_stream<br/>(finally 释放租约)"]
+        B4 --> B5["_stream_chat_v2"]
+        B5 --> B6["EventStream 初始化<br/>(request_id / conversation_id / run_id)"]
+        B6 --> B7["create_run_idempotent<br/>(request_id 幂等键)"]
+        B7 -->|"重复 request_id"| B8["重放存储事件 → 停止"]
+        B7 --> B9["emit 闭包<br/>EventStream.build + persist_event + telemetry"]
+        B9 --> B10["heartbeat + 取消轮询<br/>(_is_cancelled)"]
+        B10 --> B11{"profile 分发<br/>(resolve_profile 服务端裁决)"}
+    end
+
+    subgraph A8["chat profile (Ticket 04)"]
+        C1["记忆工具<br/>memory.consent_required / memory_save / memory_search<br/>(PermissionGate 裁决)"] --> C2["stub 分类响应<br/>(greeting / slot_followup / normal)"]
+        C2 --> C3["text → done"]
+    end
+
+    subgraph A9["route_plan profile (Ticket 05)"]
+        D1["场景分类<br/>stub_classify_route_plan<br/>(has_location / MCP 可用性)"] --> D2{"需要 MCP 证据?"}
+        D2 -->|"是"| D3["tool_call<br/>amap_map.plan_route<br/>amap_weather.get_current_weather<br/>(mcp_registry 解析, 凭据隔离)"]
+        D3 --> D4["tool_result<br/>(ok / timeout / oversize)"]
+        D2 -->|"否"| D5
+        D4 --> D5["text (无证据则明示缺失) → done"]
+    end
+
+    subgraph A10["artifact profile (Tickets 09+10)"]
+        E1["sandbox 创建<br/>E2B(生产) / LocalNative(开发)<br/>fail-closed: 任何 ComputerError → error"] --> E2["租约持久化<br/>agent_control.sqlite create_sandbox_lease"]
+        E2 --> E3["tool_call(generate_pdf)<br/>sandbox 工具: read/write/edit/glob/grep"]
+        E3 --> E4["tool_result → artifact_candidate<br/>→ 主机校验 + artifact.available<br/>(opaque id, TTL 7天)"]
+        E4 --> E5["text → done<br/>finally: 沙箱清理 (完成或取消均执行)"]
+    end
+
+    subgraph A11["cowork profile (Ticket 13)"]
+        F1["授权门: is_cowork_authorized<br/>(trusted / staging)"] --> F2["PermissionGate 鉴权 + approval 审批<br/>(approvals_v2_router 决策)"]
+        F2 --> F3["effect ledger + sandbox_bash<br/>逐步执行"]
+        F3 --> F4["finally: 沙箱清理"]
+    end
+
+    B11 -->|"chat"| A8
+    B11 -->|"route_plan"| A9
+    B11 -->|"artifact"| A10
+    B11 -->|"cowork"| A11
+
+    subgraph A12["支撑端点 (Ticket 06)"]
+        G1["GET /api/v2/chat/snapshot/{run_id}<br/>状态快照"]
+        G2["POST /api/v2/chat/cancel<br/>DB 行置 cancelled, 流观察退出"]
+        G3["GET /api/v2/chat/events/{run_id}?from_seq=N<br/>断线重放"]
+        G4["POST /api/v2/approvals/{id}/decision<br/>审批决策"]
+        G5["GET /api/v2/artifacts/{id}<br/>产物下载 (过期 410)"]
+    end
+
+    A6 -.->|"app.state 注入"| A7
+    A7 -.->|"运行期读取"| G1
+    A7 -.->|"运行期读取"| G2
+    A7 -.->|"运行期读取"| G3

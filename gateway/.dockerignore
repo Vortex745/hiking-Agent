@@ -1,0 +1,9 @@
+.git/
+Dockerfile
+*.md
+*.png
+*.log
+*.exe
+*.test
+gateway
+cloudbaserc.json

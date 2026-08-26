@@ -1,0 +1,104 @@
+# ============================================================
+# Python (ai-service/ and mcp-server/)
+# ============================================================
+.conda312/
+.venv/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.env
+*.log
+
+# ============================================================
+# Go (gateway/)
+# ============================================================
+gateway.exe
+*.exe
+*.test
+
+# ============================================================
+# Node.js (frontend/)
+# ============================================================
+node_modules/
+dist/
+.vite/
+
+# ============================================================
+# IDE / Editor
+# ============================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ============================================================
+# OS Files
+# ============================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ============================================================
+# Project Runtime Data
+# ============================================================
+memory_data/
+memory_store/
+test_memory_store/
+workspace/
+.firecrawl/
+.sisyphus/
+rag_docs/
+ai-service/memory_data/
+ai-service/memory_store/
+ai-service/test_memory_store/
+ai-service/workspace/
+ai-service/rag_docs/
+
+# ============================================================
+# Non-essential Runtime / Verification Artifacts
+# ============================================================
+test-report/
+test-screenshots/
+playwright-report/
+coverage/
+*.heapsnapshot
+*-local.log
+*-local.err.log
+frontend-vite.log
+frontend-vite.err.log
+ai-service/*-local.log
+ai-service/*-local.err.log
+ai-service/vercel-ai-runtime.log
+agent-monitor-*.png
+verification-*.png
+repo-context.md
+handoff-*.md
+progress.md
+
+# ============================================================
+# OMC / Claude Tooling
+# ============================================================
+.omc/
+.omx/
+.claude/
+
+# ============================================================
+# Root Temp / Doc Artifacts
+# ============================================================
+*.png
+*.md
+!README.md
+/ascii-art.mp4
+verify.json
+
+# ============================================================
+# Local Agent / IDE Tooling
+# ============================================================
+.codebuddy/
+.vercel
+.neon

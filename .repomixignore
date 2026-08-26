@@ -1,0 +1,27 @@
+# Ignore virtual environments
+ai-service/.conda312/
+ai-service/.venv/
+.venv/
+venv/
+env/
+
+# Ignore node modules and package lock files
+node_modules/
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+
+# Ignore build output and temp files
+dist/
+build/
+.tempmediaStorage/
+artifacts/
+.gemini/
+.git/
+*.exe
+*.log
+*.err
+
+# Ignore repomix outputs to avoid recursion
+repo-context.md
+MEMORY.md

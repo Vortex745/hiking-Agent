@@ -1,0 +1,84 @@
+%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "primaryTextColor": "#0f172a", "lineColor": "#64748b", "fontFamily": "Arial"}}}%%
+flowchart TD
+    UI["Frontend RAG 页面<br/>ragStream.ts / applyRagStreamEvent"]
+    GW["Gateway<br/>POST /api/v1/rag/query<br/>SSE 转发"]
+    API["ai-service/api/rag.py<br/>rag_query + event_stream"]
+    CHECK["取消请求 / resume 状态校验<br/>ClarificationStore"]
+    MODE{"graph runtime 可用且请求可走 graph?"}
+    DIRECT["请求守卫<br/>direct_rag_answer<br/>_rag_guard_answer"]
+    DIRECT_END["直接回答<br/>text → done"]
+    LEGACY["Legacy RAG 路径<br/>澄清 → 改写/上下文 → 检索 → 聚合 → SSE<br/>（graph runtime 不可用或请求带排除条件）"]
+
+    subgraph GRAPH["Graph runtime · RAGRuntime / LangGraph"]
+        RUN["RAGRuntime.arun<br/>run_rag_graph<br/>thread_id = chat_id"]
+        SUM["summarize_conversation<br/>滚动 summary + 最近消息<br/>每轮重置累计 docs/process"]
+        ANALYZE["analyze_query<br/>单节点融合 contextualize + rewrite<br/>is_clear / 子问题 ≤ 3 / 澄清原因"]
+        ROUTE{"is_clear?"}
+        CLARIFY["request_clarification<br/>创建 clarification 记录"]
+        INTERRUPT["LangGraph interrupt<br/>暂停当前图执行"]
+        FANOUT["Send fan-out × N<br/>每个子问题带 question_index"]
+        RETRIEVE{"retrieve 实现"}
+        SIMPLE["默认 retrieve 节点<br/>VectorStoreRetriever.search"]
+        AGG["aggregate_answer<br/>按 question_index 保序<br/>组内去重 + 冲突显式呈现"]
+        AUG["最终回答边界<br/>ContextAugmenter / LLM fallback<br/>humanize + CJK 清理"]
+    end
+
+    subgraph SUB["可选检索子图 · use_retrieve_subgraph=True"]
+        ORCH["orchestrator<br/>决定下一步动作"]
+        CHILD["search_child<br/>child 检索"]
+        PARENT["search_parent<br/>parent 回溯"]
+        COMPRESS["compress<br/>压缩工作记忆并保留安全事实"]
+        FINALIZER["finalizer<br/>去重 → final_docs"]
+        ORCH -->|search_child| CHILD --> ORCH
+        ORCH -->|search_parent| PARENT --> ORCH
+        ORCH -->|compress| COMPRESS --> ORCH
+        ORCH -->|finalize| FINALIZER
+    end
+
+    subgraph RETRIEVAL["检索与存储"]
+        HYBRID["hybrid_search<br/>dense + sparse + RRF<br/>SQLite: sqlite-vec + FTS5/jieba"]
+        BACKEND["backend_resolver<br/>sqlite / pgvector / memory"]
+        STORE[("知识库存储<br/>parent / child / vector / FTS5")]
+    end
+
+    subgraph INGEST["知识库摄入旁路"]
+        UPLOAD["/api/v1/rag/upload<br/>或云文档 / 飞书同步"]
+        LOAD["DocumentLoader<br/>txt / md / pdf / 远程文档"]
+        MARKDOWN["extract_markdown<br/>PDF → Markdown"]
+        SPLIT["IngestionPipeline<br/>parent/child 分层切分"]
+        UPSERT["upsert_document<br/>embedding + FTS5 写入"]
+        UPLOAD --> LOAD --> MARKDOWN --> SPLIT --> UPSERT --> STORE
+    end
+
+    SSE["_emit_state_sse<br/>process → documents → text → done<br/>答案写入 RAG memory"]
+    CLARIFY_SSE["clarification_needed → done<br/>前端等待用户补充答案"]
+    RESUME["第二次 POST<br/>同 chat_id + clarification_answers<br/>Command(resume=answers)"]
+
+    UI --> GW --> API --> CHECK --> MODE
+    CHECK -->|cancel| DIRECT_END
+    CHECK -->|无效 resume| DIRECT_END
+    CHECK -->|valid resume| RESUME --> MODE
+    CHECK -->|new request| MODE
+    MODE -->|graph runtime| DIRECT
+    MODE -->|legacy| LEGACY --> SSE
+    DIRECT -->|命中守卫| DIRECT_END --> UI
+    DIRECT -->|继续检索| RUN --> SUM --> ANALYZE --> ROUTE
+    ROUTE -->|不清晰 + 澄清开启| CLARIFY --> INTERRUPT --> CLARIFY_SSE --> UI
+    ROUTE -->|不清晰 + 澄清关闭| AGG
+    ROUTE -->|清晰| FANOUT --> RETRIEVE
+    RETRIEVE -->|默认 false| SIMPLE --> HYBRID --> AGG
+    RETRIEVE -->|true| ORCH --> FINALIZER --> AGG
+    AGG --> AUG --> SSE --> UI
+    HYBRID --> BACKEND --> STORE
+    PARENT -.->|SQLite parent 回溯| STORE
+
+    classDef entry fill:#e8f1ff,stroke:#2563eb,color:#0f172a;
+    classDef decision fill:#fff7ed,stroke:#ea580c,color:#431407;
+    classDef process fill:#f8fafc,stroke:#64748b,color:#0f172a;
+    classDef optional fill:#f0fdfa,stroke:#0f766e,color:#134e4a;
+    classDef storage fill:#fefce8,stroke:#a16207,color:#422006;
+    class UI,GW,API entry;
+    class MODE,ROUTE,RETRIEVE decision;
+    class RUN,SUM,ANALYZE,CLARIFY,INTERRUPT,FANOUT,SIMPLE,AGG,AUG,DIRECT,LEGACY,SSE,CLARIFY_SSE,RESUME,LOAD,MARKDOWN,SPLIT,UPSERT process;
+    class ORCH,CHILD,PARENT,COMPRESS,FINALIZER optional;
+    class BACKEND,STORE storage;

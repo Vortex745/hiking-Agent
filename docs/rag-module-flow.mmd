@@ -1,0 +1,53 @@
+flowchart TD
+    subgraph S1["摄入链路 /api/v1/rag/upload"]
+        U1["rag_upload<br/>(api/rag.py)"] --> U2["后端判定<br/>_get_retriever_sqlite_store"]
+        U2 -->|"SQLite 后端"| U3["IngestionPipeline.ingest_file"]
+        U2 -->|"pgvector/memory 后端"| U4["legacy: DocumentLoader + add_documents"]
+        U3 --> U5["extract_markdown<br/>(pymupdf4llm PDF→MD)"]
+        U5 --> U6["split_parent_chunks<br/>(H1/H2/H3 层级)"]
+        U6 --> U7["split_child_chunks<br/>(500/100 重叠)"]
+        U7 --> U8["upsert_document<br/>(parent + child_vec + FTS5)"]
+    end
+
+    subgraph S2["查询入口 /api/v1/rag/query"]
+        Q1["rag_query<br/>(api/rag.py:1041)"] --> Q2{"cancel_clarification_id?"}
+        Q2 -->|"是"| Q3["取消澄清 → JSONResponse"]
+        Q2 -->|"否"| Q4{"clarification_answers?"}
+        Q4 -->|"是"| Q5["澄清状态校验<br/>404/410/200 JSONResponse"]
+        Q4 -->|"否"| Q6{"graph runtime 切换条件<br/>runtime可用 + 无自定义model_settings + 无status + 无飞书链接"}
+        Q6 -->|"满足"| R1
+        Q6 -->|"不满足"| L0["legacy 路径<br/>澄清→改写→检索→重试→聚合→SSE"]
+    end
+
+    subgraph S3["graph runtime 路径<br/>_run_graph_runtime_sse (api/rag.py:531)"]
+        R1["读 history + 写入 user question"] --> R2{"guard 前置1<br/>direct_rag_answer 问候?"}
+        R2 -->|"是"| R3["text + done 直接回答"]
+        R2 -->|"否"| R4{"guard 前置2<br/>_rag_guard_answer 越域/不清晰?"}
+        R4 -->|"是"| R5["process + text + done<br/>跳过检索"]
+        R4 -->|"否"| R6["runtime.arun(question, chat_id, messages)"]
+        R6 --> R7["LangGraph 主图<br/>rag/graph.py"]
+    end
+
+    subgraph S4["LangGraph 主图 (rag/graph.py)"]
+        direction TB
+        G1["summarize_conversation<br/>(滚动摘要 + _RESET 重置)"] --> G2["analyze_query<br/>(contextualize + rewrite 融合<br/>输出 is_clear / sub_questions)"]
+        G2 -->|"Send 派发"| G3["retrieve × N 并行<br/>(question_index 保序)"]
+        G3 --> G4["aggregate_answer<br/>(保序聚合 + 冲突检测<br/>+ 领域能力融合)"]
+        G4 --> G5["END"]
+        G2 -->|"is_clear=False 且启用澄清"| G6["request_clarification<br/>(interrupt)"]
+        G6 -->|"Command(resume=answers)"| G2
+        G2 -->|"is_clear=False 默认"| G4
+    end
+
+    subgraph S5["retrieve 节点 (rag/graph.py:392)<br/>子图模式: rag/retrieve_subgraph.py"]
+        H1["orchestrator<br/>检索规划 + 工具调用编排<br/>(max_iterations / max_tool_calls / token 预算)"] --> H2{"路由判定<br/>_route_after_orchestrator"}
+        H2 -->|"search_child"| H3["search_child<br/>混合检索子块 (FTS5 + 向量)"]
+        H2 -->|"search_parent"| H4["search_parent<br/>父块检索 (parent_retriever_fn)"]
+        H2 -->|"compress"| H5["compress<br/>上下文压缩 (超 token 阈值)"]
+        H2 -->|"finalize"| H6["finalizer<br/>去重 + 排序 + 标记 question_index"]
+        H3 --> H1
+        H4 --> H1
+        H5 --> H1
+        H6 --> H7["返回 final_docs<br/>(带 question_index) → aggregate_answer"]
+        H7 --> G4
+    end

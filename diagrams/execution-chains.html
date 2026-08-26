@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Hiking · 执行链路图（RAG / Agent）</title>
+<style>
+  :root {
+    --bg: #0b0e12;
+    --panel: #12161d;
+    --panel-2: #171c25;
+    --line: #262e3b;
+    --ink: #e8eaed;
+    --muted: #98a2b0;
+    --faint: #6b7480;
+    --accent: #7aa3ff;
+    --accent-dim: #3a4core;
+    --green: #6fbe93;
+    --amber: #d9a441;
+    --red: #e07a7a;
+    --mono: "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+    --sans: "Segoe UI", -apple-system, "Microsoft YaHei", sans-serif;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    line-height: 1.5;
+    padding: 40px 24px 80px;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+  header.hero { margin-bottom: 44px; }
+  header.hero h1 { font-size: 22px; font-weight: 600; letter-spacing: .04em; }
+  header.hero .crumb { font-family: var(--mono); font-size: 12px; color: var(--faint); margin-bottom: 10px; }
+  header.hero .sub { color: var(--dim); font-size: 13px; max-width: 640px; margin-top: 6px; }
+
+  h2.section-title {
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--ink);
+    padding: 14px 0 6px;
+    border-top: 1px solid var(--line);
+    margin-top: 30px;
+  }
+  .legend {
+    display: flex; gap: 18px; flex-wrap: wrap;
+    margin: 14px 0 24px;
+    font-size: 12px; color: var(--dim);
+  }
+  .legend span { display: inline-flex; align-items: center; gap: 7px; }
+  .sw { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+
+  /* flow structure */
+  .chain { display: flex; flex-direction: column; }
+  .stage { display: flex; gap: 14px; justify-content: center; align-items: stretch; flex-wrap: wrap; }
+  .stage.left { justify-content: flex-start; }
+  .node {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 11px 14px;
+    min-width: 240px;
+    max-width: 300px;
+    position: relative;
+  }
+  .node .f { font-family: var(--mono); font-size: 11.5px; color: var(--accent); word-break: break-all; }
+  .node .fn { font-size: 13px; font-weight: 600; margin-top: 3px; color: var(--ink); }
+  .node .d { font-size: 12px; color: var(--dim); margin-top: 5px; }
+  .node.kind-llm    { border-color: #33436b; background: #131a2b; }
+  .node.kind-store  { border-color: #2f4a3a; background: #12211b; }
+  .node.kind-guard  { border-color: #4a3f22; background: #1e1b12; }
+  .node.kind-term   { border-color: #4a2525; background: #211414; }
+  .node.kind-entry  { border-color: #3a3f4d; background: #171c25; }
+  .node.kind-graph  { border-color: #2b3555; background: #131a2b; }
+  .node.note        { border-style: dashed; opacity: .85; min-width: 260px; }
+  .tag {
+    position: absolute; top: -9px; right: 10px;
+    font-family: var(--mono); font-size: 10px; letter-spacing: .05em;
+    padding: 2px 8px; border-radius: 999px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--faint);
+  }
+  .tag.g { color: var(--green); border-color: #2f4a3a; }
+  .tag.a { color: var(--amber); border-color: #4a3f22; }
+  .tag.r { color: var(--red);   border-color: #7f2525; }
+  .tag.l { color: var(--accent);border-color: #33406c; }
+
+  /* connectors */
+  .conn { display: flex; flex-direction: column; align-items: center; padding: 10px 0 2px; }
+  .conn .vp { width: 1px; height: 22px; background: var(--faint); }
+  .conn .head { color: var(--faint); font-size: 12px; line-height: 1; transform: translateY(-3px); }
+  .conn .label { font-family: var(--mono); font-size: 10.5px; color: var(--dim); margin-top: 1px; }
+  .conn.branch .vp { background: var(--accent-dim); }
+  .conn.end .vp { background: transparent; }
+
+  .rowlabels { display: flex; justify-content: space-between; }
+  .branch-caption { font-family: var(--mono); font-size: 10.5px; color: var(--faint); padding: 0 14px; }
+
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 760px) { .two { grid-template-columns: 1fr; } }
+
+  .foot { margin-top: 54px; padding-top: 18px; border-top: 1px solid var(--line); font-size: 11px; color: var(--faint); font-family: var(--mono); }
+  .foot code { color: var(--dim); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero-head">
+    <div class="crumb">ai-service · execution chains</div>
+    <h1>AI Hiking 执行链路图</h1>
+    <div class="sub">RAG 知识库问答模块与 Agent（HikingManus）能力模块从 HTTP 入口到 LLM / 检索 / 存储的完整链路。文件与行号对应源码，随实现演进需同步维护。</div>
+  </header>
+
+  <div class="legend">
+    <span><i class="sw" style="background:var(--panel);border:1px solid var(--line)"></i> 处理节点</span>
+    <span><i class="sw" style="background:#131a2b;border:1px solid #33406c"></i> LLM 调用</span>
+    <span><i class="sw" style="background:#12211b;border:1px solid #2f4a3a"></i> 存储 / 检索</span>
+    <span><i class="sw" style="background:#1e1b12;border:1px solid #4a3f22"></i> 守卫 / 路由</span>
+    <span><i class="sw" style="background:#211414;border:1px solid #7f2525"></i> 终止 / 退出</span>
+  </div>
+
+  <!-- ============================================================= -->
+  <h2 class="section-title">一、RAG 模块执行链路</h2>
+
+  <div class="chain">
+    <!-- entry -->
+    <div class="stage">
+      <div class="node kind-entry">
+        <span class="tag l">HTTP entry</span>
+        <div class="f">api/rag.py:1045</div>
+        <div class="fn">POST /rag/query</div>
+        <div class="d">FastAPI SSE；支持首请求 / resume（澄清） / 取消三类请求</div>
+      </div>
+      <div class="node kind-entry" style="opacity:.85">
+        <span class="tag l">HTTP entry</span>
+        <div class="f">api/rag.py:955</div>
+        <div class="fn">POST /rag/upload</div>
+        <div class="d">文档入库（同步链路，右图）</div>
+      </div>
+    </div>
+
+    <div class="conn"><div class="vp"></div><div class="head">▼</div><div class="label">request 校验</div></div>
+
+    <div class="stage">
+      <div class="node kind-guard">
+        <span class="tag a">guard</span>
+        <div class="f">api/rag.py:1070 · 1091</div>
+        <div class="fn">澄清状态校验</div>
+        <div class="d">cancel → 404；resume 校验过期 / 取消 / 已恢复</div>
+      </div>
+      <div class="node kind-guard">
+        <span class="tag a">guard</span>
+        <div class="f">api/rag.py:250 · 278</div>
+        <div class="fn">direct_rag_answer / _rag_guard_answer</div>
+        <div class="d">问候直答、越域 / 不清晰拦截（不进检索）</div>
+      </div>
+      <div class="node kind-guard">
+        <span class="tag a">guard</span>
+        <div class="f">rag/clarification.py</div>
+        <div class="fn">clarification_store</div>
+        <div class="d">需澄清问题建档（clr_id + 过期），resume 时合并回答</div>
+      </div>
+    </div>
+
+    <div class="conn branch"><div class="vp"></div><div class="head">▼</div><div class="label">路由：graph runtime 是否可用</div></div>
+    <div class="branch-caption">runtime≠None 且无自定义 model_settings / status / 飞书链接 → graph runtime；否则 legacy（零回归）</div>
+
+    <div class="lane">
+      <div class="chain">
+        <!-- graph runtime -->
+        <div class="stage">
+          <div class="node kind-graph">
+            <span class="tag l">graph runtime</span>
+            <div class="f">rag/graph.py:1169</div>
+            <div class="fn">run_rag_graph / runtime.arun</div>
+            <div class="d">LangGraph state 执行；RAGState 携带 process_messages / retrieved_docs / answer</div>
+          </div>
+        </div>
+        <div class="conn branch"><div class="vp"></div><div class="head">▼</div></div>
+        <div class="stage">
+          <div class="node kind-llm">
+            <span class="tag l">llm</span>
+            <div class="f">graph.py:119</div>
+            <div class="fn">summarize_conversation</div>
+            <div class="d">最近对话压缩为摘要（有 LLM 才调用，否则 fallback 截断)</div>
+          </div>
+          <div class="node kind-llm">
+            <span class="tag l">llm</span>
+            <div class="f">graph.py:195</div>
+            <div class="fn">analyze_query</div>
+            <div class="d">问题拆解为子问题，判 is_clear 是否需要澄清</div>
+          </div>
+        </div>
+        <div class="conn branch"><div class="vp"></div><div class="head">▼</div><div class="label">is_clear / clarification</div></div>
+        <div class="stage">
+          <div class="node kind-graph">
+            <span class="tag l">interrupt</span>
+            <div class="f">graph.py:895</div>
+            <div class="fn">request_clarification</div>
+            <div class="d">启用澄清时：is_clear=0 → interrupt 触发 → resume 恢复（Command resume）</div>
+          </div>
+          <div class="node kind-graph">
+            <span class="f g">fan-out</span>
+            <div class="f">graph.py:784 · Send × N</div>
+            <div class="fn">retrieve（每子问题一次）</div>
+            <div class="d">并发子图 / 并行检索，结果带 question_index 保序</div>
+          </div>
+        </div>
+        <div class="conn branch"><div class="vp"></div><div class="head">▼</div></div>
+        <div class="stage left">
+          <div class="node kind-graph">
+            <span class="f g">fusion</span>
+            <div class="f">rag/graph.py:392</div>
+            <div class="fn">aggregate_answer</div>
+            <div class="d">排序 / 冲突检测 / 领域能力融合（augmenter + rewriter），LLM 生成最终答案</div>
+          </div>
+          <div class="node kind-term">
+            <span class="tag r">sse</span>
+            <div class="f">api/rag.py:672 _emit_state_sse</div>
+            <div class="fn">process → documents → text → done</div>
+            <div class="d">state → SSE 事件映射，写入聊天记忆</div>
+          </div>
+        </div>
+      </div>
+      <div class="chain">
+        <!-- narrow hybrid search box -->
+        <div class="stage">
+          <div class="node kind-store">
+            <span class="tag g">hybrid</span>
+            <div class="f">rag/hybrid_retrieval.py:51</div>
+            <div class="fn">search_child_chunks</div>
+            <div class="d">检索子 chunk；命中后 parent 回溯（retrieve_parent_chunks）</div>
+          </div>
+        </div>
+        <div class="conn"><div class="vp"></div><div class="head">▼</div></div>
+        <div class="stage">
+          <div class="node kind-store" style="min-width:200px">
+            <div class="f">hybrid_retrieval.py:125</div>
+            <div class="fn">_dense_search</div>
+            <div class="d">sqlite-vec 向量相似度（文本 × 嵌入数列)</div>
+          </div>
+          <div class="node kind-store" style="min-width:200px">
+            <div class="f">hybrid_retrieval.py:192</div>
+            <div class="fn">_sparse_search</div>
+            <div class="d">FTS5 + jieba 预分词（unicode61 tokenizer），BM25</div>
+          </div>
+        </div>
+        <div class="conn"><div class="vp"></div><div class="head">▼</div></div>
+        <div class="stage left">
+          <div class="node kind-store">
+            <div class="f">hybrid_retrieval.py:256</div>
+            <div class="fn">_rrf_fuse</div>
+            <div class="d">RRF 融合重排 → source/status 过滤 → 返回带 score 片段</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="rowlabels">
+    <div class="conn end"><div class="vp"></div><div class="head">▼</div></div>
+  </div>
+
+  <!-- legacy note -->
+  <div class="stage">
+    <div class="node note">
+      <span class="tag a">legacy</span>
+      <div class="f">rag/retriever.py VectorStoreRetriever</div>
+      <div class="fn">pgvector / memory 后端路径</div>
+      <div class="d">非 SQLite 后端时：直接 add_documents 写入、简单检索 + 无澄清，保持旧行为零回归（Ticket 14 将移除）</div>
+    </div>
+  </div>
+
+  <!-- ================= upload chain ================= -->
+  <h2 class="section-title" style="margin-top:56px">二、RAG 文档入库链路</h2>
+  <div class="chain">
+    <div class="stage">
+      <div class="node kind-entry">
+        <span class="tag l">upload</span>
+        <div class="f">api/rag.py:955</div>
+        <div class="fn">rag_upload</div>
+        <div class="d">文件落盘 RAG_DOCS_DIR，解析运行时模型设置</div>
+      </div>
+    </div>
+    <div class="conn"><div class="vp"></div><div class="head">▼</div><div class="label">SQLite 后端？</div></div>
+    <div class="lane">
+      <div class="chain">
+        <div class="stage">
+          <div class="node kind-graph">
+            <span class="tag l">canonical</span>
+            <div class="f">rag/ingestion.py:427</div>
+            <div class="fn">IngestionPipeline.ingest_file</div>
+            <div class="d">SQLite 后端走 canonical 父子切分 + 索引（screenshot PDF → 415）</div>
+          </div>
+        </div>
+        <div class="conn"><div class="vp"></div><div class="head">▼</div></div>
+        <div class="stage">
+          <div class="node kind-graph">
+            <div class="f">ingestion.py:324 · :392</div>
+            <div class="fn">split_parent_chunks / split_child_chunks</div>
+            <div class="d">标题分块 + 聚合小段 + 超长拆分；子段固定窗口 + 重叠</div>
+          </div>
+          <div class="node kind-llm">
+            <span class="f g">embed</span>
+            <div class="f">ingestion.py:99 OpenAIEmbeddingAdapter</div>
+            <div class="fn">embed_documents → 向量</div>
+          </div>
+        </div>
+        <div class="conn"><div class="vp"></div><div class="head">▼</div></div>
+        <div class="stage">
+          <div class="node kind-store">
+            <span class="tag g">write</span>
+            <div class="f">rag/sqlite_store.py:179</div>
+            <div class="fn">upsert_document</div>
+            <div class="d">parent / child / vec0 / FTS5 四层同事务提交</div>
+          </div>
+          <div class="node kind-store">
+            <div class="f">sqlite_schema.py</div>
+            <div class="fn">SQLite 存储</div>
+            <div class="d">jieba 分词同步 FTS5（unicode61）；无触发器，应用层负责</div>
+          </div>
+        </div>
+      </div>
+      <div class="chain">
+        <div class="stage">
+          <div class="node note">
+            <span class="tag a">legacy</span>
+            <div class="f">api/rag.py:1008 · rag/loader.py</div>
+            <div class="fn">DocumentLoader.load_and_split + retriever.add_documents</div>
+            <div class="d">pgvector / memory 后端路径，零回归，待移除</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================= -->
+  <h2 class="section-title" style="margin-top:56px">三、Agent 模块执行链路（HikingManus）</h2>
+
+  <div class="chain">
+    <div class="stage">
+      <div class="node kind-entry">
+        <span class="tag l">HTTP entry</span>
+        <div class="f">api/chat.py:162</div>
+        <div class="fn">POST /api/v1/chat/sse → AIAgent.aexecute_stream</div>
+        <div class="d">由 ChatEndpoints 组装模型配置 + 历史 + 位置，SSE 流式</div>
+      </div>
+    </div>
+
+    <div class="conn"><div class="vp"></div><div class="head">▼</div></div>
+
+    <div class="stage">
+      <div class="node kind-guard">
+        <span class="tag a">intent</span>
+        <div class="f">agent/intake.py:422</div>
+        <div class="fn">understand_request</div>
+        <div class="d">识别意图 / 槽位（目的地、天数、难度…）/ 当前位置 → AgentRequestContext</div>
+      </div>
+      <div class="node kind-guard">
+        <span class="tag a">memory</span>
+        <div class="f">agent/agent.py:839</div>
+        <div class="fn">_inject_memory_context</div>
+        <div class="d">MemoryManager（压缩/提取）注入会话与知识记忆</div>
+      </div>
+    </div>
+
+    <div class="conn"><div class="vp"></div><div class="head">▼</div></div>
+
+    <div class="stage">
+      <div class="node kind-graph">
+        <span class="tag l">runtime</span>
+        <div class="f">agent/hiking_manus.py:26</div>
+        <div class="fn">HikingManus.create</div>
+        <div class="d">BaseAgent → ReActAgent → ToolCallAgent → HikingManus 运行时初始化</div>
+      </div>
+      <div class="node kind-graph">
+        <div class="f">agent/tool_collection.py / tools/*</div>
+        <div class="fn">ToolCollection + MCP clients</div>
+        <div class="d">hiking_domain、web_search、generate_pdf、terminal、cli 等 + MCP（地图/天气…）</div>
+      </div>
+    </div>
+
+    <div class="conn"><div class="vp"></div><div class="head">▼</div><div class="label">加载历史 → 注入用户消息</div></div>
+
+    <!-- main loop -->
+    <div class="stage">
+      <div class="node kind-graph">
+        <span class="tag l">loop</span>
+        <div class="f">agent/agent.py:866</div>
+        <div class="fn">while step &lt; max_steps</div>
+        <div class="d">重复：think → act → observe → 直到 terminate / FINISHED</div>
+      </div>
+    </div>
+
+    <div class="conn"><div class="vp"></div><div class="head">▼</div></div>
+
+    <div class="stage">
+      <div class="node kind-llm">
+        <span class="f g">llm</span>
+        <div class="f">agent/tool_call_agent.py:33</div>
+        <div class="fn">think() → _ask_tool_model</div>
+        <div class="d">绑定工具调用并预测 tool_calls；无调用 → 直接产出最终答案</div>
+      </div>
+      <div class="node kind-graph">
+        <div class="f">agent/react_agent.py:13</div>
+        <div class="fn">act()</div>
+        <div class="d">归一化工具调用（name/args/id），去重过滤</div>
+      </div>
+    </div>
+
+    <div class="conn branch"><div class="vp"></div><div class="head">▼</div><div class="label">needs_confirmation ?</div></div>
+
+    <div class="stage">
+      <div class="node kind-guard">
+        <span class="tag a">approval</span>
+        <div class="f">agent/agent.py:945 · tool_registry</div>
+        <div class="fn">_approval_event_for_tool_call</div>
+        <div class="d">高风险工具需要确认 → 挂起流，等待用户（waiting_for_user）</div>
+      </div>
+      <div class="node kind-llm">
+        <span class="f g">tool</span>
+        <div class="f">agent/tool_call_agent.py:69</div>
+        <div class="fn">execute_tool(name, args)</div>
+        <div class="d">ToolCollection 执行 → result 追加 tool 消息 → repeat/stuck 检测</div>
+      </div>
+    </div>
+
+    <div class="conn"><div class="vp"></div><div class="head">▼</div><div class="label">tool_result / terminate?</div></div>
+
+    <div class="stage left">
+      <div class="node kind-term">
+        <span class="tag r">terminal</span>
+        <div class="f">agent/task_exit.py</div>
+        <div class="fn">AgentTaskExitController</div>
+        <div class="d">terminate 工具 / 自然结束 → text + done；budget 用尽 → budget_exhausted</div>
+      </div>
+      <div class="node kind-guard">
+        <span class="tag a">guard</span>
+        <div class="f">agent/react_guard.py:21 · :75</div>
+        <div class="fn">StuckDetector / RepeatCallDetector</div>
+        <div class="d">循环或重复调用 → 提前 stop</div>
+      </div>
+    </div>
+
+    <div class="conn"><div class="vp"></div><div class="head">▼</div></div>
+
+    <div class="stage">
+      <div class="node kind-term">
+        <span class="f r">sse</span>
+        <div class="f">agent/task_exit.py done_event</div>
+        <div class="fn">thought → tool_call → tool_result → text → done</div>
+        <div class="d">审批事件、artifact 事件（图片/PDF）顺带推送；全部调用后清理 runtime</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="foot">
+    rag: api/rag.py · rag/{graph, hybrid_retrieval, sqlite_store, sqlite_schema, ingestion, clarification}.py · runtime.py<br>
+    agent: api/chat.py · agent/{agent, hiking_manus, tool_call_agent, react_agent, base_agent, intake, task_exit, react_guard}.py · tools/*
+  </div>
+
+</div>
+</body>
+</html>

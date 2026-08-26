@@ -1,0 +1,97 @@
+services:
+  postgres:
+    image: ${DOCKERHUB_IMAGE:-zijinn123/ai-hiking}:runtime-pgvector-pg16
+    container_name: ai-hiking-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ai_hiking}
+      POSTGRES_USER: ${POSTGRES_USER:-ai_hiking}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ai_hiking}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ai_hiking}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ai-hiking-net
+    restart: unless-stopped
+
+  ai-service:
+    image: ${DOCKERHUB_IMAGE:-zijinn123/ai-hiking}:ai-service-${IMAGE_TAG:-latest}
+    container_name: ai-hiking-ai-service
+    environment:
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_MODEL: ${OPENAI_MODEL:-deepseek-v4-flash}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1536}
+      RERANK_BASE_URL: ${RERANK_BASE_URL}
+      RERANK_API_KEY: ${RERANK_API_KEY}
+      RERANK_MODEL: ${RERANK_MODEL:-Qwen/Qwen3-Reranker-8B}
+      RERANK_ENABLED: ${RERANK_ENABLED:-true}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-ai_hiking}:${POSTGRES_PASSWORD:-ai_hiking}@postgres:5432/${POSTGRES_DB:-ai_hiking}}
+      REDIS_URL: ${REDIS_URL:-}
+      KV_URL: ${KV_URL:-}
+      UPSTASH_REDIS_URL: ${UPSTASH_REDIS_URL:-}
+      KV_REST_API_URL: ${KV_REST_API_URL:-}
+      KV_REST_API_TOKEN: ${KV_REST_API_TOKEN:-}
+      UPSTASH_REDIS_REST_URL: ${UPSTASH_REDIS_REST_URL:-}
+      UPSTASH_REDIS_REST_TOKEN: ${UPSTASH_REDIS_REST_TOKEN:-}
+      MEMORY_STORE_PATH: /app/memory_store
+      MEMORY_ENABLED: ${MEMORY_ENABLED:-true}
+      AMAP_API_KEY: ${AMAP_API_KEY:-}
+    volumes:
+      - ai-memory:/app/memory_store
+      - ai-rag-docs:/app/rag_docs
+      - ai-workspace:/app/workspace
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - "8000"
+    networks:
+      - ai-hiking-net
+    restart: unless-stopped
+
+  gateway:
+    image: ${DOCKERHUB_IMAGE:-zijinn123/ai-hiking}:gateway-${IMAGE_TAG:-latest}
+    container_name: ai-hiking-gateway
+    environment:
+      PORT: "8080"
+      AI_SERVICE_URL: http://ai-service:8000
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
+      CHAT_RUNTIME_SECRET: ${CHAT_RUNTIME_SECRET:-}
+      CHAT_V2_CANARY: ${CHAT_V2_CANARY:-0}
+      CHAT_RUNTIME_FORCE: ${CHAT_RUNTIME_FORCE:-}
+      CHAT_RUNTIME_ENVIRONMENT: ${CHAT_RUNTIME_ENVIRONMENT:-production}
+    depends_on:
+      - ai-service
+    expose:
+      - "8080"
+    networks:
+      - ai-hiking-net
+    restart: unless-stopped
+
+  frontend:
+    image: ${DOCKERHUB_IMAGE:-zijinn123/ai-hiking}:frontend-${IMAGE_TAG:-latest}
+    container_name: ai-hiking-frontend
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    depends_on:
+      - gateway
+    networks:
+      - ai-hiking-net
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  ai-memory:
+  ai-rag-docs:
+  ai-workspace:
+
+networks:
+  ai-hiking-net:
+    driver: bridge

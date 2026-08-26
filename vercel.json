@@ -1,0 +1,28 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "installCommand": "cd frontend && npm ci",
+  "buildCommand": "cd frontend && npm run build",
+  "outputDirectory": "frontend/dist",
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://ai-hiking-gateway.vercel.app/api/:path*"
+    },
+    {
+      "source": "/super-agent",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/love-master",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/hiking-rag",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/llm-config",
+      "destination": "/index.html"
+    }
+  ]
+}

@@ -1,0 +1,175 @@
+{
+  "schemaVersion": 1,
+  "summary": {
+    "evidenceMode": "session-limited",
+    "evidenceBoundary": {
+      "manifest": {
+        "schemaVersion": 2,
+        "sourceFingerprint": "e88322144268fef4",
+        "adapterVersion": "qoder-task-loop-source-v2",
+        "platform": "qoder",
+        "selection": {
+          "strategy": "all-eligible",
+          "eligibleCount": 0,
+          "analyzedCount": 0,
+          "confidence": "Low"
+        }
+      },
+      "episodeCoverage": {
+        "episodeCount": 0,
+        "editedEpisodeCount": 0,
+        "closedEpisodeCount": 0,
+        "recoveredEpisodeCount": 0
+      },
+      "deliveryEvidenceLevels": [],
+      "sourceGaps": []
+    },
+    "semanticFacets": {
+      "schemaVersion": 1,
+      "status": "supplementary",
+      "entries": [
+        {
+          "id": "session-insight:source-coverage",
+          "kind": "redacted-summary",
+          "episodeRef": null,
+          "status": "candidate",
+          "labels": [
+            "source-coverage",
+            "Low"
+          ],
+          "summary": "Analyzed 0 of 0 sessions; 0/5 enabled source roots exist. Use this as the current workspace evidence boundary for final insight cards.",
+          "evidenceRefs": [],
+          "modelVersion": "session-insights-v1"
+        },
+        {
+          "id": "session-insight:validation-behavior",
+          "kind": "redacted-summary",
+          "episodeRef": null,
+          "status": "candidate",
+          "labels": [
+            "validation-behavior",
+            "Low"
+          ],
+          "summary": "No validation command category was observed in the analyzed session sample. Inspect more sessions or add explicit validation guidance before claiming validation-after-edit behavior.",
+          "evidenceRefs": [],
+          "modelVersion": "session-insights-v1"
+        },
+        {
+          "id": "session-insight:post-edit-validation",
+          "kind": "rework-correction",
+          "episodeRef": null,
+          "status": "candidate",
+          "labels": [
+            "post-edit-validation",
+            "Low"
+          ],
+          "summary": "No edit event was observed in the analyzed sample. Inspect more sessions before making claims about edit or validation habits.",
+          "evidenceRefs": [],
+          "modelVersion": "session-insights-v1"
+        },
+        {
+          "id": "session-insight:execution-friction",
+          "kind": "friction-taxonomy",
+          "episodeRef": null,
+          "status": "candidate",
+          "labels": [
+            "execution-friction",
+            "Low"
+          ],
+          "summary": "No strong execution friction signal in the analyzed sample. Keep friction claims narrow unless additional failed commands, rejected actions, or warnings are inspected.",
+          "evidenceRefs": [],
+          "modelVersion": "session-insights-v1"
+        }
+      ]
+    },
+    "learningCapture": {
+      "schemaVersion": 1,
+      "state": "N/A",
+      "summary": "暂不适用——需要两个可比的观察窗口和一次改进对比。",
+      "interventions": []
+    },
+    "atAGlance": {
+      "demonstratedAutonomyRadius": {
+        "level": "R0",
+        "status": "窗口内无合格会话，自主半径不可评估",
+        "confidence": "low",
+        "reason": "0 个可审查会话，无任务执行证据"
+      },
+      "coverage": {
+        "episodeCount": 0,
+        "editedEpisodeCount": 0,
+        "closedEpisodeCount": 0,
+        "recoveredEpisodeCount": 0,
+        "selection": {
+          "strategy": "all-eligible",
+          "eligibleCount": 0,
+          "analyzedCount": 0,
+          "confidence": "Low"
+        }
+      },
+      "strongestLoop": null,
+      "largestLeak": null,
+      "priorityMoves": [
+        {
+          "findingRef": "phantom-test-suite",
+          "dimensionRef": "change-validation",
+          "move": "恢复测试套件与验证记录的一致性",
+          "expectedUnlock": "验证记录可信，回归保护可审计"
+        },
+        {
+          "findingRef": "missing-deploy-pipeline",
+          "dimensionRef": "reliable-delivery",
+          "move": "对齐部署流水线声明与实际配置",
+          "expectedUnlock": "生产发布路径可从仓库内复现"
+        },
+        {
+          "findingRef": "prod-dev-dependency-fork",
+          "dimensionRef": "controlled-execution",
+          "move": "统一生产与开发依赖约束",
+          "expectedUnlock": "容器与本地行为一致，核心 RAG 路径可复现"
+        }
+      ]
+    }
+  },
+  "dimensions": [
+    {
+      "id": "task-understanding"
+    },
+    {
+      "id": "controlled-execution"
+    },
+    {
+      "id": "change-validation"
+    },
+    {
+      "id": "reliable-delivery"
+    },
+    {
+      "id": "learning-capture"
+    }
+  ],
+  "findings": [
+    {
+      "id": "phantom-test-suite"
+    },
+    {
+      "id": "missing-deploy-pipeline"
+    },
+    {
+      "id": "prod-dev-dependency-fork"
+    },
+    {
+      "id": "completed-without-baseline"
+    },
+    {
+      "id": "ci-ai-service-compile-only"
+    },
+    {
+      "id": "session-source-unavailable",
+      "kind": "evidence-gap"
+    },
+    {
+      "id": "memory-count-conflict"
+    }
+  ]
+}

@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hiking AI · RAG / Agent 执行链路图（v2）</title>
+<style>
+:root{
+  --ink:oklch(0.14 0.008 80);
+  --canvas:oklch(0.16 0.01 80);
+  --lift-1:oklch(0.185 0.012 80);
+  --lift-2:oklch(0.21 0.013 78);
+  --amber:oklch(0.78 0.16 78);
+  --amber-dim:oklch(0.78 0.16 78 / 0.35);
+  --teal:oklch(0.78 0.11 170);
+  --teal-dim:oklch(0.78 0.11 170 / 0.35);
+  --rose:oklch(0.72 0.15 20);
+  --rose-dim:oklch(0.72 0.15 20 / 0.35);
+  --t1:oklch(0.90 0.008 80);
+  --t2:oklch(0.72 0.008 80);
+  --t3:oklch(0.55 0.006 80);
+  --line:rgba(255,255,255,.10);
+  --line-lit:var(--amber);
+  --cjk:"PingFang SC","Noto Sans SC","Microsoft YaHei",system-ui,sans-serif;
+  --mono:ui-monospace,"Cascadia Code",Consolas,"JetBrains Mono",monospace;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{background:var(--ink);color:var(--t1);font-family:var(--cjk);line-height:1.7;padding:0 20px 64px}
+.wrap{max-width:1180px;margin:0 auto}
+
+header{padding:48px 0 26px;border-bottom:1px solid var(--line)}
+h1{font-size:clamp(20px,3vw,28px);font-weight:700;letter-spacing:.02em}
+header p{margin-top:10px;color:var(--t2);font-size:13.5px;max-width:72ch}
+header p code{font-family:var(--mono);font-size:.92em;color:var(--t1)}
+.meta{margin-top:10px;font-family:var(--mono);font-size:11.5px;color:var(--t3)}
+.meta b{color:var(--amber);font-weight:600}
+
+.legend{display:flex;flex-wrap:wrap;gap:10px 26px;padding:16px 0;border-bottom:1px solid var(--line)}
+.legend .item{display:flex;align-items:center;gap:9px;font-size:12.5px;color:var(--t2)}
+.swatch{display:inline-block;width:20px;height:20px;flex:none}
+.sw-s{width:14px;height:14px;border-radius:50%;background:var(--lift-2);border:1px solid var(--line)}
+.sw-d{background:var(--lift-2);box-shadow:inset 0 0 0 1px var(--line);clip-path:polygon(50% 0,100% 50%,50% 100%,0 50%)}
+.sw-p{background:var(--lift-2);border:1px solid var(--line);border-radius:4px;clip-path:polygon(6px 0,calc(100% - 6px) 0,100% 6px,100% calc(100% - 6px),calc(100% - 6px) 100%,6px 100%,0 calc(100% - 6px),0 6px)}
+.sw-b{width:22px;border:1px dashed var(--amber-dim);border-radius:8px;background:none}
+.sw-e{width:26px;height:8px;border:2px solid var(--t2);border-style:double;border-radius:2px}
+
+section.canvas{margin-top:38px}
+.canvas h2{font-size:16px;font-weight:700;display:flex;align-items:baseline;gap:12px}
+.canvas h2 small{font-family:var(--mono);font-size:11px;color:var(--t3);font-weight:400}
+
+.diagram{position:relative;margin-top:14px;background:var(--canvas);border:1px solid var(--line);
+  border-radius:12px;background-image:radial-gradient(rgba(255,255,255,.05) 1px,transparent 1px);
+  background-size:22px 22px;min-height:860px}
+@media(max-width:1080px){.diagram{min-height:auto;aspect-ratio:100/148}}
+
+.node{position:absolute;background:var(--lift-2);color:var(--t1);border:1px solid var(--line);text-align:center;z-index:2}
+.node .nm{font-size:12px;font-weight:600;line-height:1.35;letter-spacing:.01em}
+.node .loc{font-family:var(--mono);font-size:10px;color:var(--t3);line-height:1.35;margin-top:1px}
+.node .note{font-size:10.5px;color:var(--t2);line-height:1.35;margin-top:2px}
+.node .tag{display:inline-block;margin:3px 2px 0;padding:0 6px;font-size:10px;line-height:1.7;color:var(--t2);
+  border:1px solid var(--line);border-radius:99px;background:var(--lift-1)}
+.node.proc{border-radius:10px 6px 10px 6px;padding:8px 9px}
+.node.entry{border-radius:50%;display:flex;flex-direction:column;justify-content:center;padding:10px 6px;aspect-ratio:1/1}
+.node.route{border:0;background:transparent;color:var(--t1)}
+.node.route .inner{width:100%;height:100%;background:var(--lift-2);box-shadow:inset 0 0 0 1px var(--line);
+  clip-path:polygon(50% 0,100% 50%,50% 100%,0 50%);
+  display:flex;flex-direction:column;justify-content:center;align-items:center;padding:6px}
+.node.end{border-radius:3px;border:2px solid var(--t2);border-style:double;padding:7px 4px;background:var(--canvas)}
+
+.sub{position:absolute;border:1px dashed var(--amber-dim);border-radius:14px;z-index:1;background:rgba(255,255,255,.015)}
+.sub.teal{border-color:var(--teal-dim)}
+.sub .cap{position:absolute;top:-9px;left:14px;background:var(--canvas);padding:0 8px;
+  font-family:var(--mono);font-size:10px;color:var(--amber)}
+.sub.teal .cap{color:var(--teal)}
+
+.edges{position:absolute;inset:0;width:100%;height:100%;z-index:1;pointer-events:none}
+.edges polyline{fill:none;stroke:rgba(255,255,255,.16);stroke-width:1.2;vector-effect:non-scaling-stroke}
+.edges polyline.dash{stroke-dasharray:4 4}
+.edges polyline.lit{stroke:var(--line-lit);stroke-width:1.8}
+.lbl{position:absolute;z-index:3;font-family:var(--mono);font-size:9.5px;color:var(--t3);line-height:1.5;pointer-events:none;text-align:center}
+.lbl.v{writing-mode:vertical-rl}
+
+.node.lit{background:var(--amber);color:#221a08;border-color:var(--amber)}
+.node.lit .loc{color:rgba(34,26,8,.62)}
+.node.lit .note{color:rgba(34,26,8,.72)}
+.node.lit .tag{border-color:rgba(34,26,8,.3);color:#221a08;background:rgba(34,26,8,.08)}
+.node.route.lit .inner{background:var(--amber);box-shadow:none}
+.node.end.lit{border-color:#221a08;background:var(--amber)}
+.chip{position:absolute;z-index:2;text-align:center;background:var(--lift-1);border:1px solid var(--line);
+  border-radius:99px;padding:3px 6px;font-size:10px;line-height:1.5;color:var(--t2)}
+.chip b{display:block;font-family:var(--mono);font-weight:500;font-size:8.5px;color:var(--t3);letter-spacing:.03em}
+.chip.lit{background:var(--amber);border-color:var(--amber);color:#221a08}
+.chip.lit b{color:rgba(34,26,8,.72)}
+.chip.rose{border-color:var(--rose-dim);color:var(--rose)}
+.chip.rose b{color:var(--rose)}
+.node:focus-visible,.chip:focus-visible{outline:2px solid var(--amber);outline-offset:3px}
+
+.fnrow{margin-top:12px;display:flex;flex-wrap:wrap;gap:6px 18px;align-items:center;font-family:var(--mono);font-size:11px;color:var(--t3)}
+.fnrow .fn-seg{color:var(--t2)}
+.fnrow .arrow{color:var(--amber-dim)}
+
+footer.sheet{margin-top:44px;border-top:1px solid var(--line);padding-top:16px}
+footer.sheet p{font-size:11.5px;color:var(--t3);font-family:var(--mono)}
+
+@media(max-width:640px){
+  .diagram{aspect-ratio:auto;background-image:none}
+  .edges,.sub,.lbl{display:none}
+  .node,.chip{position:static;width:min(92%,430px)!important;margin:7px auto;display:block;aspect-ratio:auto;border-radius:10px}
+  .node.entry{border-radius:10px}
+  .node.route .inner{clip-path:none;box-shadow:inset 0 0 0 1px var(--line);border-radius:10px;padding:9px}
+  .node.end{border-style:solid}
+  header{padding:36px 0 20px}
+}
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}.node,.chip,.edges polyline{transition:none}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Hiking AI · RAG / Agent 执行链路图</h1>
+  <p>基于当前源码（<b>agent_v2 主线 + LangGraph RAG 主图</b>）的全量执行链路：每个节点标注真实源码位置 <code>文件:行号</code>，悬停 / Tab 聚焦任意节点可点亮其上游路径。</p>
+  <div class="meta">基线：<b>ai-service</b> · RAG 主图 <b>rag/graph.py:987</b> · RAG 入口 <b>api/rag.py:1046</b> · Agent 装配 <b>agent_v2/startup.py:154</b> · Agent 流 <b>api/chat_v2.py:1581</b></div>
+</header>
+
+<section class="legend">
+  <span class="item"><span class="swatch sw-s"></span>入口（HTTP / 调用起点）</span>
+  <span class="item"><span class="swatch sw-d"></span>条件路由</span>
+  <span class="item"><span class="swatch sw-p"></span>处理节点</span>
+  <span class="item"><span class="swatch sw-b"></span>子图 / 泳道边界</span>
+  <span class="item"><span class="swatch sw-e"></span>终点</span>
+  <span class="item" style="color:var(--amber)">悬停 / 聚焦 → 点亮上游路径</span>
+</section>
+
+<!-- ============ RAG ============ -->
+<section class="canvas" id="rag">
+<h2>一 · RAG 模块执行链路 <small>POST /api/v1/rag/query → SSE · api/rag.py:1046</small></h2>
+
+<div class="diagram" data-diagram="rag">
+  <svg class="edges" viewBox="0 0 100 148" preserveAspectRatio="none" aria-hidden="true">
+    <polyline data-a="n-entry" data-b="d-switch" points="50,10 50,16"/>
+    <polyline class="dash" data-a="n-entry" data-b="g-cancel" points="56,7 74,7"/>
+    <polyline class="dash" data-a="n-entry" data-b="g-resume" points="56,12.5 74,12.5"/>
+    <polyline class="dash" data-a="d-switch" data-b="n-legacy" points="64,19 68,19"/>
+    <polyline data-a="d-switch" data-b="n-guards" points="50,24.5 50,27.5"/>
+    <polyline class="dash" data-a="n-guards" data-b="n-out" points="72,31 88,31"/>
+    <polyline data-a="n-guards" data-b="n-runtime" points="50,36.5 50,39.5"/>
+    <polyline data-a="n-runtime" data-b="n-sum" points="50,47.5 50,52.5"/>
+    <polyline data-a="n-sum" data-b="n-an" points="50,59.5 50,62.5"/>
+    <polyline data-a="n-an" data-b="d-clear" points="50,69.5 50,72.5"/>
+    <polyline class="dash" data-a="d-clear" data-b="n-clarify" points="40,76 18,76"/>
+    <polyline class="dash" data-a="n-clarify" data-b="n-an" points="11,81 11,63 26,63"/>
+    <polyline data-a="d-clear" data-b="n-retrieve" points="50,79.5 50,83.5"/>
+    <polyline data-a="n-retrieve" data-b="n-agg" points="50,91.5 50,95.5"/>
+    <polyline class="dash" data-a="n-agg" data-b="n-sse" points="50,103.5 50,105.5"/>
+    <polyline class="dash" data-a="n-retrieve" data-b="n-orch" points="54,88 70,88"/>
+    <polyline data-a="n-orch" data-b="n-search" points="82.5,92 82.5,94.5"/>
+    <polyline data-a="n-search" data-b="n-compress" points="82.5,101.5 82.5,104"/>
+    <polyline data-a="n-compress" data-b="n-final" points="82.5,111 82.5,113.5"/>
+    <polyline class="dash" data-a="n-final" data-b="n-agg" points="74,119 56,119 56,102"/>
+    <polyline class="dash" data-a="n-search" data-b="n-hybrid" points="76,98 72,98"/>
+    <polyline data-a="n-hybrid" data-b="n-rerank" points="82.5,108 82.5,110"/>
+    <polyline data-a="n-rerank" data-b="n-store" points="82.5,116.5 82.5,119"/>
+    <polyline data-a="n-store" data-b="n-rerank" points="76,122.5 76,117" />
+    <polyline data-a="up-load" data-b="up-md" points="16.5,121 22,121"/>
+    <polyline data-a="up-md" data-b="up-parent" points="31,121 36,121"/>
+    <polyline data-a="up-parent" data-b="up-child" points="45,121 50,121"/>
+    <polyline data-a="up-child" data-b="up-upsert" points="59,121 64,121"/>
+    <polyline class="dash" data-a="up-upsert" data-b="n-store" points="74,124.5 82.5,124.5"/>
+    <polyline class="dash" data-a="n-store" data-b="n-hybrid" points="74,125 66,107"/>
+  </svg>
+
+  <div class="node entry" id="n-entry" data-from="" tabindex="0" style="left:28%;top:1.5%;width:44%;height:8%">
+    <div class="nm">RAG 问答入口</div>
+    <div class="loc">api/rag.py:1046 · POST /api/v1/rag/query</div>
+    <div class="note">前端 SSE 消费：process · documents · text · done · clarification_needed</div>
+  </div>
+
+  <div class="chip rose" id="g-cancel" data-from="n-entry" tabindex="0" style="left:74%;top:4.5%;width:23%;height:6%">
+    <b>api/rag.py:1070</b>cancel_clarification_id → JSONResponse 404 / 200
+  </div>
+  <div class="chip rose" id="g-resume" data-from="n-entry" tabindex="0" style="left:74%;top:11%;width:23%;height:6%">
+    <b>api/rag.py:1091</b>resume 状态校验 → 404 / 410 / 200
+  </div>
+
+  <div class="node route" id="d-switch" data-from="n-entry" tabindex="0" style="left:36%;top:16%;width:28%;height:7%">
+    <div class="inner">
+      <div class="nm">graph runtime 可用?</div>
+      <div class="loc">api/rag.py:1146</div>
+    </div>
+  </div>
+
+  <div class="chip" id="n-legacy" data-from="d-switch" tabindex="0" style="left:68%;top:17.5%;width:28%;height:6%">
+    <b>legacy 路径</b>澄清 → 改写 → 混合检索 → 聚合 → SSE（零回归兜底）
+  </div>
+
+  <div class="node proc" id="n-guards" data-from="d-switch" tabindex="0" style="left:28%;top:27%;width:44%;height:8.5%">
+    <div class="nm">守卫前置</div>
+    <div class="loc">direct_rag_answer:583 · _rag_guard_answer:592</div>
+    <div class="note">问候 → 直接 text+done；越域 / 不清晰 → process+text+done（跳过检索）</div>
+  </div>
+
+  <div class="node proc" id="n-runtime" data-from="n-guards" tabindex="0" style="left:28%;top:38.5%;width:44%;height:8%">
+    <div class="nm">RAGRuntime.arun</div>
+    <div class="loc">rag/runtime.py:97 → run_rag_graph</div>
+    <div class="note">SQLite checkpointer · thread_id=chat_id · 跨轮 _RESET 重置</div>
+  </div>
+
+  <div class="sub" id="sub-main" style="left:6%;top:50.5%;width:60%;height:46%">
+    <span class="cap">LangGraph 主图 · build_rag_graph — rag/graph.py:987</span>
+  </div>
+
+  <div class="node proc" id="n-sum" data-from="n-runtime" tabindex="0" style="left:26%;top:52.5%;width:40%;height:7.5%">
+    <div class="nm">① 会话摘要</div>
+    <div class="loc">summarize_conversation · graph.py:119</div>
+    <div class="note">最近 6 条保留 · 更早并入滚动摘要</div>
+  </div>
+
+  <div class="node proc" id="n-an" data-from="n-sum" tabindex="0" style="left:26%;top:62.5%;width:40%;height:7.5%">
+    <div class="nm">② 查询分析</div>
+    <div class="loc">analyze_query · graph.py:195</div>
+    <div class="note">意图 / 清晰判定 / 子问题拆解 ≤3 · 融合 contextualize+rewrite</div>
+  </div>
+
+  <div class="node route" id="d-clear" data-from="n-an" tabindex="0" style="left:36%;top:72.5%;width:28%;height:6.5%">
+    <div class="inner">
+      <div class="nm">is_clear?</div>
+      <div class="loc">_route_after_analysis</div>
+    </div>
+  </div>
+
+  <div class="node proc" id="n-clarify" data-from="d-clear" tabindex="0" style="left:3%;top:72.5%;width:15%;height:9%">
+    <div class="nm">③ 澄清中断</div>
+    <div class="loc">request_clarification · graph.py:895</div>
+    <div class="note">__interrupt__ → SSE clarification_needed → 用户提交答案 resume</div>
+  </div>
+
+  <div class="node proc" id="n-retrieve" data-from="d-clear" tabindex="0" style="left:24%;top:83.5%;width:52%;height:8.5%">
+    <div class="nm">④ 并行检索 · Send fan-out ×N</div>
+    <div class="loc">retrieve · graph.py:392（子图模式 1099）</div>
+    <div class="note">每个子问题一个实例 · 返回 docs 标记 question_index（保序）</div>
+  </div>
+
+  <div class="node end" id="n-agg" data-from="n-retrieve" tabindex="0" style="left:28%;top:95.5%;width:44%;height:8%">
+    <div class="nm">⑤ 答案聚合 → END</div>
+    <div class="loc">aggregate_answer · graph.py:432</div>
+    <div class="note">按 question_index 保序 · 组内去重 · 冲突显式呈现 · ContextAugmenter + humanize</div>
+  </div>
+
+  <div class="node proc" id="n-sse" data-from="n-agg" tabindex="0" style="left:28%;top:105.5%;width:44%;height:7%">
+    <div class="nm">SSE 事件映射</div>
+    <div class="loc">_emit_state_sse · api/rag.py:672</div>
+    <div class="note">process → documents → text → done · 答案落记忆</div>
+  </div>
+
+  <div class="sub teal" id="sub-ret" style="left:68%;top:50.5%;width:29%;height:46%">
+    <span class="cap">检索子图 · retrieve_subgraph.py</span>
+  </div>
+
+  <div class="chip" id="n-orch" data-from="n-retrieve" tabindex="0" style="left:70%;top:52.5%;width:25%;height:6%">
+    <b>orchestrator:190</b>检索规划 + 工具编排<br>预算：迭代5 / 工具4 / token≈4000
+  </div>
+  <div class="chip" id="n-search" data-from="n-orch" tabindex="0" style="left:70%;top:60%;width:25%;height:6%">
+    <b>search_child / search_parent</b>混合检索 / 父块回溯（去重已执行查询）
+  </div>
+  <div class="chip" id="n-compress" data-from="n-search" tabindex="0" style="left:70%;top:67.5%;width:25%;height:6%">
+    <b>compress</b>工作记忆压缩（token 超阈值）<br>保留来源名 / 数字 / 证据缺口
+  </div>
+  <div class="chip" id="n-final" data-from="n-compress" tabindex="0" style="left:70%;top:75%;width:25%;height:6%">
+    <b>finalizer:646</b>去重 + 排序 + 标记 question_index<br>→ final_docs 回聚合节点
+  </div>
+
+  <div class="chip" id="n-hybrid" data-from="n-search" tabindex="0" style="left:70%;top:83.5%;width:25%;height:6.5%">
+    <b>hybrid_retrieval.py:51</b>dense（sqlite-vec）+ sparse（FTS5 jieba）<br>RRF 融合 :256 · parent 回溯 :291
+  </div>
+  <div class="chip" id="n-rerank" data-from="n-hybrid" tabindex="0" style="left:70%;top:91.5%;width:25%;height:5.5%">
+    <b>Reranker.rerank:38</b>OpenAI-compatible /rerank（可选）
+  </div>
+  <div class="chip" id="n-store" data-from="n-rerank" tabindex="0" style="left:70%;top:98.5%;width:25%;height:6%">
+    <b>backend_resolver</b>sqlite_store（parent/child/child_vec/child_fts）<br>· pgvector · memory
+  </div>
+
+  <div class="sub" id="sub-ingest" style="left:4%;top:110%;width:92%;height:16%">
+    <span class="cap">摄取链路（旁路）· POST /api/v1/rag/upload — api/rag.py:956</span>
+  </div>
+  <div class="chip" id="up-load" data-from="" tabindex="0" style="left:5%;top:112.5%;width:14%;height:7%">
+    <b>DocumentLoader · loader.py</b>txt / md / pdf / 飞书云文档
+  </div>
+  <div class="chip" id="up-md" data-from="up-load" tabindex="0" style="left:20.5%;top:112.5%;width:14%;height:7%">
+    <b>extract_markdown</b>pymupdf4llm PDF→MD<br>扫描版 PDF 显式拒绝
+  </div>
+  <div class="chip" id="up-parent" data-from="up-md" tabindex="0" style="left:36%;top:112.5%;width:14%;height:7%">
+    <b>split_parent_chunks</b>H1/H2/H3 层级<br>2000–4000 字符约束
+  </div>
+  <div class="chip" id="up-child" data-from="up-parent" tabindex="0" style="left:51.5%;top:112.5%;width:14%;height:7%">
+    <b>split_child_chunks</b>500 字符 / 100 重叠<br>全部 child 引用 parent
+  </div>
+  <div class="chip" id="up-upsert" data-from="up-child" tabindex="0" style="left:67%;top:112.5%;width:14%;height:7%">
+    <b>upsert_document</b>parent + child_vec + FTS5（jieba 分词）
+  </div>
+  <div class="lbl" style="left:75%;top:4%">守卫命中 → 直接返回</div>
+  <div class="lbl" style="left:38%;top:23.5%">飞书链接 → _sync_feishu_links_canonical:826 → ingest_content</div>
+</div>
+
+<div class="fnrow">
+  <span class="fn-seg">检索内链</span>
+  <span class="arrow">→</span> rewriter.py
+  <span class="arrow">→</span> hybrid_retrieval.py（dense + sparse + RRF）
+  <span class="arrow">→</span> reranker.py:13
+  <span class="arrow">→</span> augmenter.py（ContextAugmenter，聚合边界）
+</div>
+</section>
+
+<!-- ============ AGENT ============ -->
+<section class="canvas" id="agent">
+<h2>二 · Agent 模块执行链路 <small>POST /api/v2/chat/sse → SSE · api/chat_v2.py:2058（v2 主线）+ v1 遗留</small></h2>
+
+<div class="diagram" data-diagram="agent">
+  <svg class="edges" viewBox="0 0 100 148" preserveAspectRatio="none" aria-hidden="true">
+    <polyline data-a="as-v2rt" data-b="a-entry" points="87.5,9.5 50,9.5 50,17"/>
+    <polyline data-a="a-entry" data-b="g-capacity" points="56,21 74,21"/>
+    <polyline data-a="a-entry" data-b="n-stream" points="50,25 50,28"/>
+    <polyline data-a="n-stream" data-b="d-profile" points="50,36.5 50,40.5"/>
+    <polyline data-a="d-profile" data-b="n-chat" points="40,44.5 16,44.5 16,48.5"/>
+    <polyline data-a="d-profile" data-b="n-route" points="44,45 34,45 34,48.5"/>
+    <polyline data-a="d-profile" data-b="n-art" points="56,45 60,45 60,48.5"/>
+    <polyline data-a="d-profile" data-b="n-cowork" points="60,44.5 84,44.5 84,48.5"/>
+    <polyline class="dash" data-a="n-chat" data-b="n-rt" points="16,63.5 16,70 50,70"/>
+    <polyline class="dash" data-a="n-route" data-b="n-rt" points="34,63.5 34,70 50,70"/>
+    <polyline class="dash" data-a="n-art" data-b="n-rt" points="60,63.5 60,70 50,70"/>
+    <polyline class="dash" data-a="n-cowork" data-b="n-rt" points="84,63.5 84,70 50,70"/>
+    <polyline data-a="n-rt" data-b="t-chip" points="50,74.5 50,79.5"/>
+    <polyline class="dash" data-a="n-rt" data-b="e-snap" points="50,74.5 50,76.5 82,76.5 82,81"/>
+    <polyline data-a="t-chip" data-b="v1-tools" points="50,91.5 50,94.5 82,94.5 82,110"/>
+    <polyline data-a="v1-entry" data-b="v1-manus" points="16,119 28,119"/>
+    <polyline data-a="v1-manus" data-b="v1-loop" points="38,119 50,119"/>
+    <polyline data-a="v1-loop" data-b="v1-tools" points="60,119 72,119"/>
+    <polyline class="dash" data-a="v1-tools" data-b="v1-rag" points="83,114 8,114 8,126"/>
+    <polyline data-a="g-capacity" data-b="e-503" points="85.5,24 88,24"/>
+  </svg>
+
+  <div class="sub teal" id="sub-asm" style="left:4%;top:1%;width:92%;height:9.5%">
+    <span class="cap">启动装配 · main.py lifespan — agent_v2/startup.py:154</span>
+  </div>
+  <div class="chip" id="as-guard" data-from="" tabindex="0" style="left:5%;top:3%;width:14%;height:5.5%">
+    <b>check_v2_startup_guard</b>Vercel 守护（fail-fast）
+  </div>
+  <div class="chip" id="as-assemble" data-from="as-guard" tabindex="0" style="left:20.5%;top:3%;width:14%;height:5.5%">
+    <b>assemble_v2_runtime</b>state_dir + OS WriterLock（单写者 AC7）
+  </div>
+  <div class="chip" id="as-store" data-from="as-assemble" tabindex="0" style="left:36%;top:3%;width:14%;height:5.5%">
+    <b>三 SQLite</b>agent_control / chat_checkpoints / agent_memory
+  </div>
+  <div class="chip" id="as-repo" data-from="as-store" tabindex="0" style="left:51.5%;top:3%;width:14%;height:5.5%">
+    <b>RunRepository</b>+ MemoryService + Telemetry + Capacity
+  </div>
+  <div class="chip" id="as-agent" data-from="as-repo" tabindex="0" style="left:67%;top:3%;width:14%;height:5.5%">
+    <b>create_agent · factory.py:50</b>工具组白名单 + PermissionGate + ApprovalCallback
+  </div>
+  <div class="chip" id="as-v2rt" data-from="as-agent" tabindex="0" style="left:82.5%;top:3%;width:13%;height:5.5%">
+    <b>V2Runtime</b>→ app.state.agent_v2_runtime
+  </div>
+
+  <div class="node entry" id="a-entry" data-from="as-v2rt" tabindex="0" style="left:28%;top:13%;width:44%;height:8%">
+    <div class="nm">Chat v2 入口</div>
+    <div class="loc">api/chat_v2.py:2058 · POST /api/v2/chat/sse</div>
+    <div class="note">前端 SuperAgent（chatV2.ts:22）· 事件：thought / tool_call / tool_result / text / done</div>
+  </div>
+
+  <div class="chip rose" id="g-capacity" data-from="a-entry" tabindex="0" style="left:74%;top:18%;width:14%;height:6%">
+    <b>CapacityGuard</b>acquire_run（artifact/cowork 再 acquire_sandbox）
+  </div>
+  <div class="chip rose" id="e-503" data-from="g-capacity" tabindex="0" style="left:89%;top:21%;width:9%;height:5.5%">
+    <b>CapacityExceeded</b>→ 503 retryable
+  </div>
+
+  <div class="node proc" id="n-stream" data-from="a-entry" tabindex="0" style="left:28%;top:24%;width:44%;height:9.5%">
+    <div class="nm">_stream_chat_v2</div>
+    <div class="loc">api/chat_v2.py:1581</div>
+    <div class="note">EventStream 初始化 → create_run_idempotent（request_id 幂等；重复 → 重放存储事件）→ emit 闭包（build+persist_event+telemetry）→ heartbeat + 取消轮询</div>
+  </div>
+
+  <div class="chip rose" id="g-gates" data-from="n-stream" tabindex="0" style="left:74%;top:25%;width:23%;height:8%">
+    <b>前置 gate（终态 error）</b>v2_disabled · unknown_profile<br>cowork_unauthorized · model_unavailable
+  </div>
+
+  <div class="node route" id="d-profile" data-from="n-stream" tabindex="0" style="left:36%;top:36.5%;width:28%;height:6.5%">
+    <div class="inner">
+      <div class="nm">resolve_profile</div>
+      <div class="loc">服务端裁决 · 客户端不可覆盖</div>
+    </div>
+  </div>
+
+  <div class="node proc" id="n-chat" data-from="d-profile" tabindex="0" style="left:5%;top:46.5%;width:22%;height:16%">
+    <div class="nm">chat</div>
+    <div class="loc">记忆工具 · consent_required</div>
+    <div class="note">memory_save / memory_search（PermissionGate 裁决）→ stub 分类（greeting / slot_followup / normal）→ text → done</div>
+  </div>
+  <div class="node proc" id="n-route" data-from="d-profile" tabindex="0" style="left:29%;top:46.5%;width:22%;height:16%">
+    <div class="nm">route_plan</div>
+    <div class="loc">stub_classify_route_plan</div>
+    <div class="note">需要 MCP 证据？→ tool_call（amap_map.plan_route / amap_weather，mcp_registry 凭据隔离）→ tool_result → text → done</div>
+  </div>
+  <div class="node proc" id="n-art" data-from="d-profile" tabindex="0" style="left:53%;top:46.5%;width:22%;height:16%">
+    <div class="nm">artifact</div>
+    <div class="loc">sandbox：E2B（生产）/ LocalNative（开发）fail-closed</div>
+    <div class="note">租约持久化 → tool_call（generate_pdf 等）→ artifact_candidate → 主机校验 + artifact.available（opaque id，TTL 7 天）→ done → finally 清理</div>
+  </div>
+  <div class="node proc" id="n-cowork" data-from="d-profile" tabindex="0" style="left:77%;top:46.5%;width:22%;height:16%">
+    <div class="nm">cowork</div>
+    <div class="loc">授权门 is_cowork_authorized（trusted/staging）</div>
+    <div class="note">PermissionGate 鉴权 + approval 审批 → effect ledger + sandbox_bash 逐步执行 → finally 沙箱清理</div>
+  </div>
+
+  <div class="node proc" id="n-rt" data-from="" tabindex="0" style="left:28%;top:66%;width:44%;height:8%">
+    <div class="nm">AgentRuntime · invoke_tool</div>
+    <div class="loc">agent_v2/uniharness/runtime.py:67</div>
+    <div class="note">evaluate_permission → NEEDS_APPROVAL → approval_callback → ToolInvocation；create_subagent 守卫（Task 组 + 单层限制）</div>
+  </div>
+
+  <div class="sub" id="sub-tools" style="left:4%;top:77%;width:92%;height:12%">
+    <span class="cap">工具注册表</span>
+  </div>
+  <div class="chip" id="t-chip" data-from="n-rt" tabindex="0" style="left:5%;top:79.5%;width:14%;height:8%">
+    <b>builtin_tools.py</b>CLI / TODO / TASK / SKILLS / WEB 组白名单（Bash·Write 需审批）
+  </div>
+  <div class="chip" id="t-mcp" data-from="t-chip" tabindex="0" style="left:20.5%;top:79.5%;width:14%;height:8%">
+    <b>mcp_registry</b>MCP 服务注册 / 凭据隔离
+  </div>
+  <div class="chip" id="t-mem" data-from="t-mcp" tabindex="0" style="left:36%;top:79.5%;width:14%;height:8%">
+    <b>memory_tools</b>→ memory_service（consent 记忆写入）
+  </div>
+  <div class="chip" id="t-art" data-from="t-mem" tabindex="0" style="left:51.5%;top:79.5%;width:14%;height:8%">
+    <b>artifacts</b>产物（opaque id · TTL 7 天）
+  </div>
+  <div class="chip" id="t-appr" data-from="t-art" tabindex="0" style="left:67%;top:79.5%;width:14%;height:8%">
+    <b>approvals</b>审批流（approvals_v2_router 决策）
+  </div>
+  <div class="chip" id="t-wl" data-from="t-appr" tabindex="0" style="left:82.5%;top:79.5%;width:13.5%;height:8%">
+    <b>writer_lock · observability · safe_http / effects / permissions</b>
+  </div>
+
+  <div class="sub teal" id="sub-endpoints" style="left:4%;top:92%;width:92%;height:10%">
+    <span class="cap">支撑端点（断线重放 / 状态同步 / 审批 / 产物）</span>
+  </div>
+  <div class="chip" id="e-snap" data-from="n-rt" tabindex="0" style="left:5%;top:94.5%;width:16%;height:5.5%">
+    <b>GET /snapshot/{run_id}</b>运行状态快照
+  </div>
+  <div class="chip" id="e-cancel" data-from="e-snap" tabindex="0" style="left:22.5%;top:94.5%;width:16%;height:5.5%">
+    <b>POST /cancel</b>DB 行置 cancelled，流观察退出
+  </div>
+  <div class="chip" id="e-events" data-from="e-cancel" tabindex="0" style="left:40%;top:94.5%;width:19%;height:5.5%">
+    <b>GET /events/{run_id}?from_seq=N</b>断线事件重放
+  </div>
+  <div class="chip" id="e-approve" data-from="e-events" tabindex="0" style="left:60.5%;top:94.5%;width:18%;height:5.5%">
+    <b>POST /approvals/{id}/decision</b>审批决策
+  </div>
+  <div class="chip" id="e-art" data-from="e-approve" tabindex="0" style="left:80%;top:94.5%;width:16%;height:5.5%">
+    <b>GET /artifacts/{id}</b>产物下载（过期 410）
+  </div>
+
+  <div class="sub" id="sub-v1" style="left:4%;top:105%;width:92%;height:19%">
+    <span class="cap">遗留 v1 链路（api/chat.py · agent/）— 已非主线</span>
+  </div>
+  <div class="chip" id="v1-entry" data-from="" tabindex="0" style="left:5%;top:108%;width:20%;height:8%">
+    <b>POST /api/v1/chat/sse</b>chat_sse · api/chat.py:138（SSE 流 text/done）
+  </div>
+  <div class="chip" id="v1-manus" data-from="v1-entry" tabindex="0" style="left:27%;top:108%;width:20%;height:8%">
+    <b>HikingManus.create · hiking_manus.py:26</b>MCP 连接（stdio / http）
+  </div>
+  <div class="chip" id="v1-loop" data-from="v1-manus" tabindex="0" style="left:49%;top:108%;width:20%;height:8%">
+    <b>ToolCallAgent · max_steps=30</b>ReActAgent think → act 循环（react_agent.py:10）
+  </div>
+  <div class="chip" id="v1-tools" data-from="v1-loop" tabindex="0" style="left:71%;top:108%;width:25%;height:8%">
+    <b>工具</b>web_search · hiking_knowledge_search · route_research · MCP · terminate
+  </div>
+  <div class="chip" id="v1-rag" data-from="v1-tools" tabindex="0" style="left:5%;top:118%;width:34%;height:6%">
+    <b>知识检索</b>hiking_knowledge_search → 汇入 RAG 链路（上图）
+  </div>
+  <div class="chip" id="v1-confirm" data-from="v1-entry" tabindex="0" style="left:41%;top:118%;width:30%;height:6%">
+    <b>审批确认</b>confirmation_store · 事件附加 approval 标记
+  </div>
+</div>
+
+<div class="fnrow">
+  <span class="fn-seg">v2 事件契约</span>
+  <span class="arrow">→</span> run_started
+  <span class="arrow">→</span> progress / heartbeat
+  <span class="arrow">→</span> thought / tool_call / tool_result / text
+  <span class="arrow">→</span> 终态唯一：done · error · cancelled（chat_v2.py:1695）
+</div>
+</section>
+
+<footer class="sheet">
+  <p>Hiking AI · RAG / Agent 执行链路图 — 单文件产物，无外部依赖。file:line 全部指向 ai-service 当前源码（agent_v2 主线 + LangGraph RAG 主图）。悬停 / Tab 聚焦节点点亮上游路径；窄屏自动堆叠。</p>
+</footer>
+
+</div>
+<script>
+(function(){
+  var byId={};
+  document.querySelectorAll('.node,.chip').forEach(function(n){byId[n.id]=n});
+  function light(target){
+    document.querySelectorAll('.lit').forEach(function(n){n.classList.remove('lit')});
+    var cur=target;
+    while(cur){
+      cur.classList.add('lit');
+      cur=cur.dataset.from?byId[cur.dataset.from]:null;
+    }
+    document.querySelectorAll('.edges polyline').forEach(function(e){
+      var a=e.dataset.a,b=e.dataset.b;
+      var litA=(a==='chips'||(byId[a]&&byId[a].classList.contains('lit')));
+      var litB=(b==='chips'||(byId[b]&&byId[b].classList.contains('lit')));
+      e.classList.toggle('lit',litA&&litB);
+    });
+  }
+  document.querySelectorAll('.node,.chip').forEach(function(n){
+    n.addEventListener('mouseenter',function(){light(n)});
+    n.addEventListener('focus',function(){light(n)});
+  });
+})();
+</script>
+</body>
+</html>

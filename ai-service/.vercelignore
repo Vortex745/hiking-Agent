@@ -1,0 +1,14 @@
+.conda312/
+.venv/
+tests/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.log
+.env
+memory_data/
+memory_store/
+rag_docs/
+workspace/
+test_memory_store/
