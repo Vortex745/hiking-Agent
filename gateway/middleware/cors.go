@@ -24,9 +24,11 @@ func CORSMiddleware(allowedOrigins string) gin.HandlerFunc {
 		}
 	}
 	config := cors.Config{
-		AllowOrigins:     origins,
-		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization"},
+		AllowOrigins: origins,
+		// PATCH is required by /api/v2/memories/:memory_id; the idempotency
+		// headers are the canonical v2 headers the proxy forwards.
+		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Idempotency-Key", "X-Request-Id"},
 		AllowCredentials: true,
 	}
 	return cors.New(config)

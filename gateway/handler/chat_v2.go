@@ -238,6 +238,48 @@ func (h *ChatV2Handler) ChatV2Events(c *gin.Context) {
 	proxyV2Request(c, http.MethodGet, url, nil)
 }
 
+// ChatV2Resume proxies POST /chat/resume/:run_id?from_seq=N to the AI
+// service (Ticket 11). This is the SSE continuation endpoint: after the
+// user POSTs an approval decision, the client opens this stream to
+// receive the replayed events plus the run's remaining events.
+//
+// Like ChatV2SSE it rejects Vercel: the resumed stream re-attaches to the
+// run's durable state and sandbox lease, which only the long-lived Docker
+// gateway can host.
+func (h *ChatV2Handler) ChatV2Resume(c *gin.Context) {
+	if os.Getenv("VERCEL") != "" {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "Chat v2 streaming is not available on Vercel; use the long-lived Docker gateway.",
+		})
+		return
+	}
+	if !ensureSubjectCookie(c) {
+		return
+	}
+	runID := c.Param("run_id")
+	url := fmt.Sprintf("%s/api/v2/chat/resume/%s", h.aiServiceURL, runID)
+	if rawQuery := c.Request.URL.RawQuery; rawQuery != "" {
+		url = url + "?" + rawQuery
+	}
+	proxyV2Stream(c, http.MethodPost, url, c.Request.Body)
+}
+
+// ApprovalDecision proxies POST /approvals/:approval_id/decision to the
+// AI service (Ticket 11). The endpoint is synchronous — it records the
+// user's verdict and transitions the run to running so the resume
+// endpoint can continue it.
+func (h *ChatV2Handler) ApprovalDecision(c *gin.Context) {
+	if !ensureSubjectCookie(c) {
+		return
+	}
+	url := fmt.Sprintf(
+		"%s/api/v2/approvals/%s/decision",
+		h.aiServiceURL,
+		c.Param("approval_id"),
+	)
+	proxyV2Request(c, http.MethodPost, url, c.Request.Body)
+}
+
 func (h *ChatV2Handler) MemorySettings(c *gin.Context) {
 	if !ensureSubjectCookie(c) {
 		return

@@ -1,6 +1,8 @@
 package app
 
 import (
+	"os"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -14,6 +16,21 @@ import (
 func NewRouter(cfg *config.Config) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
+
+	// Trust only the configured proxies so c.ClientIP() (rate limiting,
+	// subject cookies) resolves the real client IP behind the frontend
+	// nginx container. Without this, every proxied request shares the
+	// nginx container IP and one global rate-limit bucket. Default trusts
+	// loopback only for local dev; Docker deployments set TRUSTED_PROXIES
+	// to the compose bridge network (172.16.0.0/12).
+	trustedProxies := os.Getenv("TRUSTED_PROXIES")
+	if trustedProxies == "" {
+		trustedProxies = "127.0.0.1,::1"
+	}
+	if err := r.SetTrustedProxies(strings.Split(trustedProxies, ",")); err != nil {
+		// Invalid list: trust no proxies — ClientIP falls back to RemoteAddr.
+		_ = r.SetTrustedProxies(nil)
+	}
 
 	r.Use(middleware.CORSMiddleware(cfg.AllowedOrigins))
 	r.Use(middleware.RateLimitMiddleware(60, 1*time.Minute))
@@ -63,6 +80,8 @@ func NewRouter(cfg *config.Config) *gin.Engine {
 		v2.GET("/chat/snapshot/:run_id", chatV2Handler.ChatV2Snapshot)
 		v2.POST("/chat/cancel/:run_id", chatV2Handler.ChatV2Cancel)
 		v2.GET("/chat/events/:run_id", chatV2Handler.ChatV2Events)
+		v2.POST("/chat/resume/:run_id", chatV2Handler.ChatV2Resume)
+		v2.POST("/approvals/:approval_id/decision", chatV2Handler.ApprovalDecision)
 		v2.GET("/memory/settings", chatV2Handler.MemorySettings)
 		v2.PUT("/memory/settings", chatV2Handler.MemorySettings)
 		v2.GET("/memories", chatV2Handler.Memories)
