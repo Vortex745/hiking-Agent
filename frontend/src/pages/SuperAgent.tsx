@@ -1156,7 +1156,33 @@ function SuperAgent() {
     })
   }, [])
 
+  // 会话轮换（新建/切换/清空/删除当前会话）时拆除仍在运行的流。
+  // 不拆的话，旧 run 的 v1 onMessage / v2 事件回调仍会向已切换的
+  // messages 追加内容，串进新会话。v2 run 尽力发出幂等取消。
+  const teardownActiveStream = useCallback(() => {
+    if (cleanupRef.current) {
+      cleanupRef.current()
+      cleanupRef.current = null
+    }
+    const persisted = v2RunRef.current
+    if (persisted) {
+      // 取消端点幂等且接受 request_id 兜底（后端 spec AC4）；失败不
+      // 影响本地收尾，服务端 run 交给 janitor/超时收敛。
+      void cancelV2Run(
+        persisted.run_id || persisted.request_id,
+        `teardown-${Date.now()}`
+      ).catch(() => undefined)
+      v2RunRef.current = null
+      saveV2PersistedRun(null)
+      v2StateRef.current = { ...v2StateRef.current, status: 'cancelled' }
+      setV2ApprovalState('idle')
+    }
+    textStream.flushNow()
+    setIsSending(false)
+  }, [textStream])
+
   const createNewSession = useCallback(() => {
+    teardownActiveStream()
     if (messages.length > 0 && activeSessionId) {
       const firstUserMsg = messages.find(m => m.role === 'user')
       const title = firstUserMsg ? firstUserMsg.content.slice(0, 30) + (firstUserMsg.content.length > 30 ? '...' : '') : '新对话'
@@ -1173,9 +1199,10 @@ function SuperAgent() {
     chatIdRef.current = next
     setV2Mode(false)
     try { localStorage.removeItem(STORAGE_KEY) } catch { /* ignore */ }
-  }, [messages, activeSessionId, v2Mode])
+  }, [messages, activeSessionId, v2Mode, teardownActiveStream])
 
   const loadSession = useCallback(async (session: ChatSession) => {
+    teardownActiveStream()
     if (!session.chatId) {
       session = { ...session, chatId: createChatId() }
     }
@@ -1214,7 +1241,7 @@ function SuperAgent() {
         // Local session remains the fallback.
       }
     }
-  }, [activeSessionId, messages, v2Mode])
+  }, [activeSessionId, messages, v2Mode, teardownActiveStream])
 
   const deleteSession = useCallback((e: React.MouseEvent, sessionId: string) => {
     e.stopPropagation()
@@ -1224,6 +1251,8 @@ function SuperAgent() {
     }
     setSessions(prev => prev.filter(s => s.id !== sessionId))
     if (activeSessionId === sessionId) {
+      // 删除的是当前活跃会话：先拆除活动流,避免旧 run 的事件写入轮换后的新会话。
+      teardownActiveStream()
       setActiveSessionId(null)
       setMessages([])
       const next = createChatId()
@@ -1232,7 +1261,7 @@ function SuperAgent() {
       setV2Mode(false)
       try { localStorage.removeItem(STORAGE_KEY) } catch { /* ignore */ }
     }
-  }, [activeSessionId, sessions])
+  }, [activeSessionId, sessions, teardownActiveStream])
 
   const handleSend = useCallback(async (
     textOverride?: string,
@@ -1429,6 +1458,7 @@ function SuperAgent() {
   }
 
   const handleClear = () => {
+    teardownActiveStream()
     const currentChatId = chatIdRef.current
     setMessages([])
     try {

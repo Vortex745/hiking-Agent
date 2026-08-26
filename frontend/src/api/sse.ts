@@ -94,6 +94,14 @@ export function createStreamConnection(
       cleanup()
       return true
     }
+    if (event.type === 'error') {
+      // error 也是终态事件：消费方（SuperAgent/HikingRAG）在 onMessage
+      // 里已按终态处理（finishStreaming）。若不在此终止，服务端关流后
+      // 还会触发一次 onError("Stream ended without a terminal event")，
+      // 在真实错误之后追加第二条"[连接错误]"。
+      cleanup()
+      return true
+    }
     return false
   }
 
