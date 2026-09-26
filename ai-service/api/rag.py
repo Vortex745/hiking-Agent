@@ -16,6 +16,7 @@ from api.models import (
     RuntimeModelSettings,
 )
 from config import settings
+from observability.langfuse_setup import reset_langfuse_session, set_langfuse_session
 from memory.factory import chat_memory_status, get_chat_memory
 from runtime_paths import runtime_dir
 
@@ -36,7 +37,6 @@ def get_rag_runtime(request: Request) -> "RAGRuntime | None":
     """
     return getattr(request.app.state, "rag_runtime", None)
 
-DocumentLoader = None
 VectorStoreRetriever = None
 CloudDocsLoader = None
 QueryRewriter = None
@@ -47,15 +47,6 @@ FeishuDocLoader = None
 find_feishu_links = None
 has_relevant_evidence = None
 clean_display_text = None
-
-
-def _get_document_loader_class():
-    global DocumentLoader
-    if DocumentLoader is None:
-        from rag.loader import DocumentLoader as loaded
-
-        DocumentLoader = loaded
-    return DocumentLoader
 
 
 def _get_vector_store_retriever_class():
@@ -144,20 +135,21 @@ def _clean_display_text(text: str) -> str:
 
 
 def _get_retriever_sqlite_store(retriever: "VectorStoreRetriever"):
-    """07 票据：从 retriever 取出底层 SQLiteStore（若 SQLite 后端可用）。
+    """从 retriever 取出底层 SQLiteStore（若 SQLite 后端可用）。
 
-    返回 None 表示 retriever 走 pgvector 或 memory 后端（legacy 路径）。
+    返回 None 表示 retriever 未启用 SQLite 后端——摄入/同步调用方必须显式报错，
+    不再存在 legacy 写入回退路径。
     13 票据：通过公共 property sqlite_store 访问，不读取 _sqlite_client 私有字段。
-    在 storage_mode=="sqlite" 但 store 为 None 时记录 warning，避免静默回退。
+    在 storage_mode=="sqlite" 但 store 为 None 时记录 warning，避免静默失败。
     """
     sqlite_store = getattr(retriever, "sqlite_store", None)
     if sqlite_store is None:
-        # 检查是否为 SQLite 后端但 store 丢失（静默回退风险）
+        # 检查是否为 SQLite 后端但 store 丢失（静默失败风险）
         storage_mode = getattr(retriever, "storage_mode", "")
         if storage_mode == "sqlite":
             logger.warning(
-                "rag_upload: storage_mode=sqlite but sqlite_store is None; "
-                "falling back to legacy upload path (canonical ingestion skipped)"
+                "rag ingestion: storage_mode=sqlite but sqlite_store is None; "
+                "ingestion will fail with an explicit error"
             )
     return sqlite_store
 
@@ -749,52 +741,6 @@ def _summarize_feishu_sync(summaries: list[dict]) -> dict:
     }
 
 
-def _sync_feishu_links(question: str, retriever: VectorStoreRetriever) -> tuple[list, list[dict]]:
-    links = _find_feishu_links(question)
-    if not links:
-        return [], []
-
-    syncer_cls, loader_cls = _get_feishu_classes()
-    loader = loader_cls()
-    syncer = syncer_cls(loader, retriever)
-    summaries: list[dict] = []
-    synced_docs = []
-
-    for link in links:
-        try:
-            if link.kind == "wiki_space":
-                summaries.extend(syncer.sync_from_space(link.token))
-                continue
-
-            docs = loader.load_and_split(link.raw, doc_type=link.doc_type)
-            # 10 票据 legacy：pgvector/memory 后端的直接写入路径，留待 Ticket 14 cutover 移除。
-            # SQLite 后端走 _sync_feishu_links_canonical，不会走到此处。
-            retriever.add_documents(docs, status="feishu")
-            syncer.synced_documents.extend(docs)
-            synced_docs.extend(docs)
-            title = docs[0].metadata.get("title", link.token) if docs else link.token
-            summaries.append({"token": link.token, "title": title, "chunks": len(docs)})
-        except Exception as exc:
-            logger.warning("Feishu link sync failed: %s", exc)
-            summaries.append({"token": link.token, "title": link.token, "chunks": 0, "error": str(exc)})
-
-    return syncer.synced_documents or synced_docs, summaries
-
-
-def _sync_default_feishu_knowledge(retriever: VectorStoreRetriever) -> tuple[list, list[dict]]:
-    syncer_cls, loader_cls = _get_feishu_classes()
-    loader = loader_cls()
-    syncer = syncer_cls(loader, retriever)
-    summaries: list[dict] = []
-
-    if settings.feishu_default_space_id:
-        summaries.extend(syncer.sync_from_space(settings.feishu_default_space_id))
-    if settings.feishu_default_folder_token:
-        summaries.extend(syncer.sync_from_folder(settings.feishu_default_folder_token))
-
-    return syncer.synced_documents, summaries
-
-
 def _ingest_feishu_raw_docs(
     raw_docs: list[dict],
     pipeline,
@@ -872,7 +818,7 @@ def _sync_feishu_links_canonical(
 
     syncer_cls, _ = _get_feishu_classes()
     # canonical 路径不使用 retriever（直接走 pipeline.ingest_content）
-    syncer = syncer_cls(loader, retriever=None)
+    syncer = syncer_cls(loader)
 
     all_summaries: list[dict] = []
     all_failed: list[dict] = []
@@ -920,7 +866,7 @@ def _sync_default_feishu_knowledge_canonical(
         (summaries, failed_docs) 元组
     """
     syncer_cls, _ = _get_feishu_classes()
-    syncer = syncer_cls(loader, retriever=None)
+    syncer = syncer_cls(loader)
 
     all_summaries: list[dict] = []
     all_failed: list[dict] = []
@@ -982,8 +928,7 @@ async def rag_upload(
 ):
     """Upload a document for RAG processing.
 
-    07 票据：SQLite 后端走 canonical ingestion（parent/child 层级切分）；
-    pgvector/memory 后端走 legacy 路径（DocumentLoader + retriever.add_documents）零回归。
+    SQLite 后端 canonical ingestion（parent/child 层级切分）是唯一摄入路径。
     扫描版 PDF 返回 415 Unsupported Media Type（不产生空索引）。
     """
     try:
@@ -996,66 +941,38 @@ async def rag_upload(
         retriever_cls = _get_vector_store_retriever_class()
         retriever = retriever_cls(**_runtime_embedding_kwargs_from_settings(runtime_settings))
 
-        # 07 票据：SQLite 后端 → canonical ingestion（统一父子切分 + 索引 + 状态）
         sqlite_store = _get_retriever_sqlite_store(retriever)
-        if sqlite_store is not None:
-            from rag.ingestion import IngestionPipeline
-
-            embedding_provider = _build_embedding_provider_for_ingestion(runtime_settings)
-            pipeline = IngestionPipeline(
-                store=sqlite_store,
-                embedding_provider=embedding_provider,
-            )
-            # source 用绝对路径身份标识（与 06 票据 ingest_file 默认行为一致）
-            report = pipeline.ingest_file(
-                file_path=file_path,
-                source=str(file_path.resolve()),
-                status=status or "active",
+        if sqlite_store is None:
+            raise HTTPException(
+                status_code=503,
+                detail="知识库存储后端未启用 SQLite，无法摄入文档",
             )
 
-            # 扫描版 PDF 或无法提取文本 → 415，不产生空索引
-            if report.skipped:
-                raise HTTPException(
-                    status_code=415,
-                    detail=f"无法解析文档：{report.skip_reason}",
-                )
+        from rag.ingestion import IngestionPipeline
 
-            return RAGUploadResponse(
-                filename=file.filename,
-                chunks=report.child_count,
-                status=status or "active",
+        embedding_provider = _build_embedding_provider_for_ingestion(runtime_settings)
+        pipeline = IngestionPipeline(
+            store=sqlite_store,
+            embedding_provider=embedding_provider,
+        )
+        # source 用绝对路径身份标识（与 06 票据 ingest_file 默认行为一致）
+        report = pipeline.ingest_file(
+            file_path=file_path,
+            source=str(file_path.resolve()),
+            status=status or "active",
+        )
+
+        # 扫描版 PDF 或无法提取文本 → 415，不产生空索引
+        if report.skipped:
+            raise HTTPException(
+                status_code=415,
+                detail=f"无法解析文档：{report.skip_reason}",
             )
-
-        # legacy 路径（pgvector / memory 后端，零回归）
-        loader_cls = _get_document_loader_class()
-        loader = loader_cls()
-        docs = loader.load_and_split(str(file_path))
-
-        # 10 票据 legacy：pgvector/memory 后端的直接写入路径，留待 Ticket 14 cutover 移除。
-        # SQLite 后端走 canonical ingestion（上方 pipeline.ingest_file 分支），不会走到此处。
-        indexing_result = retriever.add_documents(docs, status)
-        if (
-            indexing_result is not None
-            and getattr(indexing_result, "requested_count", len(docs)) > 0
-            and (
-                getattr(indexing_result, "indexed_count", len(docs)) < len(docs)
-                or getattr(indexing_result, "fallback_used", False)
-                or (
-                    settings.postgres_configured
-                    and not getattr(indexing_result, "durable", False)
-                )
-            )
-        ):
-            detail = "文档已接收，但未写入持久向量索引，暂时不能用于知识库检索。"
-            error = getattr(indexing_result, "error", None)
-            if error:
-                detail = f"{detail} 原因：{error}"
-            raise HTTPException(status_code=503, detail=detail)
 
         return RAGUploadResponse(
             filename=file.filename,
-            chunks=len(docs),
-            status=status or "none",
+            chunks=report.child_count,
+            status=status or "active",
         )
     except HTTPException:
         raise
@@ -1153,6 +1070,16 @@ async def rag_query(
             )
 
     async def event_stream():
+        # Langfuse session 归因：RAG 链路的 LLM 调用（rewriter/augmenter 等）
+        # 经 langchain_run_config() 读取该 ContextVar，实现 trace 与会话关联。
+        session_token = set_langfuse_session(req.chat_id or None)
+        try:
+            async for event in _event_stream_impl():
+                yield event
+        finally:
+            reset_langfuse_session(session_token)
+
+    async def _event_stream_impl():
         memory = get_chat_memory(req.chat_id) if req.chat_id else None
         assistant_parts: list[str] = []
 
@@ -1330,88 +1257,67 @@ async def rag_query(
                 try:
                     cloud_loader_cls = _get_cloud_docs_loader_class()
                     cloud_loader = cloud_loader_cls()
-                    # 08 票据：SQLite 后端走 canonical ingestion（父子层级切分 + 单份失败不中断）；
-                    # pgvector/memory 后端走 legacy 路径（load_and_split + add_documents）零回归
+                    # SQLite 后端 canonical ingestion（父子层级切分 + 单份失败不中断）是唯一路径
                     sqlite_store = _get_retriever_sqlite_store(retriever)
-                    if sqlite_store is not None:
-                        from rag.ingestion import IngestionPipeline
+                    if sqlite_store is None:
+                        raise RuntimeError("知识库存储后端未启用 SQLite，无法同步云知识库文档")
+                    from rag.ingestion import IngestionPipeline
 
-                        embedding_provider = _build_embedding_provider_for_ingestion(
-                            req.model_settings
-                        )
-                        pipeline = IngestionPipeline(
-                            store=sqlite_store,
-                            embedding_provider=embedding_provider,
-                        )
-                        # to_thread：load_raw_docs / ingest_content 均为同步
-                        # 网络调用，直接执行会阻塞事件循环、冻结所有并发流。
-                        raw_docs = await asyncio.to_thread(
-                            cloud_loader.load_raw_docs, settings.rag_docs_api_url
-                        )
-                        failed_docs: list[dict] = []
-                        successful_count = 0
-                        for raw in raw_docs:
-                            name = raw.get("name", "unknown")
-                            content = raw.get("content", "")
-                            try:
-                                report = await asyncio.to_thread(
-                                    pipeline.ingest_content,
-                                    markdown=content,
-                                    source=f"cloud_docs:{name}",
-                                    file_name=name,
-                                    status="cloud_docs",
-                                )
-                                # 只计入实际写入的（inserted/replaced），
-                                # noop（内容未变化）不计入 successful_count
-                                if report.action in ("inserted", "replaced"):
-                                    successful_count += 1
-                                cloud_docs.append(
-                                    {"name": name, "chunks": report.child_count}
-                                )
-                            except Exception as doc_exc:
-                                # 验收 3：单份失败不中断其他文档
-                                logger.warning(
-                                    "云知识库文档 %s 摄入失败: %s", name, doc_exc
-                                )
-                                failed_docs.append(
-                                    {"name": name, "error": str(doc_exc)[:200]}
-                                )
+                    embedding_provider = _build_embedding_provider_for_ingestion(
+                        req.model_settings
+                    )
+                    pipeline = IngestionPipeline(
+                        store=sqlite_store,
+                        embedding_provider=embedding_provider,
+                    )
+                    # to_thread：load_raw_docs / ingest_content 均为同步
+                    # 网络调用，直接执行会阻塞事件循环、冻结所有并发流。
+                    raw_docs = await asyncio.to_thread(
+                        cloud_loader.load_raw_docs, settings.rag_docs_api_url
+                    )
+                    failed_docs: list[dict] = []
+                    successful_count = 0
+                    for raw in raw_docs:
+                        name = raw.get("name", "unknown")
+                        content = raw.get("content", "")
+                        try:
+                            report = await asyncio.to_thread(
+                                pipeline.ingest_content,
+                                markdown=content,
+                                source=f"cloud_docs:{name}",
+                                file_name=name,
+                                status="cloud_docs",
+                            )
+                            # 只计入实际写入的（inserted/replaced），
+                            # noop（内容未变化）不计入 successful_count
+                            if report.action in ("inserted", "replaced"):
+                                successful_count += 1
+                            cloud_docs.append(
+                                {"name": name, "chunks": report.child_count}
+                            )
+                        except Exception as doc_exc:
+                            # 验收 3：单份失败不中断其他文档
+                            logger.warning(
+                                "云知识库文档 %s 摄入失败: %s", name, doc_exc
+                            )
+                            failed_docs.append(
+                                {"name": name, "error": str(doc_exc)[:200]}
+                            )
 
-                        yield _sse_event(
-                            "process",
-                            (
-                                f"已同步云知识库文档，获得 {successful_count} 份文档"
-                                if successful_count
-                                else "云知识库同步未获得文档片段，请检查 API 地址及返回数据"
-                            ),
-                            {
-                                "source": "cloud_docs_api",
-                                "api_url": settings.rag_docs_api_url,
-                                "chunks": successful_count,
-                                "failed_docs": failed_docs,
-                            },
-                        )
-                    else:
-                        # legacy 路径（pgvector/memory 后端，零回归）
-                        loaded = cloud_loader.load_and_split(settings.rag_docs_api_url)
-                        if loaded:
-                            # 10 票据 legacy：pgvector/memory 后端的直接写入路径，留待 Ticket 14 cutover 移除。
-                            # SQLite 后端走 canonical ingestion（上方 pipeline.ingest_content 分支），不会走到此处。
-                            retriever.add_documents(loaded, status="cloud_docs")
-                            cloud_docs.extend(loaded)
-                        yield _sse_event(
-                            "process",
-                            (
-                                f"已同步云知识库文档，获得 {len(loaded)} 个文档片段"
-                                if loaded
-                                else "云知识库同步未获得文档片段，请检查 API 地址及返回数据"
-                            ),
-                            {
-                                "source": "cloud_docs_api",
-                                "api_url": settings.rag_docs_api_url,
-                                "chunks": len(loaded),
-                            },
-                        )
+                    yield _sse_event(
+                        "process",
+                        (
+                            f"已同步云知识库文档，获得 {successful_count} 份文档"
+                            if successful_count
+                            else "云知识库同步未获得文档片段，请检查 API 地址及返回数据"
+                        ),
+                        {
+                            "source": "cloud_docs_api",
+                            "api_url": settings.rag_docs_api_url,
+                            "chunks": successful_count,
+                            "failed_docs": failed_docs,
+                        },
+                    )
                 except Exception as e:
                     logger.warning("云知识库 API 同步失败: %s", e)
                     yield _sse_event(
@@ -1444,35 +1350,28 @@ async def rag_query(
                     {"link_count": len(feishu_links)},
                 )
                 await asyncio.sleep(0.2)
-                # 09 票据：SQLite 后端走 canonical ingestion；
-                # pgvector/memory 后端走 legacy 路径（_sync_feishu_links）零回归
+                # 09 票据：SQLite 后端 canonical ingestion 是唯一路径
                 sqlite_store = _get_retriever_sqlite_store(retriever)
-                if sqlite_store is not None:
-                    from rag.ingestion import IngestionPipeline
+                if sqlite_store is None:
+                    raise RuntimeError("知识库存储后端未启用 SQLite，无法同步外部文档")
+                from rag.ingestion import IngestionPipeline
 
-                    embedding_provider = _build_embedding_provider_for_ingestion(
-                        req.model_settings
-                    )
-                    pipeline = IngestionPipeline(
-                        store=sqlite_store,
-                        embedding_provider=embedding_provider,
-                    )
-                    _, loader_cls = _get_feishu_classes()
-                    loader = loader_cls()
-                    summaries, failed_docs = await asyncio.to_thread(
-                        _sync_feishu_links_canonical,
-                        question_for_retrieval, pipeline, loader
-                    )
-                    sync_summary = _summarize_feishu_sync(summaries + failed_docs)
-                    # SQLite 后端：feishu_docs 保持 []（验收 6：通过检索获取结果）
-                    feishu_synced = bool(summaries)
-                else:
-                    # legacy 后端（pgvector/memory，零回归）
-                    feishu_docs, summaries = await asyncio.to_thread(
-                        _sync_feishu_links, question_for_retrieval, retriever
-                    )
-                    sync_summary = _summarize_feishu_sync(summaries)
-                    feishu_synced = bool(feishu_docs)
+                embedding_provider = _build_embedding_provider_for_ingestion(
+                    req.model_settings
+                )
+                pipeline = IngestionPipeline(
+                    store=sqlite_store,
+                    embedding_provider=embedding_provider,
+                )
+                _, loader_cls = _get_feishu_classes()
+                loader = loader_cls()
+                summaries, failed_docs = await asyncio.to_thread(
+                    _sync_feishu_links_canonical,
+                    question_for_retrieval, pipeline, loader
+                )
+                sync_summary = _summarize_feishu_sync(summaries + failed_docs)
+                # feishu_docs 保持 []（验收 6：通过检索获取结果，不绕过检索）
+                feishu_synced = bool(summaries)
                 yield _sse_event(
                     "process",
                     (
@@ -1498,34 +1397,27 @@ async def rag_query(
             ):
                 yield _sse_event("process", "知识库为空，正在同步默认外部知识库")
                 await asyncio.sleep(0.2)
-                # 09 票据：SQLite 后端走 canonical ingestion；
-                # pgvector/memory 后端走 legacy 路径（_sync_default_feishu_knowledge）零回归
+                # 09 票据：SQLite 后端 canonical ingestion 是唯一路径
                 sqlite_store = _get_retriever_sqlite_store(retriever)
-                if sqlite_store is not None:
-                    from rag.ingestion import IngestionPipeline
+                if sqlite_store is None:
+                    raise RuntimeError("知识库存储后端未启用 SQLite，无法同步默认外部知识库")
+                from rag.ingestion import IngestionPipeline
 
-                    embedding_provider = _build_embedding_provider_for_ingestion(
-                        req.model_settings
-                    )
-                    pipeline = IngestionPipeline(
-                        store=sqlite_store,
-                        embedding_provider=embedding_provider,
-                    )
-                    _, loader_cls = _get_feishu_classes()
-                    loader = loader_cls()
-                    summaries, failed_docs = await asyncio.to_thread(
-                        _sync_default_feishu_knowledge_canonical, pipeline, loader
-                    )
-                    sync_summary = _summarize_feishu_sync(summaries + failed_docs)
-                    # SQLite 后端：feishu_docs 保持 []（验收 6：通过检索获取结果）
-                    feishu_synced = bool(summaries)
-                else:
-                    # legacy 后端（pgvector/memory，零回归）
-                    feishu_docs, summaries = await asyncio.to_thread(
-                        _sync_default_feishu_knowledge, retriever
-                    )
-                    sync_summary = _summarize_feishu_sync(summaries)
-                    feishu_synced = bool(feishu_docs)
+                embedding_provider = _build_embedding_provider_for_ingestion(
+                    req.model_settings
+                )
+                pipeline = IngestionPipeline(
+                    store=sqlite_store,
+                    embedding_provider=embedding_provider,
+                )
+                _, loader_cls = _get_feishu_classes()
+                loader = loader_cls()
+                summaries, failed_docs = await asyncio.to_thread(
+                    _sync_default_feishu_knowledge_canonical, pipeline, loader
+                )
+                sync_summary = _summarize_feishu_sync(summaries + failed_docs)
+                # feishu_docs 保持 []（验收 6：通过检索获取结果，不绕过检索）
+                feishu_synced = bool(summaries)
                 yield _sse_event(
                     "process",
                     (

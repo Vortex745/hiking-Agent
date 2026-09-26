@@ -420,57 +420,10 @@ class FeishuDocLoader:
 
 
 class FeishuDefaultSyncer:
-    """Batch-sync Feishu default sources into the active vector store."""
+    """Batch-sync Feishu default sources as raw docs for canonical ingestion."""
 
-    def __init__(self, loader: FeishuDocLoader, retriever):
+    def __init__(self, loader: FeishuDocLoader):
         self.loader = loader
-        self.retriever = retriever
-        self.synced_documents: list[Document] = []
-
-    def sync_from_space(self, space_id: str) -> list[dict]:
-        nodes = walk_wiki_nodes(space_id, client=self.loader.client)
-        summaries: list[dict] = []
-        for node in nodes:
-            token = node.get("obj_token") or node.get("node_token") or ""
-            if not token:
-                continue
-            doc_type = _normalize_doc_type(node.get("obj_type") or "docx")
-            title = node.get("title") or token
-            try:
-                docs = self.loader.load_and_split(token, title=title, doc_type=doc_type)
-                # 10 票据 legacy：pgvector/memory 后端的直接写入路径，留待 Ticket 14 cutover 移除。
-                # SQLite 后端走 iter_raw_docs_from_space + IngestionPipeline.ingest_content，
-                # 不会实例化 FeishuDefaultSyncer(retriever=非None)，不会走到此处。
-                self.retriever.add_documents(docs, status="feishu")
-                self.synced_documents.extend(docs)
-                summaries.append({"token": token, "title": title, "chunks": len(docs)})
-            except Exception as exc:
-                logger.warning("Feishu node sync failed: %s", exc)
-                summaries.append({"token": token, "title": title, "chunks": 0, "error": str(exc)})
-        return summaries
-
-    def sync_from_folder(self, folder_token: str) -> list[dict]:
-        files = search_feishu_docs(folder_token=folder_token, client=self.loader.client).get("results", [])
-        summaries: list[dict] = []
-        for item in files:
-            meta = item.get("result_meta", item)
-            token = meta.get("token") or meta.get("file_token") or ""
-            if not token:
-                continue
-            title = meta.get("title") or meta.get("name") or token
-            doc_type = _normalize_doc_type(meta.get("doc_type") or meta.get("type") or "docx")
-            try:
-                docs = self.loader.load_and_split(token, title=title, doc_type=doc_type)
-                # 10 票据 legacy：pgvector/memory 后端的直接写入路径，留待 Ticket 14 cutover 移除。
-                # SQLite 后端走 iter_raw_docs_from_folder + IngestionPipeline.ingest_content，
-                # 不会实例化 FeishuDefaultSyncer(retriever=非None)，不会走到此处。
-                self.retriever.add_documents(docs, status="feishu")
-                self.synced_documents.extend(docs)
-                summaries.append({"token": token, "title": title, "chunks": len(docs)})
-            except Exception as exc:
-                logger.warning("Feishu folder file sync failed: %s", exc)
-                summaries.append({"token": token, "title": title, "chunks": 0, "error": str(exc)})
-        return summaries
 
     def iter_raw_docs_from_space(self, space_id: str) -> tuple[list[dict], list[dict]]:
         """09 票据：从飞书 wiki 空间拉取所有文档 raw 内容（不切分）。
