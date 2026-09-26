@@ -39,7 +39,6 @@ class Settings:
     feishu_app_secret: str = ""
     feishu_default_space_id: str = ""
     feishu_default_folder_token: str = ""
-    memory_extractor_model: str = "deepseek-v4-flash"
     amap_api_key: str = ""
     mcp_servers: dict = {}
     disabled_lanes: str = ""  # Comma-separated lane names to disable, e.g. "SIMPLE_TOOL,WORKFLOW"

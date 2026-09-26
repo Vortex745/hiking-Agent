@@ -172,9 +172,6 @@ HIKING_INTENT_TERMS = {
 
 AMBIGUOUS_ACTIVITY_TERMS = {"活动", "带我", "参加", "报名"}
 
-RAG_UNCLEAR_MSG = "我没理解你的问题。可以换成一个具体的徒步问题，比如路线、装备、天气风险、营地选择或急救处理。"
-RAG_AMBIGUOUS_ACTIVITY_MSG = "你是想问徒步活动吗？请补充目的地、天数、难度或你想了解的具体问题，我再帮你查知识库。"
-RAG_OUT_OF_DOMAIN_MSG = "这个问题看起来不属于徒步知识库范围。你可以问徒步路线、装备、天气风险、营地选择、补给或急救相关问题。"
 
 
 def _runtime_embedding_kwargs_from_settings(model_settings: RuntimeModelSettings | None) -> dict:
@@ -554,10 +551,7 @@ async def rag_query(req: RAGQuery, request: Request):
     response = StreamingResponse(
         guarded_stream(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # Disable proxy buffering (Gateway)
-        },
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
     set_subject_cookie(response, request, subject)
     return response
