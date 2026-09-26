@@ -11,7 +11,6 @@ from urllib.parse import quote
 
 import httpx
 from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from config import settings
 from rag.text_processing import denoise_text, normalize_text
@@ -249,18 +248,8 @@ def walk_wiki_nodes(
 class FeishuDocLoader:
     """Fetch Feishu docs and split them into LangChain documents."""
 
-    def __init__(
-        self,
-        client: FeishuOpenAPIClient | None = None,
-        chunk_size: int = 1000,
-        chunk_overlap: int = 200,
-    ):
+    def __init__(self, client: FeishuOpenAPIClient | None = None):
         self.client = client or FeishuOpenAPIClient()
-        self.splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            separators=["\n\n", "\n", "。", ".", " ", ""],
-        )
 
     def fetch_content(self, doc_token: str, doc_type: str = "docx") -> dict:
         doc_type = _normalize_doc_type(doc_type)
@@ -316,7 +305,7 @@ class FeishuDocLoader:
         """09 票据：拉取单个飞书文档原始内容，返回 raw dict（不切分）。
 
         canonical ingestion 路径使用：父子切分由 IngestionPipeline.ingest_content 负责。
-        与 load_and_split 共享同一解析逻辑（resolve_wiki_node + fetch_content），但不切分。
+        与 fetch_content 的解析逻辑（resolve_wiki_node + fetch_content）一致，但不切分。
 
         Args:
             link: 飞书链接信息（由 inspect_feishu_link 解析得到）
@@ -374,49 +363,6 @@ class FeishuDocLoader:
             raw["feishu_wiki_node_token"] = wiki_node_token
         return raw
 
-    def load_and_split(self, doc_token: str, title: str = "", doc_type: str = "docx") -> list[Document]:
-        link = inspect_feishu_link(doc_token)
-        wiki_node_token = ""
-        effective_token = link.token
-        effective_type = _normalize_doc_type(doc_type or link.doc_type)
-        effective_title = title
-
-        if link.kind == "wiki_space":
-            raise ValueError("飞书知识库空间链接需要使用 default-sync 或 sync_from_space 批量同步")
-        if link.kind == "wiki_node":
-            node = resolve_wiki_node(link.token, client=self.client)
-            wiki_node_token = node.get("node_token") or link.token
-            effective_token = node["obj_token"]
-            effective_type = _normalize_doc_type(node.get("obj_type") or "docx")
-            effective_title = effective_title or node.get("title") or effective_token
-        elif link.doc_type != "docx" and doc_type == "docx":
-            effective_type = link.doc_type
-
-        fetched = self.fetch_content(effective_token, effective_type)
-        text = denoise_text(normalize_text(fetched.get("markdown") or ""))
-        if not text:
-            raise RuntimeError(f"飞书文档内容为空：{effective_token}")
-
-        docs = self.splitter.create_documents([text])
-        final_title = effective_title or fetched.get("title") or effective_token
-        chunk_count = len(docs)
-        for index, doc in enumerate(docs):
-            content_hash = hashlib.sha1(
-                f"feishu:{effective_token}:{index}:{doc.page_content}".encode("utf-8")
-            ).hexdigest()
-            doc.metadata.update({
-                "id": content_hash,
-                "source": "feishu",
-                "title": final_title,
-                "feishu_doc_token": effective_token,
-                "feishu_doc_type": effective_type,
-                "chunk_index": index,
-                "chunk_count": chunk_count,
-                "content_hash": content_hash,
-            })
-            if wiki_node_token:
-                doc.metadata["feishu_wiki_node_token"] = wiki_node_token
-        return docs
 
 
 class FeishuDefaultSyncer:

@@ -37,13 +37,7 @@ class Settings:
     rag_enable_clarification: bool = False  # 08 票据：澄清双请求 + SSE 契约开关（默认关闭，零回归）
     rag_use_graph_runtime: bool = False  # 01 票据：生产 graph runtime 开关（默认关闭，零回归；02-05 票据逐步切换）
     rag_max_sub_questions: int = 3  # 04 票据：并行检索子问题上限（默认 3，零回归）
-    # 10 票据：pgvector → SQLite 存储后端 cutover 开关（默认 pgvector，零回归）
-    # 12 票据：新增 "memory" 显式后端选项（RAG_STORAGE_BACKEND=memory）
-    rag_storage_backend: str = "pgvector"  # "pgvector" | "sqlite" | "memory"
-    rag_sqlite_db_path: str = "./data/rag.sqlite"
-    rag_cutover_marker_path: str = "./data/cutover-marker.json"
-    rag_migration_progress_path: str = "./data/migration-progress.json"
-    rag_baseline_performance_path: str = "./data/baseline-performance.json"
+    rag_sqlite_db_path: str = "./data/rag.sqlite"  # SQLite 是唯一检索存储后端
     feishu_app_id: str = ""
     feishu_app_secret: str = ""
     feishu_default_space_id: str = ""
@@ -60,8 +54,10 @@ class Settings:
     # agent_v2_enabled=False 时 v1 Agent/Gateway/Frontend/RAG 行为完全不变；
     # VERCEL + agent_v2_enabled=True 同时出现时启动检查失败（见 agent_v2.startup）
     agent_v2_enabled: bool = False
-    # UniHarness 不可变 commit pin（stub 替代时记录等价上游 revision）
-    agent_v2_uniharness_pin: str = "stub-local-757bf3d"
+    # UniHarness 不可变 commit pin（Ticket 25：vendored 真实 fork 基线，
+    # provenance 见 third_party/uniharness-provenance.md；值为含项目 delta
+    # 的 fork HEAD，upstream 基点 757bf3d… 必须是其祖先）
+    agent_v2_uniharness_pin: str = "b026a26250487678aedc2beef0d0b6ae802de5c4"
     # v2 持久化目录（chat_checkpoints/agent_control/agent_memory 三个 SQLite 的父目录）
     agent_v2_state_dir: str = "./agent_state"
     # Ticket 09: artifact profile 使用的沙箱类型。
@@ -81,6 +77,11 @@ class Settings:
     # 稳定观察期已过。代码组件就绪后此 flag 仍是权威 gate；运营可随时
     # 通过此配置立即关闭 subagent（AC7）。
     agent_v2_subagent_enabled: bool = False
+    # Langfuse LLM 可观测性（可选）：未配置 key 时自动禁用，零回归。
+    langfuse_enabled: bool = True
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_base_url: str = "https://cloud.langfuse.com"
 
     def _default_runtime_dir(self, name: str) -> str:
         if os.getenv("VERCEL"):
@@ -156,13 +157,7 @@ class Settings:
         self.rag_use_graph_runtime = os.getenv("RAG_USE_GRAPH_RUNTIME", "false").lower() == "true"
         # 04 票据：并行检索子问题上限
         self.rag_max_sub_questions = int(os.getenv("RAG_MAX_SUB_QUESTIONS", "3"))
-        # 10 票据：存储后端 cutover 配置（12 票据：新增 "memory" 显式后端选项）
-        backend = os.getenv("RAG_STORAGE_BACKEND", "pgvector").lower()
-        self.rag_storage_backend = backend if backend in {"pgvector", "sqlite", "memory"} else "pgvector"
         self.rag_sqlite_db_path = os.getenv("RAG_SQLITE_DB_PATH", self._default_runtime_dir("data/rag.sqlite"))
-        self.rag_cutover_marker_path = os.getenv("RAG_CUTOVER_MARKER_PATH", self._default_runtime_dir("data/cutover-marker.json"))
-        self.rag_migration_progress_path = os.getenv("RAG_MIGRATION_PROGRESS_PATH", self._default_runtime_dir("data/migration-progress.json"))
-        self.rag_baseline_performance_path = os.getenv("RAG_BASELINE_PERFORMANCE_PATH", self._default_runtime_dir("data/baseline-performance.json"))
         self.feishu_app_id = os.getenv("FEISHU_APP_ID", "")
         self.feishu_app_secret = os.getenv("FEISHU_APP_SECRET", "")
         self.feishu_default_space_id = os.getenv("FEISHU_DEFAULT_SPACE_ID", "")
@@ -179,7 +174,7 @@ class Settings:
         # Ticket 03：Chat v2 配置加载
         self.agent_v2_enabled = os.getenv("AGENT_V2_ENABLED", "false").lower() == "true"
         self.agent_v2_uniharness_pin = os.getenv(
-            "AGENT_V2_UNIHARNESS_PIN", "stub-local-757bf3d"
+            "AGENT_V2_UNIHARNESS_PIN", "b026a26250487678aedc2beef0d0b6ae802de5c4"
         )
         self.agent_v2_state_dir = os.getenv(
             "AGENT_V2_STATE_DIR", self._default_runtime_dir("agent_state")
@@ -208,6 +203,13 @@ class Settings:
         # 仍需 Ticket 22 切流后 14 天稳定观察期（由运维外部把关）。
         self.agent_v2_subagent_enabled = (
             os.getenv("AGENT_V2_SUBAGENT_ENABLED", "false").lower() == "true"
+        )
+        # Langfuse：未配置 key 时 observability 模块返回空 callbacks，零回归。
+        self.langfuse_enabled = os.getenv("LANGFUSE_ENABLED", "true").lower() == "true"
+        self.langfuse_public_key = os.getenv("LANGFUSE_PUBLIC_KEY", "")
+        self.langfuse_secret_key = os.getenv("LANGFUSE_SECRET_KEY", "")
+        self.langfuse_base_url = os.getenv(
+            "LANGFUSE_BASE_URL", "https://cloud.langfuse.com"
         )
 
         return self

@@ -270,12 +270,9 @@ def measure(
     sample_queries = queries if queries is not None else DEFAULT_SAMPLE_QUERIES
     query_latencies: list[QueryLatency] = []
 
-    # 用 SQLite 后端初始化 retriever（强制 sqlite，不依赖 env var）
-    # 注意：这里需要 embedding API key 才能真实测量；无 key 时会回退到 memory 模式
+    # SQLite 是唯一存储后端；需要 embedding API key 才能真实测量 hybrid 检索
     from config import settings as _settings
-    original_backend = _settings.rag_storage_backend
     original_db_path = _settings.rag_sqlite_db_path
-    _settings.rag_storage_backend = "sqlite"
     _settings.rag_sqlite_db_path = sqlite_db_path
 
     try:
@@ -284,7 +281,6 @@ def measure(
         backend = retriever.storage_mode
     finally:
         # 恢复 settings（retriever 已初始化，不影响本次测量）
-        _settings.rag_storage_backend = original_backend
         _settings.rag_sqlite_db_path = original_db_path
 
     for query in sample_queries:
@@ -356,8 +352,8 @@ def main(argv: list[str] | None = None) -> int:
     from config import settings
 
     sqlite_db_path = args.sqlite_db_path or settings.rag_sqlite_db_path
-    output_path = Path(args.output) if args.output else Path(
-        settings.rag_baseline_performance_path
+    output_path = Path(args.output) if args.output else (
+        Path(sqlite_db_path).parent / "baseline-performance.json"
     )
 
     queries: list[str] | None = None

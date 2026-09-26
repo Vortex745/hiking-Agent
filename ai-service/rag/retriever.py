@@ -399,9 +399,8 @@ class VectorStoreRetriever:
     ) -> list[Document]:
         """10 票据：SQLite 后端的 sparse 检索（FTS5 + jieba）。
 
-        12 票据 review：该方法为 legacy BM25-only 路径，仍访问 read_conn 裸连接。
-        主检索路径（hybrid_search）已通过 Protocol.search() 调用，不访问裸连接。
-        Ticket 13/14 cutover 时统一移除 legacy BM25 路径或迁移到 Protocol 扩展。
+        通过 SQLiteStore 的公开 read_conn 执行 FTS5 sparse 检索（jieba 预分词）；
+        主检索路径 hybrid_search 走 Protocol.search()（dense+sparse 融合），不访问裸连接。
         """
         from rag.hybrid_retrieval import _sparse_search
 
