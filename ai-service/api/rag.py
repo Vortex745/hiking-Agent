@@ -18,7 +18,7 @@ from api.chat_v2 import _build_run_orchestrator
 from api.memory_v2 import resolve_request_subject, set_subject_cookie
 from config import settings
 from observability.langfuse_setup import reset_langfuse_session, set_langfuse_session
-from memory.factory import chat_memory_status, get_chat_memory
+from memory.factory import chat_memory_status  # T07 后仅 /rag/health 状态展示使用
 from runtime_paths import runtime_dir
 
 logger = logging.getLogger("ai-service.rag")
@@ -638,22 +638,53 @@ async def rag_documents():
     return {"documents": docs}
 
 
+def _get_kernel_checkpoints(request: Request):
+    """Resolve the kernel conversation store (CheckpointsStore) or 503.
+
+    Spec #13 phase 2 (T07): RAG page history is backed by the kernel
+    conversation store — the same surface snapshots read.
+    """
+    runtime = getattr(request.app.state, "agent_v2_runtime", None)
+    runs = getattr(runtime, "runs", None)
+    store = getattr(runs, "checkpoints", None) if runs is not None else None
+    if store is None:
+        raise HTTPException(
+            status_code=503,
+            detail="会话存储不可用（v2 runtime 未装配，检查 AGENT_V2_ENABLED）。",
+        )
+    return store
+
+
 @rag_router.get("/history/{chat_id}")
-async def rag_history(chat_id: str):
-    """Get persisted RAG chat history for a given chat_id."""
+async def rag_history(chat_id: str, request: Request):
+    """Get RAG page conversation history (kernel conversation store).
+
+    外部契约不变：{"chat_id", "messages": [{role, content}]}，仅保留
+    user / assistant 消息。
+    """
+    store = _get_kernel_checkpoints(request)
     try:
-        memory = get_chat_memory(chat_id)
-        return {"chat_id": chat_id, "messages": memory.get_messages()}
+        records = store.get_messages(conversation_id=chat_id)
     except Exception as e:
+        logger.exception("rag history read failed for chat_id=%s", chat_id)
         raise HTTPException(status_code=500, detail=str(e))
+    return {
+        "chat_id": chat_id,
+        "messages": [
+            {"role": record.role, "content": record.content}
+            for record in records
+            if record.role in ("user", "assistant")
+        ],
+    }
 
 
 @rag_router.delete("/history/{chat_id}")
-async def rag_clear_history(chat_id: str):
-    """Clear persisted RAG chat history for a given chat_id."""
+async def rag_clear_history(chat_id: str, request: Request):
+    """Clear RAG page conversation history (kernel conversation store)."""
+    store = _get_kernel_checkpoints(request)
     try:
-        memory = get_chat_memory(chat_id)
-        memory.clear()
-        return {"chat_id": chat_id, "status": "cleared"}
+        store.clear_conversation(conversation_id=chat_id)
     except Exception as e:
+        logger.exception("rag history clear failed for chat_id=%s", chat_id)
         raise HTTPException(status_code=500, detail=str(e))
+    return {"chat_id": chat_id, "status": "cleared"}

@@ -173,3 +173,86 @@ def test_query_returns_503_when_v2_runtime_missing() -> None:
 
     response = asyncio.run(run())
     assert response.status_code == 503
+
+
+# ---- history endpoints backed by the kernel conversation store (T07) -------
+
+
+def _build_app_with_store(tmp_path: Path) -> tuple[FastAPI, Any]:
+    from agent_v2.persistence import CheckpointsStore, ControlStore
+    from agent_v2.runs import RunRepository
+
+    app = FastAPI()
+    app.include_router(rag_module.rag_router, prefix="/api/v1")
+
+    class _FakeMemory:
+        def memory_enabled(self, subject_id): return True
+        def claim_conversation(self, s, c): return True
+        def owns_conversation(self, s, c): return True
+
+    store = CheckpointsStore(str(tmp_path / "ckpt.sqlite"))
+    runs_repo = RunRepository(
+        control=ControlStore(str(tmp_path / "control.sqlite")),
+        checkpoints=store,
+    )
+
+    class _FakeRuntime:
+        runs = runs_repo
+        telemetry = None
+        kernel_checkpoints = None
+        memory = _FakeMemory()
+
+    app.state.agent_v2_runtime = _FakeRuntime()
+    return app, store
+
+
+def test_history_reads_kernel_conversation_store(tmp_path: Path) -> None:
+    app, store = _build_app_with_store(tmp_path)
+    store.ensure_conversation(conversation_id="c-hist", profile_id="rag")
+    store.append_message(
+        conversation_id="c-hist", run_id="r1", role="user",
+        content="鳌太线怎么走？", sequence=0,
+    )
+    store.append_message(
+        conversation_id="c-hist", run_id="r1", role="assistant",
+        content="根据知识库证据：……", sequence=2,
+    )
+    store.append_message(
+        conversation_id="c-hist", run_id="r1", role="tool",
+        content="ignored", sequence=3,
+    )
+
+    async def run() -> Any:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            return await client.get("/api/v1/rag/history/c-hist")
+
+    response = asyncio.run(run())
+    assert response.status_code == 200
+    body = response.json()
+    assert body["chat_id"] == "c-hist"
+    assert body["messages"] == [
+        {"role": "user", "content": "鳌太线怎么走？"},
+        {"role": "assistant", "content": "根据知识库证据：……"},
+    ]
+
+
+def test_history_clear_deletes_kernel_conversation_messages(tmp_path: Path) -> None:
+    app, store = _build_app_with_store(tmp_path)
+    store.ensure_conversation(conversation_id="c-hist", profile_id="rag")
+    store.append_message(
+        conversation_id="c-hist", run_id="r1", role="user",
+        content="问题", sequence=0,
+    )
+
+    async def run() -> Any:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            deleted = await client.delete("/api/v1/rag/history/c-hist")
+            restored = await client.get("/api/v1/rag/history/c-hist")
+            return deleted, restored
+
+    deleted, restored = asyncio.run(run())
+    assert deleted.status_code == 200
+    assert deleted.json() == {"chat_id": "c-hist", "status": "cleared"}
+    assert restored.json()["messages"] == []

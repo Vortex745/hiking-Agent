@@ -3060,6 +3060,24 @@ class RunOrchestrator:
 
         yield emit("text", {"content": response_text})
 
+        # Spec #13 phase 2 (T07): persist the assistant reply so
+        # conversation history (RAG page restore, snapshots) sees both
+        # sides. Best-effort: history loss must not fail the stream.
+        if req.conversation_id and response_text and self._runs_repo is not None:
+            try:
+                self._runs_repo.checkpoints.append_message(
+                    conversation_id=req.conversation_id,
+                    run_id=run_id,
+                    role="assistant",
+                    content=response_text,
+                    sequence=2,
+                )
+            except Exception:
+                logger.exception(
+                    "chat_v2: assistant message persistence failed for run_id=%s",
+                    run_id,
+                )
+
 
 # ---- Paused-run janitor (Ticket 41) -----------------------------------------
 #

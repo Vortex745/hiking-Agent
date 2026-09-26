@@ -1708,15 +1708,38 @@ class CheckpointsStore:
             raise
         return message_id
 
+    def clear_conversation(self, conversation_id: str) -> int:
+        """Delete all messages of a conversation; return the removed count.
+
+        Spec #13 phase 2 (T07): the RAG page's history-clear endpoint is
+        backed by the kernel conversation store. The conversation row
+        itself is kept — ensure_conversation re-creates it idempotently
+        on the next run.
+        """
+        self._conn.execute("BEGIN")
+        try:
+            cursor = self._conn.execute(
+                "DELETE FROM messages WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return cursor.rowcount
+
     def get_messages(
         self,
         *,
         conversation_id: str,
         limit: int = 100,
     ) -> list[MessageRecord]:
+        # rowid order = insertion order = true conversation chronology;
+        # the per-run `sequence` alone cannot order across runs
+        # (every run restarts at 0).
         rows = self._conn.execute(
             "SELECT * FROM messages WHERE conversation_id = ? "
-            "ORDER BY sequence ASC LIMIT ?",
+            "ORDER BY rowid ASC LIMIT ?",
             (conversation_id, limit),
         ).fetchall()
         return [
