@@ -33,12 +33,16 @@ class ProfileId(str, Enum):
     ``cowork`` — extends ``artifact`` with E2B-scoped Bash (Ticket 13).
         Authorized only via explicit server-side trusted/staging policy;
         anonymous production users can never reach this profile.
+    ``rag`` — knowledge-base Q&A for the RAG page (spec #13 phase 2).
+        Knowledge-search only; the grounding gate applies to this profile
+        exactly as it does to ``chat``.
     """
 
     CHAT = "chat"
     ROUTE_PLAN = "route_plan"
     ARTIFACT = "artifact"
     COWORK = "cowork"
+    RAG = "rag"
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,14 +266,43 @@ _COWORK_PROFILE = CapabilityProfile(
 )
 
 
+# ---- rag profile (spec #13 phase 2) ---------------------------------------
+#
+# The RAG page's knowledge Q&A runs as a kernel profile. Tool surface is
+# the knowledge search alone: retrieval planning / parent back-tracing /
+# compression happen inside the tool (embedded retrieve subgraph), and the
+# grounding fail-closed gate (same predicate as chat) governs output.
+# No memory tools, no MCP, no sandbox.
+_RAG_MODEL = ModelProfile(
+    profile_id=ProfileId.RAG,
+    main_model="deepseek-v4-flash",
+    fast_model="deepseek-v4-flash",
+    context_window=32_000,
+    compaction_threshold=24_000,
+    output_limit=2_048,
+)
+
+_RAG_ALLOWED_TOOLS: tuple[str, ...] = (
+    "hiking_knowledge_search",
+)
+
+_RAG_PROFILE = CapabilityProfile(
+    profile_id=ProfileId.RAG,
+    model=_RAG_MODEL,
+    allowed_tools=_RAG_ALLOWED_TOOLS,
+    allowed_mcp_servers=None,
+)
+
+
 # Ticket 04 ships ``chat``; Ticket 05 adds ``route_plan``; Ticket 09 adds
-# ``artifact``; Ticket 13 adds ``cowork``. The enum values are the
-# wire-level ``profile_id`` strings clients send.
+# ``artifact``; Ticket 13 adds ``cowork``; spec #13 phase 2 adds ``rag``.
+# The enum values are the wire-level ``profile_id`` strings clients send.
 _PROFILES: dict[ProfileId, CapabilityProfile] = {
     ProfileId.CHAT: _CHAT_PROFILE,
     ProfileId.ROUTE_PLAN: _ROUTE_PLAN_PROFILE,
     ProfileId.ARTIFACT: _ARTIFACT_PROFILE,
     ProfileId.COWORK: _COWORK_PROFILE,
+    ProfileId.RAG: _RAG_PROFILE,
 }
 
 

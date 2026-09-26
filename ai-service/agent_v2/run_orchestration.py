@@ -700,6 +700,25 @@ def compose_chat_system_prompt(req: ChatFlowRequest, profile: CapabilityProfile)
 _NO_KNOWLEDGE_EVIDENCE_RESPONSE = "资料不足：未检索到可核验的徒步知识，无法提供具体徒步事实。"
 
 
+def compose_rag_system_prompt(req: ChatFlowRequest, profile: CapabilityProfile) -> str:
+    """Knowledge-QA system prompt for the rag profile (spec #13 phase 2).
+
+    Same retrieval discipline as chat, tuned for the RAG page: answers must
+    cite retrieved evidence, insufficiency must be stated explicitly, and
+    ambiguous questions are clarified by asking in text (no dedicated
+    clarification store — the frontend never consumed clarification events).
+    """
+    return "\n".join(
+        [
+            "你是知识库问答助手，用简体中文回答用户关于徒步知识的问题。",
+            "回答规则：先调用 hiking_knowledge_search 检索知识库，再依据检索到的片段作答，并注明信息来源（文档名）。",
+            "资料不足：若检索没有可用片段，或片段不足以回答问题，明确说明“知识库中暂无相关资料”，不要编造、不要用通用经验补充事实、不要给出任何未经资料支持的具体数字。",
+            "问题含糊时（例如缺少出行时间、路线对象等关键信息），用一句话向用户追问确认，不要猜测。",
+            "回答保持简洁、结构清晰；不得透露任何内部系统、工具或框架信息。",
+        ]
+    )
+
+
 def has_hiking_knowledge_evidence(audit_entries: list[dict[str, Any]]) -> bool:
     """Allow factual chat output only after a successful non-empty RAG search."""
     return any(
@@ -1215,6 +1234,33 @@ class RunOrchestrator:
                         return
                     yield envelope
                 mark_terminal_safe(runs_repo, run_id, "done")
+                return
+
+            if profile.profile_id == ProfileId.RAG:
+                # Spec #13 phase 2: the RAG page's knowledge Q&A is a
+                # single kernel turn with the knowledge-search tool and
+                # the grounding gate. No memory-consent hook (the rag
+                # profile has no memory tools). SSE contract matches
+                # chat exactly: one `done` terminal after `text`.
+                async for envelope in self._stream_kernel_turn(
+                    req, profile, run_id=run_id, emit=_emit,
+                ):
+                    if is_cancelled(runs_repo, run_id) and not stream.terminal_emitted:
+                        yield _emit("cancelled", {
+                            "code": "cancelled",
+                            "message": "运行已被取消。",
+                        })
+                        return
+                    yield envelope
+                if not stream.terminal_emitted:
+                    if is_cancelled(runs_repo, run_id):
+                        yield _emit("cancelled", {
+                            "code": "cancelled",
+                            "message": "运行已被取消。",
+                        })
+                        return
+                    yield _emit("done", {})
+                    mark_terminal_safe(runs_repo, run_id, "done")
                 return
 
             if profile.profile_id == ProfileId.ARTIFACT:
@@ -2955,7 +3001,11 @@ class RunOrchestrator:
             system_prompt = (
                 compose_route_plan_system_prompt(req, profile)
                 if profile.profile_id == ProfileId.ROUTE_PLAN
-                else compose_chat_system_prompt(req, profile)
+                else (
+                    compose_rag_system_prompt(req, profile)
+                    if profile.profile_id == ProfileId.RAG
+                    else compose_chat_system_prompt(req, profile)
+                )
             )
 
             response_text, kernel_audit_entries = await self._kernel_turn(
@@ -2981,7 +3031,7 @@ class RunOrchestrator:
             mark_terminal_safe(self._runs_repo, run_id, "error")
             return
 
-        if profile.profile_id == ProfileId.CHAT and (
+        if profile.profile_id in (ProfileId.CHAT, ProfileId.RAG) and (
             knowledge_search_attempted_without_evidence(audit_entries)
         ):
             response_text = _NO_KNOWLEDGE_EVIDENCE_RESPONSE
