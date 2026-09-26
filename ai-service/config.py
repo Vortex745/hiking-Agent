@@ -34,9 +34,6 @@ class Settings:
     redis_rest_token: str = ""
     redis_rest_token_source: str = ""
     rag_docs_api_url: str = ""
-    rag_enable_clarification: bool = False  # 08 票据：澄清双请求 + SSE 契约开关（默认关闭，零回归）
-    rag_use_graph_runtime: bool = False  # 01 票据：生产 graph runtime 开关（默认关闭，零回归；02-05 票据逐步切换）
-    rag_max_sub_questions: int = 3  # 04 票据：并行检索子问题上限（默认 3，零回归）
     rag_sqlite_db_path: str = "./data/rag.sqlite"  # SQLite 是唯一检索存储后端
     feishu_app_id: str = ""
     feishu_app_secret: str = ""
@@ -152,11 +149,8 @@ class Settings:
             "KV_REST_API_TOKEN",
         )
         self.rag_docs_api_url = os.getenv("RAG_DOCS_API_URL", "")
-        self.rag_enable_clarification = os.getenv("RAG_ENABLE_CLARIFICATION", "false").lower() == "true"
         # 01 票据：graph runtime 开关
-        self.rag_use_graph_runtime = os.getenv("RAG_USE_GRAPH_RUNTIME", "false").lower() == "true"
         # 04 票据：并行检索子问题上限
-        self.rag_max_sub_questions = int(os.getenv("RAG_MAX_SUB_QUESTIONS", "3"))
         self.rag_sqlite_db_path = os.getenv("RAG_SQLITE_DB_PATH", self._default_runtime_dir("data/rag.sqlite"))
         self.feishu_app_id = os.getenv("FEISHU_APP_ID", "")
         self.feishu_app_secret = os.getenv("FEISHU_APP_SECRET", "")

@@ -38,8 +38,9 @@ async def lifespan(app: FastAPI):
             if app.state.agent_v2_runtime is not None:
                 logger.info("✓ Chat v2 runtime assembled (Ticket 06: persistence + writer lock active)")
                 # 暂停超时回收：弃用的审批暂停 run 会一直占住 CapacityGuard
-                # 沙箱槽位，周期 sweep 到期释放（见 api/chat_v2.py janitor）。
-                from api.chat_v2 import start_paused_run_sweeper
+                # 沙箱槽位，周期 sweep 到期释放。Ticket 41：janitor 实现归属
+                # 编排 module（agent_v2.run_orchestration），装配只负责接线。
+                from agent_v2.run_orchestration import start_paused_run_sweeper
 
                 app.state.paused_run_sweeper = start_paused_run_sweeper(
                     app.state.agent_v2_runtime
@@ -53,96 +54,9 @@ async def lifespan(app: FastAPI):
             logger.error(f"✗ Chat v2 assembly failed: {exc}", exc_info=True)
             # 失败时 runtime 保持 None，/health 会报告 failed
     else:
-        logger.info("Chat v2 disabled; v1 path unchanged")
-
-    # 票据 01：注入 RAG checkpointer（AsyncSqliteSaver + data/rag_checkpoints.sqlite）
-    # 单元测试用 FakeCheckpointer；生产 lifespan 用真实 SQLite saver
-    rag_checkpointer_cm = None
-    try:
-        from rag.checkpointer import create_checkpointer
-
-        rag_checkpointer_cm = create_checkpointer()
-        saver = await rag_checkpointer_cm.__aenter__()
-        try:
-            await saver.setup()
-        except Exception as exc:
-            logger.warning(f"RAG checkpointer setup failed (continuing without): {exc}")
-            await rag_checkpointer_cm.__aexit__(None, None, None)
-            rag_checkpointer_cm = None
-            saver = None
-        if saver is not None:
-            app.state.rag_checkpointer = saver
-            logger.info("✓ RAG checkpointer loaded (AsyncSqliteSaver)")
-    except ImportError as exc:
-        logger.warning(f"✗ RAG checkpointer unavailable: {exc}")
-        app.state.rag_checkpointer = None
-
-    # 票据 01：装配生产 graph runtime（受控切换，默认关闭=零回归）
-    # 票据 02：注入生产 retriever/augmenter/rewriter 依赖，使清晰单问题走完整检索生命周期
-    # 当 settings.rag_use_graph_runtime=True 且 checkpointer 可用时创建 runtime；
-    # 失败时不静默：runtime=None 让调用方明确检测，并日志记录错误。
-    app.state.rag_runtime = None
-    if settings.rag_use_graph_runtime:
-        checkpointer = getattr(app.state, "rag_checkpointer", None)
-        if checkpointer is None:
-            logger.error(
-                "✗ RAG runtime enabled (RAG_USE_GRAPH_RUNTIME=true) but "
-                "checkpointer unavailable; runtime will not be assembled. "
-                "Callers will see rag_runtime=None."
-            )
-        else:
-            try:
-                from rag.runtime import RagRuntimeError, build_rag_runtime
-
-                # 票据 02：注入生产依赖（用默认 settings 创建，不支持 req.model_settings 自定义）
-                # 创建失败时不静默，让 runtime 装配失败被 /health 暴露
-                runtime_retriever = None
-                runtime_augmenter = None
-                runtime_rewriter = None
-                try:
-                    from rag.retriever import VectorStoreRetriever
-                    runtime_retriever = VectorStoreRetriever()
-                except Exception as exc:
-                    logger.error(f"✗ RAG runtime: retriever init failed: {exc}")
-                try:
-                    from rag.augmenter import ContextAugmenter
-                    runtime_augmenter = ContextAugmenter()
-                except Exception as exc:
-                    logger.error(f"✗ RAG runtime: augmenter init failed: {exc}")
-                try:
-                    from rag.rewriter import QueryRewriter
-                    runtime_rewriter = QueryRewriter()
-                except Exception as exc:
-                    logger.error(f"✗ RAG runtime: rewriter init failed: {exc}")
-
-                runtime = build_rag_runtime(
-                    settings=settings,
-                    checkpointer=checkpointer,
-                    retriever=runtime_retriever,
-                    augmenter=runtime_augmenter,
-                    rewriter=runtime_rewriter,
-                )
-                app.state.rag_runtime = runtime
-                logger.info("✓ RAG runtime assembled (graph runtime mode)")
-            except RagRuntimeError as exc:
-                logger.error(
-                    f"✗ RAG runtime assembly failed (explicit failure): {exc}"
-                )
-            except Exception as exc:
-                logger.error(
-                    f"✗ RAG runtime assembly unexpected error: {exc}",
-                    exc_info=True,
-                )
+        logger.warning("Chat v2 disabled — v1 已移除，chat 链路将不可用")
 
     yield
-
-    # 关闭 runtime（票据 01 验收 1：runtime 可关闭）
-    runtime = getattr(app.state, "rag_runtime", None)
-    if runtime is not None:
-        try:
-            await runtime.aclose()
-        except Exception as exc:
-            logger.warning(f"RAG runtime cleanup failed: {exc}")
 
     # Ticket 06：释放 v2 runtime（SQLite stores + writer lock）
     from agent_v2.startup import release_v2_runtime
@@ -157,11 +71,6 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning(f"v2 runtime release failed: {exc}")
 
-    if rag_checkpointer_cm is not None:
-        try:
-            await rag_checkpointer_cm.__aexit__(None, None, None)
-        except Exception as exc:
-            logger.warning(f"RAG checkpointer cleanup failed: {exc}")
     logger.info("Shutting down ai-hiking AI Service...")
 
 
@@ -183,49 +92,21 @@ app.add_middleware(
 
 @app.get("/health")
 async def health():
-    # 票据 01：暴露 rag_runtime 装配状态，避免开关打开但装配失败时静默走 legacy
-    runtime_enabled = bool(getattr(settings, "rag_use_graph_runtime", False))
-    runtime_assembled = getattr(app.state, "rag_runtime", None) is not None
-    if runtime_enabled and not runtime_assembled:
-        # 装配失败：显式标记，监控可察觉（不静默伪装生产成功）
-        rag_runtime_status = "failed"
-    elif runtime_enabled and runtime_assembled:
-        rag_runtime_status = "ok"
-    else:
-        rag_runtime_status = "disabled"
-    # Ticket 03：暴露 Chat v2 启用/装配状态 + UniHarness pin（可审计）
+    # Spec #13 phase 2 (T06): the RAG query route runs on the kernel
+    # (profile=rag); retrieval storage/subsystem health lives at
+    # /api/v1/rag/health. No separate RAG runtime assembly exists anymore.
     from agent_v2.health import v2_health_status
 
     v2_status = v2_health_status(app.state, settings)
     return {
         "status": "ok",
         "service": "ai-service",
-        "rag_runtime": {
-            "enabled": runtime_enabled,
-            "assembled": runtime_assembled,
-            "status": rag_runtime_status,
-        },
         "agent_v2": v2_status,
     }
 
 
 # 注册路由——按依赖可用性逐个加载
-# chat 路由: 需要 langgraph, langchain-core, openai
-try:
-    from api.chat import chat_router
-    app.include_router(chat_router, prefix="/api/v1")
-    logger.info("✓ Chat router loaded")
-except ImportError as e:
-    # 提供 fallback 端点
-    from fastapi import APIRouter
-    fallback = APIRouter()
-    @fallback.get("/chat/health")
-    async def chat_health():
-        return {"status": "ok", "module": "chat", "fallback": "ai-service-health", "service": "fallback"}
-    app.include_router(fallback, prefix="/api/v1")
-    logger.warning(f"✗ Chat router unavailable: {e}")
-
-# Ticket 04: Chat v2 路由（/api/v2/chat/sse）—— 默认关闭，灰度期由 Gateway 分桶控制
+# Chat v2 路由（/api/v2/chat/sse）—— v1 chat 已移除，v2 是唯一 chat 链路
 # 路由始终注册；v2 关闭时端点返回 error terminal event（保持 SSE 契约统一）
 # Ticket 10: 同时注册 artifacts_v2_router，提供 /api/v2/artifacts/{artifact_id} 下载
 # Ticket 11: 同时注册 approvals_v2_router，提供 /api/v2/approvals/{approval_id}/decision
@@ -266,21 +147,6 @@ except ImportError as e:
     app.include_router(fallback, prefix="/api/v1")
     logger.warning(f"✗ RAG router unavailable: {e}")
 
-# tools 路由: 需要 httpx
-try:
-    from api.tools import tools_router
-    app.include_router(tools_router, prefix="/api/v1")
-    logger.info("✓ Tools router loaded")
-except ImportError as e:
-    logger.warning(f"✗ Tools router unavailable: {e}")
-
-# artifacts 路由: 下载 workspace 内由 Agent 生成的文件
-try:
-    from api.artifacts import artifacts_router
-    app.include_router(artifacts_router, prefix="/api/v1")
-    logger.info("✓ Artifacts router loaded")
-except ImportError as e:
-    logger.warning(f"✗ Artifacts router unavailable: {e}")
 
 
 if __name__ == "__main__":

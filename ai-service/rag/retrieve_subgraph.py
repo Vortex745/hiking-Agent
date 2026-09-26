@@ -12,7 +12,7 @@
 - max_token_estimate：token 超阈值 → 强制 compress 或 finalize
 - 会超支的工具调用：orchestrator 在判定阶段直接拒绝（不执行）
 
-本模块不修改 05 票据的 graph.py 主图骨架；通过 build_rag_graph(use_retrieve_subgraph=True)
+本模块可独立作为检索库使用（build_retrieve_subgraph + run_retrieve_subgraph）；当前唯一调用方是知识检索工具（tools/hiking_knowledge）
 开关式启用，默认关闭以保持 05 票据零回归。
 
 LLM 调用通过 LLMProtocol 抽象，测试用确定性 FakeLLM 驱动。
