@@ -3051,6 +3051,11 @@ class RunOrchestrator:
             else:
                 payload["status"] = "ok" if entry.get("ok") else str(entry.get("code") or "error")
                 payload["duration_ms"] = entry.get("duration_ms")
+            # Spec #13 phase 2 (T05): bounded evidence (has_chunks/sources/
+            # chunk summaries) rides on the public tool_result event so the
+            # RAG-page SSE adapter can render the documents panel.
+            if isinstance(entry.get("evidence"), dict):
+                payload["evidence"] = entry["evidence"]
             yield emit("tool_result", payload)
 
         yield emit("text", {"content": response_text})

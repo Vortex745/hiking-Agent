@@ -191,10 +191,23 @@ class HikingKnowledgeSearchTool(BoundedDomainTool):
             for chunk in chunks
             if isinstance(chunk, Mapping) and isinstance(chunk.get("source"), str)
         ]
+        # Spec #13 phase 2 (T05): bounded chunk summaries ride in the audit
+        # trail so the RAG-page SSE adapter can render the documents panel.
+        # has_chunks/sources stay authoritative for the grounding gate.
+        chunk_summaries = [
+            {
+                "title": str(chunk.get("title") or ""),
+                "source": str(chunk.get("source") or ""),
+                "preview": str(chunk.get("preview") or "")[:220],
+            }
+            for chunk in chunks
+            if isinstance(chunk, Mapping)
+        ]
         return {
             "evidence": {
                 "has_chunks": bool(chunks),
                 "sources": sources,
+                "chunks": chunk_summaries,
             }
         }
 
