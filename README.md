@@ -41,14 +41,14 @@ AI Hiking 将 React 前端、Go API Gateway 和 Python FastAPI AI Service 组合
 徒步问答通常不只是一次普通聊天：用户可能需要结合知识库资料、天气、当前位置、路线、装备和风险判断。AI Hiking 因此把系统拆成三个清晰的运行层：
 
 - 前端负责聊天界面、文档上传、模型配置、浏览器定位和 SSE 渲染。
-- Gateway 负责统一 `/api/v1/*` 入口、CORS、限流和流式代理。
-- AI Service 负责 Agent、RAG、Memory 和徒步领域工具。
+- Gateway 负责统一 `/api/v1/*`（RAG / models）与 `/api/v2/*`（Chat）入口、CORS、限流和流式代理。
+- AI Service 负责唯一编排内核（Agent v2，含 RAG 问答 profile）、检索基线和徒步领域工具。
 
 主要能力包括：
 
 - RAG：文档加载、查询改写、向量检索、BM25、RRF 融合、可选 rerank 和答案增强。
-- Agent：意图识别、槽位抽取、按场景选择工具、LangGraph fallback、工具风险分级和记忆提交。
-- Memory：聊天历史、会话压缩、知识抽取和回答完成后的长期记忆写入。
+- Agent（Chat v2）：UniHarness 内核、可恢复运行、工具审批、产物管理和记忆提交。
+- Memory（v2）：长期记忆服务与会话存储由 Agent v2 内核统一持有（旧版 memory 包已移除）。
 
 ## 安装
 
@@ -62,7 +62,7 @@ AI Hiking 将 React 前端、Go API Gateway 和 Python FastAPI AI Service 组合
 - Go 1.22
 - 可选：`lark-cli`，用于 Feishu 同步
 - 可选：高德地图 MCP Server，用于地理和天气工具
-- 生产可选：Vercel Marketplace Redis / Upstash，用于持久化聊天历史
+- 会话与长期记忆由 Agent v2 的 SQLite 存储持有（旧版 Redis 聊天历史已随 memory 包移除）
 
 ### 克隆仓库
 
@@ -90,11 +90,19 @@ EMBEDDING_MODEL=text-embedding-3-small
 EMBEDDING_DIMENSIONS=1536
 
 MCP_SERVERS={"amap":{"command":"amap-mcp","args":["--stdio"]}}
+
+可选：配置 Langfuse 追踪 LLM 调用（未配置密钥时自动禁用）：
+
+```env
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_BASE_URL=https://cloud.langfuse.com
+```
 ```
 
 ### Docker Compose 启动
 
-Docker Compose 当前仅用于启动基础设施（PostgreSQL 和 Redis）。应用服务请在本地通过环境依赖启动。
+Docker Compose 当前仅用于启动基础设施（PostgreSQL 和 Redis，Redis 已不被应用消费，保留仅为兼容）。应用服务请在本地通过环境依赖启动。
 
 ```bash
 docker compose up -d
@@ -152,9 +160,7 @@ http://localhost:5173
 
 ```bash
 curl http://localhost:8000/health
-curl http://localhost:8000/api/v1/chat/health
 curl http://localhost:8000/api/v1/rag/health
-curl http://localhost:8000/api/v1/tools/health
 curl http://localhost:8080/health
 curl http://localhost:3000/
 ```
@@ -166,19 +172,21 @@ Browser
   │ HTTP / SSE
   ▼
 frontend/   React 18 + TypeScript + Vite + TailwindCSS
-  │ /api/v1/*
+  │ /api/v1/* (RAG / models) + /api/v2/* (Chat)
   ▼
 gateway/    Go 1.22 + Gin + CORS + proxy
   │ HTTP / SSE proxy
   ▼
 ai-service/ Python 3.12 + FastAPI
-  ├─ Agent: intent intake, hiking workflows, LangGraph fallback, memory commit
-  ├─ RAG: loader, query rewrite, vector/BM25 retrieval, rerank, answer augment
-  ├─ Memory: chat history, compression, knowledge extraction, vector store
-  └─ Tools: search, file, terminal, PDF, geo, weather, route, gear, risk
+  ├─ Agent v2: UniHarness kernel — 唯一编排栈，5 个 profile
+  │    chat / route_plan / artifact / cowork / rag
+  │    durable runs, approvals, sandbox, conversation store
+  ├─ RAG: ingestion, SQLite hybrid retrieval (FTS5 + sqlite-vec + RRF),
+  │    rerank, Feishu/cloud-docs sync — 检索基线（无自有运行时）
+  └─ Tools: knowledge search（内嵌预算检索子图）, gear, risk,
+       route, web, PDF, sandbox tools
 
-PostgreSQL + pgvector
-Redis / Upstash Redis
+SQLite（agent_control / chat_checkpoints / agent_memory / kernel_checkpoints / rag）
 ```
 
 目录结构：
@@ -186,10 +194,9 @@ Redis / Upstash Redis
 ```text
 ai-hiking/
 ├── ai-service/              # FastAPI AI Service
-│   ├── agent/               # Agent intake, policy, execution
-│   ├── api/                 # FastAPI routers
-│   ├── memory/              # Chat and long-term memory
-│   ├── rag/                 # Retrieval-augmented generation
+│   ├── agent_v2/            # UniHarness kernel — 唯一编排栈（runs/approvals/memory）
+│   ├── api/                 # FastAPI routers（rag 查询为 kernel 适配层）
+│   ├── rag/                 # 检索基线：摄入 / SQLite 混合检索 / 同步源
 │   ├── tools/               # Base and hiking-domain tools
 │   └── tests/
 ├── frontend/                # React + Vite frontend
@@ -265,8 +272,6 @@ python -m pytest tests -q
 | `OPENAI_API_KEY` | 生产 LLM Key |
 | `EMBEDDING_API_KEY` | 生产 Embedding Key |
 | `RERANK_API_KEY` | 生产 Rerank Key |
-| `REDIS_URL` | 可选，外部托管 Redis 连接串 |
-| `KV_URL` / `KV_REST_API_URL` / `KV_REST_API_TOKEN` | 可选，Vercel Marketplace Redis / Upstash 自动注入变量 |
 
 ### 生产 Compose
 
@@ -274,13 +279,7 @@ python -m pytest tests -q
 DOCKERHUB_IMAGE=zijinn123/ai-hiking IMAGE_TAG=latest docker compose -f docker-compose.prod.yml up -d
 ```
 
-生产 Compose 只包含应用服务和 Postgres；Redis 不再作为生产容器启动。需要 Redis-backed chat memory 时，提供外部托管 Redis：
-
-```env
-REDIS_URL=rediss://default:...@...
-```
-
-在 Vercel 上，优先通过 Marketplace 连接 Upstash for Redis 到 `ai-hiking-ai-service` 项目。AI Service 会自动识别 `REDIS_URL`、`KV_URL`、`UPSTASH_REDIS_URL`，也兼容 `KV_REST_API_URL` + `KV_REST_API_TOKEN` 或 `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN`。没有这些变量时，Vercel Functions 会回退到 `/tmp` 文件内存，不能保证跨冷启动持久。
+生产 Compose 只包含应用服务和 Postgres。会话与长期记忆由 Agent v2 的 SQLite 存储持有（需要为实例配置持久卷），不再依赖外部 Redis。
 
 ### CloudBase
 
@@ -327,26 +326,31 @@ MCP_SERVERS={"amap":{"command":"amap-mcp","args":["--stdio"]}}
 
 ## API
 
-前端统一访问 Gateway 的 `/api/v1/*`。
+前端访问 Gateway 的 `/api/v1/*`（RAG / models）与 `/api/v2/*`（Chat，唯一 chat 链路）。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/health` | Gateway 健康检查 |
-| `GET` | `/api/v1/chat/health` | Agent 健康检查 |
-| `POST` | `/api/v1/chat/sync` | 同步 Agent 对话 |
-| `POST` | `/api/v1/chat/sse` | SSE Agent 对话 |
-| `GET` | `/api/v1/chat/history/:chatId` | 聊天历史 |
-| `POST` | `/api/v1/chat/confirm` | 工具确认 |
-| `GET` | `/api/v1/chat/pending/:chatId` | 待确认工具 |
 | `POST` | `/api/v1/models/fetch` | 拉取模型列表 |
 | `GET` | `/api/v1/rag/health` | RAG 健康检查 |
 | `POST` | `/api/v1/rag/upload` | 上传知识库文档 |
 | `POST` | `/api/v1/rag/query` | SSE RAG 问答 |
 | `GET` | `/api/v1/rag/documents` | 文档列表 |
-| `POST` | `/api/v1/rag/feishu/sync` | 同步单个 Feishu 文档 |
-| `POST` | `/api/v1/rag/feishu/default-sync` | 同步默认 Feishu 源 |
-| `GET` | `/api/v1/tools` | 工具注册表 |
-| `GET` | `/api/v1/tools/health` | 工具配置健康检查 |
+| `GET` | `/api/v1/rag/history/:chatId` | RAG 聊天历史 |
+| `DELETE` | `/api/v1/rag/history/:chatId` | 清空 RAG 聊天历史 |
+| `POST` | `/api/v2/chat/sse` | SSE Chat v2 对话（唯一 chat 链路） |
+| `GET` | `/api/v2/chat/snapshot/:run_id` | 运行快照（刷新恢复） |
+| `POST` | `/api/v2/chat/cancel/:run_id` | 取消运行 |
+| `GET` | `/api/v2/chat/events/:run_id` | 增量事件拉取（from_seq） |
+| `POST` | `/api/v2/chat/resume/:run_id` | 恢复运行（审批后继续） |
+| `POST` | `/api/v2/approvals/:approval_id/decision` | 工具审批决策 |
+| `GET`/`PUT` | `/api/v2/memory/settings` | 记忆开关配置 |
+| `GET`/`DELETE` | `/api/v2/memories` | 长期记忆列表 / 清空 |
+| `GET` | `/api/v2/memories/export` | 导出长期记忆 |
+| `PATCH`/`DELETE` | `/api/v2/memories/:memory_id` | 编辑 / 删除单条记忆 |
+| `POST` | `/api/v2/memory/candidates/:candidate_id/decision` | 记忆候选确认 |
+| `GET` | `/api/v2/artifacts/:artifact_id` | 下载运行产物 |
+| `POST` | `/api/v2/subject/rotate` | 轮换匿名 subject 标识 |
 
 ## 维护者
 

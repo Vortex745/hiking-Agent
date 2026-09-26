@@ -18,7 +18,6 @@ from api.chat_v2 import _build_run_orchestrator
 from api.memory_v2 import resolve_request_subject, set_subject_cookie
 from config import settings
 from observability.langfuse_setup import reset_langfuse_session, set_langfuse_session
-from memory.factory import chat_memory_status  # T07 后仅 /rag/health 状态展示使用
 from runtime_paths import runtime_dir
 
 logger = logging.getLogger("ai-service.rag")
@@ -427,7 +426,6 @@ async def rag_health():
             # 09 票据验收 5：用户可见健康信息使用「外部文档」通用表述，不泄漏 legacy 品牌
             "external_doc_enabled": settings.feishu_enabled,
             "external_doc_default_configured": settings.feishu_default_configured,
-            "memory": chat_memory_status(),
         }
     except Exception as e:
         logger.exception("RAG health check failed")

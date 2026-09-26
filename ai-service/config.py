@@ -39,11 +39,7 @@ class Settings:
     feishu_app_secret: str = ""
     feishu_default_space_id: str = ""
     feishu_default_folder_token: str = ""
-    memory_store_path: str = "./memory_store"
-    memory_top_k: int = 5
-    memory_compressor_model: str = "deepseek-v4-flash"
     memory_extractor_model: str = "deepseek-v4-flash"
-    memory_enabled: bool = True
     amap_api_key: str = ""
     mcp_servers: dict = {}
     disabled_lanes: str = ""  # Comma-separated lane names to disable, e.g. "SIMPLE_TOOL,WORKFLOW"
@@ -156,11 +152,6 @@ class Settings:
         self.feishu_app_secret = os.getenv("FEISHU_APP_SECRET", "")
         self.feishu_default_space_id = os.getenv("FEISHU_DEFAULT_SPACE_ID", "")
         self.feishu_default_folder_token = os.getenv("FEISHU_DEFAULT_FOLDER_TOKEN", "")
-        self.memory_store_path = os.getenv("MEMORY_STORE_PATH", self._default_runtime_dir("memory_store"))
-        self.memory_top_k = int(os.getenv("MEMORY_TOP_K", "5"))
-        self.memory_compressor_model = os.getenv("MEMORY_COMPRESSOR_MODEL", "deepseek-v4-flash")
-        self.memory_extractor_model = os.getenv("MEMORY_EXTRACTOR_MODEL", "deepseek-v4-flash")
-        self.memory_enabled = os.getenv("MEMORY_ENABLED", "true").lower() == "true"
         self.amap_api_key = os.getenv("AMAP_API_KEY", "")
         self.mcp_servers = self._json_env("MCP_SERVERS")
         self.tavily_api_key = os.getenv("TAVILY_API_KEY", "")
