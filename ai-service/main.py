@@ -93,8 +93,9 @@ app.add_middleware(
 @app.get("/health")
 async def health():
     # Spec #13 phase 2 (T06): the RAG query route runs on the kernel
-    # (profile=rag); retrieval storage/subsystem health lives at
-    # /api/v1/rag/health. No separate RAG runtime assembly exists anymore.
+    # (profile=rag); the HTTP RAG surface was removed in A11 — RAG is a
+    # chat tool (hiking_knowledge_search) on the kernel. No separate RAG
+    # runtime assembly exists anymore.
     from agent_v2.health import v2_health_status
 
     v2_status = v2_health_status(app.state, settings)
@@ -132,20 +133,6 @@ try:
     logger.info("✓ Models router loaded")
 except ImportError as e:
     logger.warning(f"✗ Models router unavailable: {e}")
-
-# rag 路由: 需要 langchain, faiss-cpu, etc
-try:
-    from api.rag import rag_router
-    app.include_router(rag_router, prefix="/api/v1")
-    logger.info("✓ RAG router loaded")
-except ImportError as e:
-    from fastapi import APIRouter
-    fallback = APIRouter()
-    @fallback.get("/rag/health")
-    async def rag_health():
-        return {"status": "ok", "module": "rag", "fallback": "ai-service-health", "service": "fallback"}
-    app.include_router(fallback, prefix="/api/v1")
-    logger.warning(f"✗ RAG router unavailable: {e}")
 
 
 

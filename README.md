@@ -41,7 +41,7 @@ AI Hiking 将 React 前端、Go API Gateway 和 Python FastAPI AI Service 组合
 徒步问答通常不只是一次普通聊天：用户可能需要结合知识库资料、天气、当前位置、路线、装备和风险判断。AI Hiking 因此把系统拆成三个清晰的运行层：
 
 - 前端负责聊天界面、文档上传、模型配置、浏览器定位和 SSE 渲染。
-- Gateway 负责统一 `/api/v1/*`（RAG / models）与 `/api/v2/*`（Chat）入口、CORS、限流和流式代理。
+- Gateway 负责统一 `/api/v1/*`（models）与 `/api/v2/*`（Chat）入口、CORS、限流和流式代理。
 - AI Service 负责唯一编排内核（Agent v2，含 RAG 问答 profile）、检索基线和徒步领域工具。
 
 主要能力包括：
@@ -160,7 +160,6 @@ http://localhost:5173
 
 ```bash
 curl http://localhost:8000/health
-curl http://localhost:8000/api/v1/rag/health
 curl http://localhost:8080/health
 curl http://localhost:3000/
 ```
@@ -195,8 +194,8 @@ SQLite（agent_control / chat_checkpoints / agent_memory / kernel_checkpoints / 
 ai-hiking/
 ├── ai-service/              # FastAPI AI Service
 │   ├── agent_v2/            # UniHarness kernel — 唯一编排栈（runs/approvals/memory）
-│   ├── api/                 # FastAPI routers（rag 查询为 kernel 适配层）
-│   ├── rag/                 # 检索基线：摄入 / SQLite 混合检索 / 同步源
+│   ├── api/                 # FastAPI routers（chat v2 / memory / models）
+│   ├── rag/                 # 检索基线：摄入 / SQLite 混合检索 / 同步源（供知识工具调用）
 │   ├── tools/               # Base and hiking-domain tools
 │   └── tests/
 ├── frontend/                # React + Vite frontend
@@ -323,18 +322,13 @@ MCP_SERVERS={"amap":{"command":"amap-mcp","args":["--stdio"]}}
 
 ## API
 
-前端访问 Gateway 的 `/api/v1/*`（RAG / models）与 `/api/v2/*`（Chat，唯一 chat 链路）。
+前端访问 Gateway 的 `/api/v1/*`（models）与 `/api/v2/*`（Chat，唯一 chat 链路）。
+RAG 能力经 chat 内的知识检索工具（`hiking_knowledge_search`）提供，没有独立 HTTP 接口（A11 删除）。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/health` | Gateway 健康检查 |
 | `POST` | `/api/v1/models/fetch` | 拉取模型列表 |
-| `GET` | `/api/v1/rag/health` | RAG 健康检查 |
-| `POST` | `/api/v1/rag/upload` | 上传知识库文档 |
-| `POST` | `/api/v1/rag/query` | SSE RAG 问答 |
-| `GET` | `/api/v1/rag/documents` | 文档列表 |
-| `GET` | `/api/v1/rag/history/:chatId` | RAG 聊天历史 |
-| `DELETE` | `/api/v1/rag/history/:chatId` | 清空 RAG 聊天历史 |
 | `POST` | `/api/v2/chat/sse` | SSE Chat v2 对话（唯一 chat 链路） |
 | `GET` | `/api/v2/chat/snapshot/:run_id` | 运行快照（刷新恢复） |
 | `POST` | `/api/v2/chat/cancel/:run_id` | 取消运行 |

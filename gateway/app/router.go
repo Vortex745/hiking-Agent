@@ -38,21 +38,14 @@ func NewRouter(cfg *config.Config) *gin.Engine {
 	healthHandler := handler.NewHealthHandler(cfg.AIServiceURL)
 	chatV2Handler := handler.NewChatV2Handler(cfg.AIServiceURL)
 	modelsHandler := handler.NewModelsHandler(cfg.AIServiceURL)
-	ragHandler := handler.NewRAGHandler(cfg.AIServiceURL)
 
 	r.GET("/health", healthHandler.Health)
 
-	// RAG / models routes (still served under /api/v1 by the AI service).
+	// Models routes (served under /api/v1 by the AI service). The HTTP
+	// RAG surface was removed in A11 — RAG is a chat tool on the kernel.
 	api := r.Group("/api/v1")
 	{
 		api.POST("/models/fetch", modelsHandler.ModelsFetch)
-
-		api.GET("/rag/health", ragHandler.RagHealth)
-		api.POST("/rag/upload", ragHandler.RagUpload)
-		api.POST("/rag/query", ragHandler.RagQuery)
-		api.GET("/rag/documents", ragHandler.RagDocuments)
-		api.GET("/rag/history/:chatId", ragHandler.RagHistory)
-		api.DELETE("/rag/history/:chatId", ragHandler.RagClearHistory)
 	}
 
 	// Chat v2 routes — the only chat链路 (v1 chat removed). The SSE
