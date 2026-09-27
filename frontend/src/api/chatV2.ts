@@ -727,7 +727,12 @@ export async function submitV2Approval(
 }
 
 /**
- * Build the SSE URL for POST /api/v2/chat/resume/{run_id}.
+ * Build the SSE URL for POST /api/v2/chat/resume/{run_id} (A10).
+ *
+ * Prefers the server-issued ``resume_url`` from the decision response —
+ * the backend owns the gateway path, so the client should not re-derive
+ * it — and appends the replay cursor. Falls back to the documented
+ * resume path when the field is absent.
  *
  * The resume endpoint is itself an SSE stream: the server replays
  * stored events with sequence > ``fromSeq``, then emits the
@@ -736,6 +741,17 @@ export async function submitV2Approval(
  * like the initial /chat/sse URL — the only difference is the method
  * path and the ``from_seq`` query parameter.
  */
-export function buildV2ResumeStreamUrl(runId: string, fromSeq: number = 0): string {
-  return API.chatV2Resume(runId, fromSeq)
+export function buildV2ResumeUrlFromDecision(
+  decision: Pick<V2ApprovalDecisionResponse, 'resume_url' | 'run_id'>,
+  fromSeq: number,
+): string {
+  // Same-origin path via the shared API map; strip the builder's query
+  // so the cursor below stays the only parameter.
+  const fallback = API.chatV2Resume(decision.run_id, 0).split('?')[0]
+  const base =
+    typeof decision.resume_url === 'string' && decision.resume_url
+      ? decision.resume_url
+      : fallback
+  const separator = base.includes('?') ? '&' : '?'
+  return `${base}${separator}from_seq=${fromSeq}`
 }

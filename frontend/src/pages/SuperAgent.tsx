@@ -6,7 +6,7 @@ import {
   fetchV2Snapshot,
   fetchV2Events,
   submitV2Approval,
-  buildV2ResumeStreamUrl,
+  buildV2ResumeUrlFromDecision,
   fetchV2MemorySettings,
   updateV2MemorySettings,
   submitV2MemoryDecision,
@@ -19,6 +19,7 @@ import {
   V2_TERMINAL_RUN_STATUSES,
   type V2EventEnvelope,
   type V2ApprovalRequest,
+  type V2ApprovalDecisionResponse,
   type V2Memory,
   type V2MemoryCandidate,
 } from '../api/chatV2'
@@ -801,8 +802,9 @@ function SuperAgent() {
     setV2ApprovalState('submitting')
     const decisionRequestId = `dec-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
 
+    let decisionResponse: V2ApprovalDecisionResponse | null = null
     try {
-      await submitV2Approval(approval.approval_id, decision, decisionRequestId)
+      decisionResponse = await submitV2Approval(approval.approval_id, decision, decisionRequestId)
     } catch (error) {
       const message = error instanceof Error ? error.message : '审批决策失败'
       // Parse the structured 409 reason so the UI can render the right
@@ -833,7 +835,13 @@ function SuperAgent() {
     // events. The server validates the run is no longer paused and the
     // sandbox lease is still active before emitting the continuation.
     setV2ApprovalState('resuming')
-    const resumeUrl = buildV2ResumeStreamUrl(persisted.run_id, persisted.sequence_cursor)
+    // A10: the decision response carries the canonical resume URL — the
+    // backend owns the gateway path. Fall back to the documented path
+    // when the field is absent.
+    const resumeUrl = buildV2ResumeUrlFromDecision(
+      decisionResponse ?? { resume_url: '', run_id: persisted.run_id },
+      persisted.sequence_cursor,
+    )
     attachV2Stream(resumeUrl, '', {
       onOpen: () => setConnectionStatus('connected'),
       onEvent: handleV2Event,
