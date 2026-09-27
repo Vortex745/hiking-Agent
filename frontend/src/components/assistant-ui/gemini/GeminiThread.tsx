@@ -449,18 +449,11 @@ function prefersReducedMotion() {
 }
 
 const traceLabels: Record<string, string> = {
-  thought: '思考',
-  process: '流程',
-  documents: '文档',
   tool_call: '工具调用',
   tool_result: '工具结果',
   artifact_progress: '产物生成',
   review_notice: '需人工核查',
   approval_required: '需要确认',
-  artifact: '产物',
-  text: '回答',
-  done: '完成',
-  error: '错误',
 };
 
 function getPartToolName(part: any) {
@@ -490,9 +483,10 @@ function stepState(done: boolean, active: boolean): LifecycleStep['state'] {
 }
 
 function getAgentLifecycle(events: any[], isRunning: boolean, hasText: boolean): LifecycleStep[] {
-  const phases = new Set(events.map(event => event?.metadata?.phase).filter(Boolean));
   const hasToolEvent = events.some(event => ['tool_call', 'tool_result', 'approval_required'].includes(event?.type));
 
+  // 仅保留可由后端 trace 事件推导的阶段：记忆读取/查询改写在后端无对应
+  // phase 发射源（rewriter 已随 RAG 模块合并删除），重新引入前需先补后端。
   return [
     {
       title: '请求理解',
@@ -500,19 +494,9 @@ function getAgentLifecycle(events: any[], isRunning: boolean, hasText: boolean):
       state: stepState(events.length > 0, isRunning && events.length === 0),
     },
     {
-      title: '记忆读取',
-      detail: '读取会话历史、摘要和长期记忆',
-      state: stepState(phases.has('memory'), isRunning && events.length > 0 && !phases.has('memory')),
-    },
-    {
-      title: '查询改写',
-      detail: '把用户问题整理成更适合工具执行的任务',
-      state: stepState(phases.has('query_rewrite'), isRunning && phases.has('memory') && !phases.has('query_rewrite')),
-    },
-    {
       title: '工具编排',
       detail: '按风险等级选择并执行徒步工具',
-      state: stepState(hasToolEvent, isRunning && phases.has('start') && !hasToolEvent && !hasText),
+      state: stepState(hasToolEvent, isRunning && !hasToolEvent && !hasText),
     },
     {
       title: '回答生成',

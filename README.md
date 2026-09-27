@@ -46,7 +46,7 @@ AI Hiking 将 React 前端、Go API Gateway 和 Python FastAPI AI Service 组合
 
 主要能力包括：
 
-- RAG：文档加载、查询改写、向量检索、BM25、RRF 融合、可选 rerank 和答案增强。
+- RAG：文档加载、向量检索（FTS5 + sqlite-vec + RRF 融合）、可选 rerank。
 - Agent（Chat v2）：UniHarness 内核、可恢复运行、工具审批、产物管理和记忆提交。
 - Memory（v2）：长期记忆服务与会话存储由 Agent v2 内核统一持有（旧版 memory 包已移除）。
 
