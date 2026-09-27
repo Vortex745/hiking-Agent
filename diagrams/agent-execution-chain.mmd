@@ -1,101 +1,109 @@
 %%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "primaryTextColor": "#0f172a", "lineColor": "#64748b", "fontFamily": "Arial"}}}%%
 flowchart TD
-    subgraph STARTUP["Agent v2 启动装配 · main.py lifespan"]
+    subgraph STARTUP["① 启动装配 · main.py lifespan"]
         FLAG{"AGENT_V2_ENABLED?"}
+        OFF["chat 链路不可用（v1 已移除，无回退）"]
         GUARD["check_v2_startup_guard<br/>Vercel / 配置 fail-fast"]
-        LOCK["OS WriterLock<br/>单写者"]
-        DBS["三份 SQLite<br/>agent_control / chat_checkpoints / agent_memory"]
+        LOCK["OS WriterLock 单写者"]
+        DBS["SQLite ×3<br/>agent_control / chat_checkpoints / agent_memory"]
         COMPONENTS["RunRepository + MemoryService<br/>Telemetry + CapacityGuard"]
-        FACTORY["create_agent()<br/>AgentContext：工具组 / 权限 gate / 审批 callback"]
-        V2RT["app.state.agent_v2_runtime<br/>V2Runtime"]
-        FLAG -->|true| GUARD --> LOCK --> DBS --> COMPONENTS --> FACTORY --> V2RT
-        FLAG -->|false：默认| V1ONLY["不装配 v2<br/>v1 链路保持可用"]
+        SWEEP["start_paused_run_sweeper<br/>过期 paused run 清扫"]
+        V2RT["app.state.agent_v2_runtime"]
+        FLAG -->|false：默认| OFF
+        FLAG -->|true| GUARD --> LOCK --> DBS --> COMPONENTS --> SWEEP --> V2RT
     end
 
-    subgraph V2["Agent v2 · /api/v2/chat/sse"]
-        UI2["Frontend SuperAgent<br/>chatV2.ts"]
-        GW2["Gateway<br/>POST /api/v2/chat/sse"]
-        ENTRY2["api/chat_v2.py<br/>chat_v2_sse"]
-        CAP["CapacityGuard<br/>run / sandbox lease"]
-        STREAM["_stream_chat_v2<br/>EventStream 初始化"]
-        RUN["RunRepository.create_run_idempotent<br/>request_id 幂等"]
-        GATE["前置 gate<br/>conversation / v2 enabled / profile / API key"]
-        PROFILE{"resolve_profile"}
-        EMIT["emit 闭包<br/>build sequence → persist_event → telemetry → SSE"]
-        REPLAY["重复 request_id<br/>重放存储事件，不重跑工具"]
-
-        CHAT["chat profile<br/>memory consent / search / save<br/>text → done"]
-        ROUTE["route_plan profile<br/>分类 → amap_map / amap_weather MCP<br/>tool_call → tool_result → text → done"]
-        ART["artifact profile<br/>sandbox 创建 → PermissionGate<br/>approval.required / run.paused"]
-        ART_RESUME["批准后 resume<br/>generate_pdf → artifact_candidate<br/>主机校验 → artifact.available → text → done"]
-        COWORK["cowork profile<br/>授权 gate → sandbox_bash<br/>PermissionGate + effect ledger<br/>approval.required / run.paused"]
-        COWORK_RESUME["批准后 resume<br/>sandbox_bash → tool_result<br/>text → done"]
-
-        UI2 --> GW2 --> ENTRY2 --> CAP --> STREAM --> RUN --> GATE --> PROFILE
-        RUN -->|created=false| REPLAY --> EMIT
-        PROFILE -->|chat| CHAT --> EMIT
-        PROFILE -->|route_plan| ROUTE --> EMIT
-        PROFILE -->|artifact| ART --> ART_RESUME --> EMIT
-        PROFILE -->|cowork| COWORK --> COWORK_RESUME --> EMIT
+    subgraph REQ["② 请求接入 · POST /api/v2/chat/sse"]
+        UI["前端 SuperAgent<br/>chatV2.ts"]
+        GW["Go Gateway 转发"]
+        ADP["api/chat_v2.py<br/>HTTP 解析 · Pydantic 校验 · SSE 渲染"]
+        CAP["CapacityGuard 租约<br/>run / sandbox，满 → 503"]
+        ORCH["RunOrchestrator.stream_chat"]
+        RUN{"create_run_idempotent<br/>request_id 幂等"}
+        REPLAY["重复 request_id<br/>重放已存事件后结束<br/>不重跑工具"]
+        GATE["前置门禁<br/>v2 enabled · resolve_profile<br/>cowork 授权策略 · API Key"]
+        EVT["run_started → progress → heartbeat<br/>emit 闭包：build → persist → telemetry → SSE"]
+        CANCEL["流间歇轮询 is_cancelled<br/>→ cancelled 终态"]
+        UI --> GW --> ADP --> CAP --> ORCH --> RUN
+        RUN -->|重复| REPLAY
+        RUN -->|新建| GATE --> EVT
+        EVT -.-> CANCEL
     end
 
-    subgraph SUPPORT["v2 支撑端点"]
-        SNAP["GET /snapshot/:run_id<br/>运行状态与快照"]
-        EVENTS["GET /events/:run_id?from_seq=N<br/>断线事件重放"]
-        CANCEL["POST /cancel/:run_id<br/>流间歇轮询后发 cancelled"]
-        APPROVE["POST /approvals/:id/decision<br/>恢复 paused run"]
-        ARTIFACTS["GET /artifacts/:artifact_id<br/>opaque id 下载"]
+    subgraph PROFILE["③ 能力分流 · 服务端定义，客户端不可覆盖"]
+        P{"resolve_profile"}
+        CH["chat：敏感记忆 consent hook<br/>kernel turn + 记忆工具"]
+        RG["rag：kernel turn + 知识检索<br/>grounding gate"]
+        RP["route_plan：kernel turn + AMap MCP 白名单<br/>evidence 纪律 prompt"]
+        AR["artifact：沙箱 PDF 流程"]
+        CW["cowork：沙箱 Bash 流程<br/>需 AGENT_V2_COWORK_POLICY=trusted/staging"]
+        P -->|chat| CH
+        P -->|rag| RG
+        P -->|route_plan| RP
+        P -->|artifact| AR
+        P -->|cowork| CW
     end
 
-    subgraph CONTRACT["UniHarness 扩展接口（当前 v2 API 的独立契约 seam）"]
-        CONTEXT["AgentContext<br/>profile 工具可见性"]
-        RUNTIME["AgentRuntime.invoke_tool<br/>PermissionGate → approval → ToolInvocation"]
-        SUBAGENT["create_subagent guard<br/>Task group + 单层限制"]
-        CONTEXT --> RUNTIME --> SUBAGENT
+    subgraph KERNEL["④ Kernel turn · UniHarness 全项目唯一装配"]
+        ASM["assemble_kernel_agent<br/>pin 校验 · ChatOpenAI temp 0 重试 3<br/>PermissionGate · MCP 白名单 · 子代理（默认关）"]
+        CKPT["LangGraph checkpointer<br/>thread_id = v2:chat:{run_id} · 断点续跑<br/>上下文超阈值自动压缩"]
+        LOOP["ReAct 循环<br/>模型推理 → PermissionGate → 工具执行<br/>结果回填 · 全程写 audit 审计"]
+        FIN["收尾 fail-closed<br/>240s 超时 · 稳定错误码 · 无降级回退<br/>清洗 think 标记 → final_text"]
+        ASM --> CKPT --> LOOP --> FIN
     end
 
-    subgraph V1["Agent v1 · 默认实际执行链"]
-        UI1["Frontend SuperAgent / Chat UI"]
-        GW1["Gateway<br/>POST /api/v1/chat/sse"]
-        ENTRY1["api/chat.py<br/>chat_sse + event_stream"]
-        AIA["AIAgent.aexecute_stream<br/>understand_request + memory context"]
-        CREATE["HikingManus.create<br/>ToolCollection + MCP 初始化"]
-        LOOP{"ReAct loop<br/>think() → tool_calls?"}
-        TOOLS["工具执行<br/>web_search / route_research<br/>hiking_knowledge_search / MCP / terminate"]
-        RAGTOOL["hiking_knowledge_search<br/>VectorStoreRetriever.hybrid_search<br/>进入 RAG 检索后端"]
-        RESULT["tool_result → ToolMessage<br/>repeat/stuck detector"]
-        EXIT{"退出条件"}
-        TERMINAL["text / error / approval_required<br/>done metadata：exit_reason / step_count / tool_count"]
-        MEMORY["assistant 回复写入 ChatMemory<br/>可选 memory_manager commit"]
-
-        UI1 --> GW1 --> ENTRY1 --> AIA --> CREATE --> LOOP
-        LOOP -->|有工具调用| TOOLS --> RESULT --> EXIT
-        LOOP -->|无工具调用| EXIT
-        TOOLS --> RAGTOOL
-        EXIT -->|继续| LOOP
-        EXIT -->|natural_end / terminate / budget / error / stuck / waiting_for_user| TERMINAL --> MEMORY --> UI1
+    subgraph EFFECT["⑤ 副作用 CAS 账本 · drive_effect（唯一实现）"]
+        AUTH["authorized<br/>执行前先落账"]
+        CAS["CAS → executing<br/>唯一执行者获胜"]
+        COMMIT["committed<br/>结果入库，重入直接回放"]
+        FAIL["failed<br/>不重执行 · 终态错误"]
+        UK["outcome_unknown<br/>执行者崩溃 · 人工审查<br/>禁自动重放"]
+        AUTH -->|CAS| CAS --> COMMIT
+        CAS -->|执行失败| FAIL
+        CAS -->|执行者崩溃| UK
     end
 
-    V2RT -.-> UI2
-    FACTORY -.-> CONTEXT
-    ART -.-> APPROVE
-    COWORK -.-> APPROVE
-    APPROVE -.-> ART_RESUME
-    APPROVE -.-> COWORK_RESUME
-    SNAP -.-> RUN
-    EVENTS -.-> EMIT
-    CANCEL -.-> STREAM
-    ART_RESUME -.-> ARTIFACTS
+    subgraph APPROVAL["⑥ 暂停 · 审批 · 恢复（artifact / cowork）"]
+        NEED{"PermissionGate<br/>判定 NEEDS_APPROVAL?"}
+        PAUSE["approval.required + run.paused<br/>effect 先以 authorized 落账"]
+        DEC{"resolve_approval_decision<br/>approve / reject / expire 幂等"}
+        RES["stream_resume<br/>重取租约 · CAS 胜者保活沙箱<br/>effect_in_flight 不重跑 · 补发缺失事件<br/>重连合成缺失终态"]
+        CLN["不执行 · 沙箱清理"]
+        SWEEPT["后台清扫：过期 paused 自动终结"]
+        NEED -->|是| PAUSE --> DEC
+        DEC -->|approve| RES
+        DEC -->|reject / expire| CLN
+        SWEEPT -.-> DEC
+    end
+
+    subgraph TERM["⑦ 收尾与支撑端点"]
+        DONE["exactly-one-terminal<br/>text → done · error · cancelled"]
+        ART["artifact 专有：artifact_candidate<br/>→ 主机校验导出 → artifact.available<br/>→ opaque id 下载"]
+        SUPPORT["GET snapshot / events?from_seq（断线重放）<br/>POST cancel · approvals/:id/decision<br/>GET artifacts/:artifact_id"]
+        DONE --> SUPPORT
+    end
+
+    V2RT -.-> UI
+    EVT --> P
+    CH --> ASM
+    RG --> ASM
+    RP --> ASM
+    AR --> ASM
+    CW --> ASM
+    LOOP -->|高危工具| NEED
+    NEED -->|否| LOOP
+    RES --> COMMIT
+    RES --> ART
+    FIN --> DONE
+    ART --> DONE
 
     classDef entry fill:#e8f1ff,stroke:#2563eb,color:#0f172a;
     classDef decision fill:#fff7ed,stroke:#ea580c,color:#431407;
     classDef process fill:#f8fafc,stroke:#64748b,color:#0f172a;
-    classDef v2 fill:#f0fdfa,stroke:#0f766e,color:#134e4a;
-    classDef v1 fill:#fdf2f8,stroke:#be185d,color:#500724;
-    classDef support fill:#fefce8,stroke:#a16207,color:#422006;
-    class UI2,GW2,ENTRY2,UI1,GW1,ENTRY1 entry;
-    class FLAG,PROFILE,LOOP,EXIT decision;
-    class GUARD,LOCK,DBS,COMPONENTS,FACTORY,V2RT,ENTRY2,CAP,STREAM,RUN,GATE,EMIT,REPLAY,CHAT,ROUTE,ART,ART_RESUME,COWORK,COWORK_RESUME,CONTEXT,RUNTIME,SUBAGENT,AIA,CREATE,TOOLS,RAGTOOL,RESULT,TERMINAL,MEMORY process;
-    class UI2,GW2,ENTRY2,CAP,STREAM,RUN,GATE,PROFILE,CHAT,ROUTE,ART,ART_RESUME,COWORK,COWORK_RESUME,CONTEXT,RUNTIME,SUBAGENT v2;
-    class UI1,GW1,ENTRY1,AIA,CREATE,LOOP,TOOLS,RAGTOOL,RESULT,EXIT,TERMINAL,MEMORY v1;
-    class SNAP,EVENTS,CANCEL,APPROVE,ARTIFACTS support;
+    classDef risk fill:#fcebeb,stroke:#a32d2d,color:#791f1f;
+    classDef ok fill:#eaf3de,stroke:#3b6d11,color:#27500a;
+    class UI,GW,ADP entry;
+    class FLAG,RUN,P,NEED,DEC decision;
+    class OFF,GUARD,LOCK,DBS,COMPONENTS,SWEEP,V2RT,CAP,ORCH,REPLAY,GATE,EVT,CANCEL,CH,RG,RP,ASM,CKPT,LOOP,FIN,AUTH,CAS,PAUSE,RES,SUPPORT process;
+    class AR,CW,FAIL,UK,CLN risk;
+    class COMMIT,DONE,ART ok;

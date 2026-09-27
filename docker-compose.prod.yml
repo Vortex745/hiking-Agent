@@ -63,10 +63,6 @@ services:
       PORT: "8080"
       AI_SERVICE_URL: http://ai-service:8000
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
-      CHAT_RUNTIME_SECRET: ${CHAT_RUNTIME_SECRET:-}
-      CHAT_V2_CANARY: ${CHAT_V2_CANARY:-0}
-      CHAT_RUNTIME_FORCE: ${CHAT_RUNTIME_FORCE:-}
-      CHAT_RUNTIME_ENVIRONMENT: ${CHAT_RUNTIME_ENVIRONMENT:-production}
       # Trust the compose bridge network so nginx's X-Forwarded-For resolves
       # the real client IP; otherwise all users share one rate-limit bucket.
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-172.16.0.0/12}

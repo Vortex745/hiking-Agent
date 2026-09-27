@@ -17,7 +17,6 @@ scripts/
 tests/
 
 *.mp4
-!frontend/public/ascii-art.mp4
 *.log
 *.md
 !README.md

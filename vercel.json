@@ -9,10 +9,6 @@
       "destination": "https://ai-hiking-gateway.vercel.app/api/:path*"
     },
     {
-      "source": "/super-agent",
-      "destination": "/index.html"
-    },
-    {
       "source": "/llm-config",
       "destination": "/index.html"
     }
