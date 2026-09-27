@@ -1,11 +1,7 @@
-import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
+import { useState, useRef, useEffect, useCallback } from 'react'
 import { API } from '../api/config'
-import { buildRuntimeModelSettings } from '../api/llmConfig'
-import { createStreamConnection, SSEEvent } from '../api/sse'
-import { createTypewriterStreamQueue } from '../api/typewriterStream'
 import {
   createV2StreamConnection,
-  fetchChatRuntime,
   cancelV2Run,
   fetchV2Snapshot,
   fetchV2Events,
@@ -20,11 +16,9 @@ import {
   clearV2Memories,
   exportV2Memories,
   type V2EventEnvelope,
-  type V2RunSnapshot,
   type V2ApprovalRequest,
   type V2Memory,
   type V2MemoryCandidate,
-  type ChatRuntime,
 } from '../api/chatV2'
 import {
   reduceV2Event,
@@ -54,24 +48,23 @@ interface ChatSession {
   title: string
   date: string
   messages: Message[]
-  runtime?: ChatRuntime
 }
 
 type AgentScenario = 'route_plan' | 'gear_check' | 'risk_assessment' | 'report_export'
-type AgentTraceEvent = Pick<SSEEvent, 'type' | 'content' | 'metadata'>
-type AgentArtifact = Pick<SSEEvent, 'content' | 'metadata'>
+type AgentTraceEvent = {
+  type: string
+  content: string
+  metadata?: Record<string, unknown>
+}
+type AgentArtifact = {
+  content: string
+  metadata?: Record<string, unknown>
+}
 type BrowserLocation = {
   latitude: number
   longitude: number
   accuracy?: number
   source: 'browser'
-}
-type ToolConfirmationAction = 'confirm' | 'reject'
-type ToolConfirmationResponse = {
-  status?: string
-  confirmation_id?: string
-  tool_name?: string
-  tool_result?: Record<string, unknown>
 }
 
 function shouldRequestCurrentLocation(text: string) {
@@ -94,13 +87,6 @@ const quickTags = [
   { icon: AlertTriangle, text: '风险提醒', scenario: 'risk_assessment' as AgentScenario },
   { icon: Map, text: '推荐路线', scenario: 'route_plan' as AgentScenario },
 ]
-
-const traceLabels: Partial<Record<SSEEvent['type'], string>> = {
-  thought: '思考',
-  tool_call: '工具调用',
-  tool_result: '工具结果',
-  approval_required: '需要确认',
-}
 
 const STORAGE_KEY = 'ai-hiking-agent-chat'
 const SESSIONS_KEY = 'ai-hiking-agent-sessions'
@@ -177,21 +163,6 @@ function getOrCreateChatId() {
   }
 }
 
-function normalizeServerMessages(payload: unknown): Message[] {
-  const messages = (payload as { messages?: unknown })?.messages
-  if (!Array.isArray(messages)) return []
-  return messages
-    .map(item => {
-      const role = (item as { role?: unknown }).role
-      const content = (item as { content?: unknown }).content
-      if ((role !== 'user' && role !== 'assistant') || typeof content !== 'string') {
-        return null
-      }
-      return { role, content } as Message
-    })
-    .filter((item): item is Message => item !== null)
-}
-
 function sanitizeStoredValue(value: unknown): unknown {
   if (Array.isArray(value)) {
     return value.map(sanitizeStoredValue)
@@ -217,18 +188,6 @@ function sanitizeSessionForStorage(session: ChatSession): ChatSession {
   }
 }
 
-function formatConfirmedToolResult(toolResult: Record<string, unknown>) {
-  if (toolResult.ok === false) {
-    return typeof toolResult.error === 'string' && toolResult.error
-      ? `工具执行失败: ${toolResult.error}`
-      : '工具执行失败'
-  }
-  const result = toolResult.result
-  if (typeof result === 'string') return result
-  if (result === null || result === undefined) return '工具已执行'
-  return JSON.stringify(result)
-}
-
 function generateId() {
   return `session-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
 }
@@ -249,7 +208,6 @@ function loadSessions(): ChatSession[] {
       title: session.title || '新对话',
       date: session.date || getTodayDate(),
       messages: Array.isArray(session.messages) ? session.messages : [],
-      runtime: session.runtime === 'v2' ? 'v2' : 'v1',
     }))
   } catch { return [] }
 }
@@ -350,18 +308,18 @@ function SuperAgent() {
   const chatIdRef = useRef(getOrCreateChatId())
   const lastLocationRef = useRef<BrowserLocation | null>(null)
 
-  // Ticket 08: v2 mode + run state. v2Mode defaults off (spec AC7) and is
-  // persisted so an internal tester's choice survives refresh. The v2 run
-  // ref tracks the active run_id + sequence cursor so refresh recovery
-  // can call /snapshot + /events to resume without re-sending the user
-  // message or re-displaying already-shown text (spec AC3).
+  // Chat v2 是唯一 chat 链路（v1 已移除）。The v2 run ref tracks the
+  // active run_id + sequence cursor so refresh recovery can call
+  // /snapshot + /events to resume without re-sending the user message
+  // or re-displaying already-shown text (spec AC3).
   //
   // Ticket 11: ``v2ApprovalState`` tracks the in-flight decision so the
   // UI can render "处理中" while the POST /approvals/{id}/decision
   // request is in flight, and "已解决" / "恢复失败" once the resume
   // stream opens or fails. It is reset to 'idle' on the next
-  // ``approval.required`` event.
-  const [v2Mode, setV2Mode] = useState<boolean>(() => loadV2PersistedRun() !== null)
+  // ``approval.required`` event. ``pendingApproval`` mirrors the
+  // reducer's ``pendingApproval`` as React state so the approve/reject
+  // prompt re-renders when a run pauses.
   const [memoryEnabled, setMemoryEnabled] = useState(false)
   const [memoryPending, setMemoryPending] = useState(false)
   const [memoryPanelOpen, setMemoryPanelOpen] = useState(false)
@@ -372,6 +330,7 @@ function SuperAgent() {
   const [memoryError, setMemoryError] = useState('')
   const [pendingMemoryConsent, setPendingMemoryConsent] = useState<V2MemoryCandidate | null>(null)
   const [memoryDecisionPending, setMemoryDecisionPending] = useState(false)
+  const [pendingApproval, setPendingApproval] = useState<V2ApprovalRequest | null>(null)
   const v2RunRef = useRef<V2PersistedRun | null>(loadV2PersistedRun())
   const v2StateRef = useRef<V2ConversationState>(initialV2State)
   const [v2ApprovalState, setV2ApprovalState] = useState<
@@ -379,18 +338,12 @@ function SuperAgent() {
   >('idle')
 
   useEffect(() => {
-    if (!v2Mode) {
-      setMemoryEnabled(false)
-      setMemoryPanelOpen(false)
-      setPendingMemoryConsent(null)
-      return
-    }
     let cancelled = false
     void fetchV2MemorySettings()
       .then(settings => { if (!cancelled) setMemoryEnabled(settings.enabled) })
       .catch(() => { if (!cancelled) setMemoryEnabled(false) })
     return () => { cancelled = true }
-  }, [v2Mode])
+  }, [])
 
   const handleMemoryToggle = useCallback(async () => {
     if (memoryPending) return
@@ -404,7 +357,7 @@ function SuperAgent() {
   }, [memoryEnabled, memoryPending])
 
   useEffect(() => {
-    if (!v2Mode || !memoryPanelOpen) return
+    if (!memoryPanelOpen) return
     let cancelled = false
     setMemoryListPending(true)
     setMemoryError('')
@@ -419,7 +372,7 @@ function SuperAgent() {
       })
       .finally(() => { if (!cancelled) setMemoryListPending(false) })
     return () => { cancelled = true }
-  }, [v2Mode, memoryPanelOpen, memoryOffset])
+  }, [memoryPanelOpen, memoryOffset])
 
   const reloadMemories = useCallback(async () => {
     const page = await fetchV2Memories(20, memoryOffset)
@@ -537,6 +490,7 @@ function SuperAgent() {
     // resolved/error) is driven by handleV2Approval below.
     if (event.type === 'approval.required') {
       setV2ApprovalState('idle')
+      setPendingApproval(next.pendingApproval)
     }
     // Ticket 11: ``approval.resolved`` arrives on the resume stream —
     // the decision has been recorded server-side and the run is
@@ -544,6 +498,7 @@ function SuperAgent() {
     // dismiss gracefully while the next events arrive.
     if (event.type === 'approval.resolved') {
       setV2ApprovalState('resolved')
+      setPendingApproval(null)
     }
     if (event.type === 'memory.consent_required') {
       setPendingMemoryConsent(next.pendingMemoryConsent)
@@ -624,6 +579,7 @@ function SuperAgent() {
     v2RunRef.current = null
     saveV2PersistedRun(null)
     setV2ApprovalState('idle')
+    setPendingApproval(null)
 
     setMessages(prev => {
       const updated = [...prev]
@@ -854,6 +810,7 @@ function SuperAgent() {
           // renders from ``next.pendingApproval``; the user's decision
           // drives the resume flow via handleV2Approval.
           setV2ApprovalState('idle')
+          setPendingApproval(next.pendingApproval)
         } else {
           // Still running: re-attach a streaming connection to continue
           // receiving events. The server returns the existing run
@@ -895,41 +852,12 @@ function SuperAgent() {
     void recoverV2Run()
     return () => { cancelled = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [v2Mode, handleV2Event, handleV2Terminal, attachV2Stream])
+  }, [handleV2Event, handleV2Terminal, attachV2Stream])
 
   // Persist
   useEffect(() => {
     try { localStorage.setItem(STORAGE_KEY, serializeMessages(messages)) } catch { /* ignore */ }
   }, [messages])
-
-  useEffect(() => {
-    if (messages.length > 0) return
-    if (v2RunRef.current) return
-
-    let cancelled = false
-    const chatId = chatIdRef.current
-
-    async function hydrateServerHistory() {
-      try {
-        const response = await fetch(API.chatHistory(chatId), {
-          method: 'GET',
-          headers: { Accept: 'application/json' },
-        })
-        if (!response.ok) return
-        const restored = normalizeServerMessages(await response.json())
-        if (restored.length === 0 || cancelled) return
-        setMessages(prev => (prev.length === 0 ? restored : prev))
-      } catch {
-        // Local history remains the fallback.
-      }
-    }
-
-    void hydrateServerHistory()
-
-    return () => {
-      cancelled = true
-    }
-  }, [])
 
   // Persist sessions
   useEffect(() => {
@@ -953,11 +881,11 @@ function SuperAgent() {
     setSessions(prev => {
       const existing = prev.find(s => s.id === activeSessionId)
       if (existing) {
-        return prev.map(s => s.id === activeSessionId ? { ...s, chatId: chatIdRef.current, title, date: getTodayDate(), messages, runtime: v2Mode ? 'v2' as const : 'v1' as const } : s)
+        return prev.map(s => s.id === activeSessionId ? { ...s, chatId: chatIdRef.current, title, date: getTodayDate(), messages } : s)
       }
-      return [{ id: activeSessionId, chatId: chatIdRef.current, title, date: getTodayDate(), messages, runtime: v2Mode ? 'v2' as const : 'v1' as const }, ...prev].slice(0, 50)
+      return [{ id: activeSessionId, chatId: chatIdRef.current, title, date: getTodayDate(), messages }, ...prev].slice(0, 50)
     })
-  }, [activeSessionId, messages, v2Mode])
+  }, [activeSessionId, messages])
 
   const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -967,31 +895,7 @@ function SuperAgent() {
 
   useEffect(() => { return () => { cleanupRef.current?.() } }, [])
 
-  // Health check
-  const checkHealth = useCallback(async () => {
-    try {
-      const resp = await fetch(API.chatHealth, { method: 'GET' })
-      if (resp.ok) setConnectionStatus('connected')
-      else setConnectionStatus('error')
-    } catch { setConnectionStatus('error') }
-  }, [])
-
-  useEffect(() => {
-    checkHealth()
-    const id = setInterval(checkHealth, 30000)
-    return () => clearInterval(id)
-  }, [checkHealth])
-
-  const appendToLastMessage = useCallback((text: string) => {
-    setMessages(prev => {
-      const updated = [...prev]
-      const last = updated[updated.length - 1]
-      if (last && last.role === 'assistant') {
-        updated[updated.length - 1] = { ...last, content: last.content + text, isStreaming: true }
-      }
-      return updated
-    })
-  }, [])
+  // 连接状态由 v2 SSE onOpen / onError 驱动（v1 health 轮询已随 v1 移除）。
 
   const appendCancellationNotice = useCallback(() => {
     setMessages(prev => {
@@ -1013,152 +917,9 @@ function SuperAgent() {
     })
   }, [])
 
-  const textStream = useMemo(
-    () => createTypewriterStreamQueue(appendToLastMessage, { chunkSize: 3, intervalMs: 14 }),
-    [appendToLastMessage],
-  )
-
-  useEffect(() => {
-    return () => textStream.reset()
-  }, [textStream])
-
-  const appendTraceEvent = useCallback((event: SSEEvent) => {
-    setMessages(prev => {
-      const updated = [...prev]
-      const last = updated[updated.length - 1]
-      if (last && last.role === 'assistant') {
-        updated[updated.length - 1] = {
-          ...last,
-          traceEvents: [...(last.traceEvents || []), {
-            type: event.type,
-            content: event.content,
-            metadata: event.metadata,
-          }],
-          isStreaming: true,
-        }
-      }
-      return updated
-    })
-  }, [])
-
-  const appendArtifact = useCallback((event: SSEEvent) => {
-    setMessages(prev => {
-      const updated = [...prev]
-      const last = updated[updated.length - 1]
-      if (last && last.role === 'assistant') {
-        updated[updated.length - 1] = {
-          ...last,
-          artifacts: [...(last.artifacts || []), {
-            content: event.content,
-            metadata: event.metadata,
-          }],
-          isStreaming: true,
-        }
-      }
-      return updated
-    })
-  }, [])
-
-  const updateConfirmationTrace = useCallback((confirmationId: string, metadataPatch: Record<string, unknown>) => {
-    setMessages(prev => prev.map(message => {
-      if (!message.traceEvents?.length) return message
-      let changed = false
-      const traceEvents = message.traceEvents.map(event => {
-        if (event.metadata?.confirmation_id !== confirmationId) return event
-        changed = true
-        return {
-          ...event,
-          metadata: {
-            ...(event.metadata || {}),
-            ...metadataPatch,
-          },
-        }
-      })
-      return changed ? { ...message, traceEvents } : message
-    }))
-  }, [])
-
-  const appendConfirmedToolResult = useCallback((confirmationId: string, response: ToolConfirmationResponse) => {
-    const toolResult = response.tool_result
-    if (!toolResult) return
-
-    const toolName = response.tool_name
-      || (typeof toolResult.tool_name === 'string' ? toolResult.tool_name : 'tool')
-    const resultEvent: AgentTraceEvent = {
-      type: 'tool_result',
-      content: formatConfirmedToolResult(toolResult),
-      metadata: {
-        ...toolResult,
-        tool: toolName,
-        confirmation_id: confirmationId,
-        confirmation_status: response.status || 'confirmed',
-      },
-    }
-
-    setMessages(prev => prev.map(message => {
-      const traceEvents = message.traceEvents || []
-      const hasConfirmation = traceEvents.some(event => event.metadata?.confirmation_id === confirmationId)
-      const alreadyAppended = traceEvents.some(event =>
-        event.type === 'tool_result' && event.metadata?.confirmation_id === confirmationId
-      )
-      if (!hasConfirmation || alreadyAppended) return message
-      return { ...message, traceEvents: [...traceEvents, resultEvent] }
-    }))
-  }, [])
-
-  const handleToolConfirmation = useCallback(async (
-    confirmationId: string,
-    action: ToolConfirmationAction,
-  ) => {
-    updateConfirmationTrace(confirmationId, {
-      confirmation_status: action === 'confirm' ? 'confirming' : 'rejecting',
-      confirmation_action: action,
-    })
-
-    try {
-      const response = await fetch(API.chatConfirm, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-        },
-        body: JSON.stringify({
-          confirmation_id: confirmationId,
-          action,
-        }),
-      })
-      if (!response.ok) {
-        throw new Error(`确认请求失败: ${response.status}`)
-      }
-
-      const data = await response.json() as ToolConfirmationResponse
-      updateConfirmationTrace(confirmationId, {
-        confirmation_status: data.status || action,
-        confirmation_action: action,
-      })
-      if (action === 'confirm') {
-        appendConfirmedToolResult(confirmationId, data)
-      }
-    } catch (error) {
-      updateConfirmationTrace(confirmationId, {
-        confirmation_status: 'error',
-        confirmation_error: error instanceof Error ? error.message : '确认请求失败',
-      })
-    }
-  }, [appendConfirmedToolResult, updateConfirmationTrace])
-
-  const finalizeStreaming = useCallback(() => {
-    setMessages(prev => {
-      const updated = [...prev]
-      const last = updated[updated.length - 1]
-      if (last?.isStreaming) updated[updated.length - 1] = { ...last, isStreaming: false }
-      return updated
-    })
-  }, [])
-
   // 会话轮换（新建/切换/清空/删除当前会话）时拆除仍在运行的流。
-  // 不拆的话，旧 run 的 v1 onMessage / v2 事件回调仍会向已切换的
-  // messages 追加内容，串进新会话。v2 run 尽力发出幂等取消。
+  // 不拆的话，旧 run 的 v2 事件回调仍会向已切换的 messages 追加
+  // 内容，串进新会话。v2 run 尽力发出幂等取消。
   const teardownActiveStream = useCallback(() => {
     if (cleanupRef.current) {
       cleanupRef.current()
@@ -1176,10 +937,10 @@ function SuperAgent() {
       saveV2PersistedRun(null)
       v2StateRef.current = { ...v2StateRef.current, status: 'cancelled' }
       setV2ApprovalState('idle')
+      setPendingApproval(null)
     }
-    textStream.flushNow()
     setIsSending(false)
-  }, [textStream])
+  }, [])
 
   const createNewSession = useCallback(() => {
     teardownActiveStream()
@@ -1188,7 +949,7 @@ function SuperAgent() {
       const title = firstUserMsg ? firstUserMsg.content.slice(0, 30) + (firstUserMsg.content.length > 30 ? '...' : '') : '新对话'
       setSessions(prev => {
         const filtered = prev.filter(s => s.id !== activeSessionId)
-        return [{ id: activeSessionId, chatId: chatIdRef.current, title, date: getTodayDate(), messages, runtime: v2Mode ? 'v2' as const : 'v1' as const }, ...filtered].slice(0, 50)
+        return [{ id: activeSessionId, chatId: chatIdRef.current, title, date: getTodayDate(), messages }, ...filtered].slice(0, 50)
       })
     }
     const newId = generateId()
@@ -1197,15 +958,12 @@ function SuperAgent() {
     setMessages([])
     localStorage.setItem(CHAT_ID_KEY, next)
     chatIdRef.current = next
-    setV2Mode(false)
     try { localStorage.removeItem(STORAGE_KEY) } catch { /* ignore */ }
-  }, [messages, activeSessionId, v2Mode, teardownActiveStream])
+  }, [messages, activeSessionId, teardownActiveStream])
 
-  const loadSession = useCallback(async (session: ChatSession) => {
+  const loadSession = useCallback((session: ChatSession) => {
     teardownActiveStream()
-    if (!session.chatId) {
-      session = { ...session, chatId: createChatId() }
-    }
+    const target = session.chatId ? session : { ...session, chatId: createChatId() }
     if (activeSessionId && messages.length > 0) {
       const firstUserMsg = messages.find(m => m.role === 'user')
       const title = firstUserMsg ? firstUserMsg.content.slice(0, 30) + (firstUserMsg.content.length > 30 ? '...' : '') : '新对话'
@@ -1213,42 +971,20 @@ function SuperAgent() {
         const filtered = prev.filter(s => s.id !== activeSessionId)
         const existing = prev.find(s => s.id === activeSessionId)
         if (existing) {
-          return [{ ...existing, chatId: chatIdRef.current, title, date: getTodayDate(), messages, runtime: v2Mode ? 'v2' as const : 'v1' as const }, ...filtered].slice(0, 50)
+          return [{ ...existing, chatId: chatIdRef.current, title, date: getTodayDate(), messages }, ...filtered].slice(0, 50)
         }
-        return [{ id: activeSessionId, chatId: chatIdRef.current, title, date: getTodayDate(), messages, runtime: v2Mode ? 'v2' as const : 'v1' as const }, ...filtered].slice(0, 50)
+        return [{ id: activeSessionId, chatId: chatIdRef.current, title, date: getTodayDate(), messages }, ...filtered].slice(0, 50)
       })
     }
-    setActiveSessionId(session.id)
-    chatIdRef.current = session.chatId
-    setV2Mode(session.runtime === 'v2')
-    localStorage.setItem(CHAT_ID_KEY, session.chatId)
-    setMessages(session.messages)
-    try { localStorage.setItem(STORAGE_KEY, serializeMessages(session.messages)) } catch { /* ignore */ }
-
-    if (session.runtime !== 'v2') {
-      try {
-        const response = await fetch(API.chatHistory(session.chatId), {
-          method: 'GET',
-          headers: { Accept: 'application/json' },
-        })
-        if (!response.ok) return
-        const restored = normalizeServerMessages(await response.json())
-        if (restored.length === 0) return
-        setMessages(restored)
-        try { localStorage.setItem(STORAGE_KEY, serializeMessages(restored)) } catch { /* ignore */ }
-        setSessions(prev => prev.map(s => s.id === session.id ? { ...s, chatId: session.chatId, messages: restored } : s))
-      } catch {
-        // Local session remains the fallback.
-      }
-    }
-  }, [activeSessionId, messages, v2Mode, teardownActiveStream])
+    setActiveSessionId(target.id)
+    chatIdRef.current = target.chatId
+    localStorage.setItem(CHAT_ID_KEY, target.chatId)
+    setMessages(target.messages)
+    try { localStorage.setItem(STORAGE_KEY, serializeMessages(target.messages)) } catch { /* ignore */ }
+  }, [activeSessionId, messages, teardownActiveStream])
 
   const deleteSession = useCallback((e: React.MouseEvent, sessionId: string) => {
     e.stopPropagation()
-    const session = sessions.find(s => s.id === sessionId)
-    if (session?.chatId && session.runtime !== 'v2') {
-      void fetch(API.chatHistoryDelete(session.chatId), { method: 'DELETE' }).catch(() => undefined)
-    }
     setSessions(prev => prev.filter(s => s.id !== sessionId))
     if (activeSessionId === sessionId) {
       // 删除的是当前活跃会话：先拆除活动流,避免旧 run 的事件写入轮换后的新会话。
@@ -1258,10 +994,9 @@ function SuperAgent() {
       const next = createChatId()
       localStorage.setItem(CHAT_ID_KEY, next)
       chatIdRef.current = next
-      setV2Mode(false)
       try { localStorage.removeItem(STORAGE_KEY) } catch { /* ignore */ }
     }
-  }, [activeSessionId, sessions, teardownActiveStream])
+  }, [activeSessionId, teardownActiveStream])
 
   const handleSend = useCallback(async (
     textOverride?: string,
@@ -1277,13 +1012,10 @@ function SuperAgent() {
     setInput('')
     setSelectedScenario(null)
     setIsSending(true)
-    textStream.reset()
 
     const now = new Date()
     const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`
     const chatId = chatIdRef.current
-    const selectedRuntime = await fetchChatRuntime(chatId)
-    setV2Mode(selectedRuntime === 'v2')
     const replaceFromIndex = options.replaceFromIndex
     const contextMessages = typeof replaceFromIndex === 'number'
       ? messages.slice(0, Math.max(0, replaceFromIndex))
@@ -1298,19 +1030,13 @@ function SuperAgent() {
       return [...base, nextUserMessage, nextAssistantMessage]
     })
 
-    const finishStreaming = () => {
-      finalizeStreaming()
-      setIsSending(false)
-      cleanupRef.current = null
-    }
-
-    // Ticket 08: v2 branch. Spec AC1 requires an independent v2 client and
-    // v2 event reducer. v2 does NOT use the v1 typewriter queue — text
-    // deltas are written directly to the messages array so v2 stays
-    // decoupled from v1 streaming polish. The v2 request body is also
-    // strict: only message, request_id, conversation_id, profile_id, and
-    // current_location are allowed (server rejects everything else).
-    if (selectedRuntime === 'v2') {
+    // Ticket 08: v2 是唯一 chat 链路。Spec AC1 requires an independent v2
+    // client and v2 event reducer. v2 does NOT use a typewriter queue —
+    // text deltas are written directly to the messages array. The v2
+    // request body is strict: only message, request_id, conversation_id,
+    // profile_id, and current_location are allowed (server rejects
+    // everything else).
+    {
       const requestId = `req-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
       const conversationId = chatId
       // Reset v2 per-run state. The reducer's sequence monotonicity guard
@@ -1386,69 +1112,8 @@ function SuperAgent() {
         saveV2PersistedRun(null)
         setIsSending(false)
       }
-      return
     }
-
-    try {
-      const modelSettings = buildRuntimeModelSettings()
-      const payload: Record<string, unknown> = { message: text, chat_id: chatId, scenario: selectedScenario }
-      if (Object.keys(modelSettings).length > 0) {
-        payload.model_settings = modelSettings
-      }
-      const needsRouteFollowupLocation = shouldRequestRouteFollowupLocation(text, contextMessages)
-      const cachedRouteLocation = needsRouteFollowupLocation ? lastLocationRef.current : null
-      const currentLocation = cachedRouteLocation
-        || await getBrowserLocation((shouldRequestCurrentLocation(text) || needsRouteFollowupLocation) ? 10000 : 3000)
-      if (currentLocation) {
-        lastLocationRef.current = currentLocation
-        payload.current_location = currentLocation
-      } else if (needsRouteFollowupLocation && lastLocationRef.current) {
-        payload.current_location = lastLocationRef.current
-      }
-
-      const cleanup = createStreamConnection(API.chatSSE, {
-        method: 'POST',
-        body: JSON.stringify(payload),
-        onOpen: () => setConnectionStatus('connected'),
-        onMessage: (event: SSEEvent) => {
-          if (event.type === 'thought') {
-            appendTraceEvent(event)
-          } else if (event.type === 'tool_call') {
-            appendTraceEvent(event)
-          } else if (event.type === 'tool_result') {
-            appendTraceEvent(event)
-          } else if (event.type === 'approval_required') {
-            appendTraceEvent(event)
-          } else if (event.type === 'artifact') {
-            appendArtifact(event)
-          } else if (event.type === 'text') {
-            textStream.enqueue(event.content)
-          } else if (event.type === 'done') {
-            textStream.finishWhenIdle(finishStreaming)
-          } else if (event.type === 'error') {
-            textStream.flushNow()
-            appendToLastMessage(`\n\n[错误] ${event.content}`)
-            finishStreaming()
-          }
-        },
-        onError: (error: string) => {
-          textStream.flushNow()
-          appendToLastMessage(`\n\n[连接错误] ${error}`)
-          finishStreaming()
-          setConnectionStatus('error')
-        },
-        onDone: () => {
-          textStream.finishWhenIdle(finishStreaming)
-          setConnectionStatus('connected')
-        },
-      })
-      cleanupRef.current = cleanup
-    } catch (error) {
-      textStream.flushNow()
-      appendToLastMessage(`\n\n[错误] ${error instanceof Error ? error.message : '请求失败'}`)
-      finishStreaming()
-    }
-  }, [input, isSending, activeSessionId, selectedScenario, messages, appendToLastMessage, appendTraceEvent, appendArtifact, finalizeStreaming, textStream, handleV2Event, handleV2Terminal])
+  }, [input, isSending, activeSessionId, selectedScenario, messages, handleV2Event, handleV2Terminal])
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -1459,12 +1124,8 @@ function SuperAgent() {
 
   const handleClear = () => {
     teardownActiveStream()
-    const currentChatId = chatIdRef.current
     setMessages([])
     try {
-      if (!v2Mode) {
-        void fetch(API.chatHistoryDelete(currentChatId), { method: 'DELETE' }).catch(() => undefined)
-      }
       localStorage.removeItem(STORAGE_KEY)
       const next = createChatId()
       localStorage.setItem(CHAT_ID_KEY, next)
@@ -1519,10 +1180,8 @@ function SuperAgent() {
         v2StateRef.current = { ...v2StateRef.current, status: 'cancelled' }
         v2RunRef.current = null
         saveV2PersistedRun(null)
+        setPendingApproval(null)
         appendCancellationNotice()
-      } else {
-        textStream.flushNow();
-        appendCancellationNotice();
       }
       setIsSending(false)
     }
@@ -1554,8 +1213,39 @@ function SuperAgent() {
               <Menu className="w-5 h-5" />
             </button>
           )}
-          {v2Mode && (
-            <div className="absolute top-4 right-4 z-40 flex h-9 items-center gap-3 rounded-md border border-white/10 bg-black/50 px-3 text-xs text-white/80 backdrop-blur-md">
+          {v2ApprovalState === 'error' && v2StateRef.current.resumeErrorMessage && (
+            <div className="absolute left-4 right-4 top-16 z-50 ml-auto max-w-sm rounded-md border border-red-400/30 bg-zinc-950 p-4 text-sm text-white shadow-xl">
+              <div className="font-medium text-red-300">恢复失败</div>
+              <div className="mt-2 break-words text-white/75">{v2StateRef.current.resumeErrorMessage}</div>
+            </div>
+          )}
+          {pendingApproval && v2ApprovalState !== 'resolved' && (
+            <div className="absolute left-4 right-4 top-16 z-50 ml-auto max-w-sm rounded-md border border-amber-400/30 bg-zinc-950 p-4 text-sm text-white shadow-xl">
+              <div className="font-medium">
+                工具审批：{pendingApproval.tool}
+                <span className="ml-2 text-xs text-amber-300">风险 {pendingApproval.risk_level}</span>
+              </div>
+              {pendingApproval.message && <div className="mt-1 text-white/70">{pendingApproval.message}</div>}
+              <div className="mt-2 break-words text-white/75">{pendingApproval.impact}</div>
+              <div className="mt-3 flex justify-end gap-2">
+                <button
+                  className="px-3 py-1.5 text-white/70 hover:text-white disabled:opacity-50"
+                  disabled={v2ApprovalState === 'submitting' || v2ApprovalState === 'resuming'}
+                  onClick={() => { void handleV2Approval('reject') }}
+                >
+                  拒绝
+                </button>
+                <button
+                  className="rounded-md bg-emerald-600 px-3 py-1.5 text-white hover:bg-emerald-500 disabled:opacity-50"
+                  disabled={v2ApprovalState === 'submitting' || v2ApprovalState === 'resuming'}
+                  onClick={() => { void handleV2Approval('approve') }}
+                >
+                  {v2ApprovalState === 'submitting' || v2ApprovalState === 'resuming' ? '处理中...' : '批准'}
+                </button>
+              </div>
+            </div>
+          )}
+          <div className="absolute top-4 right-4 z-40 flex h-9 items-center gap-3 rounded-md border border-white/10 bg-black/50 px-3 text-xs text-white/80 backdrop-blur-md">
               <label className="flex cursor-pointer items-center gap-2">
                 <span>长期记忆</span>
                 <input
@@ -1576,8 +1266,7 @@ function SuperAgent() {
                 <Database className="h-4 w-4" />
               </button>
             </div>
-          )}
-          {v2Mode && pendingMemoryConsent && (
+          {pendingMemoryConsent && (
             <div className="absolute left-4 right-4 top-16 z-50 ml-auto max-w-sm rounded-md border border-amber-400/30 bg-zinc-950 p-4 text-sm text-white shadow-xl">
               <div className="font-medium">确认保存 {pendingMemoryConsent.category}</div>
               <div className="mt-2 break-words text-white/75">{pendingMemoryConsent.preview}</div>
@@ -1587,7 +1276,7 @@ function SuperAgent() {
               </div>
             </div>
           )}
-          {v2Mode && memoryPanelOpen && (
+          {memoryPanelOpen && (
             <div className="absolute right-4 top-16 z-50 w-[calc(100%-2rem)] max-w-sm rounded-md border border-white/10 bg-zinc-950 p-4 text-sm text-white shadow-xl">
               <div className="flex items-center justify-between">
                 <h2 className="font-medium">长期记忆</h2>
@@ -1628,7 +1317,6 @@ function SuperAgent() {
           <GeminiThread
             emptyTitle="告诉我你的徒步计划，我将为你规划路线、安排任务，并提供安全建议。"
             onRegenerate={handleRegenerate}
-            onConfirmTool={handleToolConfirmation}
             realMessageCount={messages.length}
           />
         </div>

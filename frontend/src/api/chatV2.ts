@@ -1,11 +1,9 @@
 /**
- * Chat v2 client — independent of v1 sse.ts.
+ * Chat v2 client — the only chat链路 (v1 removed).
  *
  * Ticket 08: spec AC1 requires "Frontend 使用独立 v2 client 和 version 2
  * event reducer，不把原始框架事件或 v1 event union 当作 v2 契约". This
- * module owns the v2 wire types, SSE parser, and stream connection. It
- * does NOT import from sse.ts; v1 and v2 coexist without sharing a
- * parser so a v1 regression cannot break v2 and vice versa.
+ * module owns the v2 wire types, SSE parser, and stream connection.
  *
  * Parser guarantees (spec AC6):
  *   - CRLF frame separators
@@ -18,23 +16,6 @@
  */
 
 import { API } from './config'
-
-export type ChatRuntime = 'v1' | 'v2'
-
-export async function fetchChatRuntime(conversationId: string): Promise<ChatRuntime> {
-  try {
-    const response = await fetch(API.chatRuntime(conversationId), {
-      method: 'GET',
-      credentials: 'include',
-      headers: { Accept: 'application/json' },
-    })
-    if (!response.ok) return 'v1'
-    const data = await response.json() as { runtime?: unknown }
-    return data.runtime === 'v2' ? 'v2' : 'v1'
-  } catch {
-    return 'v1'
-  }
-}
 
 // ---- Wire types ---------------------------------------------------------
 
