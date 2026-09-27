@@ -125,6 +125,13 @@ func (h *ChatV2Handler) ChatV2Snapshot(c *gin.Context) {
 	}
 	runID := c.Param("run_id")
 	url := fmt.Sprintf("%s/api/v2/chat/snapshot/%s", h.aiServiceURL, runID)
+	// A05: the backend accepts ?request_id= as a recovery fallback; the
+	// query must reach it or the gateway silently breaks that contract
+	// (black-box finding: events/resume/memories forwarded RawQuery,
+	// snapshot did not).
+	if rawQuery := c.Request.URL.RawQuery; rawQuery != "" {
+		url += "?" + rawQuery
+	}
 	proxyV2Request(c, http.MethodGet, url, nil)
 }
 
