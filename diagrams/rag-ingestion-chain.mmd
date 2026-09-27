@@ -1,27 +1,22 @@
 flowchart TD
-    UI["前端 React<br/>ragUpload / 文档管理"]
-    GW["网关 Go/Gin<br/>POST /api/v1/rag/upload"]
-    API["api/rag.py<br/>rag_upload / 云文档同步"]
+    TRIGGER["A11 后无生产触发点：<br/>原 HTTP upload / 云文档 / 飞书同步入口<br/>随 RAG HTTP 面删除<br/>（如需灌入能力，加 scripts/ CLI 调 IngestionPipeline）"]
 
-    UI --> GW --> API
-
-    API -->|本地上传| SAVE["保存文件到 rag_docs/"]
-    API -->|云知识库 API| CLOUD["CloudDocsLoader.load_raw_docs<br/>settings.rag_docs_api_url"]
-    API -->|飞书同步| FEISHU["FeishuLoader<br/>飞书文档加载"]
-    API -->|legacy 后端| LEGACY["DocumentLoader.load_and_split<br/>retriever.add_documents（零回归）"]
+    TRIGGER -->|本地上传路径| SAVE["保存文件到 rag_docs/"]
+    TRIGGER -->|云知识库 API| CLOUD["CloudDocsLoader.load_raw_docs<br/>settings.rag_docs_api_url"]
+    TRIGGER -->|飞书同步| FEISHU["FeishuLoader<br/>飞书文档加载"]
 
     SAVE --> PL["IngestionPipeline<br/>（SQLite 后端 canonical ingestion）"]
     CLOUD --> PL
     FEISHU --> PL
 
     PL --> EX["extract_markdown<br/>PDF / Markdown → 文本"]
-    EX -->|扫描版 PDF 无可提取文本| SCAN["ScannedPDFError<br/>415 返回 · 不产生空索引"]
+    EX -->|扫描版 PDF 无可提取文本| SCAN["ScannedPDFError<br/>不产生空索引"]
     EX --> P1["split_parent_chunks<br/>2000-4000 字符 parent 切分<br/>保留标题路径 headings"]
     P1 --> P2["split_child_chunks<br/>500 字符 / 100 重叠"]
     P2 --> EMB["embed_texts 批量向量化<br/>数量校验防静默截断"]
     EMB --> UD["upsert_document 事务原子写入<br/>parent 完整文档 + child<br/>+ child_vec 向量 + child_fts 分词"]
     UD --> DB[("SQLiteStore 知识库")]
-    DB -->|摄入完成立即可检索| READY["查询链路混合检索"]
+    DB -->|摄入完成立即可检索| READY["查询链路：hiking_knowledge_search<br/>（chat 内知识检索工具）"]
 
     RPT["IngestionReport<br/>parent_count / child_count<br/>action / content_hash / skipped"]
     UD --> RPT

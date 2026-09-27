@@ -10,7 +10,7 @@
 
 面向户外徒步场景的 RAG 与 Agent 智能助手。
 
-AI Hiking 将 React 前端、Go API Gateway 和 Python FastAPI AI Service 组合成一个本地优先的徒步助手。项目提供知识库问答、文档上传、Feishu 同步、路线规划、天气适宜性判断、装备检查、风险提醒、SSE 流式输出、浏览器侧模型配置和会话记忆能力。
+AI Hiking 将 React 前端、Go API Gateway 和 Python FastAPI AI Service 组合成一个本地优先的徒步助手。项目提供知识库问答（chat 内知识检索工具）、路线规划、天气适宜性判断、装备检查、风险提醒、SSE 流式输出、浏览器侧模型配置和会话记忆能力。
 
 仓库名和目录名是 `ai-hiking`；前端 `package.json` 的包名是 `ai-hiking-frontend`，因为这是一个包含前端、网关和 AI 服务的多模块仓库。
 
@@ -40,7 +40,7 @@ AI Hiking 将 React 前端、Go API Gateway 和 Python FastAPI AI Service 组合
 
 徒步问答通常不只是一次普通聊天：用户可能需要结合知识库资料、天气、当前位置、路线、装备和风险判断。AI Hiking 因此把系统拆成三个清晰的运行层：
 
-- 前端负责聊天界面、文档上传、模型配置、浏览器定位和 SSE 渲染。
+- 前端负责聊天界面、模型配置、浏览器定位和 SSE 渲染。
 - Gateway 负责统一 `/api/v1/*`（models）与 `/api/v2/*`（Chat）入口、CORS、限流和流式代理。
 - AI Service 负责唯一编排内核（Agent v2，含 RAG 问答 profile）、检索基线和徒步领域工具。
 

@@ -15,7 +15,7 @@
  *   - exactly one terminal event ends the stream
  */
 
-import { API } from './config'
+import { API, API_ORIGIN } from './config'
 
 // ---- Wire types ---------------------------------------------------------
 
@@ -748,10 +748,16 @@ export function buildV2ResumeUrlFromDecision(
   // Same-origin path via the shared API map; strip the builder's query
   // so the cursor below stays the only parameter.
   const fallback = API.chatV2Resume(decision.run_id, 0).split('?')[0]
-  const base =
+  let base =
     typeof decision.resume_url === 'string' && decision.resume_url
       ? decision.resume_url
       : fallback
+  // A10 review fix: the server issues a root-relative path; the stream
+  // connection fetches it bare, so a configured API origin must be
+  // prefixed here or the resume request would hit the frontend origin.
+  if (base.startsWith('/') && API_ORIGIN) {
+    base = `${API_ORIGIN}${base}`
+  }
   const separator = base.includes('?') ? '&' : '?'
   return `${base}${separator}from_seq=${fromSeq}`
 }

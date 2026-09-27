@@ -1,5 +1,9 @@
 const configuredApiBase = import.meta.env?.VITE_API_BASE_URL?.trim().replace(/\/+$/, '')
 
+// A10 review fix: exported so the resume builder resolves
+// server-issued relative paths against the same origin.
+export const API_ORIGIN = configuredApiBase || ''
+
 // models 端点仍由 AI service 的 /api/v1 前缀提供。
 const API_BASE = configuredApiBase || '/api/v1'
 

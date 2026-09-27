@@ -3085,7 +3085,8 @@ class RunOrchestrator:
             payload["content"] = _tool_result_summary(entry)
             # Spec #13 phase 2 (T05): bounded evidence (has_chunks/sources/
             # chunk summaries) rides on the public tool_result event so the
-            # RAG-page SSE adapter can render the documents panel.
+            # frontend renders the 检索来源 block (A09); the legacy RAG-page
+            # adapter was removed in A11.
             if isinstance(entry.get("evidence"), dict):
                 payload["evidence"] = entry["evidence"]
             yield emit("tool_result", payload)

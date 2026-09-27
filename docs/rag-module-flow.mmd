@@ -1,7 +1,6 @@
 flowchart TD
-    subgraph S1["摄入链路 /api/v1/rag/upload（IngestionPipeline 唯一路径）"]
-        U1["rag_upload<br/>(api/rag.py)"] --> U2["IngestionPipeline.ingest_file"]
-        U2 --> U3["extract_markdown<br/>(pymupdf4llm PDF→MD)"]
+    subgraph S1["摄入链路（IngestionPipeline 唯一路径）"]
+        U2["IngestionPipeline.ingest_file"] --> U3["extract_markdown<br/>(pymupdf4llm PDF→MD)"]
         U3 --> U4["split_parent_chunks<br/>(H1/H2/H3 层级)"]
         U4 --> U5["split_child_chunks<br/>(500/100 重叠)"]
         U5 --> U6["upsert_document<br/>(parent + child_vec + FTS5)"]
@@ -15,12 +14,6 @@ flowchart TD
         T2 -. "具名失败模式:<br/>子图异常退回单次混合检索" .-> T3
     end
 
-    subgraph S3["查询入口 /api/v1/rag/query（kernel 适配层）"]
-        Q1["rag_query<br/>(api/rag.py)"] --> Q2["ChatFlowRequest<br/>profile=rag, chat_id=conversation_id"]
-        Q2 --> Q3["RunOrchestrator.stream_chat<br/>(agent_v2/run_orchestration)"]
-        Q3 --> Q4["_rag_frame_from_envelope<br/>EventEnvelope → 旧五类帧<br/>process/documents/text/done/error"]
-    end
-
     subgraph S4["Kernel 回合（agent_v2 唯一编排栈）"]
         K1["run_started → progress → heartbeat"] --> K2["kernel turn<br/>system prompt: 先检索后作答<br/>注来源 / 资料不足明说 / 文本追问"]
         K2 -->|"tool 调用"| T1
@@ -29,13 +22,9 @@ flowchart TD
         K2 --> K5["会话消息持久化<br/>(CheckpointsStore.messages)"]
     end
 
-    subgraph S5["支撑端点"]
-        H1["GET /api/v1/rag/health<br/>存储/子系统健康"]
-        H2["GET+DELETE /api/v1/rag/history/{chat_id}<br/>kernel 会话存储读/清"]
-        H3["GET /api/v1/rag/documents"]
-        H4["POST /api/v1/rag/upload"]
+    subgraph S6["前端消费（SSE 直连，A11 后无独立 RAG HTTP 面）"]
+        F1["POST /api/v2/chat/sse<br/>(profile=chat / route_plan)"] --> S4
+        F2["检索来源块<br/>tool_result.evidence<br/>(has_chunks/sources/chunks)"]
+        F3["恢复：snapshot + events<br/>（A05/A06 状态机）"]
+        K4 --> F2
     end
-
-    Q3 --> S4
-    K4 --> Q4
-    K5 --> H2

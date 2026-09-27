@@ -120,6 +120,14 @@ const USER_CANCELLED_MESSAGE = '用户主动取消回答，请补充内容或点
 const RECOVERY_POLL_INTERVAL_MS = 3_000
 const RECOVERY_POLL_TIMEOUT_MS = 10 * 60 * 1_000
 
+// A06 review fix: render the reducer's reviewNotices as the same
+// "[注意] ..." lines the live stream appends, so replays/polls preserve
+// them instead of erasing the human-review context.
+const v2NoticeSuffix = (notices: string[]): string =>
+  notices.map(n => `
+
+[注意] ${n}`).join('')
+
 // Ticket 08: persisted v2 run state for refresh recovery (spec AC3).
 // We store the active run_id + sequence cursor + conversation_id so a
 // page refresh can call /snapshot + /events to resume without repeating
@@ -291,21 +299,34 @@ const convertMessage = (msg: Message, index: number): ThreadMessage => {
   const evidenceSeen = new Set<string>();
   const evidenceChunks: Array<{ title?: string; source: string; preview: string }> = [];
   for (const evt of msg.traceEvents || []) {
-    const ev = evt.metadata?.evidence as { has_chunks?: boolean; chunks?: Array<Record<string, unknown>> } | undefined;
-    if (!ev || !ev.has_chunks || !Array.isArray(ev.chunks)) continue;
-    for (const chunk of ev.chunks) {
-      if (!chunk || typeof chunk !== 'object') continue;
-      const source = typeof chunk.source === 'string' ? chunk.source : '';
-      const preview = typeof chunk.preview === 'string' ? chunk.preview : '';
-      if (!source && !preview) continue;
-      const key = `${source}|${preview}`;
-      if (evidenceSeen.has(key)) continue;
-      evidenceSeen.add(key);
-      evidenceChunks.push({
-        title: typeof chunk.title === 'string' ? chunk.title : undefined,
-        source,
-        preview,
-      });
+    const ev = evt.metadata?.evidence as { has_chunks?: boolean; sources?: unknown; chunks?: Array<Record<string, unknown>> } | undefined;
+    if (!ev || !ev.has_chunks) continue;
+    if (Array.isArray(ev.chunks)) {
+      for (const chunk of ev.chunks) {
+        if (!chunk || typeof chunk !== 'object') continue;
+        const source = typeof chunk.source === 'string' ? chunk.source : '';
+        const preview = typeof chunk.preview === 'string' ? chunk.preview : '';
+        if (!source && !preview) continue;
+        const key = `${source}|${preview}`;
+        if (evidenceSeen.has(key)) continue;
+        evidenceSeen.add(key);
+        evidenceChunks.push({
+          title: typeof chunk.title === 'string' ? chunk.title : undefined,
+          source,
+          preview,
+        });
+      }
+    }
+    // Review fix (A09 AC): the payload's top-level `sources` summary list
+    // must render too — append docs that no chunk already covered.
+    if (Array.isArray(ev.sources)) {
+      for (const src of ev.sources) {
+        if (typeof src !== 'string' || !src) continue;
+        const key = `${src}|`;
+        if (evidenceSeen.has(key) || evidenceChunks.some(c => c.source === src)) continue;
+        evidenceSeen.add(key);
+        evidenceChunks.push({ source: src, preview: '' });
+      }
     }
   }
   if (evidenceChunks.length > 0) {
@@ -681,6 +702,22 @@ function SuperAgent() {
     // stream onTerminal callback below.
   }, [])
 
+  // A07: conversation ownership follows the subject cookie. After a
+  // cookie loss the old chatId is dead — rotate to a fresh
+  // conversation. Review fix: also sync the active session entry so
+  // a refresh before the next message does not restore the dead
+  // chatId from the session list.
+  const rotateChatIdAfterForbidden = useCallback(() => {
+    const next = createChatId()
+    localStorage.setItem(CHAT_ID_KEY, next)
+    chatIdRef.current = next
+    if (activeSessionId) {
+      setSessions(prev =>
+        prev.map(s => s.id === activeSessionId ? { ...s, chatId: next } : s),
+      )
+    }
+  }, [activeSessionId])
+
   const handleV2Terminal = useCallback((event: V2EventEnvelope) => {
     // Ticket 11: ``run.paused`` is stream-terminal but NOT run-terminal.
     // The reducer has already transitioned status to ``paused``. We
@@ -718,13 +755,11 @@ function SuperAgent() {
       if (event.type === 'error') {
         const code = typeof event.payload.code === 'string' ? event.payload.code : ''
         if (code === 'conversation_forbidden') {
-          // A07: conversation ownership follows the subject cookie. After
-          // a cookie loss the old chatId is dead — rotate to a fresh
-          // conversation and explain instead of surfacing the raw
-          // backend error. Old turns stay visible read-only in history.
-          const next = createChatId()
-          localStorage.setItem(CHAT_ID_KEY, next)
-          chatIdRef.current = next
+          // A07 review fix: rotate OUTSIDE the messages updater —
+          // React updaters must stay side-effect free (StrictMode
+          // may double-invoke them). Old turns stay visible
+          // read-only in history.
+          rotateChatIdAfterForbidden()
           const separator = last.content.trim() ? '\n\n' : ''
           return [
             ...updated.slice(0, -1),
@@ -750,7 +785,7 @@ function SuperAgent() {
     })
     setIsSending(false)
     cleanupRef.current = null
-  }, [])
+  }, [rotateChatIdAfterForbidden])
 
   // Ticket 11: attach a v2 SSE stream to a URL. Shared by the initial
   // /chat/sse request, the recovery effect's re-attach, and the resume
@@ -924,7 +959,10 @@ function SuperAgent() {
           if (next.assistantText || isActive) {
             restored.push({
               role: 'assistant',
-              content: next.assistantText,
+              // Review fix: replayed effect.outcome_unknown events live in
+              // reviewNotices (the live path appends them to content
+              // directly) — re-append so the replay preserves them.
+              content: `${next.assistantText}${v2NoticeSuffix(next.reviewNotices)}`,
               isStreaming: !isV2Terminal(next),
               // A02: artifacts delivered before the refresh are part of
               // the replay state — reattach so download cards survive.
@@ -941,7 +979,7 @@ function SuperAgent() {
         if (last && last.role === 'assistant') {
           updated[updated.length - 1] = {
             ...last,
-            content: next.assistantText,
+            content: `${next.assistantText}${v2NoticeSuffix(next.reviewNotices)}`,
             isStreaming: !isV2Terminal(next),
             artifacts: next.artifacts.length > 0 ? next.artifacts : undefined,
           }
