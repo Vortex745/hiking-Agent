@@ -17,7 +17,7 @@ import Paperclip from 'reicon-react/icons/Paperclip';
 import Download from 'reicon-react/icons/Download';
 import { getConversationMemoryProgress } from '../../../api/conversationMemory';
 import { API } from '../../../api/config';
-import { useRef, useState, createContext, useContext, useCallback, useEffect, type RefObject, type PointerEvent as ReactPointerEvent } from 'react';
+import { useRef, useState, createContext, useContext, useCallback, useEffect, useLayoutEffect, type RefObject, type PointerEvent as ReactPointerEvent } from 'react';
 import gsap from 'gsap';
 import { useGSAP } from '@gsap/react';
 
@@ -605,6 +605,7 @@ const LifecycleHoverPanel = ({
   isRunning,
   pinned,
   position,
+  flipBelow,
   panelRef,
   onPinToggle,
   onDragStart,
@@ -613,6 +614,7 @@ const LifecycleHoverPanel = ({
   isRunning: boolean;
   pinned: boolean;
   position: LifecyclePosition;
+  flipBelow: boolean;
   panelRef: RefObject<HTMLDivElement>;
   onPinToggle: () => void;
   onDragStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
@@ -638,7 +640,9 @@ const LifecycleHoverPanel = ({
       className={`z-50 flex w-[240px] flex-col overflow-visible rounded-2xl border border-black/10 bg-white/95 p-4 text-left shadow-[0_16px_50px_rgba(0,0,0,0.18)] backdrop-blur-xl dark:border-white/10 dark:bg-[#1e1f20]/95 ${
         pinned
           ? 'fixed left-0 top-0 max-h-[72vh] will-change-transform'
-          : 'absolute bottom-full left-1/2 mb-2 -translate-x-1/2'
+          : `absolute left-1/2 -translate-x-1/2 ${
+              flipBelow ? 'top-full mt-2' : 'bottom-full mb-2'
+            } max-h-[min(420px,80vh)] overflow-y-auto`
       }`}
       style={pinned ? { transform: `translate3d(${position.x}px, ${position.y}px, 0)` } : undefined}
       data-lifecycle-panel={pinned ? 'pinned' : 'hover'}
@@ -775,6 +779,7 @@ const ChatMessage = () => {
   }));
   const lifecyclePanelRef = useRef<HTMLDivElement>(null);
   const lifecyclePositionRef = useRef(lifecyclePosition);
+  const [lifecycleFlipBelow, setLifecycleFlipBelow] = useState(false);
   const messageContent = useMessage((state) => state.content) as any[] || [];
   const messageRole = useMessage((state) => state.role);
   const messageStatusType = useMessage((state) => state.status?.type);
@@ -794,6 +799,20 @@ const ChatMessage = () => {
   useEffect(() => {
     lifecyclePositionRef.current = lifecyclePosition;
   }, [lifecyclePosition]);
+
+  // Hover 面板用 CSS bottom-full 锚在触发按钮上方，短回答时按钮贴近视口顶，
+  // 面板会整体溢出屏幕外；打开时量一次 anchor 上下空间决定是否翻转到下方。
+  useLayoutEffect(() => {
+    if (!showLifecycle || lifecyclePinned) return;
+    const rect = lifecycleAnchorRef.current?.getBoundingClientRect();
+    if (!rect || typeof window === 'undefined') return;
+    const spaceAbove = rect.top;
+    const spaceBelow = window.innerHeight - rect.bottom;
+    setLifecycleFlipBelow(
+      spaceAbove < LIFECYCLE_PANEL_HEIGHT + LIFECYCLE_PANEL_MARGIN
+        && spaceBelow > spaceAbove,
+    );
+  }, [showLifecycle, lifecyclePinned]);
   
   useGSAP(() => {
     const message = msgRef.current;
@@ -975,6 +994,7 @@ const ChatMessage = () => {
                       isRunning={isMessageRunning}
                       pinned={lifecyclePinned}
                       position={lifecyclePosition}
+                      flipBelow={lifecycleFlipBelow}
                       panelRef={lifecyclePanelRef}
                       onPinToggle={handleLifecyclePinToggle}
                       onDragStart={handleLifecycleDragStart}
