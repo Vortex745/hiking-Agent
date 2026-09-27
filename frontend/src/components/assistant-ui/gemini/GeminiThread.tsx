@@ -5,7 +5,16 @@ import {
   MessagePrimitive,
   useMessage,
 } from "@assistant-ui/react";
-import { ArrowUp, RotateCw, Copy, Check, X, MoreHorizontal, Pin, PinOff, GripHorizontal, Paperclip, Download } from 'lucide-react';
+import ArrowUp from 'reicon-react/icons/ArrowUp';
+import RotateRight from 'reicon-react/icons/RotateRight';
+import Copy from 'reicon-react/icons/Copy';
+import Check from 'reicon-react/icons/Check';
+import X from 'reicon-react/icons/X';
+import More from 'reicon-react/icons/More';
+import Thumbtack from 'reicon-react/icons/Thumbtack';
+import Grid from 'reicon-react/icons/Grid';
+import Paperclip from 'reicon-react/icons/Paperclip';
+import Download from 'reicon-react/icons/Download';
 import { getConversationMemoryProgress } from '../../../api/conversationMemory';
 import { useRef, useState, createContext, useContext, useCallback, useEffect, type RefObject, type PointerEvent as ReactPointerEvent } from 'react';
 import gsap from 'gsap';
@@ -76,7 +85,7 @@ const Composer = ({ onUploadClick }: { onUploadClick?: () => void }) => (
           title="上传文档"
           aria-label="上传文档"
         >
-          <Paperclip className="w-[18px] h-[18px]" strokeWidth={2} />
+          <Paperclip className="w-[18px] h-[18px]" />
         </button>
       )}
       <ComposerPrimitive.Input
@@ -93,7 +102,7 @@ const Composer = ({ onUploadClick }: { onUploadClick?: () => void }) => (
           title="发送消息"
           className="bg-[#d3e3fd] text-[#062e6f] disabled:bg-[#e8eaed] disabled:text-[#1f1f1f]/40 dark:disabled:bg-[#333537] dark:disabled:text-[#c4c7c5]/40 p-2 rounded-full transition-colors flex shrink-0 h-10 w-10 items-center justify-center press-scale"
         >
-          <ArrowUp className="w-[18px] h-[18px]" strokeWidth={2.5} aria-hidden="true" />
+          <ArrowUp className="w-[18px] h-[18px]" aria-hidden="true" />
         </ComposerPrimitive.Send>
       </AuiIf>
       
@@ -715,7 +724,7 @@ const LifecycleHoverPanel = ({
           {lifecycle.title}
         </div>
         <div className="flex shrink-0 items-center gap-1">
-          {pinned && <GripHorizontal className="h-3.5 w-3.5 text-[#5f6368] dark:text-[#bdc1c6]" strokeWidth={1.7} />}
+          {pinned && <Grid className="h-3.5 w-3.5 text-[#5f6368] dark:text-[#bdc1c6]" />}
           <button
             type="button"
             className="rounded-full p-1 text-[#5f6368] transition-colors hover:bg-black/5 hover:text-[#1f1f1f] dark:text-[#bdc1c6] dark:hover:bg-white/10 dark:hover:text-[#e3e3e3]"
@@ -729,8 +738,8 @@ const LifecycleHoverPanel = ({
             onClick={onPinToggle}
           >
             {pinned
-              ? <PinOff className="h-3.5 w-3.5" strokeWidth={1.8} />
-              : <Pin className="h-3.5 w-3.5" strokeWidth={1.8} />
+              ? <Thumbtack className="h-3.5 w-3.5" weight="Filled" />
+              : <Thumbtack className="h-3.5 w-3.5" />
             }
           </button>
         </div>
@@ -1005,7 +1014,7 @@ const ChatMessage = () => {
                   onClick={handleRegenerate}
                   title="重新生成"
                 >
-                  <RotateCw className="w-[15px] h-[15px]" strokeWidth={1.5} />
+                  <RotateRight className="w-[15px] h-[15px]" />
                 </button>
                 <button
                   className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-full transition-colors press-scale"
@@ -1013,8 +1022,8 @@ const ChatMessage = () => {
                   title={copied ? "已复制" : "复制"}
                 >
                   {copied
-                    ? <Check className="w-[15px] h-[15px] text-green-500" strokeWidth={1.5} />
-                    : <Copy className="w-[15px] h-[15px]" strokeWidth={1.5} />
+                    ? <Check className="w-[15px] h-[15px] text-green-500" />
+                    : <Copy className="w-[15px] h-[15px]" />
                   }
                 </button>
                 <div
@@ -1031,7 +1040,7 @@ const ChatMessage = () => {
                     aria-label="查看思考流程"
                     onClick={() => setShowLifecycle(true)}
                   >
-                    <MoreHorizontal className="w-[15px] h-[15px]" strokeWidth={1.5} />
+                    <More className="w-[15px] h-[15px]" />
                   </button>
                   {(showLifecycle || lifecyclePinned) && (
                     <LifecycleHoverPanel

@@ -30,8 +30,16 @@ import {
 } from '../api/v2Reducer'
 import { useExternalStoreRuntime, AssistantRuntimeProvider, ThreadMessage } from "@assistant-ui/react"
 import { GeminiThread } from '../components/assistant-ui/gemini/GeminiThread'
-import { FloatingSidebar } from '../components/FloatingSidebar'
-import { Menu, X, MessageSquare, Trash2, ClipboardList, CheckCircle2, AlertTriangle, Map, Database, Download, Pencil } from 'lucide-react'
+import { GeminiSidebar } from '../components/assistant-ui/gemini/GeminiSidebar'
+import X from 'reicon-react/icons/X'
+import Trash2 from 'reicon-react/icons/Trash2'
+import Clipboard from 'reicon-react/icons/Clipboard'
+import CheckCircle from 'reicon-react/icons/CheckCircle'
+import AlertTriangle from 'reicon-react/icons/AlertTriangle'
+import Map from 'reicon-react/icons/Map'
+import Database from 'reicon-react/icons/Database'
+import Download from 'reicon-react/icons/Download'
+import Pen from 'reicon-react/icons/Pen'
 
 interface Message {
   role: 'user' | 'assistant'
@@ -82,8 +90,8 @@ function shouldRequestRouteFollowupLocation(text: string, messages: Message[]) {
 }
 
 const quickTags = [
-  { icon: ClipboardList, text: '生成行程', scenario: 'route_plan' as AgentScenario },
-  { icon: CheckCircle2, text: '检查装备', scenario: 'gear_check' as AgentScenario },
+  { icon: Clipboard, text: '生成行程', scenario: 'route_plan' as AgentScenario },
+  { icon: CheckCircle, text: '检查装备', scenario: 'gear_check' as AgentScenario },
   { icon: AlertTriangle, text: '风险提醒', scenario: 'risk_assessment' as AgentScenario },
   { icon: Map, text: '推荐路线', scenario: 'route_plan' as AgentScenario },
 ]
@@ -291,13 +299,10 @@ function SuperAgent() {
       return null
     } catch { return null }
   })
-  const [sidebarOpen, setSidebarOpen] = useState(() => typeof window !== 'undefined' ? window.innerWidth >= 768 : true)
-
-  useEffect(() => {
-    const handleToggle = () => setSidebarOpen(prev => !prev)
-    window.addEventListener('toggle-history', handleToggle)
-    return () => window.removeEventListener('toggle-history', handleToggle)
-  }, [])
+  // 会话侧栏（assistant-ui gemini 示例的停靠左栏）：桌面端折叠/展开，
+  // 移动端为左上角菜单按钮 + 抽屉。桌面默认展开列表。
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
 
   const [input, setInput] = useState('')
   const [selectedScenario, setSelectedScenario] = useState<AgentScenario | null>(null)
@@ -983,8 +988,12 @@ function SuperAgent() {
     try { localStorage.setItem(STORAGE_KEY, serializeMessages(target.messages)) } catch { /* ignore */ }
   }, [activeSessionId, messages, teardownActiveStream])
 
-  const deleteSession = useCallback((e: React.MouseEvent, sessionId: string) => {
-    e.stopPropagation()
+  const selectSession = useCallback((sessionId: string) => {
+    const target = sessions.find(s => s.id === sessionId)
+    if (target) loadSession(target)
+  }, [sessions, loadSession])
+
+  const deleteSession = useCallback((sessionId: string) => {
     setSessions(prev => prev.filter(s => s.id !== sessionId))
     if (activeSessionId === sessionId) {
       // 删除的是当前活跃会话：先拆除活动流,避免旧 run 的事件写入轮换后的新会话。
@@ -1190,29 +1199,21 @@ function SuperAgent() {
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <div className="flex h-full w-full overflow-hidden relative">
-        {/* Floating Sidebar (Drawer) */}
-        <FloatingSidebar
-          isOpen={sidebarOpen}
-          onClose={() => setSidebarOpen(false)}
+        {/* Gemini 风格停靠侧栏：桌面折叠栏 + 移动端抽屉 */}
+        <GeminiSidebar
+          collapsed={sidebarCollapsed}
+          onCollapsedChange={setSidebarCollapsed}
+          mobileOpen={mobileSidebarOpen}
+          onMobileOpenChange={setMobileSidebarOpen}
           sessions={sessions}
           activeSessionId={activeSessionId}
           onNewSession={createNewSession}
-          onLoadSession={loadSession}
+          onSelectSession={selectSession}
           onDeleteSession={deleteSession}
         />
 
         {/* Main Gemini Thread Area */}
-        <div className="flex-1 flex flex-col relative overflow-hidden bg-transparent">
-          {/* Header Toggle Button */}
-          {!sidebarOpen && (
-            <button
-              onClick={() => setSidebarOpen(true)}
-              className="hidden md:flex absolute top-6 left-6 z-40 w-10 h-10 items-center justify-center rounded-full bg-black/40 backdrop-blur-md border border-white/10 text-white/80 hover:text-white hover:bg-black/50 transition-colors duration-150 ease-[var(--ease-out)] shadow-sm press-scale"
-              title="展开历史对话"
-            >
-              <Menu className="w-5 h-5" />
-            </button>
-          )}
+        <div className="min-w-0 flex-1 flex flex-col relative overflow-hidden bg-transparent">
           {v2ApprovalState === 'error' && v2StateRef.current.resumeErrorMessage && (
             <div className="absolute left-4 right-4 top-16 z-50 ml-auto max-w-sm rounded-md border border-red-400/30 bg-zinc-950 p-4 text-sm text-white shadow-xl">
               <div className="font-medium text-red-300">恢复失败</div>
@@ -1298,7 +1299,7 @@ function SuperAgent() {
                         <div className="mt-1 break-words text-white/85">{item.content}</div>
                       </div>
                       <div className="flex shrink-0 gap-1">
-                        <button className="flex h-7 w-7 items-center justify-center text-white/60 hover:text-white" title="编辑" onClick={() => { void handleMemoryEdit(item) }}><Pencil className="h-3.5 w-3.5" /></button>
+                        <button className="flex h-7 w-7 items-center justify-center text-white/60 hover:text-white" title="编辑" onClick={() => { void handleMemoryEdit(item) }}><Pen className="h-3.5 w-3.5" /></button>
                         <button className="flex h-7 w-7 items-center justify-center text-red-300 hover:text-red-200" title="删除" onClick={() => { void handleMemoryDelete(item.memory_id) }}><Trash2 className="h-3.5 w-3.5" /></button>
                       </div>
                     </div>

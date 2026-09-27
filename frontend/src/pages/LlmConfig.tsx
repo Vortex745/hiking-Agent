@@ -1,19 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import {
-  Brain,
-  ChevronDown,
-  Database,
-  Gauge,
-  KeyRound,
-  ListFilter,
-  Loader2,
-  RefreshCw,
-  RotateCcw,
-  Save,
-  Server,
-  Settings2,
-  SlidersHorizontal,
-} from 'lucide-react'
+import Cpu from 'reicon-react/icons/Cpu'
+import ChevronDown from 'reicon-react/icons/ChevronDown'
+import Database from 'reicon-react/icons/Database'
+import Gauge from 'reicon-react/icons/Gauge'
+import Key from 'reicon-react/icons/Key'
+import Filter from 'reicon-react/icons/Filter'
+import Loader from 'reicon-react/icons/Loader'
+import Refresh from 'reicon-react/icons/Refresh'
+import RotateLeft from 'reicon-react/icons/RotateLeft'
+import Save from 'reicon-react/icons/Save'
+import Server from 'reicon-react/icons/Server'
+import Settings2 from 'reicon-react/icons/Settings2'
+import Sliders from 'reicon-react/icons/Sliders'
 import {
   clearLlmSettings,
   DEFAULT_LLM_SETTINGS,
@@ -216,9 +214,9 @@ function ModelCombobox({
           type="button"
         >
           {loading ? (
-            <Loader2 className="h-3 w-3 animate-spin" />
+            <Loader className="h-3 w-3 animate-spin" />
           ) : (
-            <RefreshCw className="h-3 w-3" />
+            <Refresh className="h-3 w-3" />
           )}
           {loading ? '获取中...' : '获取模型'}
         </button>
@@ -399,7 +397,7 @@ function LlmConfig() {
                   <Settings2 className="h-5 w-5" />
                 </span>
                 <span className="t-icon flex h-11 w-11 items-center justify-center" data-icon="b">
-                  <SlidersHorizontal className="h-5 w-5" />
+                  <Sliders className="h-5 w-5" />
                 </span>
               </div>
               <div>
@@ -413,7 +411,7 @@ function LlmConfig() {
                 className="inline-flex h-9 items-center gap-2 rounded-sm border border-border bg-white px-4 text-sm text-text-secondary transition-[transform,border-color,color,background-color] duration-150 ease-[var(--ease-out)] hover:border-primary-light hover:text-primary-light active:scale-[0.97]"
                 onClick={handleReset}
               >
-                <RotateCcw className="h-4 w-4" />
+                <RotateLeft className="h-4 w-4" />
                 重置
               </button>
               <button
@@ -422,7 +420,7 @@ function LlmConfig() {
                 onClick={handleSave}
               >
                 {isAutoTesting ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
+                  <Loader className="h-4 w-4 animate-spin" />
                 ) : (
                   <Save className="h-4 w-4" />
                 )}
@@ -498,7 +496,7 @@ function LlmConfig() {
           <div className="t-panel-slide rounded-md border border-border bg-white p-5 shadow-sm" data-open="true">
             <div className="mb-5 flex items-center gap-3">
               <div className="flex h-10 w-10 items-center justify-center rounded-sm bg-primary/10 text-primary-light">
-                <Brain className="h-5 w-5" />
+                <Cpu className="h-5 w-5" />
               </div>
               <div>
                 <h2 className="text-base font-semibold text-text-primary">大模型配置</h2>
@@ -525,7 +523,7 @@ function LlmConfig() {
               <label className="grid gap-1.5">
                 <span className="text-xs font-semibold text-text-secondary">API Key</span>
                 <div className="flex items-center gap-2 rounded-sm border border-border bg-bg-body px-3 transition-[border-color,background-color] duration-150 ease-[var(--ease-out)] focus-within:border-primary-light focus-within:bg-white">
-                  <KeyRound className="h-4 w-4 text-text-muted" />
+                  <Key className="h-4 w-4 text-text-muted" />
                   <input
                     className="h-10 flex-1 bg-transparent text-sm outline-none"
                     id="llm-api-key"
@@ -578,7 +576,7 @@ function LlmConfig() {
               <label className="grid gap-1.5">
                 <span className="text-xs font-semibold text-text-secondary">API Key</span>
                 <div className="flex items-center gap-2 rounded-sm border border-border bg-bg-body px-3 transition-[border-color,background-color] duration-150 ease-[var(--ease-out)] focus-within:border-primary-light focus-within:bg-white">
-                  <KeyRound className="h-4 w-4 text-text-muted" />
+                  <Key className="h-4 w-4 text-text-muted" />
                   <input
                     className="h-10 flex-1 bg-transparent text-sm outline-none"
                     id="embedding-api-key"
@@ -619,7 +617,7 @@ function LlmConfig() {
           <div className="t-panel-slide rounded-md border border-border bg-white p-5 shadow-sm" data-open="true">
             <div className="mb-5 flex items-center gap-3">
               <div className="flex h-10 w-10 items-center justify-center rounded-sm bg-primary/10 text-primary-light">
-                <ListFilter className="h-5 w-5" />
+                <Filter className="h-5 w-5" />
               </div>
               <div>
                 <h2 className="text-base font-semibold text-text-primary">Rerank 模型配置</h2>
@@ -646,7 +644,7 @@ function LlmConfig() {
               <label className="grid gap-1.5">
                 <span className="text-xs font-semibold text-text-secondary">API Key</span>
                 <div className="flex items-center gap-2 rounded-sm border border-border bg-bg-body px-3 transition-[border-color,background-color] duration-150 ease-[var(--ease-out)] focus-within:border-primary-light focus-within:bg-white">
-                  <KeyRound className="h-4 w-4 text-text-muted" />
+                  <Key className="h-4 w-4 text-text-muted" />
                   <input
                     className="h-10 flex-1 bg-transparent text-sm outline-none"
                     id="rerank-api-key"

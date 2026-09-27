@@ -1,4 +1,5 @@
-import { Heart, Bot } from 'lucide-react'
+import Heart from 'reicon-react/icons/Heart'
+import Sparkles from 'reicon-react/icons/Sparkles'
 
 interface AiAvatarProps {
   type: 'love' | 'agent'
@@ -7,7 +8,7 @@ interface AiAvatarProps {
 
 function AiAvatar({ type, size = 40 }: AiAvatarProps) {
   const className = `ai-avatar ${type}`
-  const Icon = type === 'love' ? Heart : Bot
+  const Icon = type === 'love' ? Heart : Sparkles
 
   return (
     <div

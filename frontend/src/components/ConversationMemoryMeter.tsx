@@ -1,4 +1,4 @@
-import { Database } from 'lucide-react'
+import Database from 'reicon-react/icons/Database'
 import { getConversationMemoryProgress } from '../api/conversationMemory'
 
 interface ConversationMemoryMeterProps {
@@ -20,7 +20,7 @@ function ConversationMemoryMeter({ messages }: ConversationMemoryMeterProps) {
       aria-valuetext={progress.label}
       title={`当前对话记忆进度 ${progress.label}`}
     >
-      <Database className="w-3.5 h-3.5 shrink-0" strokeWidth={1.5} />
+      <Database className="w-3.5 h-3.5 shrink-0" />
       <span className="conversation-memory-meter-label">对话记忆</span>
       <span className="conversation-memory-meter-track" aria-hidden="true">
         <span
