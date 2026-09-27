@@ -224,7 +224,6 @@ Frontend：
 
 ```bash
 cd frontend
-npm test
 npm run build
 ```
 
