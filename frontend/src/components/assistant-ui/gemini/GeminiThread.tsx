@@ -16,6 +16,7 @@ import Grid from 'reicon-react/icons/Grid';
 import Paperclip from 'reicon-react/icons/Paperclip';
 import Download from 'reicon-react/icons/Download';
 import { getConversationMemoryProgress } from '../../../api/conversationMemory';
+import { API } from '../../../api/config';
 import { useRef, useState, createContext, useContext, useCallback, useEffect, type RefObject, type PointerEvent as ReactPointerEvent } from 'react';
 import gsap from 'gsap';
 import { useGSAP } from '@gsap/react';
@@ -258,35 +259,15 @@ const MarkdownText = (part: any) => {
   );
 };
 
-/** Resolve a relative download_url against the configured API base URL */
-function resolveDownloadUrl(downloadUrl: string): string {
-  if (!downloadUrl) return '';
-  // Already a full URL — return as-is
-  if (downloadUrl.startsWith('http://') || downloadUrl.startsWith('https://')) return downloadUrl;
-
-  // Check for a configured API base URL (e.g. https://api.example.com/api/v1)
-  const configuredApiBase = import.meta.env?.VITE_API_BASE_URL?.trim().replace(/\/+$/, '');
-
-  if (configuredApiBase) {
-    // download_url is like /api/v1/artifacts/xxx.pdf
-    // Replace the /api/v1 prefix with the configured full URL
-    const apiBase = '/api/v1';
-    if (downloadUrl.startsWith(apiBase)) {
-      return configuredApiBase + downloadUrl.slice(apiBase.length);
-    }
-    return configuredApiBase + (downloadUrl.startsWith('/') ? '' : '/') + downloadUrl;
-  }
-
-  // No VITE_API_BASE_URL configured — relative path works via same-origin Gateway
-  return downloadUrl;
-}
-
+/** A03: v2 artifact download card. The payload carries only the opaque
+ * artifact_id + public metadata; download goes through the shared
+ * /api/v2/artifacts/{artifact_id} endpoint (no v1 download_url exists). */
 const ArtifactList = ({ artifacts }: { artifacts: any[] }) => {
   const [downloading, setDownloading] = useState<string | null>(null);
 
-  const handleDownload = async (rawUrl: string, filename: string) => {
-    const url = resolveDownloadUrl(rawUrl);
-    setDownloading(filename);
+  const handleDownload = async (artifactId: string, filename: string) => {
+    const url = API.chatV2Artifact(artifactId);
+    setDownloading(artifactId);
     try {
       const response = await fetch(url);
       if (!response.ok) {
@@ -311,27 +292,23 @@ const ArtifactList = ({ artifacts }: { artifacts: any[] }) => {
   return (
     <div className="mt-3 border-t border-border/40 pt-3 space-y-2">
       {artifacts.map((artifact, i) => {
-        const metadata = artifact?.metadata || {};
-        const downloadUrl = typeof metadata.download_url === 'string' ? metadata.download_url : '';
-        const filename = typeof metadata.filename === 'string' ? metadata.filename : '下载文件';
-        const size = formatArtifactSize(metadata.size_bytes);
-        const isDownloading = downloading === filename;
+        const artifactId = typeof artifact?.artifact_id === 'string' ? artifact.artifact_id : '';
+        const filename = typeof artifact?.public_filename === 'string' ? artifact.public_filename : '下载文件';
+        const size = formatArtifactSize(artifact?.size_bytes);
+        const isDownloading = downloading === artifactId;
+        if (!artifactId) return null;
         return (
           <div key={i} className="flex flex-wrap items-center gap-2 text-[13px] text-text-secondary">
-            {downloadUrl ? (
-              <button
-                type="button"
-                onClick={() => handleDownload(downloadUrl, filename)}
-                disabled={isDownloading}
-                className="inline-flex min-h-8 items-center gap-1.5 rounded-md border border-border/70 bg-background px-2.5 py-1.5 font-medium text-text-primary transition-colors hover:border-primary/60 hover:text-primary disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                <Download className={`size-4${isDownloading ? ' animate-pulse' : ''}`} aria-hidden="true" />
-                <span>{isDownloading ? '下载中…' : `下载 ${filename}`}</span>
-              </button>
-            ) : (
-              <span className="leading-relaxed">{artifact.content}</span>
-            )}
-            {downloadUrl && size && <span className="text-[12px] opacity-70">{size}</span>}
+            <button
+              type="button"
+              onClick={() => handleDownload(artifactId, filename)}
+              disabled={isDownloading}
+              className="inline-flex min-h-8 items-center gap-1.5 rounded-md border border-border/70 bg-background px-2.5 py-1.5 font-medium text-text-primary transition-colors hover:border-primary/60 hover:text-primary disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <Download className={`size-4${isDownloading ? ' animate-pulse' : ''}`} aria-hidden="true" />
+              <span>{isDownloading ? '下载中…' : `下载 ${filename}`}</span>
+            </button>
+            {size && <span className="text-[12px] opacity-70">{size}</span>}
           </div>
         )
       })}
@@ -414,7 +391,11 @@ const CustomToolCall = (part: any) => {
   }
 
   if (toolName === "artifacts") {
-    return null;
+    // A03: render v2 download cards — the artifacts tool-call part carries
+    // the message's artifact list as args (wired by convertMessage).
+    const artifactList = Array.isArray(args) ? args : [];
+    if (artifactList.length === 0) return null;
+    return <ArtifactList artifacts={artifactList} />;
   }
 
   if (part.toolName === "searchSummary") {
