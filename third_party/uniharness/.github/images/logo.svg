@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 136.5 24" shape-rendering="crispEdges">
+<defs>
+  <linearGradient id="tg-light" x1="0" y1="0" x2="1" y2="0">
+    <stop offset="0%" stop-color="#8EAED4"/>
+    <stop offset="50%" stop-color="#6A8CBC"/>
+    <stop offset="100%" stop-color="#5476AC"/>
+  </linearGradient>
+  <linearGradient id="tg-dark" x1="0" y1="0" x2="1" y2="0">
+    <stop offset="0%" stop-color="#84A6CE"/>
+    <stop offset="50%" stop-color="#6084B6"/>
+    <stop offset="100%" stop-color="#4C6EA6"/>
+  </linearGradient>
+</defs>
+<style>
+  @media (prefers-color-scheme: light) {
+    .s1 { fill: #82A4CC; }
+    .s2 { fill: #8EAED4; }
+    .s3 { fill: #82A4CC; }
+    .s4 { fill: #6A8CBC; }
+    .s5 { fill: #5476AC; }
+    .s6 { fill: #6A8CBC; }
+    .wm { fill: url(#tg-light); }
+  }
+  @media (prefers-color-scheme: dark) {
+    .s1 { fill: #789CC6; }
+    .s2 { fill: #84A6CE; }
+    .s3 { fill: #789CC6; }
+    .s4 { fill: #6084B6; }
+    .s5 { fill: #4C6EA6; }
+    .s6 { fill: #6084B6; }
+    .wm { fill: url(#tg-dark); }
+  }
+</style>
+<g transform="translate(-5.09,-3.48) scale(0.0774)">
+  <polygon class="s1" points="200,45 334.2,122.5 250.2,229 250.2,171"/>
+  <polygon class="s2" points="334.2,122.5 334.2,277.5 200,258 250.2,229"/>
+  <polygon class="s3" points="334.2,277.5 200,355 149.8,229 200,258"/>
+  <polygon class="s4" points="200,355 65.8,277.5 149.8,171 149.8,229"/>
+  <polygon class="s5" points="65.8,277.5 65.8,122.5 200,142 149.8,171"/>
+  <polygon class="s6" points="65.8,122.5 200,45 250.2,171 200,142"/>
+</g>
+<text class="wm" x="27" y="12" dominant-baseline="central" font-family="Geist, sans-serif" font-size="19" font-weight="600" letter-spacing="0.5">UniHarness</text>
+</svg>

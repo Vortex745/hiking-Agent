@@ -1,0 +1,11 @@
+{
+  "name": "hiking-ai-promptfoo-evals",
+  "private": true,
+  "devDependencies": {
+    "promptfoo": "0.122.2"
+  },
+  "scripts": {
+    "eval": "promptfoo eval -c promptfooconfig.yaml --output .runs/latest.json",
+    "view": "promptfoo view"
+  }
+}

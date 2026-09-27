@@ -1,0 +1,46 @@
+name: "Integration Testing"
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        required: true
+        type: string
+        description: "From which folder this pipeline executes"
+      python-version:
+        required: true
+        type: string
+        description: "Python version to use"
+
+permissions:
+  contents: read
+
+env:
+  UV_NO_SYNC: "true"
+
+jobs:
+  build:
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    name: "Python ${{ inputs.python-version }}"
+    steps:
+      - name: "📋 Checkout Code"
+        uses: actions/checkout@v5
+
+      - name: "🐍 Set up Python ${{ inputs.python-version }} + UV"
+        uses: ./.github/actions/setup-uv
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache-suffix: integration-test-${{ inputs.working-directory }}
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: "📦 Install Test Dependencies"
+        shell: bash
+        run: uv sync --group test --locked
+
+      - name: "🧪 Run Integration Tests"
+        shell: bash
+        run: make integration_test

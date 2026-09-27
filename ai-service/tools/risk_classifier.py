@@ -24,21 +24,23 @@ class RiskLevel(str, Enum):
 
 
 # 工具名称到风险级别的静态映射
-# 工具名称统一使用 tools/ 目录中 functions 字典的 key
 TOOL_RISK_MAP: dict[str, RiskLevel] = {
     "web_search": RiskLevel.LOW,
     "web_scraping": RiskLevel.MEDIUM,
-    "file_operation": RiskLevel.HIGH,
-    "resource_download": RiskLevel.MEDIUM,
-    "terminal": RiskLevel.CRITICAL,
-    "pdf_generation": RiskLevel.LOW,
     "generate_pdf": RiskLevel.LOW,
-    "terminate": RiskLevel.HIGH,
     "route_research": RiskLevel.LOW,
     "hiking_knowledge_search": RiskLevel.LOW,
     "gear_checklist": RiskLevel.LOW,
     "risk_assessment": RiskLevel.LOW,
-    "trip_report_export": RiskLevel.HIGH,
+    # Ticket 29: server-approved AMap MCP tools (amap_weather / amap_map)
+    # — read-only evidence lookups. Registered explicitly so the
+    # fail-closed unclassified rule does not reject the profile's own
+    # allowlisted surface.
+    "get_current_weather": RiskLevel.LOW,
+    "get_weather_forecast": RiskLevel.LOW,
+    "search_poi": RiskLevel.LOW,
+    "plan_route": RiskLevel.LOW,
+    "geocode": RiskLevel.LOW,
 }
 
 

@@ -73,6 +73,15 @@ class V2Runtime:
     # at assembly time; defaults to False so upgrades stay root-only.
     subagent_enabled: bool = False
 
+    # Ticket 25: proven identity of the loaded UniHarness fork distribution.
+    # Populated only when the fail-closed startup check passed, so a healthy
+    # runtime always carries a compatible identity.
+    kernel_identity: Any = None
+
+    # Ticket 27: disk-backed kernel graph checkpoint store (recoverable
+    # UniHarness state). Public lifecycle remains with RunRepository.
+    kernel_checkpoints: Any = None
+
     # Backward compat with code that probed the Ticket 03 placeholder
     # fields. Remove once all callers migrate to ``runs`` / ``writer_lock``.
     @property
@@ -230,39 +239,57 @@ def assemble_v2_runtime(settings: Any) -> Any:
         writer_lock.release()
         raise V2StartupError(f"v2 memory store failed to open: {exc}") from exc
 
-    # Import locally so disabled deployments never pay the import cost.
-    from .uniharness import create_agent
+    # Ticket 27: provision the kernel graph checkpoint STORE handle eagerly;
+    # the aiosqlite connection opens lazily inside the request event loop.
+    # Unwritable destinations still fail closed on first use before any
+    # model work (mapped to checkpoint_unavailable by the stream layer).
+    from .kernel_persistence import KernelCheckpointStore
 
-    try:
-        context = create_agent()
-        return V2Runtime(
-            context=context,
-            uniharness_pin=pin,
-            state_dir=state_dir,
-            runs=runs,
-            memory=memory,
-            telemetry=TelemetryService(control_store),
-            capacity=CapacityGuard(
-                max_runs=20,
-                max_sandboxes=10,
-                queue_timeout_seconds=60.0,
-            ),
-            writer_lock=writer_lock,
-            writer_id=writer_lock.writer_id,
-            # Ticket 23: inject the server-side subagent gate so the
-            # chat_v2 stream can construct a SubagentDispatcher with
-            # the correct enabled state without re-reading settings.
-            subagent_enabled=is_subagent_authorized(settings),
-        )
-    except Exception as exc:
-        try:
-            control_store.release_writer_lock(writer_lock.writer_id)
-        except Exception:
-            logger.warning("writer_lock DB cleanup failed during startup")
+    kernel_checkpoints = KernelCheckpointStore(
+        Path(state_dir) / "kernel_checkpoints.sqlite"
+    )
+
+    # Ticket 25: prove the installed kernel is the pinned vendored fork
+    # BEFORE anything else is assembled. Missing or incompatible UniHarness
+    # must fail closed — never start v2 on a stub or foreign build.
+    from .uniharness.kernel_identity import resolve_kernel_identity
+
+    identity = resolve_kernel_identity(pin)
+    logger.info(
+        "UniHarness kernel identity resolved (compatible=%s, version=%s, fork_commit=%s)",
+        identity.compatible,
+        identity.distribution_version,
+        identity.fork_commit,
+    )
+    if not identity.compatible:
+        kernel_checkpoints.close()
         runs.close()
         memory.close()
         writer_lock.release()
-        raise V2StartupError(f"v2 agent failed to initialize: {exc}") from exc
+        raise V2StartupError(f"UniHarness kernel identity check failed: {identity.detail}")
+
+    # Ticket 34: the local contract stub is NO LONGER importable from the
+    # startup assembly. Agent execution goes through the real kernel via
+    # agent_v2.kernel (Ticket 26+); ``context`` is retained as ``None`` for
+    # the deprecated ``placeholder_context`` probe only.
+    return V2Runtime(
+        context=None,
+        uniharness_pin=pin,
+        kernel_identity=identity,
+        state_dir=state_dir,
+        runs=runs,
+        memory=memory,
+        telemetry=TelemetryService(control_store),
+        capacity=CapacityGuard(
+            max_runs=20,
+            max_sandboxes=10,
+            queue_timeout_seconds=60.0,
+        ),
+        writer_lock=writer_lock,
+        writer_id=writer_lock.writer_id,
+        subagent_enabled=is_subagent_authorized(settings),
+        kernel_checkpoints=kernel_checkpoints,
+    )
 
 
 def _now_iso() -> str:
@@ -301,6 +328,12 @@ def release_v2_runtime(runtime: Any) -> None:
             runtime.memory.close()
         except Exception as exc:
             logger.warning("MemoryService close failed: %s", exc)
+
+    if runtime.kernel_checkpoints is not None:
+        try:
+            runtime.kernel_checkpoints.close()
+        except Exception as exc:
+            logger.warning("KernelCheckpointStore close failed: %s", exc)
 
     if runtime.writer_lock is not None:
         runtime.writer_lock.release()

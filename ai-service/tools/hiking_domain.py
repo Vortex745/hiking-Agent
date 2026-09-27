@@ -1,24 +1,18 @@
-"""Domain tools for hiking planning, gear, risk, and artifact export."""
+"""Domain tools for hiking planning, gear, and risk."""
 
 from __future__ import annotations
 
 import logging
 import re
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from langchain_core.tools import tool
 
-from tools.pdf_generation import artifact_metadata, generate_pdf
 from tools.web_search import web_search
-from runtime_paths import runtime_dir
 
 
 logger = logging.getLogger("ai-service.hiking_domain")
-
-
-WORKSPACE_DIR = runtime_dir("WORKSPACE_DIR", "workspace")
 
 
 def _now_iso() -> str:
@@ -26,23 +20,6 @@ def _now_iso() -> str:
     # 原实现的 astimezone() 会转成本地时间,导致 queried_at 等
     # 时间戳字段与其他模块混用两种时区,排序/比较错乱。
     return datetime.now(timezone.utc).isoformat()
-
-
-def _safe_filename(value: str, suffix: str) -> str:
-    stem = "".join(c if c.isalnum() or c in " _-" else "_" for c in value).strip()
-    stem = re.sub(r"\s+", "_", stem)[:50] or "hiking_trip"
-    return f"{stem}{suffix}"
-
-
-def _resolve_workspace_path(path: str) -> Path:
-    target = (WORKSPACE_DIR / path).resolve()
-    workspace = WORKSPACE_DIR.resolve()
-    try:
-        target.relative_to(workspace)
-    except ValueError:
-        raise ValueError("文件路径超出 workspace 范围")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    return target
 
 
 ROUTE_NAME_RE = re.compile(
@@ -233,59 +210,3 @@ async def risk_assessment(
         "alternatives": ["改期", "缩短路线", "选择低海拔成熟路线", "改为城市近郊短线"],
         "recommendation": recommendation,
     }
-
-
-@tool
-async def trip_report_export(
-    title: str,
-    content: str,
-    format: str = "markdown",
-    file_name: str | None = None,
-) -> dict[str, Any]:
-    """Export a hiking trip report to Markdown, optionally generating PDF."""
-    title = (title or "徒步攻略").strip()
-    content = content or ""
-    normalized_format = (format or "markdown").strip().lower()
-    if normalized_format not in {"markdown", "md", "pdf", "both"}:
-        return {"ok": False, "message": "format 只支持 markdown、pdf 或 both。"}
-
-    md_name = file_name or _safe_filename(title, ".md")
-    if not md_name.lower().endswith(".md"):
-        md_name += ".md"
-    md_path = _resolve_workspace_path(md_name)
-    markdown = content if content.lstrip().startswith("#") else f"# {title}\n\n{content}"
-    md_path.write_text(markdown, encoding="utf-8")
-    markdown_artifact = artifact_metadata(
-        md_path,
-        title=title,
-        kind="markdown",
-        mime_type="text/markdown; charset=utf-8",
-    )
-    artifacts: list[dict[str, Any]] = []
-    if normalized_format in {"markdown", "md", "both"}:
-        artifacts.append(markdown_artifact)
-
-    result: dict[str, Any] = {
-        "ok": True,
-        "title": title,
-        "format": normalized_format,
-        "markdown_artifact": markdown_artifact,
-        "artifacts": artifacts,
-        "summary": (
-            f"Markdown 已生成：{markdown_artifact['filename']}"
-            if artifacts
-            else "导出内容已准备"
-        ),
-    }
-
-    if normalized_format in {"pdf", "both"}:
-        pdf_result = await generate_pdf.ainvoke({"title": title, "content": markdown})
-        result["pdf_result"] = pdf_result
-        if isinstance(pdf_result, dict) and pdf_result.get("ok") and isinstance(pdf_result.get("artifact"), dict):
-            artifacts.append(pdf_result["artifact"])
-            result["summary"] += f"；PDF 已生成：{pdf_result['artifact']['filename']}。"
-        else:
-            message = pdf_result.get("message") if isinstance(pdf_result, dict) else str(pdf_result)
-            result["summary"] += f"；{message}"
-
-    return result

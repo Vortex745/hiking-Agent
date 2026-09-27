@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -347,15 +348,288 @@ def _constant_time_eq(a: str, b: str) -> bool:
     return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
 
 
+# ---- Host-side verified export (Ticket 41, formerly adapter code) -----------
+#
+# Spec AC3 + decision: artifacts persist for 7 days after creation. The
+# TTL is intentionally short — artifacts are downloadable summaries, not
+# permanent user files. Operators may sweep expired rows + files in a
+# separate cron; the download endpoint returns 410 once ``expires_at``
+# elapses.
+ARTIFACT_TTL_DAYS = 7
+
+
+def _now_iso() -> str:
+    """UTC ISO 8601 timestamp with timezone suffix."""
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _expires_at_iso(created_at: str) -> str:
+    """Compute the expiry timestamp ``ARTIFACT_TTL_DAYS`` after ``created_at``.
+
+    Parses ``created_at`` (ISO 8601 with timezone) so the expiry is
+    derived from the creation time, not from ``now`` — this keeps the
+    TTL stable even if the clock drifts between insert and expiry check.
+    """
+    from datetime import datetime, timedelta
+
+    created = datetime.fromisoformat(created_at)
+    return (created + timedelta(days=ARTIFACT_TTL_DAYS)).isoformat()
+
+
+def persist_failed_artifact(
+    runs_repo,
+    run_id: str | None,
+    conversation_id: str,
+    artifact_id: str,
+    *,
+    public_filename: str,
+    mime_type: str,
+    size_bytes: int,
+    sha256: str,
+    storage_path: str,
+    failure_reason: str,
+) -> None:
+    """Persist a ``failed`` evidence row (spec AC4).
+
+    Called BEFORE the sandbox is destroyed so the manifest + failure
+    reason survive cleanup. Spec AC4 requires "sandbox 不会在证据保存前
+    被销毁" — therefore persistence failure here MUST propagate so the
+    caller can preserve the sandbox for investigation instead of
+    destroying evidence.
+    """
+    if runs_repo is None or run_id is None:
+        return
+    created_at = _now_iso()
+    expires_at = _expires_at_iso(created_at)
+    try:
+        runs_repo.insert_artifact(
+            artifact_id=artifact_id,
+            run_id=run_id,
+            conversation_id=conversation_id,
+            public_filename=public_filename,
+            mime_type=mime_type,
+            size_bytes=size_bytes,
+            sha256=sha256,
+            storage_path=storage_path,
+            status="failed",
+            failure_reason=failure_reason,
+            created_at=created_at,
+            expires_at=expires_at,
+        )
+    except Exception:
+        logger.exception(
+            "artifacts: failed to persist evidence row for artifact_id=%s; "
+            "raising to preserve sandbox per AC4",
+            artifact_id,
+        )
+        raise ArtifactEvidencePersistenceError(
+            f"failed to persist evidence row for artifact_id={artifact_id}"
+        )
+
+
+def export_artifact_to_host(
+    *,
+    computer: Any,
+    workspace_path: str,
+    relative_path: str,
+    declared_mime: str,
+    storage_dir: str,
+    runs_repo=None,
+    run_id: str | None,
+    conversation_id: str,
+) -> dict[str, Any]:
+    """Build manifest, verify on host, persist artifact, record in DB.
+
+    Returns a dict with the public metadata for the ``artifact.available``
+    event payload: ``artifact_id``, ``public_filename``, ``mime_type``,
+    ``size_bytes``, ``sha256``, ``expires_at``. Spec AC3: no sandbox or
+    host paths in the returned dict.
+
+    Spec AC1 + AC2: the host re-derives size + SHA-256 from the bytes
+    it reads via :meth:`Computer.read_artifact_bytes` and rejects any
+    mismatch with the sandbox-declared manifest. Absolute paths, ``..``,
+    symlink escape, missing file, MIME mismatch, checksum mismatch, and
+    files over 25 MB are rejected.
+
+    Spec AC4: on ANY failure (manifest build, byte read, validation,
+    host persist, DB insert) a ``failed`` evidence row is persisted
+    BEFORE this function returns/raises. The caller's ``finally`` block
+    may then safely destroy the sandbox — the evidence survives.
+
+    Raises :class:`ArtifactExportError` on failure. The caller emits a
+    terminal ``error`` event; no half-built artifact is published.
+    """
+    artifact_id = str(uuid.uuid4())
+
+    # 1. Sandbox builds the manifest (declares size + sha + mime).
+    try:
+        manifest = computer.build_manifest(
+            workspace_path, relative_path, declared_mime
+        )
+    except ComputerError as exc:
+        # Manifest build failed before we have any declarative fields.
+        # Persist a failed row with the best-effort fields we can derive
+        # from the request (relative_path → public_filename).
+        persist_failed_artifact(
+            runs_repo, run_id, conversation_id, artifact_id,
+            public_filename=Path(relative_path).name,
+            mime_type=declared_mime,
+            size_bytes=0,
+            sha256="",
+            storage_path="",
+            failure_reason=f"manifest build failed: {exc}",
+        )
+        raise ArtifactExportError(f"manifest build failed: {exc}") from exc
+
+    # 2. Host reads the bytes back. The host re-derives size + sha from
+    # these bytes — the sandbox's declared values are NOT trusted.
+    try:
+        actual_bytes = computer.read_artifact_bytes(workspace_path, relative_path)
+    except ComputerError as exc:
+        persist_failed_artifact(
+            runs_repo, run_id, conversation_id, artifact_id,
+            public_filename=manifest.public_filename,
+            mime_type=manifest.declared_mime,
+            size_bytes=manifest.size_bytes,
+            sha256=manifest.sha256,
+            storage_path="",
+            failure_reason=f"artifact read failed: {exc}",
+        )
+        raise ArtifactExportError(
+            f"artifact read failed: {exc}", manifest=manifest
+        ) from exc
+
+    # 3. Validate manifest against actual bytes (spec AC1, AC2).
+    #    validate_manifest re-derives size + sha256 from actual_bytes
+    #    and rejects any mismatch. It also rejects path traversal,
+    #    symlink escape (via relative_path validation), MIME mismatch,
+    #    and >25 MB files.
+    try:
+        validate_manifest(manifest, actual_bytes)
+    except ArtifactExportError:
+        # validate_manifest already populated the manifest on the exc
+        # via ArtifactExportError.__init__ when raised from validators
+        # that have the manifest in scope. Re-raise after evidence row.
+        persist_failed_artifact(
+            runs_repo, run_id, conversation_id, artifact_id,
+            public_filename=manifest.public_filename,
+            mime_type=manifest.declared_mime,
+            size_bytes=manifest.size_bytes,
+            sha256=manifest.sha256,
+            storage_path="",
+            failure_reason="manifest validation failed",
+        )
+        raise
+
+    # 4. Symlink escape check (defense-in-depth, spec AC2). The
+    #    relative_path validator already rejected ``..`` and absolute
+    #    paths; this catches symlinks inside the workspace that point
+    #    outside it.
+    full_path = os.path.join(workspace_path, relative_path)
+    if is_symlink_escape(workspace_path, full_path):
+        persist_failed_artifact(
+            runs_repo, run_id, conversation_id, artifact_id,
+            public_filename=manifest.public_filename,
+            mime_type=manifest.declared_mime,
+            size_bytes=manifest.size_bytes,
+            sha256=manifest.sha256,
+            storage_path="",
+            failure_reason="symlink escape detected",
+        )
+        raise ArtifactExportError(
+            "symlink escape detected", manifest=manifest
+        )
+
+    # 5. Compute host storage path + persist bytes atomically.
+    storage_path = host_storage_path(
+        storage_dir, artifact_id, manifest.public_filename
+    )
+    try:
+        persist_artifact_bytes(storage_path, actual_bytes)
+    except Exception as exc:
+        persist_failed_artifact(
+            runs_repo, run_id, conversation_id, artifact_id,
+            public_filename=manifest.public_filename,
+            mime_type=manifest.declared_mime,
+            size_bytes=manifest.size_bytes,
+            sha256=manifest.sha256,
+            storage_path=storage_path,
+            failure_reason=f"host persist failed: {exc}",
+        )
+        raise ArtifactExportError(
+            f"host persist failed: {exc}", manifest=manifest
+        ) from exc
+
+    # 6. Insert the artifact row (status='available'). The row is the
+    #    source of truth for the download endpoint — the file on disk
+    #    is the blob, the row carries the public metadata + expiry.
+    created_at = _now_iso()
+    expires_at = _expires_at_iso(created_at)
+    if runs_repo is not None and run_id is not None:
+        try:
+            runs_repo.insert_artifact(
+                artifact_id=artifact_id,
+                run_id=run_id,
+                conversation_id=conversation_id,
+                public_filename=manifest.public_filename,
+                mime_type=manifest.declared_mime,
+                size_bytes=manifest.size_bytes,
+                sha256=manifest.sha256,
+                storage_path=storage_path,
+                status="available",
+                failure_reason=None,
+                created_at=created_at,
+                expires_at=expires_at,
+            )
+        except Exception as exc:
+            # DB insert failed after the file was written — best-effort
+            # delete the orphan so storage does not accumulate blobs
+            # with no matching row. The run still fails; the operator
+            # checks logs for the orphan cleanup.
+            try:
+                os.remove(storage_path)
+            except OSError:
+                logger.warning(
+                    "artifacts: orphan artifact file left at %s after DB insert failed",
+                    storage_path,
+                )
+            persist_failed_artifact(
+                runs_repo, run_id, conversation_id, artifact_id,
+                public_filename=manifest.public_filename,
+                mime_type=manifest.declared_mime,
+                size_bytes=manifest.size_bytes,
+                sha256=manifest.sha256,
+                storage_path="",
+                failure_reason=f"artifact DB insert failed: {exc}",
+            )
+            raise ArtifactExportError(
+                f"artifact DB insert failed: {exc}", manifest=manifest
+            ) from exc
+
+    return {
+        "artifact_id": artifact_id,
+        "public_filename": manifest.public_filename,
+        "mime_type": manifest.declared_mime,
+        "size_bytes": manifest.size_bytes,
+        "sha256": manifest.sha256,
+        "expires_at": expires_at,
+    }
+
+
 __all__ = [
+    "ARTIFACT_TTL_DAYS",
     "ArtifactEvidencePersistenceError",
     "ArtifactExportError",
     "ArtifactManifest",
     "MAX_ARTIFACT_BYTES",
     "compute_sha256",
+    "export_artifact_to_host",
     "host_storage_path",
     "is_symlink_escape",
     "persist_artifact_bytes",
+    "persist_failed_artifact",
     "validate_declared_mime",
     "validate_manifest",
     "validate_public_filename",

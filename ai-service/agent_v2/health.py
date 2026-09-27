@@ -51,6 +51,17 @@ def v2_health_status(app_state: Any, settings: Any) -> dict[str, Any]:
         "uniharness_pin": getattr(settings, "agent_v2_uniharness_pin", "unknown"),
     }
 
+    # Ticket 25: surface the proven kernel identity so health can never be
+    # mistaken for a stub build. A ready runtime always carries a verified
+    # fork identity (startup fails closed otherwise).
+    if isinstance(runtime, V2Runtime) and runtime.kernel_identity is not None:
+        identity = runtime.kernel_identity
+        payload["kernel_identity"] = {
+            "distribution_version": identity.distribution_version,
+            "fork_commit": identity.fork_commit,
+            "compatible": identity.compatible,
+        }
+
     # Ticket 06: persistence + writer lock audit fields. Only populate
     # when the runtime is the real V2Runtime (Ticket 06+); the Ticket 03
     # placeholder exposes neither.

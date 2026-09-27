@@ -1,0 +1,4 @@
+node_modules/
+dist/
+backend_dist/
+lima_dist/
