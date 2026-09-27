@@ -410,7 +410,16 @@ def _require_conversation_owner(request: Request, conversation_id: str) -> None:
 
 
 @chat_v2_router.get("/snapshot/{run_id}")
-async def chat_v2_snapshot(run_id: str, request: Request):
+async def chat_v2_snapshot(
+    run_id: str,
+    request: Request,
+    request_id: str = Query(
+        default="",
+        description="A05/AC4 fallback: client idempotency key used to resolve "
+        "the run when the path run_id is empty or unknown (refresh before "
+        "the first event delivered the server run_id).",
+    ),
+):
     """Return the run snapshot — spec AC3.
 
     The snapshot includes conversation messages, run status, sequence
@@ -420,12 +429,21 @@ async def chat_v2_snapshot(run_id: str, request: Request):
     Ticket 40: the read is driven by the orchestration module
     (:meth:`RunOrchestrator.load_snapshot`); the adapter maps a missing
     run to 404.
+
+    A05: the path ``run_id`` may be a ``request_id`` (same AC4 semantics
+    as cancel) and ``?request_id=`` provides a fallback when the client
+    only knows its idempotency key.
     """
-    _get_runs_repo(request)  # 503 guard when v2 persistence is not assembled
+    runs_repo = _get_runs_repo(request)  # 503 guard when v2 persistence is not assembled
+    resolved_run_id = runs_repo.resolve_run_id(run_id)
+    if resolved_run_id is None and request_id:
+        resolved_run_id = runs_repo.resolve_run_id(request_id)
+    if resolved_run_id is None:
+        raise HTTPException(status_code=404, detail="Run not found")
     orchestrator = _build_run_orchestrator(
         getattr(request.app.state, "agent_v2_runtime", None)
     )
-    snapshot = orchestrator.load_snapshot(run_id)
+    snapshot = orchestrator.load_snapshot(resolved_run_id)
     if snapshot is None:
         raise HTTPException(status_code=404, detail="Run not found")
     _require_conversation_owner(request, snapshot.conversation_id)
@@ -530,6 +548,11 @@ async def chat_v2_events(
     run_id: str,
     request: Request,
     from_seq: int = Query(default=0, ge=0, description="Replay events with sequence > from_seq"),
+    request_id: str = Query(
+        default="",
+        description="A05/AC4 fallback: client idempotency key used to resolve "
+        "the run when the path run_id is empty or unknown.",
+    ),
 ):
     """Replay stored events for reconnect — spec AC4.
 
@@ -537,13 +560,23 @@ async def chat_v2_events(
     in ascending order. ``from_seq=0`` returns the full stream. Clients
     use this to reconnect after a network drop without re-executing tools.
 
+    A05: the path ``run_id`` may be a ``request_id`` (same AC4 semantics
+    as cancel) and ``?request_id=`` provides a fallback when the client
+    only knows its idempotency key.
+
     Response shape: ``{"run_id": ..., "from_seq": N, "events": [...]}``
     where each event matches the v2 wire envelope.
     """
     runs_repo = _get_runs_repo(request)
-    # Verify the run exists so we return 404 instead of an empty event list
-    # for an unknown run_id.
-    run = runs_repo.get_run(run_id)
+    # A05: resolve either identifier before the existence check so an
+    # unknown path id with a known request_id still replays (AC4 parity
+    # with cancel).
+    resolved_run_id = runs_repo.resolve_run_id(run_id)
+    if resolved_run_id is None and request_id:
+        resolved_run_id = runs_repo.resolve_run_id(request_id)
+    if resolved_run_id is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    run = runs_repo.get_run(resolved_run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
     _require_conversation_owner(request, run.conversation_id)
@@ -551,9 +584,9 @@ async def chat_v2_events(
     orchestrator = _build_run_orchestrator(
         getattr(request.app.state, "agent_v2_runtime", None)
     )
-    events = orchestrator.load_events(run_id, from_seq=from_seq)
+    events = orchestrator.load_events(resolved_run_id, from_seq=from_seq)
     return {
-        "run_id": run_id,
+        "run_id": resolved_run_id,
         "from_seq": from_seq,
         "events": events,
     }
