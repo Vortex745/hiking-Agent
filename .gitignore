@@ -102,3 +102,29 @@ verify.json
 .codebuddy/
 .vercel
 .neon
+
+# ============================================================
+# Runtime State / Agent Scratch
+# ============================================================
+/agent_state/
+/rag_checkpoints/
+/ai-service/agent_state/
+/ai-service/data/
+/ai-service/rag_checkpoints/
+/ai-service/ai-service/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+writer.lock
+/.scratch/
+/.tmp-ticket*/
+/.codegraph/
+/.qoder/
+/.omx/
+/.archive/
+/.wayfinder/
+/evals/promptfoo/node_modules/
+/evals/promptfoo/.runs/
+
+# langfuse 本地编排的密钥不入库
+third_party/langfuse/.env
