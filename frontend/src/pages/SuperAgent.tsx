@@ -15,6 +15,8 @@ import {
   deleteV2Memory,
   clearV2Memories,
   exportV2Memories,
+  planV2Recovery,
+  V2_TERMINAL_RUN_STATUSES,
   type V2EventEnvelope,
   type V2ApprovalRequest,
   type V2Memory,
@@ -109,6 +111,13 @@ const CHAT_ID_KEY = 'ai-hiking-agent-chat-id'
 const ACTIVE_SESSION_KEY = 'ai-hiking-agent-active-session'
 const SENSITIVE_LOCATION_FIELDS = new Set(['latitude', 'longitude', 'accuracy'])
 const USER_CANCELLED_MESSAGE = '用户主动取消回答，请补充内容或点击重试。'
+
+// A06: recovery polling. A running run cannot be re-attached (a duplicate
+// POST /chat/sse with the same request_id replays stored events and closes
+// without a terminal), so recovery replays once and then polls the
+// snapshot until the run reaches a terminal or pauses.
+const RECOVERY_POLL_INTERVAL_MS = 3_000
+const RECOVERY_POLL_TIMEOUT_MS = 10 * 60 * 1_000
 
 // Ticket 08: persisted v2 run state for refresh recovery (spec AC3).
 // We store the active run_id + sequence cursor + conversation_id so a
@@ -804,60 +813,55 @@ function SuperAgent() {
     })
   }, [v2ApprovalState, attachV2Stream, handleV2Event, handleV2Terminal])
 
-  // Ticket 08 + 11: refresh recovery (spec AC3 + AC6). On mount, if a v2
-  // run was active and has not reached a terminal state, fetch the
-  // snapshot and replay events from the stored cursor. This restores
-  // the assistant text, tool trace, and — if paused — the pending
-  // approval prompt without re-sending the user message.
+  // Ticket 08 + 11 + A06: refresh recovery as an explicit state machine
+  // driven by planV2Recovery. On mount: a locally terminal run skips the
+  // network entirely; otherwise one snapshot fetch decides between clear
+  // (run unknown), single replay (terminal), approval re-show (paused),
+  // or replay + snapshot polling (still running). Polling replaces the
+  // old stream re-attach, which replayed without a terminal and surfaced
+  // as a spurious stream error.
   useEffect(() => {
     const persisted = v2RunRef.current
     if (!persisted) return
     const persistedRun = persisted
     let cancelled = false
+    let pollTimer: ReturnType<typeof setTimeout> | null = null
 
-    async function recoverV2Run() {
-      try {
-        const snapshot = await fetchV2Snapshot(persistedRun.run_id)
-        if (cancelled || snapshot === null) {
-          // Run unknown on the server (e.g. DB reset). Clear local state.
-          v2RunRef.current = null
-          saveV2PersistedRun(null)
-          setV2ApprovalState('idle')
-          return
-        }
+    // A05: snapshot/events resolve the request_id too, so the recovery
+    // identifier is run_id || request_id — the empty run_id case (refresh
+    // before the first event) recovers via the idempotency key.
+    const recoveryId = persistedRun.run_id || persistedRun.request_id
 
-        // Replay events from the stored cursor. The reducer is idempotent
-        // w.r.t. sequence monotonicity, so replaying already-seen events
-        // is a no-op.
-        const replay = await fetchV2Events(persistedRun.run_id, persistedRun.sequence_cursor)
-        if (cancelled) return
+    const clearPersisted = () => {
+      v2RunRef.current = null
+      saveV2PersistedRun(null)
+      setV2ApprovalState('idle')
+      setPendingApproval(null)
+    }
 
-        const replayEnvelopes: V2EventEnvelope[] = replay.events.map(evt => ({
-          version: '2',
-          sequence: evt.sequence,
-          type: evt.type,
-          payload: evt.payload,
-          request_id: evt.request_id,
-          conversation_id: evt.conversation_id,
-          run_id: evt.run_id,
-          event_id: evt.event_id,
-          timestamp: evt.timestamp,
-        }))
-        const next = reduceV2Events(v2StateRef.current, replayEnvelopes)
-        v2StateRef.current = next
+    const applyReplay = async (): Promise<V2ConversationState> => {
+      const replay = await fetchV2Events(recoveryId, persistedRun.sequence_cursor)
+      const replayEnvelopes: V2EventEnvelope[] = replay.events.map(evt => ({
+        version: '2',
+        sequence: evt.sequence,
+        type: evt.type,
+        payload: evt.payload,
+        request_id: evt.request_id,
+        conversation_id: evt.conversation_id,
+        run_id: evt.run_id,
+        event_id: evt.event_id,
+        timestamp: evt.timestamp,
+      }))
+      const next = reduceV2Events(v2StateRef.current, replayEnvelopes)
+      v2StateRef.current = next
 
-        // Restore the user message + assistant placeholder if we have one.
-        // We only do this when messages is empty (fresh page load) to avoid
-        // duplicating an already-rendered user turn.
-        setMessages(prev => {
-          if (prev.length > 0) return prev
+      setMessages(prev => {
+        if (prev.length === 0) {
+          // Fresh page load: restore the user message + assistant turn.
           const restored: Message[] = []
           if (persistedRun.user_message) {
             restored.push({ role: 'user', content: persistedRun.user_message })
           }
-          // Ticket 11: keep the assistant placeholder streaming iff the
-          // run is still active (running OR paused). Paused runs render
-          // the approve/reject UI on top of the placeholder.
           const isActive = next.status === 'running' || next.status === 'paused'
           if (next.assistantText || isActive) {
             restored.push({
@@ -870,61 +874,132 @@ function SuperAgent() {
             })
           }
           return restored
-        })
-
-        // Update the persisted cursor so the next recovery starts from here.
-        v2RunRef.current = {
-          ...persistedRun,
-          sequence_cursor: next.sequenceCursor,
-          pending_approval: next.pendingApproval,
-          v2_status: next.status === 'idle' ? undefined : next.status,
         }
-        saveV2PersistedRun(v2RunRef.current)
+        // Polling replays: refresh the trailing assistant message in
+        // place so text/artifacts produced while polling show up when
+        // the run finishes.
+        const updated = [...prev]
+        const last = updated[updated.length - 1]
+        if (last && last.role === 'assistant') {
+          updated[updated.length - 1] = {
+            ...last,
+            content: next.assistantText,
+            isStreaming: !isV2Terminal(next),
+            artifacts: next.artifacts.length > 0 ? next.artifacts : undefined,
+          }
+        }
+        return updated
+      })
 
+      // Update the persisted cursor so the next recovery starts from here.
+      v2RunRef.current = {
+        ...persistedRun,
+        sequence_cursor: next.sequenceCursor,
+        pending_approval: next.pendingApproval,
+        v2_status: next.status === 'idle' ? undefined : next.status,
+      }
+      saveV2PersistedRun(v2RunRef.current)
+      return next
+    }
+
+    const showApprovalPrompt = (next: V2ConversationState) => {
+      setV2ApprovalState('idle')
+      setPendingApproval(next.pendingApproval)
+    }
+
+    const startPolling = () => {
+      const deadline = Date.now() + RECOVERY_POLL_TIMEOUT_MS
+      const schedule = () => {
+        if (Date.now() >= deadline) {
+          // Cap: stop polling and hand the decision back to the user.
+          setMessages(prev => {
+            const updated = [...prev]
+            const last = updated[updated.length - 1]
+            if (last && last.role === 'assistant') {
+              const separator = last.content.trim() ? '\n\n' : ''
+              updated[updated.length - 1] = {
+                ...last,
+                content: `${last.content}${separator}[提示] 任务耗时较长，后台仍在执行；可稍后刷新查看结果。`,
+                isStreaming: false,
+              }
+            }
+            return updated
+          })
+          return
+        }
+        pollTimer = setTimeout(() => { void poll() }, RECOVERY_POLL_INTERVAL_MS)
+      }
+      const poll = async () => {
+        if (cancelled) return
+        try {
+          const snapshot = await fetchV2Snapshot(recoveryId)
+          if (cancelled) return
+          if (snapshot === null) {
+            // Run row vanished mid-poll (server reaped it) — render
+            // whatever the event log still holds and stop.
+            await applyReplay()
+            if (cancelled) return
+            clearPersisted()
+            return
+          }
+          if (V2_TERMINAL_RUN_STATUSES.has(snapshot.status)) {
+            await applyReplay()
+            if (cancelled) return
+            clearPersisted()
+            return
+          }
+          if (snapshot.status === 'paused') {
+            // Approval became necessary while polling — re-show the
+            // prompt; the persisted run stays for handleV2Approval.
+            const next = await applyReplay()
+            if (cancelled) return
+            showApprovalPrompt(next)
+            return
+          }
+          schedule()
+        } catch {
+          // Transient network error — keep polling until the deadline.
+          schedule()
+        }
+      }
+      schedule()
+    }
+
+    async function recoverV2Run() {
+      try {
+        // First pass without a snapshot: only the local-only decisions
+        // (skip / local-terminal) can be made here.
+        const prePlan = planV2Recovery(persistedRun, null)
+        if (prePlan.kind === 'skip' || prePlan.kind === 'local-terminal') return
+
+        const snapshot = await fetchV2Snapshot(recoveryId)
+        if (cancelled) return
+        const plan = planV2Recovery(persistedRun, snapshot ? snapshot.status : null)
+
+        if (plan.kind === 'clear') {
+          // Run unknown on the server (e.g. DB reset). Clear local state.
+          clearPersisted()
+          return
+        }
+        if (plan.kind === 'replay-terminal') {
+          await applyReplay()
+          if (cancelled) return
+          clearPersisted()
+          return
+        }
+        const next = await applyReplay()
+        if (cancelled) return
         if (isV2Terminal(next)) {
-          // Terminal already reached: clear the persisted run.
-          v2RunRef.current = null
-          saveV2PersistedRun(null)
-          setV2ApprovalState('idle')
-        } else if (isV2Paused(next)) {
-          // Ticket 11 spec AC6: paused run — do NOT re-attach a stream.
-          // The run is awaiting user approval. The approve/reject UI
-          // renders from ``next.pendingApproval``; the user's decision
-          // drives the resume flow via handleV2Approval.
-          setV2ApprovalState('idle')
-          setPendingApproval(next.pendingApproval)
-        } else {
-          // Still running: re-attach a streaming connection to continue
-          // receiving events. The server returns the existing run
-          // idempotently via request_id.
-          const body = JSON.stringify({
-            message: persistedRun.user_message,
-            request_id: persistedRun.request_id,
-            conversation_id: persistedRun.conversation_id,
-            profile_id: 'chat',
-          })
-          attachV2Stream(API.chatV2SSE, body, {
-            onOpen: () => setConnectionStatus('connected'),
-            onEvent: handleV2Event,
-            onTerminal: handleV2Terminal,
-            onError: (error) => {
-              setConnectionStatus('error')
-              setMessages(prev => {
-                const updated = [...prev]
-                const last = updated[updated.length - 1]
-                if (last && last.role === 'assistant') {
-                  updated[updated.length - 1] = {
-                    ...last,
-                    content: `${last.content}\n\n[连接错误] ${error}`,
-                    isStreaming: false,
-                  }
-                }
-                return updated
-              })
-              setIsSending(false)
-            },
-          })
+          clearPersisted()
+          return
         }
+        if (isV2Paused(next)) {
+          // Ticket 11 spec AC6: paused run — do NOT re-attach a stream.
+          // The approve/reject UI renders from next.pendingApproval.
+          showApprovalPrompt(next)
+          return
+        }
+        startPolling()
       } catch {
         // Recovery failed (network/snapshot error). Leave the persisted
         // run in place; the user can retry by refreshing again.
@@ -932,9 +1007,12 @@ function SuperAgent() {
     }
 
     void recoverV2Run()
-    return () => { cancelled = true }
+    return () => {
+      cancelled = true
+      if (pollTimer) clearTimeout(pollTimer)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [handleV2Event, handleV2Terminal, attachV2Stream])
+  }, [])
 
   // Persist
   useEffect(() => {

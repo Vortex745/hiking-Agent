@@ -405,6 +405,55 @@ export interface V2ReplayResponse {
   }>
 }
 
+// ---- Recovery planning (A06) ----------------------------------------------
+
+/** Run-level terminal statuses, as returned by /snapshot and persisted as v2_status. */
+export const V2_TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set([
+  'done',
+  'error',
+  'cancelled',
+])
+
+export type V2RecoveryPlan =
+  | { kind: 'skip' } // no usable id — nothing to recover, keep local state
+  | { kind: 'local-terminal' } // persisted status already terminal — trust it, skip the network
+  | { kind: 'clear' } // server has no record — drop the local recovery context
+  | { kind: 'replay-terminal' } // server terminal — replay once and finalize
+  | { kind: 'replay-paused' } // server paused — replay and re-show the approval prompt
+  | { kind: 'poll' } // server still running — replay, then poll the snapshot
+
+/**
+ * Pure recovery decision (A06). Fed the persisted run context and the
+ * snapshot status (``null`` when the snapshot 404'd or was not fetched).
+ * The recovery effect in SuperAgent executes the returned plan.
+ *
+ * A running run cannot be re-attached: a duplicate POST /chat/sse with
+ * the same request_id replays stored events and closes the stream
+ * WITHOUT a terminal (the run is not done server-side), which the
+ * client would report as ``stream_closed_without_terminal``. Polling
+ * the snapshot until the run reaches a terminal or pauses is the
+ * recovery path instead.
+ */
+export function planV2Recovery(
+  persisted: { run_id?: string; request_id?: string; v2_status?: string },
+  snapshotStatus: string | null,
+): V2RecoveryPlan {
+  // Empty run_id (refresh before the first event) with no request_id
+  // either — nothing identifies the run; keep the local context so the
+  // server-side run is not orphaned by a local reset.
+  if (!persisted.run_id && !persisted.request_id) return { kind: 'skip' }
+  // Ticket 08 documented contract: a locally terminal run skips the
+  // snapshot fetch entirely (avoids the 404 race when the server reaped
+  // the run row).
+  if (persisted.v2_status && V2_TERMINAL_RUN_STATUSES.has(persisted.v2_status)) {
+    return { kind: 'local-terminal' }
+  }
+  if (snapshotStatus === null) return { kind: 'clear' }
+  if (V2_TERMINAL_RUN_STATUSES.has(snapshotStatus)) return { kind: 'replay-terminal' }
+  if (snapshotStatus === 'paused') return { kind: 'replay-paused' }
+  return { kind: 'poll' }
+}
+
 export interface V2CancelResponse {
   accepted: boolean
   reason: string
