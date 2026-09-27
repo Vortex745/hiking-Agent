@@ -684,6 +684,25 @@ function SuperAgent() {
         ]
       }
       if (event.type === 'error') {
+        const code = typeof event.payload.code === 'string' ? event.payload.code : ''
+        if (code === 'conversation_forbidden') {
+          // A07: conversation ownership follows the subject cookie. After
+          // a cookie loss the old chatId is dead — rotate to a fresh
+          // conversation and explain instead of surfacing the raw
+          // backend error. Old turns stay visible read-only in history.
+          const next = createChatId()
+          localStorage.setItem(CHAT_ID_KEY, next)
+          chatIdRef.current = next
+          const separator = last.content.trim() ? '\n\n' : ''
+          return [
+            ...updated.slice(0, -1),
+            {
+              ...last,
+              content: `${last.content}${separator}[提示] 原会话已失效，已为你开启新对话，请重新发送消息。`,
+              isStreaming: false,
+            },
+          ]
+        }
         const message =
           (typeof event.payload.message === 'string' && event.payload.message) ||
           (typeof event.payload.code === 'string' && event.payload.code) ||
