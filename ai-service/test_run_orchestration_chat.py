@@ -456,3 +456,40 @@ def test_leases_acquired_and_released_on_stream_exit(tmp_path: Path):
 
 def types_of(items: list[Any]) -> list[str]:
     return [e.type for e in items]
+
+
+def test_chat_tool_result_carries_server_id_and_content(tmp_path: Path):
+    """A08: audit → tool_result conversion exposes server_id (the old
+    ``server`` rename lost the field on the wire) and a human-readable
+    content summary so the trace panel shows what each step did."""
+    kernel_calls: list[dict[str, Any]] = []
+    audits = [
+        {"tool": "weather_lookup", "phase": "result", "ok": True, "duration_ms": 1234},
+        {
+            "phase": "mcp_unavailable",
+            "ok": False,
+            "code": "mcp_server_unavailable",
+            "server_id": "amap",
+        },
+        {"tool": "file_write", "phase": "denied", "code": "denied_by_gate"},
+    ]
+    orch = _orchestrator(tmp_path, kernel_calls, kernel_result=("回答", audits))
+
+    items = _stream(orch, _flow_req())
+    results = {e.payload.get("tool"): e.payload for e in items if e.type == "tool_result"}
+
+    weather = results["weather_lookup"]
+    assert weather["status"] == "ok"
+    assert "server" not in weather  # old renamed key must not return
+    assert weather["content"] == "完成，耗时 1234ms"
+
+    # The mcp_unavailable audit has no tool name — the payload's tool
+    # key falls back to server_id.
+    amap = results["amap"]
+    assert amap["server_id"] == "amap"
+    assert "不可用" in amap["content"]
+
+    denied = results["file_write"]
+    assert denied["status"] == "denied"
+    assert denied["reason"] == "denied_by_gate"
+    assert "拒绝" in denied["content"]

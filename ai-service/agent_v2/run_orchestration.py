@@ -750,6 +750,30 @@ def knowledge_search_attempted_without_evidence(
     return attempted and not has_hiking_knowledge_evidence(audit_entries)
 
 
+def _tool_result_summary(entry: dict[str, Any]) -> str:
+    """A08: human-readable one-liner for the public ``tool_result`` payload.
+
+    The trace panel renders this as the step description; without it the
+    chat-path tool rows (audit-derived, no natural ``content``) render
+    empty. Explicit messages win, then per-phase summaries, then a
+    duration line.
+    """
+    explicit = entry.get("message") or entry.get("reason")
+    if isinstance(explicit, str) and explicit:
+        return explicit
+    phase = entry.get("phase")
+    if phase == "mcp_unavailable":
+        return f"MCP 服务 {entry.get('server_id') or '未知'} 当前不可用"
+    if phase == "denied":
+        return f"工具被拒绝执行（{entry.get('code') or 'denied'}）"
+    if entry.get("ok") is False:
+        return f"执行失败（{entry.get('code') or 'error'}）"
+    duration = entry.get("duration_ms")
+    if isinstance(duration, (int, float)) and duration >= 0:
+        return f"完成，耗时 {duration:.0f}ms"
+    return "已完成"
+
+
 def compose_route_plan_system_prompt(
     req: ChatFlowRequest, profile: CapabilityProfile
 ) -> str:
@@ -3044,13 +3068,21 @@ class RunOrchestrator:
             payload: dict[str, Any] = {"tool": entry.get("tool") or entry.get("server_id")}
             if entry.get("phase") == "mcp_unavailable":
                 payload["status"] = "mcp_server_unavailable"
-                payload["server"] = entry.get("server_id")
             elif entry.get("phase") == "denied":
                 payload["status"] = "denied"
                 payload["reason"] = entry.get("code")
             else:
                 payload["status"] = "ok" if entry.get("ok") else str(entry.get("code") or "error")
                 payload["duration_ms"] = entry.get("duration_ms")
+            # A08: the MCP source keeps its audit field name (server_id).
+            # The old ``server`` rename made the field vanish for the
+            # frontend, which reads server_id — "which source is down"
+            # was lost on the wire.
+            if entry.get("server_id"):
+                payload["server_id"] = entry.get("server_id")
+            # A08: human-readable one-liner so the trace panel shows what
+            # each step did instead of an empty row.
+            payload["content"] = _tool_result_summary(entry)
             # Spec #13 phase 2 (T05): bounded evidence (has_chunks/sources/
             # chunk summaries) rides on the public tool_result event so the
             # RAG-page SSE adapter can render the documents panel.
