@@ -285,6 +285,37 @@ const convertMessage = (msg: Message, index: number): ThreadMessage => {
     });
   }
 
+  // A09: aggregate retrieval evidence from tool_result payloads into a
+  // message-level 检索来源 part (dedup by source+preview).
+  const evidenceSeen = new Set<string>();
+  const evidenceChunks: Array<{ title?: string; source: string; preview: string }> = [];
+  for (const evt of msg.traceEvents || []) {
+    const ev = evt.metadata?.evidence as { has_chunks?: boolean; chunks?: Array<Record<string, unknown>> } | undefined;
+    if (!ev || !ev.has_chunks || !Array.isArray(ev.chunks)) continue;
+    for (const chunk of ev.chunks) {
+      if (!chunk || typeof chunk !== 'object') continue;
+      const source = typeof chunk.source === 'string' ? chunk.source : '';
+      const preview = typeof chunk.preview === 'string' ? chunk.preview : '';
+      if (!source && !preview) continue;
+      const key = `${source}|${preview}`;
+      if (evidenceSeen.has(key)) continue;
+      evidenceSeen.add(key);
+      evidenceChunks.push({
+        title: typeof chunk.title === 'string' ? chunk.title : undefined,
+        source,
+        preview,
+      });
+    }
+  }
+  if (evidenceChunks.length > 0) {
+    content.push({
+      type: "tool-call",
+      toolCallId: `evidence-${index}`,
+      toolName: "evidence",
+      args: evidenceChunks
+    });
+  }
+
   return {
     id: `msg-${index}`,
     role: msg.role,

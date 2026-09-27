@@ -321,10 +321,6 @@ const CustomToolCall = (part: any) => {
   const toolName = part.toolName || part.part?.toolName;
   const args = part.args || part.part?.args;
   
-  if (toolName === "processSteps") {
-    return null;
-  }
-  
   if (toolName === "traceEvents") {
     const traceEvents = args as any[];
     if (!traceEvents || traceEvents.length === 0) return null;
@@ -398,27 +394,28 @@ const CustomToolCall = (part: any) => {
     return <ArtifactList artifacts={artifactList} />;
   }
 
-  if (part.toolName === "searchSummary") {
-    const summary = part.args;
-    if (!summary || summary.documents.length === 0) return null;
+  if (part.toolName === "evidence") {
+    // A09: retrieval sources aggregated from tool_result evidence — the
+    // chat knowledge tool rides citations on the public payload.
+    const sources = Array.isArray(part.args) ? part.args : [];
+    if (sources.length === 0) return null;
     return (
       <details className="mt-4 border-t border-border/40 pt-3 text-[13px] text-text-secondary">
         <summary className="cursor-pointer select-none font-medium text-text-primary outline-none">
-          文档搜索 · {summary.searchedCount} 篇文档 / {summary.matchedChunks} 个片段
+          检索来源 · {sources.length} 条片段
         </summary>
         <div className="mt-3 space-y-3 opacity-90">
-          {summary.documents.map((doc: any, idx: number) => (
-            <div key={`${doc.title}-${idx}`} className="border-l-2 border-primary/25 pl-3">
+          {sources.map((doc: any, idx: number) => (
+            <div key={`${doc.source}-${idx}`} className="border-l-2 border-primary/25 pl-3">
               <div className="font-medium text-text-primary">
-                {idx + 1}. {doc.title}
+                {idx + 1}. {doc.title || doc.source}
               </div>
               <div className="text-[12px] mt-0.5 opacity-70">
                 来源：{sourceLabel(doc.source)}
-                {doc.chunks ? ` · ${doc.chunks} 个片段` : ''}
               </div>
-              {doc.content && (
+              {doc.preview && (
                 <div className="mt-1.5 whitespace-pre-wrap text-text-secondary">
-                  {doc.content}
+                  {doc.preview}
                 </div>
               )}
             </div>
@@ -530,43 +527,6 @@ function getAgentLifecycle(events: any[], isRunning: boolean, hasText: boolean):
   ];
 }
 
-function getRagLifecycle(processSteps: string[], hasSearchSummary: boolean, isRunning: boolean, hasText: boolean): LifecycleStep[] {
-  const hasProcess = processSteps.length > 0;
-
-  return [
-    {
-      title: '接收问题',
-      detail: '构建 RAG 查询载荷并打开 SSE 连接',
-      state: 'complete',
-    },
-    {
-      title: '查询理解',
-      detail: '进行简单问题识别或查询改写',
-      state: stepState(hasProcess || hasText || hasSearchSummary, isRunning && !hasProcess && !hasText),
-    },
-    {
-      title: '知识检索',
-      detail: '向量检索、BM25 召回和候选片段融合',
-      state: stepState(hasSearchSummary, isRunning && hasProcess && !hasSearchSummary && !hasText),
-    },
-    {
-      title: '上下文组装',
-      detail: '筛选命中文档并准备回答上下文',
-      state: stepState(hasSearchSummary || hasText, isRunning && hasSearchSummary && !hasText),
-    },
-    {
-      title: '回答生成',
-      detail: '根据上下文流式输出最终回复',
-      state: stepState(hasText, isRunning && !hasText),
-    },
-    {
-      title: '完成收尾',
-      detail: '发送 done 事件并关闭本次流',
-      state: stepState(!isRunning && hasText, false),
-    },
-  ];
-}
-
 function getGenericLifecycle(isRunning: boolean, hasText: boolean): LifecycleStep[] {
   return [
     {
@@ -591,8 +551,6 @@ function buildLifecycle(content: readonly any[], isRunning: boolean) {
   const text = getMessageText(content).trim();
   const hasText = text.length > 0;
   const traceEvents = (getToolArgs(content, 'traceEvents') || []) as any[];
-  const processSteps = (getToolArgs(content, 'processSteps') || []) as string[];
-  const searchSummary = getToolArgs(content, 'searchSummary') as any;
 
   if (traceEvents.length > 0) {
     return {
@@ -602,20 +560,6 @@ function buildLifecycle(content: readonly any[], isRunning: boolean) {
         label: traceLabels[event?.type] || event?.type || '事件',
         content: String(event?.content || '').trim(),
       })).filter(event => event.content),
-    };
-  }
-
-  if (processSteps.length > 0 || searchSummary) {
-    const documentCount = typeof searchSummary?.searchedCount === 'number'
-      ? `命中 ${searchSummary.searchedCount} 篇文档 / ${searchSummary.matchedChunks || 0} 个片段`
-      : '';
-    return {
-      title: 'RAG 技术生命周期',
-      steps: getRagLifecycle(processSteps, Boolean(searchSummary), isRunning, hasText),
-      recentEvents: [
-        ...processSteps.slice(-3).map(step => ({ label: '流程', content: step })),
-        ...(documentCount ? [{ label: '检索', content: documentCount }] : []),
-      ],
     };
   }
 
