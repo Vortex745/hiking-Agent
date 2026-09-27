@@ -2,13 +2,8 @@ package handler
 
 import (
 	"bufio"
-	"bytes"
-	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,57 +15,16 @@ import (
 
 // ChatV2Handler proxies Chat v2 requests to the AI service.
 //
-// Ticket 07 — true streaming proxy for explicit v2 traffic. Unlike the
-// v1 SSE proxy, v2 NEVER buffers on Vercel: the handler rejects v2 SSE
-// with HTTP 503 when VERCEL is set, because durable run state cannot
-// live on ephemeral serverless storage (spec AC4). Non-streaming v2
-// endpoints (snapshot/cancel/events) are plain pass-through proxies.
+// Chat v2 is the only chat链路 — the v1 runtime selector / canary
+// bucketing was removed together with the v1 chat backend.
 //
-// All v1 routes and handlers remain unchanged — v2 is additive.
+// Ticket 07 — true streaming proxy. v2 NEVER buffers on Vercel: the
+// handler rejects v2 SSE with HTTP 503 when VERCEL is set, because
+// durable run state cannot live on ephemeral serverless storage
+// (spec AC4). Non-streaming v2 endpoints (snapshot/cancel/events) are
+// plain pass-through proxies.
 type ChatV2Handler struct {
 	aiServiceURL string
-	selector     *RuntimeSelector
-}
-
-type RuntimeSelector struct {
-	Secret      string
-	Canary      string
-	Force       string
-	Environment string
-}
-
-func (s RuntimeSelector) Select(conversationID string) string {
-	if s.Force == "v1" {
-		return "v1"
-	}
-	trusted := s.Environment == "staging" || s.Environment == "trusted" || s.Environment == "internal"
-	if s.Force == "v2" {
-		if trusted {
-			return "v2"
-		}
-		return "v1"
-	}
-	if s.Canary == "internal" {
-		if trusted {
-			return "v2"
-		}
-		return "v1"
-	}
-
-	percentages := map[string]uint64{
-		"0": 0, "1": 1, "5": 5, "25": 25, "50": 50, "100": 100,
-	}
-	percentage, ok := percentages[s.Canary]
-	if !ok || s.Secret == "" || conversationID == "" {
-		return "v1"
-	}
-	mac := hmac.New(sha256.New, []byte(s.Secret))
-	_, _ = mac.Write([]byte(conversationID))
-	bucket := binary.BigEndian.Uint64(mac.Sum(nil)[:8]) % 100
-	if bucket < percentage {
-		return "v2"
-	}
-	return "v1"
 }
 
 const subjectCookieName = "hiking_subject"
@@ -132,24 +86,8 @@ func forwardResponseCookies(c *gin.Context, resp *http.Response) {
 }
 
 // NewChatV2Handler creates a new ChatV2Handler.
-func NewChatV2Handler(aiServiceURL string, selectors ...RuntimeSelector) *ChatV2Handler {
-	handler := &ChatV2Handler{aiServiceURL: aiServiceURL}
-	if len(selectors) > 0 {
-		handler.selector = &selectors[0]
-	}
-	return handler
-}
-
-func (h *ChatV2Handler) Runtime(c *gin.Context) {
-	conversationID := c.Param("conversation_id")
-	if conversationID == "" || h.selector == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "runtime selection unavailable"})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"conversation_id": conversationID,
-		"runtime":         h.selector.Select(conversationID),
-	})
+func NewChatV2Handler(aiServiceURL string) *ChatV2Handler {
+	return &ChatV2Handler{aiServiceURL: aiServiceURL}
 }
 
 // ChatV2SSE proxies a Chat v2 SSE run to the AI service with true
@@ -171,27 +109,6 @@ func (h *ChatV2Handler) ChatV2SSE(c *gin.Context) {
 			"error": "Chat v2 streaming is not available on Vercel; use the long-lived Docker gateway.",
 		})
 		return
-	}
-	if h.selector != nil {
-		body, err := io.ReadAll(c.Request.Body)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
-			return
-		}
-		c.Request.Body = io.NopCloser(bytes.NewReader(body))
-		var request struct {
-			ConversationID string `json:"conversation_id"`
-		}
-		if json.Unmarshal(body, &request) != nil || request.ConversationID == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "conversation_id is required"})
-			return
-		}
-		if h.selector.Select(request.ConversationID) != "v2" {
-			c.JSON(http.StatusConflict, gin.H{
-				"error": gin.H{"code": "runtime_v1_required", "retryable": true},
-			})
-			return
-		}
 	}
 	if !ensureSubjectCookie(c) {
 		return

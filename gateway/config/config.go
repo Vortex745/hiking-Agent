@@ -9,10 +9,6 @@ type Config struct {
 	Port           string
 	AIServiceURL   string
 	AllowedOrigins string
-	RuntimeSecret  string
-	ChatV2Canary   string
-	RuntimeForce   string
-	RuntimeEnv     string
 }
 
 // Load reads configuration from environment variables.
@@ -21,10 +17,6 @@ func Load() *Config {
 		Port:           getEnv("PORT", "8080"),
 		AIServiceURL:   getEnv("AI_SERVICE_URL", "http://localhost:8000"),
 		AllowedOrigins: getEnv("ALLOWED_ORIGINS", defaultAllowedOrigins),
-		RuntimeSecret:  getEnv("CHAT_RUNTIME_SECRET", ""),
-		ChatV2Canary:   getEnv("CHAT_V2_CANARY", "0"),
-		RuntimeForce:   getEnv("CHAT_RUNTIME_FORCE", ""),
-		RuntimeEnv:     getEnv("CHAT_RUNTIME_ENVIRONMENT", "production"),
 	}
 }
 

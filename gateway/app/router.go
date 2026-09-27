@@ -36,29 +36,15 @@ func NewRouter(cfg *config.Config) *gin.Engine {
 	r.Use(middleware.RateLimitMiddleware(60, 1*time.Minute))
 
 	healthHandler := handler.NewHealthHandler(cfg.AIServiceURL)
-	chatHandler := handler.NewChatHandler(cfg.AIServiceURL)
-	chatV2Handler := handler.NewChatV2Handler(cfg.AIServiceURL, handler.RuntimeSelector{
-		Secret: cfg.RuntimeSecret, Canary: cfg.ChatV2Canary,
-		Force: cfg.RuntimeForce, Environment: cfg.RuntimeEnv,
-	})
+	chatV2Handler := handler.NewChatV2Handler(cfg.AIServiceURL)
 	modelsHandler := handler.NewModelsHandler(cfg.AIServiceURL)
 	ragHandler := handler.NewRAGHandler(cfg.AIServiceURL)
-	toolsHandler := handler.NewToolsHandler(cfg.AIServiceURL)
 
 	r.GET("/health", healthHandler.Health)
-	r.GET("/api/chat/runtime/:conversation_id", chatV2Handler.Runtime)
 
+	// RAG / models routes (still served under /api/v1 by the AI service).
 	api := r.Group("/api/v1")
 	{
-		api.GET("/chat/health", chatHandler.ChatHealth)
-		api.POST("/chat/sync", chatHandler.ChatSync)
-		api.POST("/chat/sse", chatHandler.ChatSSE)
-		api.GET("/chat/history/:chatId", chatHandler.ChatHistory)
-		api.DELETE("/chat/history/:chatId", chatHandler.ChatClearHistory)
-		api.POST("/chat/confirm", chatHandler.ChatConfirm)
-		api.GET("/chat/pending/:chatId", chatHandler.ChatPending)
-		api.GET("/artifacts/*filePath", chatHandler.ArtifactDownload)
-
 		api.POST("/models/fetch", modelsHandler.ModelsFetch)
 
 		api.GET("/rag/health", ragHandler.RagHealth)
@@ -67,13 +53,11 @@ func NewRouter(cfg *config.Config) *gin.Engine {
 		api.GET("/rag/documents", ragHandler.RagDocuments)
 		api.GET("/rag/history/:chatId", ragHandler.RagHistory)
 		api.DELETE("/rag/history/:chatId", ragHandler.RagClearHistory)
-
-		api.GET("/tools/health", toolsHandler.ToolsHealth)
 	}
 
-	// Ticket 07: Chat v2 routes. The SSE endpoint rejects Vercel at the
-	// handler level (durable run state requires the long-lived Docker
-	// gateway). All v1 routes above remain unchanged.
+	// Chat v2 routes — the only chat链路 (v1 chat removed). The SSE
+	// endpoint rejects Vercel at the handler level (durable run state
+	// requires the long-lived Docker gateway).
 	v2 := r.Group("/api/v2")
 	{
 		v2.POST("/chat/sse", chatV2Handler.ChatV2SSE)
