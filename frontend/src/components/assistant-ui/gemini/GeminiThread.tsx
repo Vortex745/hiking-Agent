@@ -626,7 +626,7 @@ const LifecycleHoverPanel = ({
           ? 'fixed left-0 top-0 max-h-[72vh] will-change-transform'
           : `absolute left-1/2 -translate-x-1/2 ${
               flipBelow ? 'top-full mt-2' : 'bottom-full mb-2'
-            } max-h-[min(420px,80vh)] overflow-y-auto`
+            } max-h-[min(420px,80vh)]`
       }`}
       style={pinned ? { transform: `translate3d(${position.x}px, ${position.y}px, 0)` } : undefined}
       data-lifecycle-panel={pinned ? 'pinned' : 'hover'}
@@ -686,7 +686,7 @@ const LifecycleHoverPanel = ({
         const safeIdx = Math.min(Math.max(sliderIndex, 0), maxIdx);
         const currentEvent = lifecycle.recentEvents[safeIdx];
         return (
-          <div className="mt-2 flex min-h-0 flex-1 flex-col border-t border-black/10 pt-2 dark:border-white/10">
+          <div className="mt-2 flex min-h-0 flex-1 flex-col overflow-y-auto border-t border-black/10 pt-2 dark:border-white/10">
             <div className="mb-1.5 shrink-0 flex items-center justify-between px-1.5">
               <span className="text-[11px] font-medium text-[#5f6368] dark:text-[#bdc1c6]">事件流程</span>
               <span className="text-[10px] tabular-nums text-[#5f6368] dark:text-[#bdc1c6] opacity-70">{safeIdx + 1} / {lifecycle.recentEvents.length}</span>
