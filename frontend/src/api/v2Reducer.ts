@@ -32,11 +32,12 @@ import type {
   V2EventType,
   V2ApprovalRequest,
   V2MemoryCandidate,
+  V2Artifact,
 } from './chatV2'
 import { TERMINAL_V2_EVENT_TYPES } from './chatV2'
 
 export interface V2ToolTrace {
-  type: 'tool_call' | 'tool_result'
+  type: 'tool_call' | 'tool_result' | 'artifact_progress'
   tool: string
   server_id?: string
   status?: string
@@ -93,6 +94,19 @@ export interface V2ConversationState {
    */
   resumeErrorMessage: string
   pendingMemoryConsent: V2MemoryCandidate | null
+  /**
+   * A02: artifacts delivered during the current run via
+   * ``artifact.available`` (in arrival order). The UI assigns these to
+   * the active assistant message; recovery rebuilds the message from
+   * here. Cleared never mid-run — a run can deliver multiple artifacts.
+   */
+  artifacts: V2Artifact[]
+  /**
+   * A02: human-review notices from ``effect.outcome_unknown`` — the
+   * server emits these before the terminal error so the client can show
+   * "需要人工核查" context beyond the bare error text.
+   */
+  reviewNotices: string[]
 }
 
 export const initialV2State: V2ConversationState = {
@@ -108,6 +122,8 @@ export const initialV2State: V2ConversationState = {
   lastApprovalDecision: null,
   resumeErrorMessage: '',
   pendingMemoryConsent: null,
+  artifacts: [],
+  reviewNotices: [],
 }
 
 /**
@@ -208,6 +224,51 @@ export function reduceV2Event(
             content: readString(event.payload, 'content'),
             sequence: event.sequence,
           },
+        ],
+      }
+
+    case 'artifact_candidate':
+      // A02: the sandbox has produced a candidate artifact and host-side
+      // export is pending. Surface as a trace line; the download card
+      // only appears on artifact.available.
+      return {
+        ...base,
+        status: 'running',
+        toolTrace: [
+          ...base.toolTrace,
+          {
+            type: 'artifact_progress',
+            tool: readString(event.payload, 'tool') || 'artifact',
+            content:
+              readString(event.payload, 'message') || '正在生成产物…',
+            sequence: event.sequence,
+          },
+        ],
+      }
+
+    case 'artifact.available':
+      // A02: collect the verified artifact (payload carries ONLY opaque
+      // artifact_id + public metadata per spec AC3). The UI renders a
+      // download card pointing at /api/v2/artifacts/{artifact_id}.
+      {
+        const artifact = readArtifact(event.payload)
+        return artifact
+          ? { ...base, status: 'running', artifacts: [...base.artifacts, artifact] }
+          : { ...base, status: 'running', droppedCount: base.droppedCount + 1 }
+      }
+
+    case 'effect.outcome_unknown':
+      // A02: a side effect finished with an unknown outcome — the server
+      // contract emits this BEFORE the terminal error so the client can
+      // show the human-review context, not just the bare error text.
+      return {
+        ...base,
+        status: 'running',
+        reviewNotices: [
+          ...base.reviewNotices,
+          readString(event.payload, 'message') ||
+            readString(event.payload, 'code') ||
+            '部分操作结果未知，需要人工核查',
         ],
       }
 
@@ -368,6 +429,29 @@ function readObject(
     return value as Record<string, unknown>
   }
   return undefined
+}
+
+/**
+ * Helper: read the ``artifact.available`` payload into a typed
+ * ``V2Artifact``. Returns null unless the two identity fields are
+ * present — a malformed artifact payload must not crash the reducer.
+ * Exported for the UI layer, which attaches artifacts to messages.
+ */
+export function readArtifact(payload: Record<string, unknown>): V2Artifact | null {
+  const artifactId = payload['artifact_id']
+  const filename = payload['public_filename']
+  if (typeof artifactId !== 'string' || !artifactId) return null
+  if (typeof filename !== 'string' || !filename) return null
+  const size = payload['size_bytes']
+  return {
+    artifact_id: artifactId,
+    public_filename: filename,
+    mime_type: readString(payload, 'mime_type'),
+    size_bytes: typeof size === 'number' ? size : 0,
+    sha256: typeof payload['sha256'] === 'string' ? payload['sha256'] : undefined,
+    expires_at: typeof payload['expires_at'] === 'string' ? payload['expires_at'] : undefined,
+    message: typeof payload['message'] === 'string' ? payload['message'] : undefined,
+  }
 }
 
 /**

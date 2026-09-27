@@ -476,6 +476,8 @@ const traceLabels: Record<string, string> = {
   documents: '文档',
   tool_call: '工具调用',
   tool_result: '工具结果',
+  artifact_progress: '产物生成',
+  review_notice: '需人工核查',
   approval_required: '需要确认',
   artifact: '产物',
   text: '回答',

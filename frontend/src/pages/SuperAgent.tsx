@@ -26,6 +26,7 @@ import {
   initialV2State,
   isV2Terminal,
   isV2Paused,
+  readArtifact as readArtifactFromPayload,
   type V2ConversationState,
 } from '../api/v2Reducer'
 import { useExternalStoreRuntime, AssistantRuntimeProvider, ThreadMessage } from "@assistant-ui/react"
@@ -64,9 +65,15 @@ type AgentTraceEvent = {
   content: string
   metadata?: Record<string, unknown>
 }
+// A02: v2 artifact shape (payload of artifact.available). Download goes
+// through /api/v2/artifacts/{artifact_id} — no v1 download_url exists.
 type AgentArtifact = {
-  content: string
-  metadata?: Record<string, unknown>
+  artifact_id: string
+  public_filename: string
+  mime_type: string
+  size_bytes: number
+  sha256?: string
+  expires_at?: string
 }
 type BrowserLocation = {
   latitude: number
@@ -538,6 +545,73 @@ function SuperAgent() {
         }
         return updated
       })
+    } else if (event.type === 'artifact_candidate') {
+      // A02: candidate artifact produced, host-side export pending.
+      const traceEvent: AgentTraceEvent = {
+        type: 'artifact_progress',
+        content:
+          typeof event.payload.message === 'string' && event.payload.message
+            ? event.payload.message
+            : '正在生成产物…',
+        metadata: event.payload as Record<string, unknown>,
+      }
+      setMessages(prev => {
+        const updated = [...prev]
+        const last = updated[updated.length - 1]
+        if (last && last.role === 'assistant') {
+          updated[updated.length - 1] = {
+            ...last,
+            traceEvents: [...(last.traceEvents || []), traceEvent],
+            isStreaming: true,
+          }
+        }
+        return updated
+      })
+    } else if (event.type === 'artifact.available') {
+      // A02: verified artifact ready — attach the download card to the
+      // active assistant message. The payload is the public shape only.
+      const artifact = readArtifactFromPayload(event.payload)
+      if (!artifact) return
+      setMessages(prev => {
+        const updated = [...prev]
+        const last = updated[updated.length - 1]
+        if (last && last.role === 'assistant') {
+          updated[updated.length - 1] = {
+            ...last,
+            artifacts: [...(last.artifacts || []), artifact],
+            isStreaming: true,
+          }
+        }
+        return updated
+      })
+    } else if (event.type === 'effect.outcome_unknown') {
+      // A02: side effect finished with unknown outcome — the server
+      // contract emits this before the terminal error. Surface the
+      // human-review notice in the main flow (same pattern as the
+      // error terminal) plus the trace panel.
+      const notice =
+        (typeof event.payload.message === 'string' && event.payload.message) ||
+        (typeof event.payload.code === 'string' && event.payload.code) ||
+        '部分操作结果未知，需要人工核查'
+      const traceEvent: AgentTraceEvent = {
+        type: 'review_notice',
+        content: notice,
+        metadata: event.payload as Record<string, unknown>,
+      }
+      setMessages(prev => {
+        const updated = [...prev]
+        const last = updated[updated.length - 1]
+        if (last && last.role === 'assistant') {
+          const separator = last.content.trim() ? '\n\n' : ''
+          updated[updated.length - 1] = {
+            ...last,
+            content: `${last.content}${separator}[注意] ${notice}`,
+            traceEvents: [...(last.traceEvents || []), traceEvent],
+            isStreaming: true,
+          }
+        }
+        return updated
+      })
     } else if (event.type === 'approval.required') {
       // Surface the approval request as a trace event so the lifecycle
       // panel shows why the run paused. The actual approve/reject
@@ -790,6 +864,9 @@ function SuperAgent() {
               role: 'assistant',
               content: next.assistantText,
               isStreaming: !isV2Terminal(next),
+              // A02: artifacts delivered before the refresh are part of
+              // the replay state — reattach so download cards survive.
+              artifacts: next.artifacts.length > 0 ? next.artifacts : undefined,
             })
           }
           return restored

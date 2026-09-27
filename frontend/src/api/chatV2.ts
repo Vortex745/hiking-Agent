@@ -31,14 +31,32 @@ export type V2EventType =
   | 'text'
   | 'tool_call'
   | 'tool_result'
+  | 'artifact_candidate'
+  | 'artifact.available'
   | 'approval.required'
   | 'approval.resolved'
   | 'memory.consent_required'
   | 'run.paused'
+  | 'effect.outcome_unknown'
   | 'error'
   | 'done'
   | 'cancelled'
   | 'heartbeat'
+
+/**
+ * artifact.available payload (A02): the only public artifact shape. No
+ * sandbox path, no host storage path — download goes through
+ * /api/v2/artifacts/{artifact_id}.
+ */
+export interface V2Artifact {
+  artifact_id: string
+  public_filename: string
+  mime_type: string
+  size_bytes: number
+  sha256?: string
+  expires_at?: string
+  message?: string
+}
 
 // Run-terminal events: the run is in a final state and no further
 // continuation is possible. The reducer's sticky guard refuses to
@@ -189,10 +207,13 @@ function isV2EventType(value: unknown): value is V2EventType {
     value === 'text' ||
     value === 'tool_call' ||
     value === 'tool_result' ||
+    value === 'artifact_candidate' ||
+    value === 'artifact.available' ||
     value === 'approval.required' ||
     value === 'approval.resolved' ||
     value === 'memory.consent_required' ||
     value === 'run.paused' ||
+    value === 'effect.outcome_unknown' ||
     value === 'error' ||
     value === 'done' ||
     value === 'cancelled' ||
