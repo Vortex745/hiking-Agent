@@ -1,33 +1,16 @@
 const configuredApiBase = import.meta.env?.VITE_API_BASE_URL?.trim().replace(/\/+$/, '')
 
+// models 端点仍由 AI service 的 /api/v1 前缀提供。
 const API_BASE = configuredApiBase || '/api/v1'
 
-// Ticket 08: v2 endpoints live under /api/v2 and are served by the long-lived
-// Docker gateway. The base is derived independently so v1 and v2 can coexist
-// during the canary without one affecting the other's routing.
+// Chat v2 端点位于 /api/v2，由长驻 Docker gateway 提供服务。
+// v1 chat 已移除，v2 是唯一 chat 链路。
 const V2_BASE = configuredApiBase
   ? configuredApiBase.replace(/\/api\/v1\/?$/, '/api/v2')
   : '/api/v2'
 
 export const API = {
-  chatRuntime: (conversationId: string) =>
-    `/api/chat/runtime/${encodeURIComponent(conversationId)}`,
-  chatSSE: `${API_BASE}/chat/sse`,
-  chatSync: `${API_BASE}/chat/sync`,
-  chatHealth: `${API_BASE}/chat/health`,
-  chatConfirm: `${API_BASE}/chat/confirm`,
-  chatPending: (chatId: string) => `${API_BASE}/chat/pending/${encodeURIComponent(chatId)}`,
-  chatHistory: (chatId: string) => `${API_BASE}/chat/history/${encodeURIComponent(chatId)}`,
-  chatHistoryDelete: (chatId: string) => `${API_BASE}/chat/history/${encodeURIComponent(chatId)}`,
-
   modelsFetch: `${API_BASE}/models/fetch`,
-
-  ragQuery: `${API_BASE}/rag/query`,
-  ragUpload: `${API_BASE}/rag/upload`,
-  ragHealth: `${API_BASE}/rag/health`,
-  ragDocuments: `${API_BASE}/rag/documents`,
-  ragHistory: (chatId: string) => `${API_BASE}/rag/history/${encodeURIComponent(chatId)}`,
-  ragHistoryDelete: (chatId: string) => `${API_BASE}/rag/history/${encodeURIComponent(chatId)}`,
 
   // Ticket 08: Chat v2 endpoints. The SSE endpoint is the only streaming
   // surface; snapshot/cancel/events support refresh recovery and cancel.

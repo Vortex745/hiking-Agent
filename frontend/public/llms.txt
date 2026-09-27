@@ -3,5 +3,4 @@
 AI智能徒步助手提供徒步知识检索、路线规划、天气风险判断和装备建议。
 
 - [首页](https://530745.xyz/)
-- [RAG 模块](https://530745.xyz/hiking-rag)
 - [Agent 模块](https://530745.xyz/super-agent)

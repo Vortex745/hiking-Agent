@@ -13,14 +13,6 @@
       "destination": "/index.html"
     },
     {
-      "source": "/love-master",
-      "destination": "/index.html"
-    },
-    {
-      "source": "/hiking-rag",
-      "destination": "/index.html"
-    },
-    {
       "source": "/llm-config",
       "destination": "/index.html"
     }

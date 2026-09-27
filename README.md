@@ -216,7 +216,6 @@ ai-hiking/
 | 路由 | 页面 | 用途 |
 |---|---|---|
 | `/` | 首页 | 项目入口和模块跳转 |
-| `/hiking-rag` | RAG 模块 | 文档上传、知识库问答、检索过程展示 |
 | `/super-agent` | Agent 模块 | 徒步助手对话、工具过程、路线/装备/风险任务 |
 | `/llm-config` | 模型配置 | 浏览器侧 LLM、Embedding、Rerank 参数配置 |
 
@@ -309,7 +308,7 @@ https://gateway-262534-6-1364947792.sh.run.tcloudbase.com/api/v1
 
 - `EMBEDDING_API_KEY` 是否可用。
 - PostgreSQL 是否运行。
-- 是否已经在 `/hiking-rag` 上传文档。
+- 知识库中是否已经灌入文档（RAG 独立页已删除，前端不再有上传入口）。
 - `DATABASE_URL` 是否指向正确数据库。
 
 ### 天气或位置工具不可用

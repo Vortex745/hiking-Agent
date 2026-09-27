@@ -200,32 +200,6 @@ export interface SpeedTestMeasurement {
 export type ModelUsage = 'llm' | 'embedding' | 'rerank'
 type InferredModelUsage = ModelUsage | 'other' | 'unknown'
 
-export interface RuntimeModelSettingsPayload {
-  llm?: {
-    base_url: string
-    api_key: string
-    model: string
-  }
-  embedding?: {
-    base_url: string
-    api_key: string
-    model: string
-    dimensions: number
-  }
-  rerank?: {
-    base_url: string
-    api_key: string
-    model: string
-  }
-}
-
-export interface RagQueryPayload {
-  question: string
-  chat_id?: string
-  status: string | null
-  model_settings?: RuntimeModelSettingsPayload
-}
-
 export function filterModelList(models: ModelInfo[], query: string): ModelInfo[] {
   const keyword = query.trim().toLowerCase()
   if (!keyword) return models
@@ -375,60 +349,6 @@ function defaultNow(): number {
 
 export function canRunSpeedTest(baseUrl: string, apiKey: string): boolean {
   return Boolean(baseUrl.trim() && apiKey.trim())
-}
-
-function hasRunnableModelConfig(config: { baseUrl: string; apiKey: string; model: string }): boolean {
-  return Boolean(config.baseUrl.trim() && config.apiKey.trim() && config.model.trim())
-}
-
-export function buildRuntimeModelSettings(settings: LlmSettings = loadLlmSettings()): RuntimeModelSettingsPayload {
-  const payload: RuntimeModelSettingsPayload = {}
-
-  if (hasRunnableModelConfig(settings.llm)) {
-    payload.llm = {
-      base_url: settings.llm.baseUrl.trim(),
-      api_key: settings.llm.apiKey.trim(),
-      model: settings.llm.model.trim(),
-    }
-  }
-
-  if (hasRunnableModelConfig(settings.embedding)) {
-    payload.embedding = {
-      base_url: settings.embedding.baseUrl.trim(),
-      api_key: settings.embedding.apiKey.trim(),
-      model: settings.embedding.model.trim(),
-      dimensions: settings.embedding.dimensions,
-    }
-  }
-
-  if (hasRunnableModelConfig(settings.rerank)) {
-    payload.rerank = {
-      base_url: settings.rerank.baseUrl.trim(),
-      api_key: settings.rerank.apiKey.trim(),
-      model: settings.rerank.model.trim(),
-    }
-  }
-
-  return payload
-}
-
-export function buildRagQueryPayload(
-  question: string,
-  status: string | null,
-  settings: LlmSettings = loadLlmSettings(),
-  chatId?: string,
-): RagQueryPayload {
-  const modelSettings = buildRuntimeModelSettings(settings)
-  const payload: RagQueryPayload = { question, status }
-  if (chatId) {
-    payload.chat_id = chatId
-  }
-
-  if (Object.keys(modelSettings).length > 0) {
-    payload.model_settings = modelSettings
-  }
-
-  return payload
 }
 
 export async function fetchModels(
