@@ -129,13 +129,13 @@ function speedStatusClassName(status: SpeedTestStatus) {
     case 'testing':
       return 'bg-primary/10 text-primary-light'
     case 'success':
-      return 'bg-emerald-500/10 text-emerald-600'
+      return 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
     case 'error':
-      return 'bg-red-500/10 text-red-500'
+      return 'bg-red-500/10 text-red-500 dark:text-red-400'
     case 'skipped':
-      return 'bg-slate-200 text-slate-600'
+      return 'bg-slate-200 text-slate-600 dark:bg-white/10 dark:text-[#bdc1c6]'
     default:
-      return 'bg-slate-100 text-text-muted'
+      return 'bg-slate-100 text-text-muted dark:bg-white/5'
   }
 }
 
@@ -222,7 +222,7 @@ function ModelCombobox({
         </button>
       </div>
       <div className="relative" ref={containerRef}>
-        <div className="flex items-center gap-0 rounded-sm border border-border bg-bg-body transition-[border-color,background-color] duration-150 ease-[var(--ease-out)] focus-within:border-primary-light focus-within:bg-white">
+        <div className="flex items-center gap-0 rounded-sm border border-border bg-bg-body transition-[border-color,background-color] duration-150 ease-[var(--ease-out)] focus-within:border-primary-light focus-within:bg-white dark:border-white/10 dark:focus-within:bg-[#1e1f20]">
           <input
             className="h-10 flex-1 bg-transparent px-3 text-sm outline-none"
             id={`${usage}-model`}
@@ -250,7 +250,7 @@ function ModelCombobox({
           <div className="mt-1 text-xs text-red-500">{error}</div>
         )}
         {open && filtered.length > 0 && (
-          <div className="absolute left-0 right-0 top-full z-10 mt-1 max-h-48 overflow-y-auto rounded-sm border border-border bg-white shadow-lg">
+          <div className="absolute left-0 right-0 top-full z-10 mt-1 max-h-48 overflow-y-auto rounded-sm border border-border bg-white shadow-lg dark:border-white/10 dark:bg-[#1e1f20]">
             {filtered.map(model => (
               <button
                 className={`block w-full px-3 py-1.5 text-left text-sm transition-colors hover:bg-primary/10 hover:text-primary-light ${model.id === value ? 'bg-primary/5 font-medium text-primary-light' : 'text-text-primary'}`}
@@ -264,7 +264,7 @@ function ModelCombobox({
           </div>
         )}
         {open && filtered.length === 0 && models.length > 0 && (
-          <div className="absolute left-0 right-0 top-full z-10 mt-1 rounded-sm border border-border bg-white px-3 py-2 text-xs text-text-muted shadow-lg">
+          <div className="absolute left-0 right-0 top-full z-10 mt-1 rounded-sm border border-border bg-white px-3 py-2 text-xs text-text-muted shadow-lg dark:border-white/10 dark:bg-[#1e1f20]">
             无匹配模型
           </div>
         )}
@@ -390,7 +390,7 @@ function LlmConfig() {
       <div className="mx-auto flex w-full max-w-[1180px] flex-col gap-5">
         {/* Header */}
         <section className="t-panel-slide" data-open="true">
-          <div className="flex flex-wrap items-center justify-between gap-4 border-b border-border pb-5">
+          <div className="flex flex-wrap items-center justify-between gap-4 border-b border-border pb-5 dark:border-white/10">
             <div className="flex items-center gap-3">
               <div className="t-icon-swap h-11 w-11 rounded-sm bg-primary text-white" data-state="a">
                 <span className="t-icon flex h-11 w-11 items-center justify-center" data-icon="a">
@@ -408,7 +408,7 @@ function LlmConfig() {
 
             <div className="flex items-center gap-2">
               <button
-                className="inline-flex h-9 items-center gap-2 rounded-sm border border-border bg-white px-4 text-sm text-text-secondary transition-[transform,border-color,color,background-color] duration-150 ease-[var(--ease-out)] hover:border-primary-light hover:text-primary-light active:scale-[0.97]"
+                className="inline-flex h-9 items-center gap-2 rounded-sm border border-border bg-white px-4 text-sm text-text-secondary transition-[transform,border-color,color,background-color] duration-150 ease-[var(--ease-out)] hover:border-primary-light hover:text-primary-light active:scale-[0.97] dark:border-white/10 dark:bg-white/5"
                 onClick={handleReset}
               >
                 <RotateLeft className="h-4 w-4" />
@@ -434,7 +434,7 @@ function LlmConfig() {
         <section className="grid grid-cols-5 gap-3 max-xl:grid-cols-3 max-lg:grid-cols-2 max-sm:grid-cols-1">
           {summary.map((item, index) => (
             <div
-              className="rounded-sm border border-border bg-white px-4 py-3 shadow-sm"
+              className="rounded-sm border border-border bg-white px-4 py-3 shadow-sm dark:border-white/10 dark:bg-[#1e1f20]"
               key={item.label}
               style={{ animation: `fadeUp 260ms var(--ease-out) ${index * 45}ms both` }}
             >
@@ -451,7 +451,7 @@ function LlmConfig() {
             { key: 'rerank' as const, label: 'Rerank 测速', state: speedTests.rerank },
           ].map((item, index) => (
             <div
-              className="rounded-sm border border-border bg-white px-4 py-4 shadow-sm"
+              className="rounded-sm border border-border bg-white px-4 py-4 shadow-sm dark:border-white/10 dark:bg-[#1e1f20]"
               key={item.key}
               style={{ animation: `fadeUp 260ms var(--ease-out) ${index * 55}ms both` }}
             >
@@ -493,7 +493,7 @@ function LlmConfig() {
         {/* Model Forms */}
         <section className="grid grid-cols-3 gap-5 max-xl:grid-cols-2 max-lg:grid-cols-1">
           {/* LLM Config */}
-          <div className="t-panel-slide rounded-md border border-border bg-white p-5 shadow-sm" data-open="true">
+          <div className="t-panel-slide rounded-md border border-border bg-white p-5 shadow-sm dark:border-white/10 dark:bg-[#1e1f20]" data-open="true">
             <div className="mb-5 flex items-center gap-3">
               <div className="flex h-10 w-10 items-center justify-center rounded-sm bg-primary/10 text-primary-light">
                 <Cpu className="h-5 w-5" />
@@ -507,7 +507,7 @@ function LlmConfig() {
             <div className="grid gap-4">
               <label className="grid gap-1.5">
                 <span className="text-xs font-semibold text-text-secondary">Base URL</span>
-                <div className="flex items-center gap-2 rounded-sm border border-border bg-bg-body px-3 transition-[border-color,background-color] duration-150 ease-[var(--ease-out)] focus-within:border-primary-light focus-within:bg-white">
+                <div className="flex items-center gap-2 rounded-sm border border-border bg-bg-body px-3 transition-[border-color,background-color] duration-150 ease-[var(--ease-out)] focus-within:border-primary-light focus-within:bg-white dark:border-white/10 dark:focus-within:bg-[#1e1f20]">
                   <Server className="h-4 w-4 text-text-muted" />
                   <input
                     className="h-10 flex-1 bg-transparent text-sm outline-none"
@@ -522,7 +522,7 @@ function LlmConfig() {
 
               <label className="grid gap-1.5">
                 <span className="text-xs font-semibold text-text-secondary">API Key</span>
-                <div className="flex items-center gap-2 rounded-sm border border-border bg-bg-body px-3 transition-[border-color,background-color] duration-150 ease-[var(--ease-out)] focus-within:border-primary-light focus-within:bg-white">
+                <div className="flex items-center gap-2 rounded-sm border border-border bg-bg-body px-3 transition-[border-color,background-color] duration-150 ease-[var(--ease-out)] focus-within:border-primary-light focus-within:bg-white dark:border-white/10 dark:focus-within:bg-[#1e1f20]">
                   <Key className="h-4 w-4 text-text-muted" />
                   <input
                     className="h-10 flex-1 bg-transparent text-sm outline-none"
@@ -546,7 +546,7 @@ function LlmConfig() {
           </div>
 
           {/* Embedding Config */}
-          <div className="t-panel-slide rounded-md border border-border bg-white p-5 shadow-sm" data-open="true">
+          <div className="t-panel-slide rounded-md border border-border bg-white p-5 shadow-sm dark:border-white/10 dark:bg-[#1e1f20]" data-open="true">
             <div className="mb-5 flex items-center gap-3">
               <div className="flex h-10 w-10 items-center justify-center rounded-sm bg-primary/10 text-primary-light">
                 <Database className="h-5 w-5" />
@@ -560,7 +560,7 @@ function LlmConfig() {
             <div className="grid gap-4">
               <label className="grid gap-1.5">
                 <span className="text-xs font-semibold text-text-secondary">Base URL</span>
-                <div className="flex items-center gap-2 rounded-sm border border-border bg-bg-body px-3 transition-[border-color,background-color] duration-150 ease-[var(--ease-out)] focus-within:border-primary-light focus-within:bg-white">
+                <div className="flex items-center gap-2 rounded-sm border border-border bg-bg-body px-3 transition-[border-color,background-color] duration-150 ease-[var(--ease-out)] focus-within:border-primary-light focus-within:bg-white dark:border-white/10 dark:focus-within:bg-[#1e1f20]">
                   <Server className="h-4 w-4 text-text-muted" />
                   <input
                     className="h-10 flex-1 bg-transparent text-sm outline-none"
@@ -575,7 +575,7 @@ function LlmConfig() {
 
               <label className="grid gap-1.5">
                 <span className="text-xs font-semibold text-text-secondary">API Key</span>
-                <div className="flex items-center gap-2 rounded-sm border border-border bg-bg-body px-3 transition-[border-color,background-color] duration-150 ease-[var(--ease-out)] focus-within:border-primary-light focus-within:bg-white">
+                <div className="flex items-center gap-2 rounded-sm border border-border bg-bg-body px-3 transition-[border-color,background-color] duration-150 ease-[var(--ease-out)] focus-within:border-primary-light focus-within:bg-white dark:border-white/10 dark:focus-within:bg-[#1e1f20]">
                   <Key className="h-4 w-4 text-text-muted" />
                   <input
                     className="h-10 flex-1 bg-transparent text-sm outline-none"
@@ -599,7 +599,7 @@ function LlmConfig() {
               <label className="grid gap-1.5">
                 <span className="text-xs font-semibold text-text-secondary">向量维度</span>
                 <input
-                  className="h-10 rounded-sm border border-border bg-bg-body px-3 text-sm outline-none transition-[border-color,background-color] duration-150 ease-[var(--ease-out)] focus:border-primary-light focus:bg-white"
+                  className="h-10 rounded-sm border border-border bg-bg-body px-3 text-sm outline-none transition-[border-color,background-color] duration-150 ease-[var(--ease-out)] focus:border-primary-light focus:bg-white dark:border-white/10 dark:focus:bg-[#1e1f20]"
                   id="embedding-dimensions"
                   min="64"
                   max="4096"
@@ -614,7 +614,7 @@ function LlmConfig() {
           </div>
 
           {/* Rerank Config */}
-          <div className="t-panel-slide rounded-md border border-border bg-white p-5 shadow-sm" data-open="true">
+          <div className="t-panel-slide rounded-md border border-border bg-white p-5 shadow-sm dark:border-white/10 dark:bg-[#1e1f20]" data-open="true">
             <div className="mb-5 flex items-center gap-3">
               <div className="flex h-10 w-10 items-center justify-center rounded-sm bg-primary/10 text-primary-light">
                 <Filter className="h-5 w-5" />
@@ -628,7 +628,7 @@ function LlmConfig() {
             <div className="grid gap-4">
               <label className="grid gap-1.5">
                 <span className="text-xs font-semibold text-text-secondary">Base URL</span>
-                <div className="flex items-center gap-2 rounded-sm border border-border bg-bg-body px-3 transition-[border-color,background-color] duration-150 ease-[var(--ease-out)] focus-within:border-primary-light focus-within:bg-white">
+                <div className="flex items-center gap-2 rounded-sm border border-border bg-bg-body px-3 transition-[border-color,background-color] duration-150 ease-[var(--ease-out)] focus-within:border-primary-light focus-within:bg-white dark:border-white/10 dark:focus-within:bg-[#1e1f20]">
                   <Server className="h-4 w-4 text-text-muted" />
                   <input
                     className="h-10 flex-1 bg-transparent text-sm outline-none"
@@ -643,7 +643,7 @@ function LlmConfig() {
 
               <label className="grid gap-1.5">
                 <span className="text-xs font-semibold text-text-secondary">API Key</span>
-                <div className="flex items-center gap-2 rounded-sm border border-border bg-bg-body px-3 transition-[border-color,background-color] duration-150 ease-[var(--ease-out)] focus-within:border-primary-light focus-within:bg-white">
+                <div className="flex items-center gap-2 rounded-sm border border-border bg-bg-body px-3 transition-[border-color,background-color] duration-150 ease-[var(--ease-out)] focus-within:border-primary-light focus-within:bg-white dark:border-white/10 dark:focus-within:bg-[#1e1f20]">
                   <Key className="h-4 w-4 text-text-muted" />
                   <input
                     className="h-10 flex-1 bg-transparent text-sm outline-none"

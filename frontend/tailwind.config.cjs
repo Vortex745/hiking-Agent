@@ -13,14 +13,16 @@ module.exports = {
           hover: '#23543c',
         },
         bg: {
-          body: '#f5f5f0',
+          // var() 引用 index.css 的 token，深色系统下由 prefers-color-scheme 覆盖块切换；
+          // 不能在此处用透明度修饰符（bg-bg-body/50 会退化成实色）
+          body: 'var(--bg-body)',
           card: '#ffffff',
           sidebar: '#1a3c2a',
         },
         text: {
-          primary: '#333333',
-          secondary: '#666666',
-          muted: '#999999',
+          primary: 'var(--text-primary)',
+          secondary: 'var(--text-secondary)',
+          muted: 'var(--text-muted)',
         },
         border: {
           DEFAULT: '#e8e8e3',
