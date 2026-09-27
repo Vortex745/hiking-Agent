@@ -134,6 +134,9 @@ class CurrentLocationV2(BaseModel):
 
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    # Browser geolocation reports horizontal accuracy in meters; it rides
+    # along with every capture, so the strict contract must accept it.
+    accuracy: Optional[float] = None
     province: str = ""
     city: str = ""
     district: str = ""

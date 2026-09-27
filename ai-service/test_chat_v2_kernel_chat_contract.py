@@ -189,3 +189,67 @@ def test_real_kernel_end_to_end_success_over_http_sse(monkeypatch):
     assert terminals == ["done"]
     seqs = [e["sequence"] for e in events]
     assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)
+
+
+def _make_validation_probe_app(monkeypatch):
+    """App whose kernel stub records whether the request reached it."""
+    called: dict[str, int] = {"n": 0}
+
+    async def _failing_run(**kwargs: Any):
+        called["n"] += 1
+        raise KernelModelFailure("model_unavailable", "stub")
+
+    from agent_v2 import kernel as kernel_module
+
+    monkeypatch.setattr(kernel_module, "run_chat_turn", _failing_run)
+
+    from types import SimpleNamespace
+
+    def _fake_subject(request):
+        request.state.subject_id = "sub-1"
+        return None, SimpleNamespace(issued=False, token="tok", subject_id="sub-1")
+
+    monkeypatch.setattr(chat_v2_module, "resolve_request_subject", _fake_subject)
+    app, _state = _build_app(None)
+    monkeypatch.setattr(chat_v2_module.settings, "agent_v2_enabled", True)
+    return app, called
+
+
+async def _post_raw(app: FastAPI, payload: dict[str, Any]):
+    """Non-streaming probe: status code is enough to observe validation."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        return await client.post("/api/v2/chat/sse", json=payload)
+
+
+def test_current_location_accepts_browser_accuracy_field(monkeypatch):
+    """Browser geolocation always carries ``accuracy``; the strict contract
+    must not 422 it away (A01)."""
+    app, called = _make_validation_probe_app(monkeypatch)
+    events = asyncio.run(_post_sse(app, {
+        "message": "我这里适合徒步吗",
+        "request_id": "req-loc-accuracy",
+        "profile_id": "chat",
+        "current_location": {
+            "latitude": 30.26,
+            "longitude": 119.56,
+            "accuracy": 35.0,
+            "source": "browser",
+        },
+    }))
+    # Validation passed -> the stream opened and the kernel stub ran.
+    assert called["n"] == 1
+    assert events[-1]["type"] == "error"  # stub terminal, stream completed
+
+
+def test_current_location_still_rejects_unknown_fields(monkeypatch):
+    """extra=forbid keeps guarding against unknown location fields (A01)."""
+    app, called = _make_validation_probe_app(monkeypatch)
+    response = asyncio.run(_post_raw(app, {
+        "message": "我这里适合徒步吗",
+        "request_id": "req-loc-unknown",
+        "profile_id": "chat",
+        "current_location": {"latitude": 30.26, "elevation_m": 100},
+    }))
+    assert response.status_code == 422
+    assert called["n"] == 0  # kernel never reached
