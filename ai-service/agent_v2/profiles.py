@@ -160,6 +160,8 @@ _CHAT_PROFILE = CapabilityProfile(
 # of truth for connection parameters and tool allowlists; the profile
 # only declares which servers it may reach.
 _ROUTE_PLAN_ALLOWED_TOOLS: tuple[str, ...] = (
+    "route_compare",
+    "report_export",
     # Inherits chat's low-risk hiking surface…
     "hiking_knowledge_search",
     "gear_checklist",

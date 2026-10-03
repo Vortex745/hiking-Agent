@@ -293,6 +293,16 @@ const convertMessage = (msg: Message, index: number): ThreadMessage => {
       args: msg.artifacts
     });
   }
+  const comparisons = new globalThis.Map<string, Record<string, unknown>>();
+  for (const event of msg.traceEvents || []) {
+    const result = event.metadata?.route_comparison;
+    if (result && typeof result === 'object' && typeof (result as Record<string, unknown>).comparison_id === 'string') {
+      comparisons.set((result as Record<string, unknown>).comparison_id as string, result as Record<string, unknown>);
+    }
+  }
+  for (const [id, result] of comparisons) {
+    content.push({ type: 'tool-call', toolCallId: id, toolName: 'routeComparison', args: result });
+  }
 
   // A09: aggregate retrieval evidence from tool_result payloads into a
   // message-level 检索来源 part (dedup by source+preview).
@@ -1260,7 +1270,7 @@ function SuperAgent() {
 
   const handleSend = useCallback(async (
     textOverride?: string,
-    options: { replaceFromIndex?: number } = {},
+    options: { replaceFromIndex?: number; profileId?: 'route_plan' } = {},
   ) => {
     const text = typeof textOverride === 'string' ? textOverride.trim() : input.trim()
     if (!text || isSending) return
@@ -1316,7 +1326,7 @@ function SuperAgent() {
           message: text,
           request_id: requestId,
           conversation_id: conversationId,
-          profile_id: selectedScenario === 'route_plan' ? 'route_plan' : 'chat',
+          profile_id: options.profileId || (selectedScenario === 'route_plan' ? 'route_plan' : 'chat'),
         }
         const needsRouteFollowupLocation = shouldRequestRouteFollowupLocation(text, contextMessages)
         const cachedRouteLocation = needsRouteFollowupLocation ? lastLocationRef.current : null
@@ -1567,6 +1577,8 @@ function SuperAgent() {
             </div>
           )}
           <GeminiThread
+            onExportRoute={comparisonId => { void handleSend(`请导出带来源的路线比较 PDF，comparison_id=${comparisonId}`, { profileId: 'route_plan' }) }}
+            isSending={isSending}
             emptyTitle="告诉我你的徒步计划，我将为你规划路线、安排任务，并提供安全建议。"
             onRegenerate={handleRegenerate}
             realMessageCount={messages.length}

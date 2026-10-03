@@ -34,6 +34,7 @@ import logging
 import shutil
 import tempfile
 import time
+from io import BytesIO
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -44,6 +45,63 @@ logger = logging.getLogger("ai-service.agent_v2.computer")
 
 
 SandboxType = Literal["local_native", "wsl_localvm", "remote_e2b"]
+
+
+def _render_pdf_bytes(content: str) -> bytes:
+    """Render text into a valid PDF document.
+
+    The sandbox implementation is intentionally small, but returning a text
+    file with a ``.pdf`` suffix makes artifact MIME validation meaningless.
+    ReportLab keeps the development path deterministic and produces bytes that
+    PDF readers and downstream artifact checks can actually parse.
+    """
+    try:
+        from reportlab.lib.enums import TA_LEFT
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import ParagraphStyle
+        from reportlab.lib.units import mm
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+        from xml.sax.saxutils import escape
+    except ImportError as exc:
+        raise ComputerError(
+            "PDF generation requires reportlab; install ai-service/requirements.txt"
+        ) from exc
+
+    font_name = "Helvetica"
+    try:
+        pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+        font_name = "STSong-Light"
+    except Exception:
+        # Latin-only content still has a usable fallback when the CID font is
+        # unavailable in a minimal local environment.
+        logger.warning("STSong-Light is unavailable; using Helvetica for PDF text")
+
+    output = BytesIO()
+    document = SimpleDocTemplate(
+        output,
+        pagesize=A4,
+        rightMargin=18 * mm,
+        leftMargin=18 * mm,
+        topMargin=18 * mm,
+        bottomMargin=18 * mm,
+        title="AI Hiking artifact",
+    )
+    style = ParagraphStyle(
+        "ArtifactBody",
+        fontName=font_name,
+        fontSize=10,
+        leading=15,
+        alignment=TA_LEFT,
+    )
+    lines = content.splitlines() or [""]
+    story = []
+    for line in lines:
+        story.append(Paragraph(escape(line) or "&nbsp;", style))
+        story.append(Spacer(1, 3))
+    document.build(story)
+    return output.getvalue()
 
 
 # ---- Failure modes (injectable for tests + future E2B mapping) ------------
@@ -320,13 +378,11 @@ class LocalNativeComputer(Computer):
     ) -> str:
         if self._failure_mode == "timeout":
             raise SandboxTimeoutError("injected command timeout")
-        # Stub PDF: write the content as a text file with a .pdf suffix.
-        # Real E2B integration runs a headless PDF generator in the sandbox.
         safe_name = Path(filename).name  # strip any path components
         if not safe_name.endswith(".pdf"):
             safe_name = f"{safe_name}.pdf"
         full = Path(workspace_path) / safe_name
-        data = content.encode("utf-8")
+        data = _render_pdf_bytes(content)
         full.write_bytes(data)
         self._files_written += 1
         self._bytes_written += len(data)
@@ -529,7 +585,7 @@ class RemoteE2BComputer(Computer):
         if not safe_name.endswith(".pdf"):
             safe_name = f"{safe_name}.pdf"
         full = Path(workspace_path) / safe_name
-        data = content.encode("utf-8")
+        data = _render_pdf_bytes(content)
         full.write_bytes(data)
         self._files_written += 1
         self._bytes_written += len(data)

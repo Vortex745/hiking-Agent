@@ -783,6 +783,9 @@ def compose_route_plan_system_prompt(
         "证据纪律：路线里程/爬升/耗时必须来自 route_research 或地图工具；",
         "天气与预警必须来自天气工具或 web_search；引用来源名称。",
         "关键证据（路线事实、天气）缺失时明确说明缺失项并给出保守建议，禁止编造数据。",
+        "路线比较必须调用 route_compare；候选最多五条，传 name/city/origin/destination，不传事实。",
+        "缺少候选或起终点先请用户补充。输出以比较工具的推荐、证据与风险状态为准。",
+        "用户要 PDF 时调用 report_export，comparison_id 必须来自已完成的比较结果。",
         "不得透露内部系统、工具名或框架信息。",
     ]
     if req.current_location is not None:
@@ -1257,7 +1260,9 @@ class RunOrchestrator:
                         })
                         return
                     yield envelope
-                mark_terminal_safe(runs_repo, run_id, "done")
+                if not stream.terminal_emitted:
+                    yield _emit("done", {})
+                    mark_terminal_safe(runs_repo, run_id, "done")
                 return
 
             if profile.profile_id == ProfileId.RAG:
@@ -1625,6 +1630,7 @@ class RunOrchestrator:
         *,
         run_id: str | None,
         emit: EmitEnvelope,
+        report_content: str | None = None,
     ) -> AsyncGenerator[EventEnvelope, None]:
         """artifact profile flow.
 
@@ -1831,7 +1837,7 @@ class RunOrchestrator:
             # (hard boundary = workspace chdir + path guard + env isolation);
             # the product policy ladder re-enters at generate_pdf/export below.
             try:
-                plan_text, audits = await self._kernel_turn(
+                plan_text, audits = (report_content, []) if report_content is not None else await self._kernel_turn(
                     system_prompt=(
                         "你是徒步计划撰写助手，用简体中文输出结构化 Markdown 徒步计划"
                         "（目的地/日程/装备/风险与建议）。缺失的信息显式标注为假设；"
@@ -2355,6 +2361,15 @@ class RunOrchestrator:
                     user_message = msg.get("content", "")
                     break
             plan_content = user_message
+            # A route report is code-rendered from a persisted, verified
+            # comparison; approval resume must not replace it with the prompt.
+            for event in reversed(all_events):
+                report = event.get("payload", {}).get("route_report")
+                if isinstance(report, dict):
+                    from route_compare.models import ComparisonResult
+                    from route_compare.service import render_report
+                    plan_content = render_report(ComparisonResult.model_validate(report))
+                    break
 
             def _execute_pdf() -> dict[str, Any]:
                 generated = computer.generate_pdf(
@@ -2984,7 +2999,16 @@ class RunOrchestrator:
         audit_entries: list[dict[str, Any]] = []
         mcp_servers: dict[str, Any] = {}
         mcp_required = getattr(profile, "allowed_mcp_servers", None)
-        if mcp_required:
+        has_comparison = "route_compare" in profile.allowed_tools
+        route_session = None
+        if has_comparison:
+            from agent_v2.route_tools import RouteSession
+            route_session = RouteSession(settings=self._settings, run_id=run_id,
+                audit_sink=audit_entries.append, runs_repo=self._runs_repo,
+                conversation_id=req.conversation_id)
+        # Comparison collects MCP inside its bounded leaf. Mounting raw MCP
+        # here would make a failed handshake abort before gaps can be rendered.
+        if mcp_required and not has_comparison:
             mcp_servers, mcp_audits = build_profile_mcp_servers(profile, self._settings)
             if not mcp_servers:
                 # Every allowlisted evidence source is unavailable → fail
@@ -3004,6 +3028,8 @@ class RunOrchestrator:
                 audit_sink=audit_entries.append,
                 memory_service=memory,
                 subject_id=subject_id,
+                settings=self._settings,
+                route_session=route_session,
             )
             kernel_gate = build_chat_kernel_gate(
                 profile,
@@ -3055,6 +3081,14 @@ class RunOrchestrator:
             mark_terminal_safe(self._runs_repo, run_id, "error")
             return
 
+        if has_comparison:
+            from route_compare.models import ComparisonResult
+            from route_compare.service import comparison_text
+            comparisons = [entry["route_comparison"] for entry in audit_entries
+                           if isinstance(entry.get("route_comparison"), dict)]
+            response_text = (comparison_text(ComparisonResult.model_validate(comparisons[-1])) if comparisons else
+                "请提供要比较的路线名、所在城市与各路线起终点。尚未完成可核验比较，无法给出可靠推荐。")
+
         if profile.profile_id in (ProfileId.CHAT, ProfileId.RAG) and (
             knowledge_search_attempted_without_evidence(audit_entries)
         ):
@@ -3066,6 +3100,12 @@ class RunOrchestrator:
         # one terminal.
         for entry in audit_entries:
             payload: dict[str, Any] = {"tool": entry.get("tool") or entry.get("server_id")}
+            if entry.get("phase") == "call":
+                payload["args"] = entry.get("args", {})
+                if entry.get("server_id"):
+                    payload["server_id"] = entry["server_id"]
+                yield emit("tool_call", payload)
+                continue
             if entry.get("phase") == "mcp_unavailable":
                 payload["status"] = "mcp_server_unavailable"
             elif entry.get("phase") == "denied":
@@ -3089,7 +3129,20 @@ class RunOrchestrator:
             # adapter was removed in A11.
             if isinstance(entry.get("evidence"), dict):
                 payload["evidence"] = entry["evidence"]
+            for key in ("route_comparison", "route_report"):
+                if isinstance(entry.get(key), dict):
+                    payload[key] = entry[key]
             yield emit("tool_result", payload)
+
+        reports = [entry["route_report"] for entry in audit_entries if isinstance(entry.get("route_report"), dict)]
+        if reports:
+            from route_compare.models import ComparisonResult
+            from route_compare.service import render_report
+            report_content = render_report(ComparisonResult.model_validate(reports[-1]))
+            async for envelope in self._stream_artifact_flow(req, resolve_profile("artifact"),
+                run_id=run_id, emit=emit, report_content=report_content):
+                yield envelope
+            return
 
         yield emit("text", {"content": response_text})
 

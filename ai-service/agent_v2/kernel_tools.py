@@ -80,6 +80,7 @@ class BoundedDomainTool(BaseAgentTool[Any]):
     # Subclasses set:
     delegate_name: str = ""
     timeout_seconds: float = TOOL_EXECUTION_TIMEOUT_SECONDS
+    max_output_chars: int = MAX_TOOL_OUTPUT_CHARS
 
     def __init__(
         self,
@@ -134,7 +135,7 @@ class BoundedDomainTool(BaseAgentTool[Any]):
             return ToolResult(error=f"工具 {self.name} 执行失败，请稍后重试。")
 
         duration_ms = int((time.perf_counter() - started) * 1000)
-        output = _normalize_result(raw)
+        output = _normalize_result(raw, max_chars=self.max_output_chars)
         audit_entry = {
             "phase": "result",
             "ok": True,
@@ -146,7 +147,7 @@ class BoundedDomainTool(BaseAgentTool[Any]):
         return ToolResult(output=output)
 
 
-def _normalize_result(raw: Any) -> str:
+def _normalize_result(raw: Any, *, max_chars: int = MAX_TOOL_OUTPUT_CHARS) -> str:
     """Flatten the product dict/str result into a bounded model-facing string."""
     import json
 
@@ -157,8 +158,8 @@ def _normalize_result(raw: Any) -> str:
             text = json.dumps(raw, ensure_ascii=False)
         except TypeError:
             text = str(raw)
-    if len(text) > MAX_TOOL_OUTPUT_CHARS:
-        text = text[:MAX_TOOL_OUTPUT_CHARS] + "\n…(输出已截断)"
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n…(输出已截断)"
     return text
 
 
@@ -772,6 +773,8 @@ def build_chat_extra_tools(
     audit_sink: AuditSink | None,
     memory_service: Any | None = None,
     subject_id: str | None = None,
+    settings: Any | None = None,
+    route_session: Any | None = None,
 ) -> list[BoundedDomainTool]:
     """Instantiate adapters for the profile's implementable tool surface.
 
@@ -788,10 +791,12 @@ def build_chat_extra_tools(
         raise KernelAssemblyError(f"no kernel tool adapters registered for profile {profile_key!r}")
 
     memory_names = {"memory_save", "memory_search"}
+    route_names = {"route_compare", "report_export"}
     missing = sorted(
         set(profile.allowed_tools)
         - set(registry)
         - memory_names
+        - route_names
     )
     if missing:
         raise KernelAssemblyError(
@@ -802,6 +807,14 @@ def build_chat_extra_tools(
         registry[name](run_id=run_id, audit_sink=audit_sink, delegate=_unwrapped_delegate(name))
         for name in sorted(set(profile.allowed_tools) & set(registry))
     ]
+    if route_names & set(profile.allowed_tools):
+        from agent_v2.route_tools import RouteSession, build_route_tools
+        if settings is None:
+            from config import settings as server_settings
+            settings = server_settings
+        session = route_session or RouteSession(settings=settings, run_id=run_id, audit_sink=audit_sink)
+        tools.extend(tool for tool in build_route_tools(session, run_id=run_id, audit_sink=audit_sink)
+                     if tool.name in profile.allowed_tools)
     # Ticket 32: memory tools require BOTH the product service and a
     # server-resolved subject; without either they are not constructed and
     # the kernel never sees a way to touch long-term memory.

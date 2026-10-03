@@ -17,6 +17,7 @@ import Paperclip from 'reicon-react/icons/Paperclip';
 import Download from 'reicon-react/icons/Download';
 import { getConversationMemoryProgress } from '../../../api/conversationMemory';
 import { API } from '../../../api/config';
+import { RouteComparisonCard } from '../../RouteComparison';
 import { useRef, useState, createContext, useContext, useCallback, useEffect, useLayoutEffect, type RefObject, type PointerEvent as ReactPointerEvent } from 'react';
 import gsap from 'gsap';
 import { useGSAP } from '@gsap/react';
@@ -24,6 +25,8 @@ import { useGSAP } from '@gsap/react';
 gsap.registerPlugin(useGSAP);
 
 interface GeminiThreadProps {
+  onExportRoute?: (comparisonId: string) => void;
+  isSending?: boolean;
   emptyTitle: string;
   /** Called when user clicks "regenerate" — parent should resend the last user prompt */
   onRegenerate?: () => void;
@@ -35,13 +38,15 @@ interface GeminiThreadProps {
 
 /** Context to pass callbacks down to ChatMessage without prop drilling */
 const ThreadActionsContext = createContext<{
+  onExportRoute?: (comparisonId: string) => void;
+  isSending?: boolean;
   onRegenerate?: () => void;
   onConfirmTool?: (confirmationId: string, action: 'confirm' | 'reject') => void;
   realMessageCount: number;
 }>({ realMessageCount: 0 });
 
-export const GeminiThread = ({ emptyTitle, onRegenerate, onUploadClick, onConfirmTool, realMessageCount = 0 }: GeminiThreadProps) => (
-  <ThreadActionsContext.Provider value={{ onRegenerate, onConfirmTool, realMessageCount }}>
+export const GeminiThread = ({ emptyTitle, onRegenerate, onUploadClick, onConfirmTool, onExportRoute, isSending, realMessageCount = 0 }: GeminiThreadProps) => (
+  <ThreadActionsContext.Provider value={{ onRegenerate, onConfirmTool, onExportRoute, isSending, realMessageCount }}>
     <ThreadPrimitive.Root className="h-full bg-[#fdfcfc] dark:bg-[#131314] flex flex-col overflow-hidden w-full relative">
       <AuiIf condition={(s) => s.thread.isEmpty}>
         <EmptyState emptyTitle={emptyTitle} onUploadClick={onUploadClick} />
@@ -769,6 +774,8 @@ const ChatMessage = () => {
   const messageStatusType = useMessage((state) => state.status?.type);
   const artifactArgs = getToolArgs(messageContent, "artifacts");
   const messageArtifacts = Array.isArray(artifactArgs) ? artifactArgs : [];
+  const routeResults = messageContent.filter(part => part.type === 'tool-call' && part.toolName === 'routeComparison');
+  const { onExportRoute, isSending: routeExportBusy } = useContext(ThreadActionsContext);
   const isMessageRunning = messageStatusType === 'running';
   const isAssistantThinking = messageRole === 'assistant'
     && isMessageRunning
@@ -933,6 +940,7 @@ const ChatMessage = () => {
             <div className="max-w-full text-[15px] text-[#1f1f1f] dark:text-[#e3e3e3] leading-relaxed break-words">
               <MessagePrimitive.Parts components={{ Text: MarkdownText, ToolCall: CustomToolCall } as any} />
               {messageArtifacts.length > 0 && <ArtifactList artifacts={messageArtifacts} />}
+              {routeResults.map(part => <RouteComparisonCard key={part.toolCallId} value={part.args} onExport={onExportRoute} busy={routeExportBusy} />)}
               {isAssistantThinking && <AiThinking text={thinkingText} />}
             </div>
             

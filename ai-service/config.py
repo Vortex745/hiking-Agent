@@ -11,6 +11,14 @@ if not os.getenv("VERCEL"):
 
 
 class Settings:
+    route_decision_provider: str = "llm"
+    route_decision_timeout_seconds: float = 15.0
+    route_compare_data_mode: str = "live"
+    route_compare_demo_scenario: str = "complete"
+    route_decision_external_adapter: str = "route_compare.typesafe_adapter:TypeSafeProvider"
+    route_decision_external_model: str = "jev-latest"
+    route_decision_external_url: str = "https://api.typesafe.ai/v1/systemone"
+    typesafe_api_key: str = ""
     openai_base_url: str = ""
     openai_api_key: str = ""
     openai_model: str = "deepseek-v4-flash"
@@ -109,6 +117,14 @@ class Settings:
         return self._expand_env_refs(parsed) if isinstance(parsed, dict) else {}
 
     def load(self) -> "Settings":
+        self.route_decision_provider = os.getenv("ROUTE_DECISION_PROVIDER", "llm")
+        self.route_decision_timeout_seconds = float(os.getenv("ROUTE_DECISION_TIMEOUT_SECONDS", "15"))
+        self.route_compare_data_mode = os.getenv("ROUTE_COMPARE_DATA_MODE", "live")
+        self.route_compare_demo_scenario = os.getenv("ROUTE_COMPARE_DEMO_SCENARIO", "complete")
+        self.route_decision_external_adapter = os.getenv("ROUTE_DECISION_EXTERNAL_ADAPTER", self.route_decision_external_adapter)
+        self.route_decision_external_model = os.getenv("ROUTE_DECISION_EXTERNAL_MODEL", "jev-latest")
+        self.route_decision_external_url = os.getenv("ROUTE_DECISION_EXTERNAL_URL", self.route_decision_external_url)
+        self.typesafe_api_key = os.getenv("TYPESAFE_API_KEY", "")
         self.openai_base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
         self.openai_api_key = os.getenv("OPENAI_API_KEY", "")
         self.openai_model = os.getenv("OPENAI_MODEL", "deepseek-v4-flash")

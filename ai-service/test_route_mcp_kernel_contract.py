@@ -63,7 +63,7 @@ def test_mcp_builder_materializes_stdio_config_with_secret_env(monkeypatch):
     assert set(servers) == {"amap_weather", "amap_map"}
     weather = servers["amap_weather"]
     assert weather["type"] == "stdio" and weather["command"] == "npx"
-    assert "@amap/amap-weather-mcp" in weather["args"]
+    assert "@amap/amap-maps-mcp-server@0.0.8" in weather["args"]
     # Secret values ride ONLY inside env (subprocess-local), never elsewhere.
     assert weather["env"]["AMAP_API_KEY"] == "ak-test-value"
     assert "ak-test-value" not in str(weather.get("command")) + str(weather.get("args"))
@@ -102,9 +102,9 @@ def test_approved_mcp_server_tool_pair_passes_gate(monkeypatch):
     sink: list[dict[str, Any]] = []
     rule = _rule_for(profile, sink)
 
-    decision = rule.check("mcp__amap_map__plan_route", {"destination": "杭州"})
+    decision = rule.check("mcp__amap_map__maps_direction_walking", {"destination": "杭州"})
     cfg = resolve_mcp_server("amap_map")
-    assert "plan_route" in cfg.tool_allowlist  # precondition sanity
+    assert "maps_direction_walking" in cfg.tool_allowlist  # precondition sanity
     assert decision is None or decision.result is PermissionResult.ALLOWED
     assert [s for s in sink if s.get("phase") == "denied"] == []
 

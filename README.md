@@ -12,6 +12,8 @@
 
 AI Hiking 将 React 前端、Go API Gateway 和 Python FastAPI AI Service 组合成一个本地优先的徒步助手。项目提供知识库问答（chat 内知识检索工具）、路线规划、天气适宜性判断、装备检查、风险提醒、SSE 流式输出、浏览器侧模型配置和会话记忆能力。
 
+路线比较支持最多五条候选、默认 LLM 与可选外部决策 Provider、代码强制的证据/安全门、来源展开和审批后 PDF 导出。配置、离线评估及面试演示见 [路线比较演示](docs/route-comparison-demo.md)。
+
 仓库名和目录名是 `ai-hiking`；前端 `package.json` 的包名是 `ai-hiking-frontend`，因为这是一个包含前端、网关和 AI 服务的多模块仓库。
 
 ## 目录
