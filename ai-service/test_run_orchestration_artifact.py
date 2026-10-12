@@ -180,7 +180,9 @@ def test_artifact_flow_is_driven_end_to_end_by_the_module(tmp_path):
 
     call = next(e for e in items if e.type == "tool_call")
     assert call.payload["tool"] == "generate_pdf"
-    assert call.payload["args"] == {"filename": "hiking-plan.pdf"}
+    # Ticket 09 AC3: the canonical args carry the plan-book revision
+    # discriminator next to the unchanged filename.
+    assert call.payload["args"] == {"filename": "hiking-plan.pdf", "plan_revision": 1}
 
     # The export hook runs on the host with the sandbox binding, and the
     # artifact.available payload carries only public metadata.

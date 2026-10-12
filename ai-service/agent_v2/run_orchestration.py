@@ -368,6 +368,90 @@ def synthesize_terminal_type(snapshot: RunSnapshot | None) -> str | None:
 _ARTIFACT_FILENAME = "hiking-plan.pdf"
 
 
+def pdf_generate_args(*, revision: int) -> dict[str, Any]:
+    """Canonical ``generate_pdf`` tool args for ONE plan-book generation (Ticket 09 AC3).
+
+    Approvals and effects are keyed ``(run_id, tool_name, args_canonical)`` and a
+    committed effect is replayed from ``result_json``, never re-executed: inside
+    one run two identical ``generate_pdf`` calls are the SAME logical side
+    effect, so a regeneration that kept these args byte-identical would return
+    the OLD artifact instead of producing a new one. The plan-book revision
+    therefore travels inside the canonical args — a new generation is a new
+    approval and a new effect by construction.
+
+    The filename stays ``_ARTIFACT_FILENAME``: it is duplicated in
+    ``api/chat_v2.py`` and ``test_route_report_export.py``/
+    ``test_run_orchestration_artifact.py`` derive ids and pins from it, and only
+    the discriminator is added next to it. Removing ``plan_revision`` here is a
+    mutation the AC3 tests in ``test_artifact_versioned_generation.py`` fail —
+    the second drive of the same run recovers the committed effect and never
+    re-executes.
+    """
+    return {"filename": _ARTIFACT_FILENAME, "plan_revision": int(revision)}
+
+
+def _next_plan_revision(runs_repo: Any, conversation_id: str) -> int:
+    """The generation number the NEXT plan-book publication takes (AC3/AC4).
+
+    Read from the version-history rows (AC4), not from run state: the history is
+    the only thing that knows how many books this conversation has published,
+    and it outlives every run. Best-effort: no repository, no conversation or a
+    failed read is revision 1 — a wrong-but-unique discriminator cannot
+    resurrect the replay hazard within one run (keys carry run_id anyway) and
+    the publication below re-derives the authoritative revision from the table.
+    """
+    if runs_repo is None or not conversation_id:
+        return 1
+    try:
+        current = runs_repo.get_current_plan_artifact_version(conversation_id)
+    except Exception:
+        logger.exception(
+            "run_orchestration: artifact version history unread for conversation=%s; "
+            "defaulting to revision 1", conversation_id,
+        )
+        return 1
+    return (current.revision + 1) if current is not None else 1
+
+
+def _record_plan_artifact_version(
+    runs_repo: Any,
+    *,
+    conversation_id: str,
+    artifact_id: str,
+    run_id: str | None,
+) -> dict[str, Any]:
+    """Publish one generation into the version history (AC4) after a real export.
+
+    Returns the public relation for the ``artifact.available`` payload:
+    ``plan_revision`` and ``previous_artifact_id``. The artifact bytes, size and
+    expiry stay owned by the ``artifacts`` row and its download rules — this row
+    only records the relation, per the ticket's reuse-not-reinvent rule.
+    Best-effort: a history write must never un-publish an artifact that already
+    exists on disk and in ``artifacts``; on failure the event simply carries no
+    revision and the error is logged for operators.
+    """
+    relation: dict[str, Any] = {}
+    if runs_repo is None or not artifact_id or not conversation_id:
+        return relation
+    try:
+        draft = runs_repo.get_plan_draft(conversation_id)
+        record = runs_repo.publish_plan_artifact_version(
+            conversation_id=conversation_id,
+            artifact_id=artifact_id,
+            draft_id=draft.draft_id if draft is not None else "",
+            published_by_run_id=run_id or "",
+        )
+        relation["plan_revision"] = record.revision
+        relation["previous_artifact_id"] = record.previous_artifact_id
+    except Exception:
+        logger.exception(
+            "run_orchestration: could not record artifact version for "
+            "conversation=%s artifact=%s; the artifact itself is published",
+            conversation_id, artifact_id,
+        )
+    return relation
+
+
 def _pdf_plan_status_inputs(runs_repo: Any, conversation_id: str) -> dict[str, Any]:
     """The plan side of the PDF cover, read from the rows the plan flow wrote.
 
@@ -2530,6 +2614,17 @@ class RunOrchestrator:
                 })
                 return
 
+            # Ticket 09 AC3: this flow publishes generation ``revision`` of the
+            # conversation's plan book. The revision rides inside the canonical
+            # tool args (see :func:`pdf_generate_args`), so the approval below —
+            # and the effect key the resume path re-derives from its stored
+            # args — is a NEW logical side effect even when the filename (and
+            # everything else) is unchanged. The export site records the same
+            # revision into the version history (AC4).
+            conversation_id = req.conversation_id or f"conv-{req.request_id}"
+            plan_revision = _next_plan_revision(runs_repo, conversation_id)
+            pdf_args = pdf_generate_args(revision=plan_revision)
+
             # Ticket 11 — PermissionGate check BEFORE tool_call.
             # Spec AC3: "approval.required 后 graph 持久 interrupt，并以
             # run.paused 结束当前流；工具在批准前没有副作用".
@@ -2539,9 +2634,7 @@ class RunOrchestrator:
             # WITHOUT destroying the sandbox (spec AC4: the same sandbox must
             # be reused when the user approves).
             gate = self._gate_factory() if self._gate_factory else PermissionGate()
-            verdict = gate.evaluate(
-                profile, "generate_pdf", {"filename": _ARTIFACT_FILENAME}
-            )
+            verdict = gate.evaluate(profile, "generate_pdf", pdf_args)
             if verdict.decision == PermissionDecision.DENY:
                 mark_terminal_safe(runs_repo, run_id, "error")
                 yield emit("error", {
@@ -2553,7 +2646,7 @@ class RunOrchestrator:
                 approval_id = compute_approval_id(
                     run_id=run_id or req.request_id,
                     tool_name="generate_pdf",
-                    args={"filename": _ARTIFACT_FILENAME},
+                    args=pdf_args,
                 )
                 created_at = _now_iso()
                 expires_at = compute_expiry(created_at)
@@ -2565,7 +2658,7 @@ class RunOrchestrator:
                             run_id=run_id,
                             conversation_id=req.conversation_id or f"conv-{req.request_id}",
                             tool_name="generate_pdf",
-                            args_canonical=canonical_args({"filename": _ARTIFACT_FILENAME}),
+                            args_canonical=canonical_args(pdf_args),
                             risk_level=verdict.risk.value if verdict.risk else "high",
                             impact=impact,
                             created_at=created_at,
@@ -2585,7 +2678,7 @@ class RunOrchestrator:
                 yield emit("approval.required", {
                     "approval_id": approval_id,
                     "tool": "generate_pdf",
-                    "args": {"filename": _ARTIFACT_FILENAME},
+                    "args": pdf_args,
                     "risk_level": verdict.risk.value if verdict.risk else "high",
                     "impact": impact,
                     "expires_at": expires_at,
@@ -2672,7 +2765,7 @@ class RunOrchestrator:
                 plan_content = json.dumps(pdf_document, ensure_ascii=False)
             yield emit("tool_call", {
                 "tool": "generate_pdf",
-                "args": {"filename": _ARTIFACT_FILENAME},
+                "args": pdf_args,
             })
 
             # Generate PDF inside sandbox. Fail-closed: timeout/error → terminal.
@@ -2734,7 +2827,6 @@ class RunOrchestrator:
             # is terminal — the run does NOT publish a half-built
             # artifact (spec AC4). The evidence row is saved BEFORE the
             # sandbox cleanup runs (in ``finally``).
-            conversation_id = req.conversation_id or f"conv-{req.request_id}"
             try:
                 export = self._export_artifact(
                     computer=computer,
@@ -2772,6 +2864,15 @@ class RunOrchestrator:
             # opaque artifact_id + public metadata. No sandbox path, no
             # host storage_path, no run_id (the envelope already carries
             # run_id for clients that need it).
+            # Ticket 09 AC4: plus the version relation — which generation this
+            # is and which artifact it replaced — so the client's draft can
+            # show 当前版本/历史 without ever learning a storage path.
+            relation = _record_plan_artifact_version(
+                runs_repo,
+                conversation_id=conversation_id,
+                artifact_id=export["artifact_id"],
+                run_id=run_id,
+            )
             yield emit("artifact.available", {
                 "artifact_id": export["artifact_id"],
                 "public_filename": export["public_filename"],
@@ -2779,6 +2880,7 @@ class RunOrchestrator:
                 "size_bytes": export["size_bytes"],
                 "sha256": export["sha256"],
                 "expires_at": export["expires_at"],
+                **relation,
                 "message": "artifact 已就绪，可通过 /api/v2/artifacts/{artifact_id} 下载。",
             })
 
@@ -3210,7 +3312,11 @@ class RunOrchestrator:
                 effect_key=effect_key,
                 external_idempotency_key=external_idempotency_key,
                 args_canonical=resolved.args_canonical,
-                tool_args={"filename": artifact_filename},
+                # Ticket 09: the FULL approved args (filename + plan_revision)
+                # drive the ledger — the effect key already derives from them,
+                # and the emitted tool_call must show what was approved, not a
+                # trimmed copy.
+                tool_args=(approved_args or {"filename": artifact_filename}),
                 all_events=all_events,
                 has_tool_call=has_tool_call,
                 has_tool_result_ok=has_tool_result_ok,
@@ -3293,6 +3399,12 @@ class RunOrchestrator:
                     "size_bytes": export["size_bytes"],
                     "sha256": export["sha256"],
                     "expires_at": export["expires_at"],
+                    **_record_plan_artifact_version(
+                        runs_repo,
+                        conversation_id=run.conversation_id,
+                        artifact_id=export["artifact_id"],
+                        run_id=run_id,
+                    ),
                     "message": "artifact 已就绪，可通过 /api/v2/artifacts/{artifact_id} 下载。",
                 })
             else:

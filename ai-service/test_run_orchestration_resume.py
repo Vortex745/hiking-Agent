@@ -309,16 +309,21 @@ def test_concurrent_resume_preserves_sandbox_while_executor_is_live(tmp_path):
     )
 
     # Simulate the concurrent CAS winner: an effect left EXECUTING plus
-    # a recent persisted tool_call proving the executor is live.
+    # a recent persisted tool_call proving the executor is live. The args
+    # are taken from the approval row itself — the same derivation the
+    # resume flow makes (Ticket 09: the canonical args now carry the
+    # plan_revision discriminator) — so the simulated winner addresses the
+    # effect this approval will re-derive.
+    approved_args = json.loads(repo.get_approval(approval_id).args_canonical)
     effect_key = compute_effect_key(
-        run_id=run_id, tool_name="generate_pdf", args={"filename": "hiking-plan.pdf"}
+        run_id=run_id, tool_name="generate_pdf", args=approved_args
     )
     repo.insert_effect(
         effect_key=effect_key,
         run_id=run_id,
         conversation_id="conv",
         tool_name="generate_pdf",
-        args_canonical='{"filename": "hiking-plan.pdf"}',
+        args_canonical=json.dumps(approved_args, sort_keys=True, separators=(",", ":")),
         external_idempotency_key=f"ext-{effect_key}",
     )
     _record, won = repo.transition_effect_to_executing(effect_key)
@@ -327,7 +332,7 @@ def test_concurrent_resume_preserves_sandbox_while_executor_is_live(tmp_path):
         run_id=run_id,
         sequence=100,
         event_type="tool_call",
-        payload={"tool": "generate_pdf", "args": {"filename": "hiking-plan.pdf"}},
+        payload={"tool": "generate_pdf", "args": approved_args},
         request_id="req-40conc",
         conversation_id="conv",
         timestamp=_now_iso(),
@@ -359,15 +364,18 @@ def test_crashed_executing_effect_becomes_outcome_unknown_on_resume(tmp_path):
     )
 
     # Crash between CAS and commit: EXECUTING effect, NO live tool_call.
+    # Args come from the approval row (see the concurrent-resume test above
+    # for why — Ticket 09's plan_revision rides in args_canonical).
+    approved_args = json.loads(repo.get_approval(approval_id).args_canonical)
     effect_key = compute_effect_key(
-        run_id=run_id, tool_name="generate_pdf", args={"filename": "hiking-plan.pdf"}
+        run_id=run_id, tool_name="generate_pdf", args=approved_args
     )
     repo.insert_effect(
         effect_key=effect_key,
         run_id=run_id,
         conversation_id="conv",
         tool_name="generate_pdf",
-        args_canonical='{"filename": "hiking-plan.pdf"}',
+        args_canonical=json.dumps(approved_args, sort_keys=True, separators=(",", ":")),
         external_idempotency_key=f"ext-{effect_key}",
     )
     _record, won = repo.transition_effect_to_executing(effect_key)
