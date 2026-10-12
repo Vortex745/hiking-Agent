@@ -223,12 +223,269 @@ def test_the_discriminator_lives_in_the_canonical_args_and_keeps_the_filename(tm
     assert approval_1 != approval_2
 
 
+# ---- AC1/AC2/AC3/AC5: two real generations through the existing lifecycle ---
+#
+# These run the REAL LocalNativeComputer (mkdtemp workspace, real ReportLab
+# render, real host-side verified export into ``agent_v2_state_dir/artifacts``)
+# and the REAL download endpoint, so the claims are about actual files and
+# actual bytes — not a mock's bookkeeping.
+
+from datetime import datetime, timedelta, timezone
+
+from agent_v2.artifacts import ARTIFACT_TTL_DAYS
+from agent_v2.computer import LocalNativeComputer
+from agent_v2.memory_service import MemoryService
+from agent_v2.repositories.memory import MemoryStore
+from agent_v2.run_orchestration import ChatFlowRequest, RunOrchestrator
+from api.chat_v2 import artifacts_v2_router, _cleanup_sandbox
+from api.memory_v2 import SUBJECT_COOKIE_NAME
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
+import hashlib
+
+
+def _e2e_orchestrator(tmp_path, repo, computer, texts: list[str]):
+    calls: list[int] = []
+
+    async def fake_kernel(**kwargs: Any) -> tuple[str, list[dict[str, Any]]]:
+        text = texts[min(len(calls), len(texts) - 1)]
+        calls.append(1)
+        return text, []
+
+    settings = SimpleNamespace(
+        agent_v2_enabled=True, openai_api_key="sk-test", openai_model="test-model",
+        agent_v2_state_dir=str(tmp_path / "state"),
+    )
+    return RunOrchestrator(
+        settings=settings,
+        runs_repo=repo,
+        kernel_turn=fake_kernel,
+        computer_factory=lambda *a, **k: computer,
+        sandbox_cleanup=_cleanup_sandbox,
+    )
+
+
+def _pause_approve_resume(orch: RunOrchestrator, repo: RunRepository, request_id: str,
+                          conversation_id: str) -> tuple[list[Any], str]:
+    req = ChatFlowRequest(
+        message="重新生成计划书 PDF", request_id=request_id,
+        conversation_id=conversation_id, profile_id="artifact",
+    )
+
+    async def pause() -> list[Any]:
+        return [e async for e in orch.stream_chat(req)]
+
+    events = asyncio.run(pause())
+    assert events[-1].type == "run.paused"
+    run_id = events[-1].run_id
+    approval = repo.list_pending_approvals_for_run(run_id)[0]
+    decision = orch.resolve_approval_decision(
+        approval.approval_id, decision="approve",
+        decision_request_id=f"dec-{request_id}",
+    )
+    assert decision.status in ("recorded", "idempotent")
+
+    async def resume() -> list[Any]:
+        return [e async for e in orch.stream_resume(run_id=run_id)]
+
+    resumed = asyncio.run(resume())
+    return resumed, run_id
+
+
+def test_a_changed_plan_regenerates_a_new_artifact_without_touching_the_old_one(tmp_path):
+    """AC1+AC3+AC4+AC5 end to end on real bytes: generation 2 is a NEW artifact
+    rendered through the SAME physical sandbox lifecycle; generation 1 keeps its
+    exact bytes, its own file, and its own download/expiry rules."""
+    repo = _repo(tmp_path)
+    memory = MemoryService(MemoryStore(str(tmp_path / "memory.sqlite")))
+    owner = memory.resolve_subject(None)
+    stranger = memory.resolve_subject(None)
+    memory.claim_conversation(owner.subject_id, "conv-regen")
+
+    orch = _e2e_orchestrator(
+        tmp_path, repo, LocalNativeComputer(),
+        ["# 徒步计划 第一版\n集合时间上午八点", "# 徒步计划 第二版\n集合时间改到清晨六点"],
+    )
+
+    first, run1 = _pause_approve_resume(orch, repo, "req-regen-1", "conv-regen")
+    avail1 = next(e for e in first if e.type == "artifact.available")
+    assert avail1.payload["plan_revision"] == 1
+    assert avail1.payload["previous_artifact_id"] == ""
+    lease1 = repo.get_sandbox_lease(run1)
+    assert lease1.status == "destroyed"  # AC1: cleanup ran, no host fallback
+
+    second, run2 = _pause_approve_resume(orch, repo, "req-regen-2", "conv-regen")
+    avail2 = next(e for e in second if e.type == "artifact.available")
+    assert avail2.payload["plan_revision"] == 2
+    assert avail2.payload["previous_artifact_id"] == avail1.payload["artifact_id"]
+
+    art1 = repo.get_artifact(avail1.payload["artifact_id"])
+    art2 = repo.get_artifact(avail2.payload["artifact_id"])
+    assert art1 is not None and art2 is not None
+    # AC3: a NEW artifact — new opaque id, new host directory, different bytes.
+    assert art1.artifact_id != art2.artifact_id
+    assert art1.storage_path != art2.storage_path
+    import os
+    assert os.path.isfile(art1.storage_path) and os.path.isfile(art2.storage_path)
+    assert art1.sha256 != art2.sha256
+    # AC4: the draft's relation rows — current is generation 2, history is ordered.
+    current = repo.get_current_plan_artifact_version("conv-regen")
+    assert current is not None and current.artifact_id == art2.artifact_id
+    assert [v.revision for v in repo.list_plan_artifact_versions("conv-regen")] == [1, 2]
+
+    # AC5: BOTH generations still obey the download rules — the old file was
+    # not overwritten, so it still hashes to its own recorded digest.
+    app = FastAPI()
+    app.state.agent_v2_runtime = SimpleNamespace(runs=repo, memory=memory)
+    app.include_router(artifacts_v2_router, prefix="/api/v2")
+
+    async def download() -> tuple[Any, Any, Any]:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test",
+            cookies={SUBJECT_COOKIE_NAME: owner.token},
+        ) as client:
+            got1 = await client.get(f"/api/v2/artifacts/{art1.artifact_id}")
+            got2 = await client.get(f"/api/v2/artifacts/{art2.artifact_id}")
+            client.cookies.set(SUBJECT_COOKIE_NAME, stranger.token)
+            denied = await client.get(f"/api/v2/artifacts/{art1.artifact_id}")
+            return got1, got2, denied
+
+    got1, got2, denied = asyncio.run(download())
+    assert got1.status_code == 200 and hashlib.sha256(got1.content).hexdigest() == art1.sha256
+    assert got2.status_code == 200 and hashlib.sha256(got2.content).hexdigest() == art2.sha256
+    assert got1.content != got2.content and got1.content.startswith(b"%PDF-")
+    # AC1 physical sandbox: the bytes were rendered by the real reportlab path
+    # inside the mkdtemp workspace and exported — never a host-side fallback.
+    assert b"v2-sandbox-" not in got1.content  # no path leak in the payload
+    assert "storage_path" not in avail1.payload and "workspace_path" not in avail1.payload
+    # Cross-subject access stays denied for the OLD artifact too.
+    assert denied.status_code in (403, 404)
+
+
+def test_expiry_still_bites_old_generations_after_regeneration(tmp_path):
+    """AC5: TTL + expired status keep their meaning for superseded generations.
+
+    There is no cron sweeper in this repo — expiry is enforced at download
+    time (runtime fallback) — so this test does NOT claim a background sweep;
+    it pins the 7-day TTL on the new row and the 410 once the row is past it.
+    """
+    repo = _repo(tmp_path)
+    memory = MemoryService(MemoryStore(str(tmp_path / "memory.sqlite")))
+    owner = memory.resolve_subject(None)
+    memory.claim_conversation(owner.subject_id, "conv-expire")
+    orch = _e2e_orchestrator(tmp_path, repo, LocalNativeComputer(), ["# 计划"])
+    first, _run1 = _pause_approve_resume(orch, repo, "req-expire-1", "conv-expire")
+    avail = next(e for e in first if e.type == "artifact.available")
+    art = repo.get_artifact(avail.payload["artifact_id"])
+    created = datetime.fromisoformat(art.created_at)
+    expires = datetime.fromisoformat(art.expires_at)
+    assert (expires - created) == timedelta(days=ARTIFACT_TTL_DAYS)
+
+    repo.mark_artifact_expired(art.artifact_id)
+    app = FastAPI()
+    app.state.agent_v2_runtime = SimpleNamespace(runs=repo, memory=memory)
+    app.include_router(artifacts_v2_router, prefix="/api/v2")
+
+    async def download():
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test",
+                               cookies={SUBJECT_COOKIE_NAME: owner.token}) as c:
+            return await c.get(f"/api/v2/artifacts/{art.artifact_id}")
+
+    gone = asyncio.run(download())
+    assert gone.status_code == 410
+
+
+def test_a_failed_render_publishes_nothing(tmp_path):
+    """AC2: a failed render publishes no half-artifact.
+
+    The render fails INSIDE the sandbox (injected timeout in the real
+    computer); the run terminates with an error, the effect is ``failed``,
+    NO artifact row exists, NO ``artifact.available`` was emitted, and the
+    version history stayed empty — nothing was published to supersede the
+    draft's current artifact.
+    """
+    repo = _repo(tmp_path)
+    orch = _e2e_orchestrator(tmp_path, repo, LocalNativeComputer(failure_mode="timeout"),
+                             ["# 会失败的计划"])
+    resumed, run_id = _pause_approve_resume(orch, repo, "req-failrender", "conv-fail")
+    types = [e.type for e in resumed]
+    assert "artifact.available" not in types
+    assert types[-1] == "error"
+    assert repo.list_artifacts_for_run(run_id) == []
+    assert repo.list_plan_artifact_versions("conv-fail") == []
+    run = repo.get_run(run_id)
+    assert run is not None and run.status == "error"
+
+
+def test_a_failed_export_persists_evidence_before_cleanup_and_downloads_410(tmp_path):
+    """AC2+AC5: the export-side failure path keeps its contract.
+
+    A sandbox whose manifest lies about the checksum gets NO published
+    artifact: ``export_artifact_to_host`` persists the ``failed`` evidence row
+    BEFORE cleanup (proven: the row exists and its artifact id appears in no
+    available state) and the REAL download endpoint answers 410 for it."""
+    class LyingComputer(LocalNativeComputer):
+        def build_manifest(self, workspace_path, relative_path, declared_mime):
+            from agent_v2.artifacts import ArtifactManifest
+            real = super().build_manifest(workspace_path, relative_path, declared_mime)
+            return ArtifactManifest(
+                relative_path=real.relative_path,
+                public_filename=real.public_filename,
+                declared_mime=real.declared_mime,
+                size_bytes=real.size_bytes,
+                sha256="0" * 64,  # sandbox tampering: the host must reject
+            )
+
+    repo = _repo(tmp_path)
+    memory = MemoryService(MemoryStore(str(tmp_path / "memory.sqlite")))
+    owner = memory.resolve_subject(None)
+    memory.claim_conversation(owner.subject_id, "conv-lying")
+
+    class _AllowGate:
+        def evaluate(self, profile, tool_name, args=None):
+            from agent_v2.permissions import (
+                PermissionDecision, PermissionVerdict, RiskLevel,
+            )
+            return PermissionVerdict(
+                decision=PermissionDecision.ALLOW, risk=RiskLevel.LOW, reason="allow",
+            )
+
+    orch = _e2e_orchestrator(tmp_path, repo, LyingComputer(), ["# 篡改校验和的计划"])
+    orch._gate_factory = _AllowGate
+
+    req = ChatFlowRequest(
+        message="出 PDF", request_id="req-lying-export",
+        conversation_id="conv-lying", profile_id="artifact",
+    )
+    items = asyncio.run(_stream(orch, req))
+    types = [e.type for e in items]
+    assert "artifact.available" not in types
+    assert types[-1] == "error"
+    failed_rows = [a for a in repo.list_artifacts_for_run(items[0].run_id)
+                   if a.status == "failed"]
+    assert len(failed_rows) == 1
+
+    app = FastAPI()
+    app.state.agent_v2_runtime = SimpleNamespace(runs=repo, memory=memory)
+    app.include_router(artifacts_v2_router, prefix="/api/v2")
+
+    async def download():
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test",
+                               cookies={SUBJECT_COOKIE_NAME: owner.token}) as c:
+            return await c.get(f"/api/v2/artifacts/{failed_rows[0].artifact_id}")
+
+    gone = asyncio.run(download())
+    assert gone.status_code == 410
+
+
+async def _stream(orch: RunOrchestrator, req: ChatFlowRequest) -> list[Any]:
+    return [e async for e in orch.stream_chat(req)]
+
+
 def test_the_pause_approval_carries_the_next_plan_revision(tmp_path):
     """AC3 at the flow seam: the approval a paused run creates is keyed by the
     generation it is about to publish, and the stored ``args_canonical`` is what
     the resume path replays into ``compute_effect_key``."""
-    from agent_v2.run_orchestration import ChatFlowRequest, RunOrchestrator
-
     repo = _repo(tmp_path)
     run_id = _make_run(repo, "req-ac3flow")
     repo.publish_plan_artifact_version(
@@ -265,3 +522,21 @@ def test_the_pause_approval_carries_the_next_plan_revision(tmp_path):
     stored = repo.get_approval(pause.payload["approval_id"])
     assert stored is not None
     assert canonical_args({"filename": "hiking-plan.pdf", "plan_revision": 2}) == stored.args_canonical
+
+
+def test_the_discriminator_change_never_resurrects_the_replay_for_identical_calls(tmp_path):
+    """Control half of AC3: the ledger still dedupes the SAME generation.
+
+    Without this, "make regeneration execute" could be cheated by disabling
+    effect replay entirely. Two drives with the same run + same args (same
+    revision) must recover the committed result without re-executing.
+    """
+    repo = _repo(tmp_path)
+    run_id = _make_run(repo, "req-dedup")
+    executed: list[int] = []
+    first, _k1, _e1 = _drive_pdf(repo, run_id, pdf_generate_args(revision=7), executed)
+    assert first.status == "executed" and executed == [1]
+    again, k2, _e2 = _drive_pdf(repo, run_id, pdf_generate_args(revision=7), executed)
+    assert k2 == _k1
+    assert again.status == "recovered"
+    assert executed == [1]
