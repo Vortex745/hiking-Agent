@@ -316,3 +316,130 @@ def test_an_abandoned_plan_turn_leaves_no_half_written_state(flow):
     assert _drafts(frames)[0]["payload"]["stage"] == "minimal_draft"
     assert frames[-1]["type"] == "done"
     assert flow.model_calls == []
+
+
+# ---- The plan book's export run (AC2 / AC3 / AC4 / AC5 subject) -----------
+#
+# The plan book is published through the EXISTING trigger sites: a route_plan
+# turn whose kernel calls ``route_compare`` + ``report_export``, then the same
+# HIGH-risk ``generate_pdf`` approval pause. These helpers drive that once and
+# let each test ask its own question about it. The computer is the real
+# ``LocalNativeComputer`` (mkdtemp workspace, real ReportLab render, real
+# verified host export) because AC2/AC3 are claims about bytes and rows, not
+# about a mock's bookkeeping.
+
+def _recording_computer(produced: list[str]):
+    class _Computer(LocalNativeComputer):
+        def generate_pdf(self, workspace_path, content, filename):
+            produced.append(content)
+            return super().generate_pdf(workspace_path, content, filename)
+
+    return _Computer()
+
+
+def _install_route_plan_model(monkeypatch, flow, *, meeting_point: str):
+    """Fake kernel that performs the sourced-comparison + export tool pair.
+
+    One call per run: the count doubles as the AC3 assertion that a resume does
+    not re-ask the model for the plan body (the report is code-rendered).
+    """
+
+    async def model(**kwargs):
+        flow.model_calls.append(kwargs["message"])
+        compare = next(t for t in kwargs["extra_tools"] if t.name == "route_compare")
+        export = next(t for t in kwargs["extra_tools"] if t.name == "report_export")
+        result = json.loads((await compare(candidates=[{
+            "name": "演示林间环线", "city": "演示城市",
+            "origin": "起点", "destination": "终点"}])).output)
+        await export(comparison_id=result["comparison_id"], plan_details={
+            "activity_date": "2026-11-08", "meeting_time": "08:30",
+            "meeting_point": meeting_point, "participants": 12,
+        })
+        return "模型正文不应进入计划书", []
+
+    monkeypatch.setattr(kernel, "run_chat_turn", model)
+
+
+def _export_payload(request_id: str) -> dict[str, Any]:
+    """The plan book's export turn: a route_plan turn, no structured intent.
+
+    Deliberately NOT a plan-intent request — :func:`evaluate_plan_intent` stays
+    the only plan transition decider, and the PDF is queued by the existing
+    ``report_export`` trigger site (ticket 09's rule: ``plan_regenerate`` alone
+    never queues a PDF).
+    """
+    return {
+        "message": "请导出带来源的计划书 PDF", "request_id": request_id,
+        "conversation_id": CONV, "profile_id": "route_plan",
+    }
+
+
+def _pause_plan_book(flow, monkeypatch, *, request_id: str, meeting_point: str,
+                     produced: list[str]) -> tuple[list[dict], list[dict]]:
+    """Open the plan book once: draft turn, then the approval-paused export run.
+
+    Returns ``(paused_frames, resume_frames)`` with the approval already
+    recorded; the PDF is rendered only by the resume stream, and the plan rows
+    (draft + arrangements) are on record before it, so the version row the
+    export publishes carries a real ``draft_id``.
+    """
+    # 1. the model-free draft turn that the book is built from.
+    draft_frames = _post_sse(flow.app, flow.subject, _submit(f"book-{request_id}"))
+    assert draft_frames[-1]["type"] == "done"
+    assert _drafts(draft_frames)[0]["payload"]["draft"]["arrangements"]["meeting_point"] \
+        == _ARRANGEMENTS["meeting_point"]
+
+    # 2. the export run: kernel pair → pause → approve → resume renders.
+    _install_route_plan_model(monkeypatch, flow, meeting_point=meeting_point)
+    monkeypatch.setattr(chat_api, "_build_artifact_computer",
+                        lambda *a, **k: _recording_computer(produced))
+
+    async def run():
+        async with _client(flow.app, flow.subject) as client:
+            paused = _frames(await client.post(
+                "/api/v2/chat/sse", json=_export_payload(request_id)))
+            assert paused[-1]["type"] == "run.paused", paused
+            approval = next(e["payload"] for e in paused if e["type"] == "approval.required")
+            decided = await client.post(
+                f"/api/v2/approvals/{approval['approval_id']}/decision",
+                json={"decision": "approve", "decision_request_id": f"dec-{request_id}"})
+            assert decided.status_code == 200
+            resumed = _frames(await client.post(
+                f"/api/v2/chat/resume/{paused[-1]['run_id']}",
+                params={"from_seq": paused[-1]["sequence"]}))
+            return paused, resumed
+
+    return asyncio.run(run())
+
+
+def _available(frames: list[dict]) -> list[dict]:
+    return [f for f in frames if f["type"] == "artifact.available"]
+
+
+# ---- AC2: a duplicate request cannot publish a second PDF ------------------
+
+def test_replaying_a_published_plan_book_request_publishes_nothing_new(flow, monkeypatch):
+    """AC2: the same ``request_id`` is a replay, all the way to the artifact.
+
+    After the run has completed, re-POSTing the export request replays the whole
+    stored stream — pause frames and resume continuation — and executes nothing:
+    one render, one ``artifacts`` row, one version row, one download.
+    """
+    produced: list[str] = []
+    request_id = "req-book-dup"
+    paused, resumed = _pause_plan_book(
+        flow, monkeypatch, request_id=request_id,
+        meeting_point="北门停车场", produced=produced)
+    assert len(produced) == 1
+    assert _available(resumed)[0]["payload"]["plan_revision"] == 1
+
+    again = _post_sse(flow.build(), flow.subject, _export_payload(request_id))
+
+    assert again == paused + resumed
+    assert len(_available(again)) == 1
+    assert len(produced) == 1, "the duplicate request re-rendered the PDF"
+    run_id = flow.repo.resolve_run_id(request_id)
+    assert run_id is not None and len(flow.repo.list_artifacts_for_run(run_id)) == 1
+    versions = flow.repo.list_plan_artifact_versions(CONV)
+    assert [v.revision for v in versions] == [1]
+    assert versions[0].artifact_id == _available(resumed)[0]["payload"]["artifact_id"]
