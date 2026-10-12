@@ -373,6 +373,61 @@ CREATE TABLE IF NOT EXISTS plan_completeness_checks (
 
 CREATE INDEX IF NOT EXISTS idx_plan_completeness_checks_draft
 ON plan_completeness_checks(draft_id);
+
+-- Ticket 09 AC4: the plan book's artifact version history. A NEW table, never
+-- a ``plan_drafts`` column (``ControlStore.__init__`` only runs CREATE TABLE IF
+-- NOT EXISTS, so an added column silently never exists on an existing database).
+-- One row per PUBLISHED generation, keyed by ``(conversation_id, revision)``:
+-- the draft's answer to "which artifact is current" (MAX revision) and "what
+-- came before" (the ascending list, each row naming the artifact it replaced).
+-- Deliberately NOT FK'd to ``run_id``: events/artifacts/approvals/effects
+-- cascade-delete with the run (persistence.py runs/FK notes above), and this
+-- relation must outlive the run that produced the artifact or a deleted run
+-- would silently rewrite the draft's history. ``published_by_run_id`` is a
+-- plain audit string for the same reason.
+CREATE TABLE IF NOT EXISTS plan_artifact_versions (
+    conversation_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    draft_id TEXT NOT NULL DEFAULT '',
+    artifact_id TEXT NOT NULL,
+    previous_artifact_id TEXT NOT NULL DEFAULT '',
+    published_by_run_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (conversation_id, revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_artifact_versions_conv
+ON plan_artifact_versions(conversation_id);
+
+-- Ticket 09 (gap ticket 08 left open): the deterministic gate's safety record
+-- as a ROW, so the PDF cover's 安全门 line reads what the gate answered instead
+-- of staying 待核验 in real exports. Ticket 07's :class:`PlanSafety` only rode
+-- the ``plan.draft_state.safety`` event payload; this stores that payload
+-- verbatim (the stable codes, the gate's own booleans, its own message string
+-- and the comparison it speaks for). Nothing is derived here: the row exists
+-- only because a plan turn ran the route gate, and it is superseded with the
+-- draft it belongs to (``draft_id``), cleared with the rest of the unfinished
+-- plan state on cancel. New table for the same CREATE-TABLE-IF-NOT-EXISTS
+-- reason as above.
+CREATE TABLE IF NOT EXISTS plan_safety_records (
+    conversation_id TEXT PRIMARY KEY,
+    draft_id TEXT NOT NULL,
+    hard_stop INTEGER NOT NULL CHECK (hard_stop IN (0, 1)),
+    codes_json TEXT NOT NULL DEFAULT '[]',
+    formal_route_plan_allowed INTEGER NOT NULL CHECK (formal_route_plan_allowed IN (0, 1)),
+    message TEXT NOT NULL DEFAULT '',
+    comparison_id TEXT NOT NULL DEFAULT '',
+    comparison_status TEXT NOT NULL DEFAULT '',
+    gate_reasons_json TEXT NOT NULL DEFAULT '[]',
+    required_action TEXT NOT NULL DEFAULT '',
+    recorded_by_run_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_safety_records_draft
+ON plan_safety_records(draft_id);
 """
 
 
@@ -599,6 +654,72 @@ class CompletenessCheckRecord:
     checked_by_run_id: str
     created_at: str
     updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class PlanArtifactVersionRecord:
+    """Snapshot of a plan_artifact_versions row (Ticket 09 AC4).
+
+    One published generation of the plan book: the revision number (also the
+    discriminator inside ``generate_pdf``'s canonical args), the artifact it
+    points at, and the artifact it replaced. ``artifact_id`` is an id, not a
+    copy: bytes, size and expiry stay owned by the ``artifacts`` row and its
+    download rules (AC5), so the history can never contradict them.
+    """
+
+    conversation_id: str
+    revision: int
+    draft_id: str
+    artifact_id: str
+    previous_artifact_id: str
+    published_by_run_id: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class PlanSafetyRecord:
+    """Snapshot of a plan_safety_records row (Ticket 09, ticket 07's record).
+
+    The gate's answer as data, stored verbatim from
+    :meth:`agent_v2.plan_workflow.PlanSafety.to_payload`: booleans, stable
+    codes, the gate's own message, and the comparison it speaks for. There is
+    no field for a re-derived sentence or a report-eligibility flag — the cover
+    copy comes from the payload ``report_pdf`` already knows how to read, and
+    ``render_report`` stays the only eligibility authority.
+    """
+
+    conversation_id: str
+    draft_id: str
+    hard_stop: bool
+    codes: tuple[str, ...]
+    formal_route_plan_allowed: bool
+    message: str
+    comparison_id: str
+    comparison_status: str
+    gate_reasons: tuple[str, ...]
+    required_action: str
+    recorded_by_run_id: str
+    created_at: str
+    updated_at: str
+
+    def to_payload(self) -> dict[str, Any]:
+        """The :meth:`PlanSafety.to_payload` shape, rebuilt from the row.
+
+        Read back by :func:`agent_v2.run_orchestration._pdf_plan_status_inputs`
+        and passed to ``build_report_document(safety=...)`` — the same shape the
+        cover already expects, with no new keys and no new sentences.
+        """
+        return {
+            "hard_stop": self.hard_stop,
+            "codes": list(self.codes),
+            "formal_route_plan_allowed": self.formal_route_plan_allowed,
+            "message": self.message,
+            "comparison_id": self.comparison_id,
+            "comparison_status": self.comparison_status,
+            "gate_reasons": list(self.gate_reasons),
+            "required_action": self.required_action,
+        }
 
 
 # ---- Approval statuses (Ticket 11) ---------------------------------------
@@ -1613,6 +1734,244 @@ class ControlStore:
         try:
             cursor = self._conn.execute(
                 "DELETE FROM plan_completeness_checks WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return cursor.rowcount
+
+    # -- plan-book artifact version history (Ticket 09 AC4) -------------
+
+    def publish_plan_artifact_version(
+        self,
+        *,
+        conversation_id: str,
+        artifact_id: str,
+        draft_id: str = "",
+        published_by_run_id: str = "",
+    ) -> PlanArtifactVersionRecord:
+        """Append one published generation to the conversation's history.
+
+        Revision = MAX(revision)+1 and ``previous_artifact_id`` = whatever held
+        that slot before, both read inside the same BEGIN/COMMIT as the INSERT,
+        so the chain is derived by the storage layer rather than claimed by the
+        caller — a flow that forgets (or mis-states) what came before cannot
+        make this table disagree with itself. The table is append-only by
+        design: history that could be overwritten in place would not be a
+        record of what came before. Empty ``conversation_id``/``artifact_id``
+        are refused at the boundary — a version row that points at nothing is
+        exactly the fabricated claim this ticket forbids.
+        """
+        if not (conversation_id or "").strip():
+            raise ValueError("invalid artifact version conversation_id")
+        if not (artifact_id or "").strip():
+            raise ValueError("invalid artifact version artifact_id")
+
+        now = _now_iso()
+        self._conn.execute("BEGIN")
+        try:
+            row = self._conn.execute(
+                "SELECT MAX(revision) AS max_rev FROM plan_artifact_versions "
+                "WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            revision = int(row["max_rev"]) + 1 if row and row["max_rev"] is not None else 1
+            previous_row = self._conn.execute(
+                "SELECT artifact_id FROM plan_artifact_versions "
+                "WHERE conversation_id = ? AND revision = ?",
+                (conversation_id, revision - 1),
+            ).fetchone()
+            previous_artifact_id = previous_row["artifact_id"] if previous_row else ""
+            self._conn.execute(
+                "INSERT INTO plan_artifact_versions "
+                "(conversation_id, revision, draft_id, artifact_id, previous_artifact_id, "
+                " published_by_run_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    conversation_id,
+                    revision,
+                    draft_id or "",
+                    artifact_id,
+                    previous_artifact_id,
+                    published_by_run_id or "",
+                    now,
+                    now,
+                ),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        record = self.get_plan_artifact_version(conversation_id, revision)
+        assert record is not None  # just wrote it
+        return record
+
+    def get_plan_artifact_version(
+        self, conversation_id: str, revision: int
+    ) -> PlanArtifactVersionRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM plan_artifact_versions WHERE conversation_id = ? AND revision = ?",
+            (conversation_id, int(revision)),
+        ).fetchone()
+        return self._row_to_artifact_version(row) if row is not None else None
+
+    def get_current_plan_artifact_version(
+        self, conversation_id: str
+    ) -> PlanArtifactVersionRecord | None:
+        """The draft's answer to "which artifact is current" — or ``None``.
+
+        ``None`` before any plan book was ever published: no row, no current
+        artifact, and the version discriminator starts at 1.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM plan_artifact_versions WHERE conversation_id = ? "
+            "ORDER BY revision DESC LIMIT 1",
+            (conversation_id,),
+        ).fetchone()
+        return self._row_to_artifact_version(row) if row is not None else None
+
+    def list_plan_artifact_versions(
+        self, conversation_id: str
+    ) -> list[PlanArtifactVersionRecord]:
+        """"What came before": the full history in generation order."""
+        rows = self._conn.execute(
+            "SELECT * FROM plan_artifact_versions WHERE conversation_id = ? "
+            "ORDER BY revision ASC",
+            (conversation_id,),
+        ).fetchall()
+        return [self._row_to_artifact_version(row) for row in rows]
+
+    def _row_to_artifact_version(self, row: sqlite3.Row) -> PlanArtifactVersionRecord:
+        return PlanArtifactVersionRecord(
+            conversation_id=row["conversation_id"],
+            revision=int(row["revision"]),
+            draft_id=row["draft_id"],
+            artifact_id=row["artifact_id"],
+            previous_artifact_id=row["previous_artifact_id"],
+            published_by_run_id=row["published_by_run_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    # -- safety record (Ticket 09; ticket 07's payload, stored) ----------
+
+    def upsert_plan_safety_record(
+        self,
+        *,
+        conversation_id: str,
+        draft_id: str,
+        payload: dict,
+        recorded_by_run_id: str = "",
+    ) -> PlanSafetyRecord:
+        """Store the gate's answer verbatim for the conversation's draft.
+
+        ``payload`` is :meth:`agent_v2.plan_workflow.PlanSafety.to_payload` —
+        this method reads ONLY that shape (booleans, stable codes, the gate's
+        own message and reason strings) and refuses anything else, so no
+        caller can smuggle a derived safety sentence or an eligibility flag
+        into the row. One row per conversation, replaced in place: the current
+        record is the latest gate answer for the draft on record.
+        """
+        if not (conversation_id or "").strip():
+            raise ValueError("invalid plan safety conversation_id")
+        if not (draft_id or "").strip():
+            raise ValueError("invalid plan safety draft_id")
+        allowed = {
+            "hard_stop", "codes", "formal_route_plan_allowed", "message",
+            "comparison_id", "comparison_status", "gate_reasons", "required_action",
+        }
+        unknown = set(payload) - allowed
+        if unknown:
+            raise ValueError(f"unknown plan safety payload keys: {sorted(unknown)}")
+        if not isinstance(payload.get("hard_stop"), bool):
+            raise ValueError("plan safety payload needs a boolean hard_stop")
+        if not isinstance(payload.get("formal_route_plan_allowed"), bool):
+            raise ValueError("plan safety payload needs a boolean formal_route_plan_allowed")
+
+        now = _now_iso()
+        existing = self.get_plan_safety_record(conversation_id)
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute(
+                "INSERT INTO plan_safety_records "
+                "(conversation_id, draft_id, hard_stop, codes_json, formal_route_plan_allowed, "
+                " message, comparison_id, comparison_status, gate_reasons_json, "
+                " required_action, recorded_by_run_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(conversation_id) DO UPDATE SET "
+                " draft_id = excluded.draft_id, "
+                " hard_stop = excluded.hard_stop, "
+                " codes_json = excluded.codes_json, "
+                " formal_route_plan_allowed = excluded.formal_route_plan_allowed, "
+                " message = excluded.message, "
+                " comparison_id = excluded.comparison_id, "
+                " comparison_status = excluded.comparison_status, "
+                " gate_reasons_json = excluded.gate_reasons_json, "
+                " required_action = excluded.required_action, "
+                " recorded_by_run_id = excluded.recorded_by_run_id, "
+                " updated_at = excluded.updated_at",
+                (
+                    conversation_id,
+                    draft_id,
+                    1 if payload["hard_stop"] else 0,
+                    json.dumps(list(payload.get("codes") or []), ensure_ascii=False),
+                    1 if payload["formal_route_plan_allowed"] else 0,
+                    str(payload.get("message") or ""),
+                    str(payload.get("comparison_id") or ""),
+                    str(payload.get("comparison_status") or ""),
+                    json.dumps(list(payload.get("gate_reasons") or []), ensure_ascii=False),
+                    str(payload.get("required_action") or ""),
+                    recorded_by_run_id or "",
+                    existing.created_at if existing else now,
+                    now,
+                ),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        record = self.get_plan_safety_record(conversation_id)
+        assert record is not None  # just wrote it
+        return record
+
+    def get_plan_safety_record(self, conversation_id: str) -> PlanSafetyRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM plan_safety_records WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return PlanSafetyRecord(
+            conversation_id=row["conversation_id"],
+            draft_id=row["draft_id"],
+            hard_stop=bool(row["hard_stop"]),
+            codes=tuple(json.loads(row["codes_json"])),
+            formal_route_plan_allowed=bool(row["formal_route_plan_allowed"]),
+            message=row["message"],
+            comparison_id=row["comparison_id"],
+            comparison_status=row["comparison_status"],
+            gate_reasons=tuple(json.loads(row["gate_reasons_json"])),
+            required_action=row["required_action"],
+            recorded_by_run_id=row["recorded_by_run_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def clear_plan_safety_record(self, conversation_id: str) -> int:
+        """Drop the conversation's safety row (cancelled plan).
+
+        Part of ticket 02 AC4's unfinished-state clearing, widened like
+        ticket 06's: a cancelled plan must not leave the last gate refusal
+        behind for the next draft to inherit. PUBLISHED artifact history is
+        deliberately NOT cleared here — it is evidence of what was handed out,
+        and old artifacts keep their own download/expiry rules (AC5).
+        """
+        self._conn.execute("BEGIN")
+        try:
+            cursor = self._conn.execute(
+                "DELETE FROM plan_safety_records WHERE conversation_id = ?",
                 (conversation_id,),
             )
             self._conn.execute("COMMIT")

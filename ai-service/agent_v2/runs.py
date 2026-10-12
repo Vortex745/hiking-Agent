@@ -405,6 +405,73 @@ class RunRepository:
         """Drop the conversation's saved verdict (cancelled / replaced draft)."""
         return self.control.clear_completeness_check(conversation_id)
 
+    # -- plan-book artifact versions (Ticket 09 AC4) -----------------
+
+    def publish_plan_artifact_version(
+        self,
+        *,
+        conversation_id: str,
+        artifact_id: str,
+        draft_id: str = "",
+        published_by_run_id: str = "",
+    ):
+        """Append one published plan-book generation to the conversation's history.
+
+        Ticket 09's facade over the version table: flows reach the history only
+        through here, never through :class:`ControlStore`. The row is what makes
+        the draft able to answer "which artifact is current" and "what came
+        before"; the chain and the revision number are derived by the storage
+        layer, and the revision is also the version discriminator that keeps a
+        regeneration from replaying a committed effect.
+        """
+        return self.control.publish_plan_artifact_version(
+            conversation_id=conversation_id,
+            artifact_id=artifact_id,
+            draft_id=draft_id,
+            published_by_run_id=published_by_run_id,
+        )
+
+    def get_current_plan_artifact_version(self, conversation_id: str):
+        """The current published artifact's version row, or ``None``."""
+        return self.control.get_current_plan_artifact_version(conversation_id)
+
+    def list_plan_artifact_versions(self, conversation_id: str) -> list:
+        """The full generation history, oldest first."""
+        return self.control.list_plan_artifact_versions(conversation_id)
+
+    # -- safety record (Ticket 09; ticket 07's gate answer, stored) --
+
+    def save_plan_safety(
+        self,
+        *,
+        conversation_id: str,
+        draft_id: str,
+        payload: dict,
+        recorded_by_run_id: str = "",
+    ):
+        """Store the deterministic gate's safety answer for this draft.
+
+        ``payload`` is :meth:`agent_v2.plan_workflow.PlanSafety.to_payload` —
+        stored verbatim so the PDF cover can read the same shape the event
+        already carried. The row records what the gate ANSWERED; it decides
+        nothing: :func:`route_compare.service.render_report` stays the only
+        eligibility authority (ticket 06 AC6's split, kept).
+        """
+        return self.control.upsert_plan_safety_record(
+            conversation_id=conversation_id,
+            draft_id=draft_id,
+            payload=payload,
+            recorded_by_run_id=recorded_by_run_id,
+        )
+
+    def get_plan_safety(self, conversation_id: str):
+        """The conversation's safety row, or ``None`` when the gate never answered."""
+        return self.control.get_plan_safety_record(conversation_id)
+
+    def clear_plan_safety(self, conversation_id: str) -> int:
+        """Drop the conversation's safety row (cancelled plan)."""
+        return self.control.clear_plan_safety_record(conversation_id)
+
     def mark_run_done(self, run_id: str) -> None:
         """Transition a running run to ``done`` terminal.
 
