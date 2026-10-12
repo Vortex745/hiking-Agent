@@ -35,6 +35,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -822,6 +824,179 @@ def test_the_version_history_outlives_the_run_and_reports_unavailable_not_repair
 
     gone = asyncio.run(download())
     assert gone.status_code == 404  # unreadable, not repaired, not 500
+
+
+# ---- AC1 / AC5 on the client: the mirror and the closure contract ----------
+#
+# There is no frontend test runner (``frontend/package.json`` has no test or
+# lint script), so the client half is pinned by reading the sources — real
+# coverage of the wiring, NOT a browser pass. ``npx tsc`` catches a missing
+# field in a typed position; these catch the silent kinds: a payload read but
+# never shown, a recovery context dropped on a disconnect, a draft field that
+# ``isSamePlanDraft`` forgot to compare (which makes a post-refresh change read
+# as "no change").
+
+FRONTEND = Path(__file__).resolve().parents[1] / "frontend" / "src"
+
+
+def _ts(relative: str) -> str:
+    return (FRONTEND / relative).read_text(encoding="utf-8")
+
+
+def _interface_body(source: str, name: str) -> str:
+    """The body of ``interface X { … }`` or ``type X = { … }``."""
+    block = re.search(
+        rf"(?:export )?(?:interface {name}|type {name} =)\s*\{{(.*?)\n\}}", source, re.S)
+    assert block, f"{name} not found in the frontend sources"
+    return block.group(1)
+
+
+def _function_bodies(source: str, signature: str) -> list[str]:
+    """Every body that starts at an occurrence of ``signature``."""
+    bodies, start = [], 0
+    while True:
+        index = source.find(signature, start)
+        if index == -1:
+            return bodies
+        open_brace = source.index("{", index)
+        depth, cursor = 0, open_brace
+        while cursor < len(source):
+            if source[cursor] == "{":
+                depth += 1
+            elif source[cursor] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            cursor += 1
+        bodies.append(source[open_brace:cursor + 1])
+        start = index + len(signature)
+
+
+def _function_body(source: str, signature: str) -> str:
+    start = source.index(signature)
+    open_brace = source.index("{", start)
+    depth, index = 0, open_brace
+    while index < len(source):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[open_brace:index + 1]
+        index += 1
+    raise AssertionError(f"unbalanced braces after {signature!r}")
+
+
+def test_the_artifact_version_relation_reaches_every_frontend_home():
+    """AC5's surface: ticket 09's additive payload fields are read and typed.
+
+    ``artifact.available`` carries ``plan_revision`` / ``previous_artifact_id``;
+    a client that never reads them cannot show 当前版本 / 历史 at all, so the
+    three homes (wire type, strict reader, the message-level mirror that is what
+    survives a refresh) must move together — the same class of bug notes-02's
+    landmine 1 describes for draft fields.
+    """
+    wire = _interface_body(_ts("api/chatV2.ts"), "V2Artifact")
+    assert "plan_revision?: number" in wire
+    assert "previous_artifact_id?: string" in wire
+
+    reader = _function_body(_ts("api/v2Reducer.ts"), "export function readArtifact")
+    assert "payload['plan_revision']" in reader
+    assert "payload['previous_artifact_id']" in reader
+    # Read strictly: a non-positive or non-integer revision is no revision.
+    assert "Number.isInteger(revision)" in reader and "revision > 0" in reader
+
+    mirrored = _ts("pages/SuperAgent.tsx")
+    assert "plan_revision?: number" in _interface_body(mirrored, "AgentArtifact")
+    assert "previous_artifact_id?: string" in _interface_body(mirrored, "AgentArtifact")
+
+
+def test_the_plan_book_panel_shows_current_version_and_history_without_guessing():
+    """AC5: the mirror shows 当前版本 / 历史 from the server's numbers only.
+
+    The chain is derived over the artifacts the client already holds (so it is
+    rebuilt from the persisted session after a refresh), an artifact without a
+    revision is not counted as a version, expiry is judged from the artifact's
+    own ``expires_at`` and rendered as 已过期/不可用 rather than repaired away,
+    and the block rides the EXISTING restore panel instead of adding a second
+    ``top-16`` absolutely-positioned surface.
+    """
+    source = _ts("pages/SuperAgent.tsx")
+
+    derive = _function_body(source, "function readPlanArtifactVersions")
+    assert "message.artifacts" in derive, "the chain must come from the artifacts themselves"
+    assert "typeof revision !== 'number'" in derive  # no record, no claim
+    assert "runs" not in derive.lower(), "version state must never be re-derived from run rows"
+    assert "sort((a, b) => a.revision - b.revision)" in derive
+
+    assert "计划书版本：当前第" in source
+    assert "历史：" in source
+    assert "已过期/不可用" in source
+    expired = _function_body(source, "function isPlanArtifactUnavailable")
+    assert "if (!version.expiresAt) return false" in expired  # unknown is not expired
+
+    restore_panel = source[source.index("本会话有未完成的行程草稿"):source.index("取消草稿")]
+    assert "计划书版本" in restore_panel, (
+        "the version block must live inside the restore panel, not beside it"
+    )
+    version_line = restore_panel[restore_panel.index("计划书版本") - 400:restore_panel.index("计划书版本")]
+    assert "absolute" not in version_line
+
+
+def test_a_stream_that_ends_without_a_terminal_is_never_treated_as_success():
+    """AC1's client half: transport closure is outcome_unknown, not a completion.
+
+    The parser reports the closure marker; the page must (a) tell the user the
+    outcome is unconfirmed, (b) keep the persisted run so ``planV2Recovery`` can
+    reconcile via /snapshot + /events, and (c) keep clearing the run for a real
+    error, so an ordinary failure does not leave a phantom to poll.
+    """
+    client = _ts("api/chatV2.ts")
+    assert "export const V2_STREAM_CLOSED_WITHOUT_TERMINAL = " \
+        "'stream_closed_without_terminal'" in client
+    loop = _function_body(client, "async function readStream") if \
+        "async function readStream" in client else client
+    assert "options.onError(V2_STREAM_CLOSED_WITHOUT_TERMINAL)" in loop
+    assert "!aborted && !terminalSeen" in loop
+
+    page = _ts("pages/SuperAgent.tsx")
+    assert "V2_STREAM_CLOSED_WITHOUT_TERMINAL" in page
+    # The send path's own error handler (there are several onError callbacks —
+    # the resume path's has different duties), found by what it must now know.
+    handlers = _function_bodies(page, "onError: (error) =>")
+    closure = [body for body in handlers if "closedWithoutTerminal" in body]
+    assert len(closure) == 1, "the send path must distinguish the closure marker"
+    handler = closure[0]
+    assert "const closedWithoutTerminal = error === V2_STREAM_CLOSED_WITHOUT_TERMINAL" in handler
+    # Only a real error drops the recovery context.
+    guarded = handler[handler.index("if (!closedWithoutTerminal)"):]
+    assert "saveV2PersistedRun(null)" in guarded
+    assert "结果未确认" in handler
+    # And the run is NOT marked terminal: nothing in the handler sets a terminal
+    # v2_status, which is what keeps ``planV2Recovery`` on the poll/replay path.
+    assert "v2_status" not in handler
+
+
+def test_every_plan_draft_field_is_compared_by_the_restore_diff():
+    """notes-02 landmine 1, widened into a guard: the four homes stay in step.
+
+    ``isSamePlanDraft`` decides whether a restored draft differs from the live
+    one. A ``V2PlanDraftState`` field it does not compare makes a post-refresh
+    change read as "no change", so the effect hands back the OLD object and the
+    new value silently disappears — a recovery/idempotency bug that no type
+    checker can see. This pins it for every top-level field, present and future.
+    """
+    wire = _interface_body(_ts("api/chatV2.ts"), "V2PlanDraftState")
+    fields = set(re.findall(r"^  ([a-z_]+)[?]?:", wire, re.M))
+    assert fields, "no plan draft fields found — the parser is wrong, not the source"
+
+    compare = _function_body(_ts("api/planDraftStore.ts"), "export function isSamePlanDraft")
+    missing = {field for field in fields if field not in compare}
+    assert missing == set(), f"isSamePlanDraft does not compare: {sorted(missing)}"
+
+    read = _function_body(_ts("api/v2Reducer.ts"), "export function readPlanDraftState")
+    unread = {field for field in fields if f"'{field}'" not in read and f'"{field}"' not in read}
+    assert unread == set(), f"readPlanDraftState never reads: {sorted(unread)}"
 
 
 # ---- AC2: a duplicate request cannot publish a second PDF ------------------

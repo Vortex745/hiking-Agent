@@ -17,6 +17,7 @@ import {
   exportV2Memories,
   planV2Recovery,
   V2_TERMINAL_RUN_STATUSES,
+  V2_STREAM_CLOSED_WITHOUT_TERMINAL,
   type V2EventEnvelope,
   type V2ApprovalRequest,
   type V2ApprovalDecisionResponse,
@@ -95,6 +96,11 @@ type AgentArtifact = {
   size_bytes: number
   sha256?: string
   expires_at?: string
+  // Ticket 10: the plan book's version relation, verbatim from
+  // ``artifact.available`` (``readArtifact`` keeps it only when the server sent
+  // a positive integer revision). Absent for anything that is not a generation.
+  plan_revision?: number
+  previous_artifact_id?: string
 }
 type BrowserLocation = {
   latitude: number
@@ -188,6 +194,63 @@ const PLAN_RULE_VERDICT_LABELS: Record<'complete' | 'confirmation_required' | 's
   complete: '字段与格式规则均已通过（仍不代表安全放行）',
   confirmation_required: '可生成草案，但仍有待确认/待核验清单',
   supplement_required: '缺少核心安排，请先在表单补齐',
+}
+
+/**
+ * Ticket 10: the plan book's version chain, read from the artifacts this
+ * conversation already holds.
+ *
+ * The numbers are the SERVER's, copied: ``artifact.available`` carries
+ * ``plan_revision`` / ``previous_artifact_id`` straight from the
+ * ``plan_artifact_versions`` transaction that derived them, so the panel never
+ * counts cards or re-reads run rows (they cascade-delete; the history does not).
+ * An artifact with no revision is simply not a plan-book generation — a chat
+ * attachment or a payload from a server that predates versioning renders
+ * nothing here, because "no record" is not "version 0".
+ *
+ * It is derived over the messages rather than held in extra state, because the
+ * message list is what the session store persists: after a refresh the chain is
+ * rebuilt from the same artifacts the thread already showed, which is the client
+ * half of AC1 (断线后可以通过快照或事件恢复) for the artifact surface.
+ */
+type PlanArtifactVersion = {
+  artifactId: string
+  revision: number
+  previousArtifactId: string
+  filename: string
+  /** Absent means unknown, which renders no expiry claim at all. */
+  expiresAt?: string
+}
+
+function readPlanArtifactVersions(messages: Message[]): PlanArtifactVersion[] {
+  const byId = new globalThis.Map<string, PlanArtifactVersion>()
+  for (const message of messages) {
+    for (const artifact of message.artifacts || []) {
+      const revision = artifact.plan_revision
+      if (typeof revision !== 'number' || !artifact.artifact_id) continue
+      byId.set(artifact.artifact_id, {
+        artifactId: artifact.artifact_id,
+        revision,
+        previousArtifactId: artifact.previous_artifact_id || '',
+        filename: artifact.public_filename,
+        expiresAt: artifact.expires_at,
+      })
+    }
+  }
+  return [...byId.values()].sort((a, b) => a.revision - b.revision)
+}
+
+/**
+ * Whether a published generation is still downloadable. The server's own rule
+ * is the artifact row's ``expires_at`` (TTL, and 410 once past it), so an expired
+ * entry is labelled 已过期/不可用 rather than repaired or hidden — and a missing
+ * timestamp is not treated as expired, only as unknown.
+ */
+function isPlanArtifactUnavailable(version: PlanArtifactVersion): boolean {
+  if (!version.expiresAt) return false
+  const expires = Date.parse(version.expiresAt)
+  if (Number.isNaN(expires)) return false
+  return expires <= Date.now()
 }
 
 const STORAGE_KEY = 'ai-hiking-agent-chat'
@@ -537,6 +600,16 @@ function SuperAgent() {
     () => v2RunRef.current?.plan_draft ?? null,
   )
   const [planDialogOpen, setPlanDialogOpen] = useState(false)
+
+  // Ticket 10: the plan book's published generations, as this client knows them
+  // — from the ``artifact.available`` payloads it has already received (and
+  // re-reads from the persisted session after a refresh). Pure derivation over
+  // ``messages``, so there is no second copy of the version state to keep in
+  // sync, and nothing here re-derives versions from run rows.
+  const planVersions = readPlanArtifactVersions(messages)
+  const currentPlanVersion = planVersions.length > 0
+    ? planVersions[planVersions.length - 1]
+    : null
 
   // StrictMode rule (see the messages-updater comment below): state
   // transitions stay in event handlers, durable writes happen here.
@@ -1581,20 +1654,33 @@ function SuperAgent() {
           onTerminal: handleV2Terminal,
           onError: (error) => {
             setConnectionStatus('error')
+            // Ticket 10 AC1: transport closure without a terminal is
+            // outcome_unknown, never success and never a completed run. The
+            // notice says so, and the run identifier stays persisted so the
+            // mount-time recovery (``planV2Recovery`` → /snapshot → /events or
+            // poll) can reconcile what actually happened — clearing it here is
+            // what orphaned a live server-side run after a dropped connection.
+            const closedWithoutTerminal = error === V2_STREAM_CLOSED_WITHOUT_TERMINAL
             setMessages(prev => {
               const updated = [...prev]
               const last = updated[updated.length - 1]
               if (last && last.role === 'assistant') {
                 updated[updated.length - 1] = {
                   ...last,
-                  content: `${last.content}\n\n[连接错误] ${error}`,
+                  content: `${last.content}\n\n${
+                    closedWithoutTerminal
+                      ? '[结果未确认] 连接已中断且未收到终端事件，可在恢复后查看运行状态。'
+                      : `[连接错误] ${error}`
+                  }`,
                   isStreaming: false,
                 }
               }
               return updated
             })
-            v2RunRef.current = null
-            saveV2PersistedRun(null)
+            if (!closedWithoutTerminal) {
+              v2RunRef.current = null
+              saveV2PersistedRun(null)
+            }
             setIsSending(false)
             cleanupRef.current = null
           },
@@ -2095,6 +2181,30 @@ function SuperAgent() {
                   安全门：{planDraft.safety.codes.join('、')}
                   {planDraft.safety.message ? ` · ${planDraft.safety.message}` : ''}
                   {planDraft.safety.hard_stop ? ' · 已阻止正式路线计划' : ''}
+                </p>
+              )}
+              {/* Ticket 10 AC5's surface: 当前版本 / 历史, read from the version
+                  relation the server published with each artifact. A cancelled
+                  draft keeps this list on purpose — the rows are evidence of
+                  what was handed out, and superseded generations stay
+                  downloadable under their own id until their own TTL says
+                  otherwise (labelled 已过期/不可用, never repaired or hidden). */}
+              {planVersions.length > 0 && (
+                <p className="mt-1 text-xs text-text-muted">
+                  计划书版本：当前第 {currentPlanVersion?.revision} 版
+                  {currentPlanVersion && isPlanArtifactUnavailable(currentPlanVersion)
+                    ? '（已过期/不可用）'
+                    : ''}
+                  {planVersions.length > 1 && (
+                    <>
+                      {' · 历史：'}
+                      {planVersions
+                        .slice(0, -1)
+                        .map(version => `第 ${version.revision} 版${
+                          isPlanArtifactUnavailable(version) ? '（已过期/不可用）' : ''}`)
+                        .join('、')}
+                    </>
+                  )}
                 </p>
               )}
               <div className="mt-3 flex flex-wrap justify-end gap-2">

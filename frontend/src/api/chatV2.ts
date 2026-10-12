@@ -397,6 +397,17 @@ export const V2_PLAN_DRAFT_STAGES: ReadonlySet<V2PlanDraftStage> = new Set([
  * artifact.available payload (A02): the only public artifact shape. No
  * sandbox path, no host storage path — download goes through
  * /api/v2/artifacts/{artifact_id}.
+ *
+ * Ticket 09 made the plan book versioned and ticket 10 gives it a surface: the
+ * payload carries the version relation ADDITIVELY — ``plan_revision`` is the
+ * generation this artifact is (1 for the first book, 2 for the regeneration
+ * that superseded it) and ``previous_artifact_id`` names the book it replaced
+ * (empty for the first). Both are absent for a payload from a server that
+ * predates versioning and for any non-plan artifact, so a client never infers a
+ * version from a missing field: no number, no claim. The bytes, size, expiry
+ * and download rules stay owned by the artifact row — this is the relation the
+ * server derived inside its publish transaction, which is why the client mirror
+ * reads it verbatim rather than counting cards.
  */
 export interface V2Artifact {
   artifact_id: string
@@ -406,6 +417,8 @@ export interface V2Artifact {
   sha256?: string
   expires_at?: string
   message?: string
+  plan_revision?: number
+  previous_artifact_id?: string
 }
 
 // Run-terminal events: the run is in a final state and no further
@@ -416,6 +429,20 @@ export const TERMINAL_V2_EVENT_TYPES: ReadonlySet<V2EventType> = new Set([
   'done',
   'cancelled',
 ])
+
+/**
+ * Ticket 10: the marker a stream connection reports when the response body
+ * ended WITHOUT any terminal event (a proxy timeout, a dropped connection, a
+ * gateway restart). It is deliberately not a terminal: the server-side run may
+ * still be executing, still be paused, or may have finished while nothing was
+ * delivered.
+ *
+ * Callers must treat it as ``outcome_unknown`` — show that the outcome is
+ * unconfirmed, keep the run identifier so ``planV2Recovery`` can reconcile via
+ * /snapshot + /events — and never as success. Clearing the persisted run here
+ * is what turns a recoverable disconnect into an orphaned server-side run.
+ */
+export const V2_STREAM_CLOSED_WITHOUT_TERMINAL = 'stream_closed_without_terminal'
 
 // Stream-terminal events: the SSE response body ends after one of these
 // is emitted. ``run.paused`` is stream-terminal (the server closes the
@@ -690,7 +717,7 @@ export function createV2StreamConnection(
       // without a terminal, the caller must treat the run as
       // outcome_unknown and reconcile via /snapshot + /events.
       if (!aborted && !terminalSeen) {
-        options.onError('stream_closed_without_terminal')
+        options.onError(V2_STREAM_CLOSED_WITHOUT_TERMINAL)
       }
     } catch (error) {
       if (!aborted && !(error instanceof DOMException && error.name === 'AbortError')) {

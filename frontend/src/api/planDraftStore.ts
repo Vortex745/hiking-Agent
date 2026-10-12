@@ -169,6 +169,16 @@ export function isSamePlanDraft(
   return a.stage === b.stage
     && a.draft_id === b.draft_id
     && a.conversation_id === b.conversation_id
+    // Ticket 10: how the draft got there is part of what a restore shows.
+    // ``intent`` is the structured intent this turn carried and ``source`` says
+    // whether a structured click or natural-language rules opened the flow, and
+    // two consecutive turns CAN land on the same stage with different values
+    // (a research turn that parks on ``minimal_draft`` after a plain submit).
+    // Comparing the stage alone reads that as "no change", so the mirror keeps
+    // describing the earlier turn — notes-02 landmine 1, applied to the two
+    // fields that were left out.
+    && a.intent === b.intent
+    && a.source === b.source
     && a.summary === b.summary
     // Ticket 04 AC5: the draft's type is compared like every other field. Skip
     // it and a route_plan → generic_draft flip (or the reverse) looks like "no

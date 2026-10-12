@@ -730,6 +730,8 @@ export function readArtifact(payload: Record<string, unknown>): V2Artifact | nul
   if (typeof artifactId !== 'string' || !artifactId) return null
   if (typeof filename !== 'string' || !filename) return null
   const size = payload['size_bytes']
+  const revision = payload['plan_revision']
+  const previous = payload['previous_artifact_id']
   return {
     artifact_id: artifactId,
     public_filename: filename,
@@ -738,6 +740,14 @@ export function readArtifact(payload: Record<string, unknown>): V2Artifact | nul
     sha256: typeof payload['sha256'] === 'string' ? payload['sha256'] : undefined,
     expires_at: typeof payload['expires_at'] === 'string' ? payload['expires_at'] : undefined,
     message: typeof payload['message'] === 'string' ? payload['message'] : undefined,
+    // Ticket 10: the version relation, read strictly. A revision that is not a
+    // positive integer is no revision at all — the card stays an ordinary
+    // artifact instead of being numbered by a guess (and the plan-book panel
+    // below hides rather than inventing 第 1 版 for a payload that said nothing).
+    plan_revision: typeof revision === 'number' && Number.isInteger(revision) && revision > 0
+      ? revision
+      : undefined,
+    previous_artifact_id: typeof previous === 'string' ? previous : undefined,
   }
 }
 
