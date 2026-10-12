@@ -79,6 +79,7 @@ from agent_v2.observability import CapacityExceeded
 from agent_v2.permissions import (
     PermissionGate,
 )
+from agent_v2.plan_workflow import PlanIntent
 from agent_v2.run_orchestration import (
     ChatFlowRequest,
     RunOrchestrator,
@@ -152,6 +153,14 @@ class ChatV2Request(BaseModel):
     rejected with HTTP 400. This is what prevents clients from injecting
     ``model``, ``api_key``, ``tools``, ``mcp_servers``, or any other
     configuration that the server owns.
+
+    Ticket 01 adds the plan-book entry contract — still a whitelist, not
+    an open bag: ``intent`` is annotated with
+    :data:`agent_v2.plan_workflow.PlanIntent`, so an intent outside
+    ``plan_create`` / ``plan_confirm`` / ``plan_cancel`` /
+    ``plan_regenerate`` fails validation with 422 **before** the stream
+    starts (spec AC5: 服务端拒绝未知 intent). Routing on it is
+    deterministic — the LLM never decides whether a plan book is created.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -167,6 +176,10 @@ class ChatV2Request(BaseModel):
         description="Capability profile id. Server-defined; clients cannot add profiles.",
     )
     current_location: Optional[CurrentLocationV2] = None
+    intent: Optional[PlanIntent] = Field(
+        default=None,
+        description="Whitelisted structured intent. Unknown values are rejected.",
+    )
 
 
 # ---- Response helpers -----------------------------------------------------
@@ -356,6 +369,7 @@ async def chat_v2_sse(req: ChatV2Request, request: Request):
         profile_id=req.profile_id,
         conversation_id=req.conversation_id,
         current_location=req.current_location,
+        intent=req.intent,
     )
 
     async def guarded_stream() -> AsyncGenerator[str, None]:

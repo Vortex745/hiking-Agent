@@ -276,6 +276,28 @@ CREATE TABLE IF NOT EXISTS raw_sampling_audit (
 
 CREATE INDEX IF NOT EXISTS idx_raw_sampling_expiry
 ON raw_sampling_audit(disabled_at, expires_at);
+
+-- Ticket 01: the plan-book draft. Keyed by ``conversation_id`` (the
+-- existing ownership axis), NOT by run_id: runs, artifacts, events and
+-- sandbox leases are run-scoped with ON DELETE CASCADE, and a draft must
+-- outlive the run that created it so tickets 02/05 can restore and revise
+-- it. ``stage`` is the same vocabulary the ``plan.draft_state`` event
+-- carries, so server and frontend read one state. ``destination_or_route``
+-- / ``activity_date`` / ``participants`` stay empty until the dialog
+-- submits them — an uncollected arrangement is absent, never invented.
+CREATE TABLE IF NOT EXISTS plan_drafts (
+    conversation_id TEXT PRIMARY KEY,
+    draft_id TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    destination_or_route TEXT NOT NULL DEFAULT '',
+    activity_date TEXT NOT NULL DEFAULT '',
+    participants INTEGER,
+    updated_by_run_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_drafts_stage ON plan_drafts(stage);
 """
 
 
@@ -368,8 +390,38 @@ class ArtifactRecord:
     expires_at: str
 
 
-# ---- Approval statuses (Ticket 11) ---------------------------------------
+# ---- Plan draft (Ticket 01) ----------------------------------------------
 
+#: Stages a stored draft may hold. Mirrors
+#: :class:`agent_v2.plan_workflow.PlanDraftStage`; written as literals here
+#: so the persistence layer does not import the domain module.
+_VALID_PLAN_DRAFT_STAGES: frozenset[str] = frozenset(
+    {"awaiting_confirmation", "awaiting_input", "minimal_draft", "cancelled"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PlanDraftRecord:
+    """Snapshot of a plan_drafts row (Ticket 01).
+
+    ``stage`` is the shared draft-state vocabulary. The three arrangement
+    fields hold whatever the user has submitted so far — an unsubmitted
+    dialog leaves them empty/``None``, which is how "待确认" stays honest
+    downstream: nothing is invented to fill a gap.
+    """
+
+    conversation_id: str
+    draft_id: str
+    stage: str
+    destination_or_route: str
+    activity_date: str
+    participants: int | None
+    updated_by_run_id: str
+    created_at: str
+    updated_at: str
+
+
+# ---- Approval statuses (Ticket 11) ---------------------------------------
 
 ApprovalStatus = Literal["pending", "approved", "rejected", "expired"]
 
@@ -984,6 +1036,91 @@ class ControlStore:
             failure_reason=row["failure_reason"],
             created_at=row["created_at"],
             expires_at=row["expires_at"],
+        )
+
+    # -- plan drafts (Ticket 01) ---------------------------------------
+
+    def upsert_plan_draft(
+        self,
+        *,
+        conversation_id: str,
+        stage: str,
+        draft_id: str | None = None,
+        destination_or_route: str = "",
+        activity_date: str = "",
+        participants: int | None = None,
+        updated_by_run_id: str = "",
+    ) -> PlanDraftRecord:
+        """Insert or replace the conversation's single plan draft.
+
+        Ticket 01 spec AC8: the draft is one-per-conversation and lives on
+        the conversation axis, so an entry click, a dialog submit and a
+        later cancel all overwrite the same row instead of accumulating
+        history. ``draft_id`` is preserved across upserts so the frontend
+        can tell that the draft it is looking at is still the same draft.
+
+        Raises ``ValueError`` for a stage outside the shared vocabulary —
+        a typo must not become an unrenderable draft state.
+        """
+        if stage not in _VALID_PLAN_DRAFT_STAGES:
+            raise ValueError(f"invalid plan draft stage: {stage!r}")
+        if participants is not None and not 1 <= participants <= 10000:
+            raise ValueError(f"invalid plan draft participants: {participants!r}")
+
+        now = _now_iso()
+        existing = self.get_plan_draft(conversation_id)
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute(
+                "INSERT INTO plan_drafts "
+                "(conversation_id, draft_id, stage, destination_or_route, "
+                " activity_date, participants, updated_by_run_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(conversation_id) DO UPDATE SET "
+                " stage = excluded.stage, "
+                " destination_or_route = excluded.destination_or_route, "
+                " activity_date = excluded.activity_date, "
+                " participants = excluded.participants, "
+                " updated_by_run_id = excluded.updated_by_run_id, "
+                " updated_at = excluded.updated_at",
+                (
+                    conversation_id,
+                    draft_id or (existing.draft_id if existing else str(uuid.uuid4())),
+                    stage,
+                    destination_or_route,
+                    activity_date,
+                    participants,
+                    updated_by_run_id,
+                    existing.created_at if existing else now,
+                    now,
+                ),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        record = self.get_plan_draft(conversation_id)
+        assert record is not None  # just wrote it
+        return record
+
+    def get_plan_draft(self, conversation_id: str) -> PlanDraftRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM plan_drafts WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        return self._row_to_plan_draft(row) if row is not None else None
+
+    def _row_to_plan_draft(self, row: sqlite3.Row) -> PlanDraftRecord:
+        return PlanDraftRecord(
+            conversation_id=row["conversation_id"],
+            draft_id=row["draft_id"],
+            stage=row["stage"],
+            destination_or_route=row["destination_or_route"],
+            activity_date=row["activity_date"],
+            participants=row["participants"],
+            updated_by_run_id=row["updated_by_run_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
         )
 
     # -- approvals (Ticket 11) -----------------------------------------

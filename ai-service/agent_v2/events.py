@@ -63,6 +63,19 @@ EventVersion = Literal["2"]
 #   required to retry. This event is NOT itself a stream terminal —
 #   the ``error`` terminal still follows to satisfy the
 #   exactly-one-terminal-per-stream contract.
+#
+# Ticket 01 adds the plan-book draft state:
+# * ``plan.draft_state`` — the conversation's plan draft moved to a new
+#   stage (``awaiting_confirmation`` / ``awaiting_input`` /
+#   ``minimal_draft`` / ``cancelled``). It is how BOTH sides recognise the
+#   draft: the frontend opens its dialog from ``awaiting_input`` and never
+#   from ``awaiting_confirmation``. The stage vocabulary is shared with
+#   ``plan_drafts.stage`` (:mod:`agent_v2.plan_workflow`). Adding a member
+#   here REQUIRES updating the frontend union + type guard
+#   (``frontend/src/api/chatV2.ts``), the pure reducer
+#   (``frontend/src/api/v2Reducer.ts``) and the UI side-effect chain
+#   (``frontend/src/pages/SuperAgent.tsx``) — otherwise the event is
+#   silently dropped as ``unknown_dropped``.
 EventType = Literal[
     "run_started",
     "progress",
@@ -74,6 +87,7 @@ EventType = Literal[
     "approval.required",
     "approval.resolved",
     "memory.consent_required",
+    "plan.draft_state",
     "run.paused",
     "effect.outcome_unknown",
     "error",

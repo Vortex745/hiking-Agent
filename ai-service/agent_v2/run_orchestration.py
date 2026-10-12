@@ -88,6 +88,14 @@ from agent_v2.events import (
 from agent_v2.memory_tools import extract_sensitive_memory
 from agent_v2.observability import CapacityExceeded
 from agent_v2.permissions import PermissionDecision, PermissionGate
+from agent_v2.plan_workflow import (
+    BLOCK_MESSAGE,
+    PlanDraftStage,
+    STAGE_MESSAGE,
+    classify_plan_request,
+    evaluate_plan_intent,
+    render_minimal_draft,
+)
 from agent_v2.profiles import (
     CapabilityProfile,
     ProfileId,
@@ -117,6 +125,12 @@ class ChatFlowRequest:
     exactly what the flows consume; ``current_location`` carries the
     adapter's validated ``CurrentLocationV2`` object (only
     ``model_dump`` is called on it).
+
+    Ticket 01: ``intent`` is the whitelisted structured plan-book intent
+    (already validated at the wire boundary) and ``plan_input`` the
+    adapter-validated :class:`agent_v2.plan_workflow.PlanDraftInput`.
+    Both must be mirrored here or the flow sees ``None`` for every
+    request.
     """
 
     message: str
@@ -124,6 +138,8 @@ class ChatFlowRequest:
     profile_id: str = "chat"
     conversation_id: str | None = None
     current_location: Any | None = None
+    intent: str | None = None
+    plan_input: Any | None = None
 
 
 # Kernel entry: ``agent_v2.kernel.run_chat_turn`` and test fakes with the
@@ -157,6 +173,50 @@ ArtifactExporter = Callable[..., dict[str, Any]]
 # PermissionGate constructor hook. Injected from the adapter so ASGI
 # contract tests can keep monkeypatching the adapter global.
 GateFactory = Callable[[], Any]
+
+
+@dataclass(frozen=True, slots=True)
+class PlanEntry:
+    """Deterministic plan-flow entry decision (Ticket 01).
+
+    ``route`` is the only thing the flow trusts:
+
+    * ``intent`` — the client sent a whitelisted structured intent
+      (quick-action button, dialog submit, confirm/cancel).
+    * ``open_form`` — the rules found an unambiguous plan-book ask in the
+      free text, so the dialog opens (spec AC1).
+    * ``ask_confirmation`` — the text is planning-shaped but ambiguous:
+      the server asks first and the dialog stays closed (spec AC2).
+
+    ``source`` records whether a structured intent or the rule classifier
+    produced the entry, which is what the draft-state event carries for
+    audit.
+    """
+
+    route: Literal["intent", "open_form", "ask_confirmation"]
+    source: Literal["structured_intent", "natural_language"]
+    intent: str | None = None
+
+
+def _resolve_plan_entry(req: ChatFlowRequest, profile: CapabilityProfile) -> PlanEntry | None:
+    """Decide whether this request belongs to the plan flow — rules only.
+
+    Returns ``None`` for everything else, including every non-``chat``
+    profile: the plan entry must never hijack route_plan / rag / artifact
+    runs, and it must never be decided by a model.
+    """
+    if profile.profile_id != ProfileId.CHAT:
+        return None
+
+    if req.intent:
+        return PlanEntry("intent", "structured_intent", req.intent)
+
+    outcome = classify_plan_request(req.message).outcome
+    if outcome == "clear_plan_intent":
+        return PlanEntry("open_form", "natural_language", "plan_create")
+    if outcome == "ambiguous":
+        return PlanEntry("ask_confirmation", "natural_language")
+    return None
 
 
 @dataclass
@@ -1071,6 +1131,165 @@ class RunOrchestrator:
             sandbox_lease=sandbox_lease,
         )
 
+    # -- the plan-book entry stream (Ticket 01) --
+
+    async def _stream_plan_flow(
+        self,
+        req: ChatFlowRequest,
+        entry: PlanEntry,
+        *,
+        run_id: str | None,
+        emit: EmitEnvelope,
+    ) -> AsyncGenerator[EventEnvelope, None]:
+        """Drive one plan-book entry step and yield its events.
+
+        The whole flow is rule-driven: :func:`evaluate_plan_intent` decides
+        what the intent may do given the stored draft stage, and the kernel
+        is never invoked (spec AC4). Every accepted step ends by moving the
+        conversation's draft row and emitting the same stage on the wire,
+        so server and frontend recognise the draft state from one
+        vocabulary (spec AC8).
+
+        Deliberately NOT in scope here (later tickets): draft restore after
+        cancel (02), route-comparison reuse (03), research (04), summaries
+        and completeness rules (05-07), PDF (08-09).
+        """
+        runs_repo = self._runs_repo
+
+        yield emit("run_started", {})
+        if is_cancelled(runs_repo, run_id):
+            yield emit("cancelled", {"code": "cancelled", "message": "运行已被取消。"})
+            return
+
+        stored = (
+            runs_repo.get_plan_draft(req.conversation_id)
+            if runs_repo is not None and req.conversation_id
+            else None
+        )
+        current_stage = PlanDraftStage(stored.stage) if stored else None
+
+        if entry.route == "ask_confirmation":
+            # AC2: an ambiguous request never opens the flow. The stage
+            # exists so a later ``plan_confirm`` has something to confirm —
+            # and a confirm without it is a stable rejection, not a guess.
+            stage = PlanDraftStage.AWAITING_CONFIRMATION
+            intent: str | None = None
+            draft_input = None
+        else:
+            intent = entry.intent or "plan_create"
+            transition = evaluate_plan_intent(
+                intent=intent,
+                current_stage=current_stage,
+                plan_input=req.plan_input,
+                conversation_id=req.conversation_id,
+            )
+            if transition.blocked:
+                mark_terminal_safe(runs_repo, run_id, "error")
+                yield emit("error", {
+                    "code": "plan_intent_blocked",
+                    "status": "blocked",
+                    "reason": transition.reason,
+                    "message": BLOCK_MESSAGE.get(
+                        transition.reason or "", "计划书操作未完成，请重试。"
+                    ),
+                })
+                return
+            stage = transition.stage or PlanDraftStage.AWAITING_INPUT
+            draft_input = transition.draft_input
+
+        # Uncollected arrangements stay absent — an upsert keeps whatever the
+        # user already submitted instead of blanking it or inventing a value.
+        fields = draft_input
+        destination = (
+            fields.destination_or_route if fields is not None
+            else (stored.destination_or_route if stored else "")
+        )
+        activity_date = (
+            fields.activity_date if fields is not None
+            else (stored.activity_date if stored else "")
+        )
+        participants = (
+            fields.participants if fields is not None
+            else (stored.participants if stored else None)
+        )
+
+        record = None
+        if runs_repo is not None and req.conversation_id:
+            try:
+                record = runs_repo.save_plan_draft(
+                    conversation_id=req.conversation_id,
+                    stage=stage.value,
+                    destination_or_route=destination,
+                    activity_date=activity_date,
+                    participants=participants,
+                    updated_by_run_id=run_id or "",
+                )
+            except Exception:
+                logger.exception(
+                    "chat_v2: plan draft persistence failed for conversation=%s; "
+                    "stream continues with the in-stream draft state",
+                    req.conversation_id,
+                )
+
+        yield emit("plan.draft_state", {
+            "stage": stage.value,
+            "draft_id": record.draft_id if record else "",
+            "conversation_id": req.conversation_id or "",
+            "source": entry.source,
+            "intent": intent or "",
+            "draft": {
+                "destination_or_route": destination,
+                "activity_date": activity_date,
+                "participants": participants,
+            },
+        })
+
+        if stage is PlanDraftStage.MINIMAL_DRAFT:
+            text = render_minimal_draft(
+                destination_or_route=destination,
+                activity_date=activity_date,
+                participants=participants,
+            )
+        else:
+            text = STAGE_MESSAGE[stage]
+
+        envelope = emit("text", {"content": text})
+        self._persist_plan_reply(req, run_id, envelope, text)
+        yield envelope
+
+        mark_terminal_safe(runs_repo, run_id, "done")
+        yield emit("done", {})
+
+    def _persist_plan_reply(
+        self,
+        req: ChatFlowRequest,
+        run_id: str | None,
+        envelope: EventEnvelope,
+        text: str,
+    ) -> None:
+        """Append the plan reply to conversation history, best-effort.
+
+        Uses the text event's OWN sequence rather than the hardcoded
+        ``sequence=2`` the kernel path passes (the context-pack landmine):
+        a run can now hold a plan text message and nothing collides.
+        """
+        runs_repo = self._runs_repo
+        if runs_repo is None or run_id is None or not req.conversation_id or not text:
+            return
+        try:
+            runs_repo.checkpoints.append_message(
+                conversation_id=req.conversation_id,
+                run_id=run_id,
+                role="assistant",
+                content=text,
+                sequence=envelope.sequence,
+            )
+        except Exception:
+            logger.exception(
+                "chat_v2: plan assistant message persistence failed for run_id=%s",
+                run_id,
+            )
+
     # -- the chat stream --
 
     async def stream_chat(
@@ -1282,6 +1501,20 @@ class RunOrchestrator:
                     "code": "model_unavailable",
                     "message": "主模型未配置 API Key (OPENAI_API_KEY 为空)。",
                 })
+                return
+
+            # Ticket 01: plan-book entry. Routing here is structured
+            # intent + deterministic rules ONLY — the kernel is never
+            # consulted, so no model decides whether a plan book is
+            # created (spec AC4; ticket 06 forbids external models for
+            # plan judgement). Falls through when the rules say this is
+            # ordinary chat.
+            plan_entry = _resolve_plan_entry(req, profile)
+            if plan_entry is not None:
+                async for envelope in self._stream_plan_flow(
+                    req, plan_entry, run_id=run_id, emit=_emit,
+                ):
+                    yield envelope
                 return
 
             # Normal flow: run_started → progress → text → done. Only now

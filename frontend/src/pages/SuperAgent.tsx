@@ -22,6 +22,9 @@ import {
   type V2ApprovalDecisionResponse,
   type V2Memory,
   type V2MemoryCandidate,
+  type V2PlanIntent,
+  type V2PlanDraftState,
+  type V2PlanDraftFields,
 } from '../api/chatV2'
 import {
   reduceV2Event,
@@ -30,6 +33,7 @@ import {
   isV2Terminal,
   isV2Paused,
   readArtifact as readArtifactFromPayload,
+  readPlanDraftState,
   type V2ConversationState,
 } from '../api/v2Reducer'
 import { useExternalStoreRuntime, AssistantRuntimeProvider, ThreadMessage } from "@assistant-ui/react"
@@ -108,6 +112,19 @@ const quickTags = [
   { icon: Map, text: '推荐路线', scenario: 'route_plan' as AgentScenario },
 ]
 
+/**
+ * Ticket 01: human labels for the whitelisted plan intents. Only used to
+ * render the user's own bubble when a send carries structured intent and
+ * no typed text — routing never reads these strings; the server reads
+ * ``intent``.
+ */
+const PLAN_INTENT_LABELS: Record<V2PlanIntent, string> = {
+  plan_create: '生成行程',
+  plan_confirm: '确认生成计划书',
+  plan_cancel: '取消生成计划书',
+  plan_regenerate: '重新生成草稿',
+}
+
 const STORAGE_KEY = 'ai-hiking-agent-chat'
 const SESSIONS_KEY = 'ai-hiking-agent-sessions'
 const CHAT_ID_KEY = 'ai-hiking-agent-chat-id'
@@ -152,6 +169,10 @@ interface V2PersistedRun {
   // Ticket 11: last-known run status so recovery knows whether to
   // re-attach a stream, re-show the approval prompt, or do nothing.
   v2_status?: 'running' | 'paused' | 'done' | 'error' | 'cancelled'
+  // Ticket 01: the last plan-draft stage this conversation reached. Stored
+  // so a later ticket can recognise "there is a draft" without re-asking
+  // the server; ticket 01 itself does not build the restore UX.
+  plan_stage?: V2PlanDraftState['stage']
 }
 const V2_RUN_KEY = 'ai-hiking-agent-v2-active-run'
 function loadV2PersistedRun(): V2PersistedRun | null {
@@ -432,6 +453,24 @@ function SuperAgent() {
   const [v2ApprovalState, setV2ApprovalState] = useState<
     'idle' | 'submitting' | 'resuming' | 'resolved' | 'error'
   >('idle')
+
+  // Ticket 01: plan-book entry state. ``planDraft`` mirrors the server's
+  // draft stage (from ``plan.draft_state``); the dialog opens ONLY for
+  // ``awaiting_input`` — an ``awaiting_confirmation`` stage renders the
+  // confirm prompt instead, because an ambiguous request must be confirmed
+  // before the flow opens (spec AC2).
+  const [planDraft, setPlanDraft] = useState<V2PlanDraftState | null>(null)
+  const [planDialogOpen, setPlanDialogOpen] = useState(false)
+
+  // StrictMode rule (see the messages-updater comment below): state
+  // transitions stay in event handlers, durable writes happen here.
+  useEffect(() => {
+    if (!planDraft) return
+    const persisted = v2RunRef.current
+    if (!persisted) return
+    v2RunRef.current = { ...persisted, plan_stage: planDraft.stage }
+    saveV2PersistedRun(v2RunRef.current)
+  }, [planDraft])
 
   useEffect(() => {
     let cancelled = false
@@ -1282,10 +1321,22 @@ function SuperAgent() {
 
   const handleSend = useCallback(async (
     textOverride?: string,
-    options: { replaceFromIndex?: number; profileId?: 'route_plan' } = {},
+    options: {
+      replaceFromIndex?: number
+      profileId?: 'route_plan'
+      /**
+       * Ticket 01: a whitelisted structured intent. Plan routing is
+       * intent-driven, so an intent send needs no typed text — the old
+       * `if (!text) return` guard silently no-oped quick actions.
+       */
+      intent?: V2PlanIntent
+      /** The dialog's validated fields; only sent with plan_create/regenerate. */
+      planInput?: V2PlanDraftFields
+    } = {},
   ) => {
     const text = typeof textOverride === 'string' ? textOverride.trim() : input.trim()
-    if (!text || isSending) return
+    if (isSending) return
+    if (!text && !options.intent) return
 
     if (!activeSessionId) {
       setActiveSessionId(generateId())
@@ -1302,7 +1353,13 @@ function SuperAgent() {
     const contextMessages = typeof replaceFromIndex === 'number'
       ? messages.slice(0, Math.max(0, replaceFromIndex))
       : messages
-    const nextUserMessage: Message = { role: 'user', content: text, time: timeStr }
+    // An intent send may carry no typed text; the bubble then shows the
+    // intent's human label instead of an empty message.
+    const nextUserMessage: Message = {
+      role: 'user',
+      content: text || (options.intent ? PLAN_INTENT_LABELS[options.intent] : ''),
+      time: timeStr,
+    }
     const nextAssistantMessage: Message = { role: 'assistant', content: '', isStreaming: true, hasStreamed: true }
 
     setMessages(prev => {
@@ -1340,10 +1397,21 @@ function SuperAgent() {
           conversation_id: conversationId,
           profile_id: options.profileId || (selectedScenario === 'route_plan' ? 'route_plan' : 'chat'),
         }
+        // Ticket 01: the plan entry travels as structured data. The strict
+        // server model rejects anything outside its whitelist, so an intent
+        // here is the only way in — never a sentence carrying a pseudo id.
+        if (options.intent) {
+          v2Payload.intent = options.intent
+          if (options.planInput) v2Payload.plan_input = options.planInput
+        }
         const needsRouteFollowupLocation = shouldRequestRouteFollowupLocation(text, contextMessages)
-        const cachedRouteLocation = needsRouteFollowupLocation ? lastLocationRef.current : null
-        const currentLocation = cachedRouteLocation
-          || await getBrowserLocation((shouldRequestCurrentLocation(text) || needsRouteFollowupLocation) ? 10000 : 3000)
+        // A plan send must not trigger a geolocation prompt: the draft flow
+        // is field-driven and profile `chat`.
+        const cachedRouteLocation = !options.intent && needsRouteFollowupLocation ? lastLocationRef.current : null
+        const currentLocation = options.intent
+          ? null
+          : cachedRouteLocation
+            || await getBrowserLocation((shouldRequestCurrentLocation(text) || needsRouteFollowupLocation) ? 10000 : 3000)
         if (currentLocation) {
           lastLocationRef.current = currentLocation
           v2Payload.current_location = currentLocation

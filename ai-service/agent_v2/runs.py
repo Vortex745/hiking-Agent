@@ -31,6 +31,7 @@ from agent_v2.persistence import (
     CheckpointsStore,
     ControlStore,
     EffectRecord,
+    PlanDraftRecord,
     RunAlreadyTerminal,
     RunNotFound,
     RunRecord,
@@ -253,6 +254,46 @@ class RunRepository:
 
     def mark_artifact_expired(self, artifact_id: str) -> ArtifactRecord | None:
         return self.control.mark_artifact_expired(artifact_id)
+
+    # -- plan drafts (Ticket 01) ----------------------------------------
+
+    def save_plan_draft(
+        self,
+        *,
+        conversation_id: str,
+        stage: str,
+        destination_or_route: str = "",
+        activity_date: str = "",
+        participants: int | None = None,
+        updated_by_run_id: str = "",
+    ) -> PlanDraftRecord:
+        """Upsert the conversation's single plan draft (Ticket 01 AC8).
+
+        Adapters and flows go through this facade, never through
+        :class:`ControlStore` directly — the two-database split stays the
+        repository's business. The draft is keyed by ``conversation_id``
+        and deliberately NOT run-scoped, so it outlives the run that
+        wrote it (``run_events``/``artifacts`` cascade on run delete).
+        """
+        return self.control.upsert_plan_draft(
+            conversation_id=conversation_id,
+            stage=stage,
+            destination_or_route=destination_or_route,
+            activity_date=activity_date,
+            participants=participants,
+            updated_by_run_id=updated_by_run_id,
+        )
+
+    def get_plan_draft(self, conversation_id: str) -> PlanDraftRecord | None:
+        """Read the current draft state, or ``None`` when no draft exists.
+
+        ``None`` is a state, not an error: it means the plan flow has
+        never been opened in this conversation, which is what
+        :func:`agent_v2.plan_workflow.evaluate_plan_intent` needs in order
+        to reject ``plan_confirm`` / ``plan_cancel`` / ``plan_regenerate``
+        with a stable reason.
+        """
+        return self.control.get_plan_draft(conversation_id)
 
     def mark_run_done(self, run_id: str) -> None:
         """Transition a running run to ``done`` terminal.

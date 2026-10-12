@@ -33,8 +33,10 @@ import type {
   V2ApprovalRequest,
   V2MemoryCandidate,
   V2Artifact,
+  V2PlanDraftState,
+  V2PlanDraftStage,
 } from './chatV2'
-import { TERMINAL_V2_EVENT_TYPES } from './chatV2'
+import { TERMINAL_V2_EVENT_TYPES, V2_PLAN_DRAFT_STAGES } from './chatV2'
 
 export interface V2ToolTrace {
   type: 'tool_call' | 'tool_result' | 'artifact_progress'
@@ -107,6 +109,13 @@ export interface V2ConversationState {
    * "需要人工核查" context beyond the bare error text.
    */
   reviewNotices: string[]
+  /**
+   * Ticket 01: the conversation's plan-book draft state, set by
+   * ``plan.draft_state``. ``null`` means no plan flow has been opened. The
+   * UI opens the dialog only from ``awaiting_input``; ``awaiting_confirmation``
+   * is the ambiguous-intent prompt and must leave the dialog closed.
+   */
+  planDraft: V2PlanDraftState | null
 }
 
 export const initialV2State: V2ConversationState = {
@@ -124,6 +133,7 @@ export const initialV2State: V2ConversationState = {
   pendingMemoryConsent: null,
   artifacts: [],
   reviewNotices: [],
+  planDraft: null,
 }
 
 /**
@@ -255,6 +265,17 @@ export function reduceV2Event(
         return artifact
           ? { ...base, status: 'running', artifacts: [...base.artifacts, artifact] }
           : { ...base, status: 'running', droppedCount: base.droppedCount + 1 }
+      }
+
+    case 'plan.draft_state':
+      // Ticket 01 AC8: the server moved this conversation's plan draft to
+      // a new stage. The reducer only records it — deciding whether that
+      // means "open the dialog" or "ask for confirmation" is the UI's
+      // reading of ``stage``, and an unreadable payload counts as dropped
+      // instead of guessing.
+      {
+        const draft = readPlanDraftState(event.payload)
+        return draft ? { ...base, status: 'running', planDraft: draft } : base
       }
 
     case 'effect.outcome_unknown':
@@ -429,6 +450,39 @@ function readObject(
     return value as Record<string, unknown>
   }
   return undefined
+}
+
+/**
+ * Helper: read the ``plan.draft_state`` payload (Ticket 01) into a typed
+ * ``V2PlanDraftState``. Returns null when the stage is missing or outside
+ * the shared vocabulary — an unknown stage must never open a dialog on a
+ * guess.
+ */
+export function readPlanDraftState(
+  payload: Record<string, unknown>,
+): V2PlanDraftState | null {
+  const stage = payload['stage']
+  if (typeof stage !== 'string' || !V2_PLAN_DRAFT_STAGES.has(stage as V2PlanDraftStage)) {
+    return null
+  }
+  const rawDraft = payload['draft']
+  const draft = (rawDraft && typeof rawDraft === 'object' ? rawDraft : {}) as Record<string, unknown>
+  const participants = draft['participants']
+  return {
+    stage: stage as V2PlanDraftStage,
+    draft_id: typeof payload['draft_id'] === 'string' ? payload['draft_id'] : '',
+    conversation_id: typeof payload['conversation_id'] === 'string' ? payload['conversation_id'] : '',
+    source: payload['source'] === 'natural_language' ? 'natural_language' : 'structured_intent',
+    intent: typeof payload['intent'] === 'string' ? payload['intent'] : '',
+    draft: {
+      destination_or_route:
+        typeof draft['destination_or_route'] === 'string' ? draft['destination_or_route'] : '',
+      activity_date: typeof draft['activity_date'] === 'string' ? draft['activity_date'] : '',
+      participants: typeof participants === 'number' && Number.isFinite(participants)
+        ? participants
+        : null,
+    },
+  }
 }
 
 /**

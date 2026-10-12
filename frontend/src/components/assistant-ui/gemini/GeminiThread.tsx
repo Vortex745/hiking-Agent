@@ -26,6 +26,12 @@ gsap.registerPlugin(useGSAP);
 
 interface GeminiThreadProps {
   onExportRoute?: (comparisonId: string) => void;
+  /**
+   * Ticket 01: the 生成行程 quick action. It sends the structured
+   * ``plan_create`` intent — never a sentence stuffed with a pseudo id,
+   * which is the anti-pattern ``onExportRoute`` still uses.
+   */
+  onGeneratePlan?: () => void;
   isSending?: boolean;
   emptyTitle: string;
   /** Called when user clicks "regenerate" — parent should resend the last user prompt */
@@ -39,17 +45,18 @@ interface GeminiThreadProps {
 /** Context to pass callbacks down to ChatMessage without prop drilling */
 const ThreadActionsContext = createContext<{
   onExportRoute?: (comparisonId: string) => void;
+  onGeneratePlan?: () => void;
   isSending?: boolean;
   onRegenerate?: () => void;
   onConfirmTool?: (confirmationId: string, action: 'confirm' | 'reject') => void;
   realMessageCount: number;
 }>({ realMessageCount: 0 });
 
-export const GeminiThread = ({ emptyTitle, onRegenerate, onUploadClick, onConfirmTool, onExportRoute, isSending, realMessageCount = 0 }: GeminiThreadProps) => (
-  <ThreadActionsContext.Provider value={{ onRegenerate, onConfirmTool, onExportRoute, isSending, realMessageCount }}>
+export const GeminiThread = ({ emptyTitle, onRegenerate, onUploadClick, onConfirmTool, onExportRoute, onGeneratePlan, isSending, realMessageCount = 0 }: GeminiThreadProps) => (
+  <ThreadActionsContext.Provider value={{ onRegenerate, onConfirmTool, onExportRoute, onGeneratePlan, isSending, realMessageCount }}>
     <ThreadPrimitive.Root className="h-full bg-[#fdfcfc] dark:bg-[#131314] flex flex-col overflow-hidden w-full relative">
       <AuiIf condition={(s) => s.thread.isEmpty}>
-        <EmptyState emptyTitle={emptyTitle} onUploadClick={onUploadClick} />
+        <EmptyState emptyTitle={emptyTitle} onUploadClick={onUploadClick} onGeneratePlan={onGeneratePlan} isSending={isSending} />
       </AuiIf>
       <AuiIf condition={(s) => !s.thread.isEmpty}>
         <div className="flex-1 overflow-hidden flex flex-col relative w-full">
@@ -67,7 +74,12 @@ export const GeminiThread = ({ emptyTitle, onRegenerate, onUploadClick, onConfir
   </ThreadActionsContext.Provider>
 );
 
-const EmptyState = ({ emptyTitle, onUploadClick }: { emptyTitle: string; onUploadClick?: () => void }) => (
+const EmptyState = ({ emptyTitle, onUploadClick, onGeneratePlan, isSending }: {
+  emptyTitle: string;
+  onUploadClick?: () => void;
+  onGeneratePlan?: () => void;
+  isSending?: boolean;
+}) => (
   <div className="relative flex grow h-full items-center justify-center">
     <div
       aria-hidden="true"
@@ -76,6 +88,23 @@ const EmptyState = ({ emptyTitle, onUploadClick }: { emptyTitle: string; onUploa
     <div className="relative z-10 w-full max-w-[800px] px-6 flex flex-col items-center">
       <h1 className="text-center text-3xl font-medium mb-12 text-[#1f1f1f] dark:text-[#e3e3e3]">{emptyTitle}</h1>
       <Composer onUploadClick={onUploadClick} />
+      {onGeneratePlan && (
+        // Ticket 01: the plan-book quick action. A structured intent
+        // entry, so it is not the orphaned quickTags/selectedScenario
+        // dead code — clicking sends ``plan_create`` with no text.
+        <div className="mt-6 flex w-full flex-wrap justify-center gap-2">
+          <button
+            type="button"
+            onClick={onGeneratePlan}
+            disabled={isSending}
+            className="press-scale inline-flex items-center gap-1.5 rounded-lg border border-black/10 bg-white px-3 py-2 text-sm text-[#1f1f1f] transition-colors hover:bg-black/5 disabled:pointer-events-none disabled:opacity-45 dark:border-white/10 dark:bg-[#1e1f20] dark:text-[#e3e3e3] dark:hover:bg-white/5"
+            title="生成行程计划书"
+          >
+            <Grid className="size-4" aria-hidden="true" />
+            生成行程
+          </button>
+        </div>
+      )}
     </div>
   </div>
 );

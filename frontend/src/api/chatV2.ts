@@ -36,12 +36,66 @@ export type V2EventType =
   | 'approval.required'
   | 'approval.resolved'
   | 'memory.consent_required'
+  | 'plan.draft_state'
   | 'run.paused'
   | 'effect.outcome_unknown'
   | 'error'
   | 'done'
   | 'cancelled'
   | 'heartbeat'
+
+// ---- Plan book (Ticket 01) ------------------------------------------------
+
+/**
+ * The whitelisted structured intents the server accepts on
+ * ``POST /api/v2/chat/sse``. Quick actions send these directly; free text is
+ * only ever normalised by server-side rules. An intent outside this list is
+ * rejected by the server's request model before streaming starts, so the
+ * frontend must never invent one.
+ */
+export type V2PlanIntent =
+  | 'plan_create'
+  | 'plan_confirm'
+  | 'plan_cancel'
+  | 'plan_regenerate'
+
+/**
+ * Draft stages of ``plan.draft_state`` — the same vocabulary as
+ * ``PlanDraftStage`` on the server and ``plan_drafts.stage`` in SQLite.
+ *
+ * ``awaiting_confirmation`` is the ambiguous-intent parking lot: the server
+ * asked whether to generate a plan book, and the dialog MUST stay closed
+ * until the user confirms. Only ``awaiting_input`` opens it.
+ */
+export type V2PlanDraftStage =
+  | 'awaiting_confirmation'
+  | 'awaiting_input'
+  | 'minimal_draft'
+  | 'cancelled'
+
+/** The three fields the entry dialog collects. Absent values stay absent. */
+export interface V2PlanDraftFields {
+  destination_or_route: string
+  activity_date: string
+  participants: number | null
+}
+
+export interface V2PlanDraftState {
+  stage: V2PlanDraftStage
+  draft_id: string
+  conversation_id: string
+  /** Whether a structured intent or the deterministic rules opened the flow. */
+  source: 'structured_intent' | 'natural_language'
+  intent: string
+  draft: V2PlanDraftFields
+}
+
+export const V2_PLAN_DRAFT_STAGES: ReadonlySet<V2PlanDraftStage> = new Set([
+  'awaiting_confirmation',
+  'awaiting_input',
+  'minimal_draft',
+  'cancelled',
+])
 
 /**
  * artifact.available payload (A02): the only public artifact shape. No
@@ -212,6 +266,7 @@ function isV2EventType(value: unknown): value is V2EventType {
     value === 'approval.required' ||
     value === 'approval.resolved' ||
     value === 'memory.consent_required' ||
+    value === 'plan.draft_state' ||
     value === 'run.paused' ||
     value === 'effect.outcome_unknown' ||
     value === 'error' ||
