@@ -474,6 +474,9 @@ export function readPlanDraftState(
     conversation_id: typeof payload['conversation_id'] === 'string' ? payload['conversation_id'] : '',
     source: payload['source'] === 'natural_language' ? 'natural_language' : 'structured_intent',
     intent: typeof payload['intent'] === 'string' ? payload['intent'] : '',
+    // Ticket 02 AC3: the rendered draft summary. Absent on an older payload,
+    // which is an empty summary — never a guess and never a dropped event.
+    summary: typeof payload['summary'] === 'string' ? payload['summary'] : '',
     draft: {
       destination_or_route:
         typeof draft['destination_or_route'] === 'string' ? draft['destination_or_route'] : '',

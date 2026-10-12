@@ -87,6 +87,14 @@ export interface V2PlanDraftState {
   /** Whether a structured intent or the deterministic rules opened the flow. */
   source: 'structured_intent' | 'natural_language'
   intent: string
+  /**
+   * Ticket 02 AC3: the server-rendered draft summary for this stage and these
+   * fields (``plan_workflow.draft_summary``). It travels inside the draft
+   * state, so the dialog's read-only block and the chat bubble show the same
+   * text, and a restored draft still shows its summary after a refresh.
+   * Empty only for a payload from a server that predates this field.
+   */
+  summary: string
   draft: V2PlanDraftFields
 }
 

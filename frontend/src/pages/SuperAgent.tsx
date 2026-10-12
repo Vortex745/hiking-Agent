@@ -23,6 +23,7 @@ import {
   type V2Memory,
   type V2MemoryCandidate,
   type V2PlanIntent,
+  type V2PlanDraftStage,
   type V2PlanDraftState,
   type V2PlanDraftFields,
 } from '../api/chatV2'
@@ -36,6 +37,13 @@ import {
   readPlanDraftState,
   type V2ConversationState,
 } from '../api/v2Reducer'
+import {
+  clearPlanDraft,
+  isReopenablePlanDraftStage,
+  isSamePlanDraft,
+  loadPlanDraft,
+  savePlanDraft,
+} from '../api/planDraftStore'
 import { useExternalStoreRuntime, AssistantRuntimeProvider, ThreadMessage } from "@assistant-ui/react"
 import { GeminiThread } from '../components/assistant-ui/gemini/GeminiThread'
 import PlanDraftDialog from '../components/PlanDraftDialog'
@@ -125,6 +133,18 @@ const PLAN_INTENT_LABELS: Record<V2PlanIntent, string> = {
   plan_confirm: '确认生成计划书',
   plan_cancel: '取消生成计划书',
   plan_regenerate: '重新生成草稿',
+}
+
+/**
+ * Ticket 02: what a restored draft is waiting for. Keyed by the stage union,
+ * so TypeScript forces a label for every stage a future ticket adds — the
+ * same trick ``PLAN_INTENT_LABELS`` uses to keep the vocabulary from drifting.
+ */
+const PLAN_STAGE_LABELS: Record<V2PlanDraftStage, string> = {
+  awaiting_confirmation: '等你确认是否生成计划书',
+  awaiting_input: '等你填写基本信息',
+  minimal_draft: '最小草稿已生成，可继续修改',
+  cancelled: '已取消',
 }
 
 const STORAGE_KEY = 'ai-hiking-agent-chat'
@@ -464,9 +484,12 @@ function SuperAgent() {
   // confirm prompt instead, because an ambiguous request must be confirmed
   // before the flow opens (spec AC2).
   //
-  // Seeded from the persisted run so a refresh still knows a draft exists.
-  // Nothing here reopens the dialog on restore — that decision is ticket 02's
-  // restore UX, so this stays a read of "does a draft exist" only.
+  // Seeded from the persisted run so a refresh mid-run still knows a draft
+  // exists; ticket 02 adds the durable half (the conversation-keyed store
+  // below), which is what survives a refresh *after* a run terminal. Neither
+  // path auto-opens the dialog — restoring shows the 恢复草稿 panel and the
+  // user decides, so a page load can never look like an action it did not
+  // take (spec AC2 + AC5).
   const [planDraft, setPlanDraft] = useState<V2PlanDraftState | null>(
     () => v2RunRef.current?.plan_draft ?? null,
   )
@@ -489,6 +512,42 @@ function SuperAgent() {
     v2RunRef.current = { ...persisted, plan_draft: planDraft }
     saveV2PersistedRun(v2RunRef.current)
   }, [planDraft])
+
+  // Ticket 02 AC1/AC2/AC4: the durable mirror, keyed by CONVERSATION rather
+  // than by the run. Written from this effect only (never from a `setMessages`
+  // updater), and a `cancelled` draft clears the conversation's slot instead
+  // of storing it — that is what "取消流程会清理未完成的计划状态" means on the
+  // client, and it is why re-entering the conversation shows nothing to
+  // restore after a cancel.
+  useEffect(() => {
+    if (!planDraft) return
+    const conversationId = planDraft.conversation_id || chatIdRef.current
+    if (!conversationId) return
+    if (planDraft.stage === 'cancelled') {
+      clearPlanDraft(conversationId)
+      return
+    }
+    savePlanDraft({ ...planDraft, conversation_id: conversationId })
+  }, [planDraft])
+
+  // Ticket 02 AC2: restore on entry — page load and conversation switch.
+  // ``V2PersistedRun`` is nulled at every run terminal, so the run record
+  // cannot be the restore source; this store is. Skipped while a request is
+  // in flight, because the live stream owns the draft state then, and the
+  // mid-run refresh path already replays ``plan.draft_state`` through
+  // ``applyReplay``.
+  useEffect(() => {
+    if (isSending) return
+    const conversationId = chatIdRef.current
+    const stored = loadPlanDraft(conversationId)
+    // Returning the same object identity when nothing changed keeps this
+    // idempotent under StrictMode's double invoke.
+    setPlanDraft(current => {
+      if (isSamePlanDraft(current, stored)) return current
+      if (current && (current.conversation_id || conversationId) === conversationId) return current
+      return stored
+    })
+  }, [activeSessionId, isSending])
 
   useEffect(() => {
     let cancelled = false
@@ -1612,14 +1671,33 @@ function SuperAgent() {
   }, [handleSend])
 
   const handlePlanDialogDismiss = useCallback(() => {
+    // AC2: closing the dialog parks the draft — nothing leaves the page, so
+    // the conversation keeps its stored stage and the 恢复草稿 panel takes
+    // over. Cancelling has its own action below; conflating the two would
+    // destroy the draft the moment the user stepped away.
     setPlanDialogOpen(false)
-    // Only a stage the user actually reached can be cancelled — cancelling
-    // ``awaiting_confirmation`` (nothing open) or an already-cancelled draft
-    // would come back as ``cancel_without_active_draft``.
-    if (planDraft && (planDraft.stage === 'awaiting_input' || planDraft.stage === 'minimal_draft')) {
+  }, [])
+
+  // AC4: the one exit that clears the plan state. Only a stage the user
+  // actually reached can be cancelled — cancelling ``awaiting_confirmation``
+  // (nothing open) or an already-cancelled draft would come back as
+  // ``cancel_without_active_draft``. The shared stage set is also what the
+  // restore panel is keyed on, so the two cannot drift.
+  const handlePlanDialogCancel = useCallback(() => {
+    setPlanDialogOpen(false)
+    if (planDraft && isReopenablePlanDraftStage(planDraft.stage)) {
       void handleSend('', { intent: 'plan_cancel' })
     }
   }, [handleSend, planDraft])
+
+  // Ticket 02 AC2: reopen the dialog from the draft this conversation already
+  // has. Deliberately local — no request leaves the page, so restoring a
+  // draft cannot start a route comparison, a plan judgement, or a PDF (AC5).
+  // The form re-seeds from the stored fields, and the read-only summary block
+  // from the stored summary, on the dialog's own open effect.
+  const handleRestorePlanDraft = useCallback(() => {
+    setPlanDialogOpen(true)
+  }, [])
 
   const handlePlanConfirm = useCallback(() => {
     void handleSend('', { intent: 'plan_confirm' })
@@ -1754,6 +1832,34 @@ function SuperAgent() {
               </div>
             </div>
           )}
+          {/* Ticket 02 AC2: the restore affordance. A draft in an open stage
+              survives a refresh or a conversation switch (conversation-keyed
+              store), and this panel is how the user gets it back — reopening
+              is a local action, so nothing is compared, judged, or rendered.
+              It stays hidden while the dialog itself is open, and
+              ``awaiting_confirmation`` has its own prompt above instead. */}
+          {planDraft && !planDialogOpen && isReopenablePlanDraftStage(planDraft.stage) && (
+            <div className="absolute left-4 right-4 top-16 z-50 ml-auto max-w-sm rounded-md border border-border bg-white p-4 text-sm text-text-primary shadow-xl dark:border-white/10 dark:bg-[#1e1f20]">
+              <div className="font-medium">本会话有未完成的行程草稿</div>
+              <p className="mt-1 text-xs text-text-muted">
+                草稿 {planDraft.draft_id ? planDraft.draft_id.slice(0, 8) : '—'}：
+                {PLAN_STAGE_LABELS[planDraft.stage]}
+                {planDraft.draft.destination_or_route
+                  ? ` · ${planDraft.draft.destination_or_route}`
+                  : ''}
+                {planDraft.draft.activity_date ? ` · ${planDraft.draft.activity_date}` : ''}
+                {planDraft.draft.participants != null ? ` · ${planDraft.draft.participants} 人` : ''}
+              </p>
+              <div className="mt-3 flex justify-end gap-2">
+                <Button variant="ghost" size="sm" disabled={isSending} onClick={handlePlanDialogCancel}>
+                  取消草稿
+                </Button>
+                <Button variant="accent" size="sm" onClick={handleRestorePlanDraft}>
+                  恢复草稿
+                </Button>
+              </div>
+            </div>
+          )}
           <GeminiThread
             onExportRoute={comparisonId => { void handleSend(`请导出带来源的路线比较 PDF，comparison_id=${comparisonId}`, { profileId: 'route_plan' }) }}
             onGeneratePlan={handleGeneratePlan}
@@ -1764,12 +1870,16 @@ function SuperAgent() {
           />
           {/* Ticket 01 AC1/AC6: the entry dialog. Opens only from the
               server's ``awaiting_input`` stage, and re-seeds from the stored
-              draft so a second entry does not discard what the user typed. */}
+              draft so a second entry does not discard what the user typed.
+              Ticket 02: the same stored draft carries its summary, shown
+              read-only above the form so an edit and its summary stay in sync. */}
           <PlanDraftDialog
             open={planDialogOpen}
             busy={isSending}
             initial={planDraft?.draft}
+            summary={planDraft?.summary}
             onDismiss={handlePlanDialogDismiss}
+            onCancel={handlePlanDialogCancel}
             onSubmit={handlePlanDialogSubmit}
           />
         </div>

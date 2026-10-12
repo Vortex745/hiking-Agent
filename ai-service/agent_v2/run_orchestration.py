@@ -91,10 +91,9 @@ from agent_v2.permissions import PermissionDecision, PermissionGate
 from agent_v2.plan_workflow import (
     BLOCK_MESSAGE,
     PlanDraftStage,
-    STAGE_MESSAGE,
     classify_plan_request,
+    draft_summary,
     evaluate_plan_intent,
-    render_minimal_draft,
 )
 from agent_v2.profiles import (
     CapabilityProfile,
@@ -1150,9 +1149,12 @@ class RunOrchestrator:
         so server and frontend recognise the draft state from one
         vocabulary (spec AC8).
 
-        Deliberately NOT in scope here (later tickets): draft restore after
-        cancel (02), route-comparison reuse (03), research (04), summaries
-        and completeness rules (05-07), PDF (08-09).
+        Deliberately NOT in scope here (later tickets): route-comparison
+        reuse (03), research (04), summaries and completeness rules (05-07),
+        PDF (08-09). Ticket 02 adds the two halves it owns: the draft summary
+        travels on ``plan.draft_state`` (AC3), and ``cancelled`` clears the
+        conversation's unfinished state (AC4) — restore itself reads the
+        stored row back through this same event vocabulary.
         """
         runs_repo = self._runs_repo
 
@@ -1231,12 +1233,24 @@ class RunOrchestrator:
                     req.conversation_id,
                 )
 
+        # Ticket 02 AC3: the summary is rendered from the fields that were just
+        # stored, and it travels INSIDE the draft state so a later restore can
+        # re-read the same text the chat bubble showed. Rendering it here also
+        # keeps one source of truth — the dialog and the thread cannot drift.
+        summary = draft_summary(
+            stage=stage,
+            destination_or_route=destination,
+            activity_date=activity_date,
+            participants=participants,
+        )
+
         yield emit("plan.draft_state", {
             "stage": stage.value,
             "draft_id": record.draft_id if record else "",
             "conversation_id": req.conversation_id or "",
             "source": entry.source,
             "intent": intent or "",
+            "summary": summary,
             "draft": {
                 "destination_or_route": destination,
                 "activity_date": activity_date,
@@ -1244,15 +1258,7 @@ class RunOrchestrator:
             },
         })
 
-        if stage is PlanDraftStage.MINIMAL_DRAFT:
-            text = render_minimal_draft(
-                destination_or_route=destination,
-                activity_date=activity_date,
-                participants=participants,
-            )
-        else:
-            text = STAGE_MESSAGE[stage]
-
+        text = summary
         envelope = emit("text", {"content": text})
         self._persist_plan_reply(req, run_id, envelope, text)
         yield envelope

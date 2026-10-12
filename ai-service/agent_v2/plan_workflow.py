@@ -307,6 +307,34 @@ STAGE_MESSAGE: dict[PlanDraftStage, str] = {
 }
 
 
+def draft_summary(
+    *,
+    stage: PlanDraftStage,
+    destination_or_route: str,
+    activity_date: str,
+    participants: int | None,
+) -> str:
+    """The draft summary for a stage and the fields stored with it (Ticket 02 AC3).
+
+    One deterministic renderer for both consumers — the ``plan.draft_state``
+    payload the restore UX reads back after a refresh, and the chat bubble the
+    flow streams — so they cannot drift. Every stage must be covered here:
+    a stage the summary cannot render is a crash on restore, not a silent
+    miss (``MINIMAL_DRAFT`` is the one stage whose copy is the preview, which
+    is why :data:`STAGE_MESSAGE` has no entry for it).
+
+    Nothing is invented: the summary is a pure function of the stored fields,
+    so editing a field and re-rendering is the same call.
+    """
+    if stage is PlanDraftStage.MINIMAL_DRAFT:
+        return render_minimal_draft(
+            destination_or_route=destination_or_route,
+            activity_date=activity_date,
+            participants=participants,
+        )
+    return STAGE_MESSAGE[stage]
+
+
 def render_minimal_draft(
     *,
     destination_or_route: str,

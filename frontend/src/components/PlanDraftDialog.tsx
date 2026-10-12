@@ -35,13 +35,31 @@ const INPUT_CLASS =
 
 export interface PlanDraftDialogProps {
   open: boolean
-  /** Dismiss (Escape, backdrop, 取消) — the parent cancels the plan flow. */
+  /**
+   * Park the draft: backdrop, Escape and the X all close the dialog without
+   * cancelling anything (Ticket 02 AC2 — the user must be able to step away
+   * and restore this conversation's draft later).
+   */
   onDismiss: () => void
+  /**
+   * Cancel the plan flow (footer 取消) — the only exit that clears the draft
+   * (Ticket 02 AC4). Falls back to parking when the parent has no separate
+   * cancel action.
+   */
+  onCancel?: () => void
   onSubmit: (fields: V2PlanDraftFields) => void
   /** Re-opened dialog keeps what the user already typed; server fields win. */
   initial?: Partial<V2PlanDraftFields>
   /** A request is in flight: keep the dialog from submitting twice. */
   busy?: boolean
+  /**
+   * Ticket 02 AC3: the server-rendered draft summary for the fields already
+   * stored, shown read-only above the form so an edit and its summary stay
+   * together. It is the text the server produced (``plan_workflow.draft_summary``)
+   * — this component never composes plan content itself, and an empty summary
+   * (a draft with nothing rendered yet) renders no block.
+   */
+  summary?: string
 }
 
 interface FieldErrors {
@@ -74,7 +92,7 @@ export function validatePlanDraftFields(values: {
   return errors
 }
 
-export const PlanDraftDialog = ({ open, onDismiss, onSubmit, initial, busy = false }: PlanDraftDialogProps) => {
+export const PlanDraftDialog = ({ open, onDismiss, onCancel, onSubmit, initial, busy = false, summary }: PlanDraftDialogProps) => {
   const [destinationOrRoute, setDestinationOrRoute] = useState(initial?.destination_or_route ?? '')
   const [activityDate, setActivityDate] = useState(initial?.activity_date ?? '')
   const [participants, setParticipants] = useState(
@@ -142,10 +160,28 @@ export const PlanDraftDialog = ({ open, onDismiss, onSubmit, initial, busy = fal
               先填三项基本信息，得到可预览的最小草稿；其余安排留空，会显示"待确认"。
             </p>
           </div>
-          <Button variant="ghost" size="sm" onClick={onDismiss} aria-label="关闭计划书弹窗" title="关闭">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onDismiss}
+            aria-label="关闭计划书弹窗"
+            title="先关掉，草稿会保留"
+          >
             <X className="size-4" aria-hidden="true" />
           </Button>
         </div>
+
+        {/* Ticket 02 AC3: the read-only summary slot ticket 01 left open.
+            Server-rendered text only — this component adds no claims of its
+            own, so the 待确认 / 待核验 boundary cannot be crossed here. */}
+        {summary && (
+          <div
+            className="mb-4 rounded-md border border-border p-3 text-xs leading-relaxed whitespace-pre-wrap text-text-secondary dark:border-white/10"
+            aria-label="当前草稿摘要"
+          >
+            {summary}
+          </div>
+        )}
 
         <form
           className="grid gap-4"
@@ -204,7 +240,7 @@ export const PlanDraftDialog = ({ open, onDismiss, onSubmit, initial, busy = fal
           </label>
 
           <div className="mt-1 flex justify-end gap-2">
-            <Button variant="ghost" size="md" onClick={onDismiss} disabled={busy}>
+            <Button variant="ghost" size="md" onClick={onCancel ?? onDismiss} disabled={busy}>
               取消
             </Button>
             <Button variant="accent" size="md" type="submit" disabled={busy}>
