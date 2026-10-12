@@ -540,3 +540,220 @@ def test_the_discriminator_change_never_resurrects_the_replay_for_identical_call
     assert k2 == _k1
     assert again.status == "recovered"
     assert executed == [1]
+
+
+# ---- The cover's 安全门 line: ticket 07's safety record, now a row ------------
+#
+# Ticket 08 left this gap: the cover read 待核验 in real exports because the
+# safety answer only rode ``plan.draft_state.safety``. These tests drive the
+# REAL plan flow (offline fixture + deterministic provider, no model — the
+# ``kernel_calls == []`` invariant is asserted) and then read the rows that the
+# two export sites consume via ``_pdf_plan_status_inputs``.
+
+from agent_v2.plan_workflow import (
+    SAFETY_MESSAGE,
+    PlanSafetyReason,
+    PlanDraftInput,
+    SUPPLEMENT_ARRANGEMENT_KEYS,
+)
+
+
+_PLAN_CONV = "conv-safety-09"
+
+
+class _SilentMemory:
+    def memory_enabled(self, subject_id): return True
+
+    def claim_conversation(self, s, c): return True
+
+    def owns_conversation(self, s, c): return True
+
+
+def _plan_settings(scenario: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        agent_v2_enabled=True, openai_api_key="sk-test", openai_model="test-model",
+        agent_v2_cowork_policy="disabled", agent_v2_state_dir="/tmp/unused",
+        route_compare_data_mode="offline", route_decision_provider="deterministic",
+        route_compare_demo_scenario=scenario,
+    )
+
+
+def _plan_drive(repo: RunRepository, *requests: ChatFlowRequest, scenario: str):
+    kernel_calls: list[str] = []
+
+    async def fake_kernel(**kwargs):
+        kernel_calls.append(kwargs["message"])
+        return "普通回答。", []
+
+    orch = RunOrchestrator(
+        settings=_plan_settings(scenario), runs_repo=repo, memory=_SilentMemory(),
+        kernel_turn=fake_kernel,
+    )
+
+    async def drive():
+        return [[e async for e in orch.stream_chat(req, subject_id="subj-09")]
+                for req in requests]
+
+    streams = asyncio.run(drive())
+    return streams, kernel_calls
+
+
+def _plan_req(request_id: str, *, message="生成行程", intent=None, plan_input=None,
+              conversation_id=_PLAN_CONV) -> ChatFlowRequest:
+    return ChatFlowRequest(
+        message=message, request_id=request_id, conversation_id=conversation_id,
+        profile_id="chat", intent=intent, plan_input=plan_input,
+    )
+
+
+_CORE_ARRANGEMENTS = {
+    "meeting_time": "08:30",
+    "meeting_point": "长坪沟景区北门停车场",
+    "emergency_contact": "13800000000",
+}
+
+
+def _plan_submit(request_id: str) -> ChatFlowRequest:
+    arrangements = {key: "" for key in SUPPLEMENT_ARRANGEMENT_KEYS}
+    arrangements.update(_CORE_ARRANGEMENTS)
+    return _plan_req(
+        request_id, message="提交草稿", intent="plan_create",
+        plan_input=PlanDraftInput.model_validate({
+            # notes-05 landmine 7: the offline fixtures only speak for the demo
+            # route; any other place name researches as insufficient_evidence.
+            "destination_or_route": "演示林间环线",
+            "activity_date": "2026-11-08",
+            "participants": 12,
+            "arrangements": arrangements,
+        }),
+    )
+
+
+def _draft_payload_of(events: list[Any]) -> dict:
+    return [e for e in events if e.type == "plan.draft_state"][-1].payload
+
+
+def test_a_dangerous_research_turn_stores_the_gate_refusal_as_a_row(tmp_path):
+    """The refusal the event carried is now ALSO a row, verbatim, on the draft."""
+    repo = _repo(tmp_path)
+    (submit_stream, research_stream), kernel_calls = _plan_drive(
+        repo, _plan_submit("req-safety-submit"),
+        _plan_req("req-safety-research", intent="plan_research_route"),
+        scenario="severe_weather",
+    )
+    payload = _draft_payload_of(research_stream)
+    assert payload["safety"]["hard_stop"] is True
+    assert PlanSafetyReason.SEVERE_WEATHER in payload["safety"]["codes"]
+
+    draft = repo.get_plan_draft(_PLAN_CONV)
+    row = repo.get_plan_safety(_PLAN_CONV)
+    assert row is not None
+    assert row.draft_id == draft.draft_id
+    # Verbatim: the row replays exactly the payload the event carried.
+    assert row.to_payload()["message"] == payload["safety"]["message"]
+    assert row.codes == tuple(payload["safety"]["codes"])
+    assert row.hard_stop is True
+    assert row.formal_route_plan_allowed == payload["safety"]["formal_route_plan_allowed"]
+    assert kernel_calls == []  # plan turns stay model-free
+
+
+def test_a_research_turn_that_the_gate_recommended_stores_a_no_block_row(tmp_path):
+    """The fix for the real-export gap: the gate's PASS is also on record.
+
+    Every field comes from the leaf's own answer (status ``recommended`` from
+    the deterministic gate) — no sentence, no threshold re-derived here. The
+    cover line report_pdf draws from this row is its pre-existing
+    未拦截 wording, chosen by the stored booleans, not new copy.
+    """
+    repo = _repo(tmp_path)
+    _streams, _calls = _plan_drive(
+        repo, _plan_submit("req-pass-submit"),
+        _plan_req("req-pass-research", intent="plan_research_route"),
+        scenario="complete",
+    )
+    row = repo.get_plan_safety(_PLAN_CONV)
+    assert row is not None
+    assert row.hard_stop is False
+    assert row.formal_route_plan_allowed is True
+    assert row.message == ""
+    assert row.comparison_status == "recommended"
+    assert row.codes == ()
+
+
+def test_a_cancelled_plan_clears_the_safety_row(tmp_path):
+    """Ticket 06 landmine 7's rule, widened: unfinished plan state goes together."""
+    repo = _repo(tmp_path)
+    _streams, _calls = _plan_drive(
+        repo, _plan_submit("req-cancel-submit"),
+        _plan_req("req-cancel-research", intent="plan_research_route"),
+        _plan_req("req-cancel-go", message="取消计划", intent="plan_cancel"),
+        scenario="severe_weather",
+    )
+    assert repo.get_plan_safety(_PLAN_CONV) is None
+
+
+def test_the_pdf_cover_inputs_read_the_stored_safety_row(tmp_path):
+    """``_pdf_plan_status_inputs`` now passes ``safety=`` — the payload shape
+    ``build_report_document`` already expects — and the cover renders the gate's
+    message instead of 待核验."""
+    from agent_v2.run_orchestration import _pdf_plan_status_inputs
+    from route_compare.models import ComparisonResult
+    from route_compare.report_pdf import build_report_document
+
+    repo = _repo(tmp_path)
+    (submit_stream, research_stream), kernel_calls = _plan_drive(
+        repo, _plan_submit("req-cover-submit"),
+        _plan_req("req-cover-research", intent="plan_research_route"),
+        scenario="severe_weather",
+    )
+    assert kernel_calls == []
+    inputs = _pdf_plan_status_inputs(repo, _PLAN_CONV)
+    assert "safety" in inputs
+    assert inputs["safety"]["hard_stop"] is True
+    assert SAFETY_MESSAGE[PlanSafetyReason.SEVERE_WEATHER] in inputs["safety"]["message"]
+
+    # And the document builder that BOTH export sites call draws the cover line
+    # from that record, over the very comparison the research turn surfaced —
+    # the 安全门 row is the stored message, not 待核验.
+    comparison = next(
+        e.payload["route_comparison"] for e in research_stream
+        if e.type == "tool_result" and "route_comparison" in e.payload
+    )
+    result = ComparisonResult.model_validate(comparison)
+    document = build_report_document(result, **inputs)
+    safety_line = next(
+        line for line in document["cover"]["status_lines"] if line["label"] == "安全门")
+    assert safety_line["value"] == inputs["safety"]["message"]
+    assert safety_line["value"] != "待核验"
+
+
+def test_a_safety_row_from_an_older_draft_never_describes_the_current_book(tmp_path):
+    """Ticket 07's staleness discipline, applied to the new row: the safety row
+    counts only while it belongs to the draft on record."""
+    from agent_v2.run_orchestration import _pdf_plan_status_inputs
+
+    repo = _repo(tmp_path)
+    draft = repo.save_plan_draft(
+        conversation_id="conv-stale", stage="minimal_draft",
+        destination_or_route="某条线", activity_date="2026-10-18", participants=4,
+    )
+    repo.save_plan_safety(
+        conversation_id="conv-stale", draft_id="draft-of-a-previous-plan",
+        payload={"hard_stop": True, "codes": ["no_go"],
+                 "formal_route_plan_allowed": False,
+                 "message": SAFETY_MESSAGE[PlanSafetyReason.NO_GO]},
+        recorded_by_run_id="run-old",
+    )
+    inputs = _pdf_plan_status_inputs(repo, "conv-stale")
+    assert "safety" not in inputs  # stays 待核验 rather than inheriting a stale refusal
+    assert draft.stage == "minimal_draft"
+
+    # The row written for THIS draft does count.
+    repo.save_plan_safety(
+        conversation_id="conv-stale", draft_id=draft.draft_id,
+        payload={"hard_stop": False, "codes": [], "formal_route_plan_allowed": True,
+                 "message": ""},
+        recorded_by_run_id="run-new",
+    )
+    inputs = _pdf_plan_status_inputs(repo, "conv-stale")
+    assert inputs["safety"]["formal_route_plan_allowed"] is True

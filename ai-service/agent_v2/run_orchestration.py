@@ -468,9 +468,9 @@ def _pdf_plan_status_inputs(runs_repo: Any, conversation_id: str) -> dict[str, A
       builder, which is where an absent field stays 待确认.
 
     Nothing here reads or implies ``report_allowed`` — eligibility stays
-    :func:`route_compare.service.render_report`'s alone. The safety record has no
-    row yet (ticket 07 carries it on the event payload), so the cover's 安全门
-    line stays 待核验 until the approval ticket owns that read.
+    :func:`route_compare.service.render_report`'s alone. The 安全门 line reads
+    the stored safety row (ticket 07's payload, given a table by ticket 09);
+    no row — or a row from another draft — keeps the line at 待核验.
     """
     inputs: dict[str, Any] = {"plan_type": "route_plan"}
     if runs_repo is None or not conversation_id:
@@ -485,6 +485,16 @@ def _pdf_plan_status_inputs(runs_repo: Any, conversation_id: str) -> dict[str, A
             merged["participants"] = f"{draft.participants} 人" if draft.participants else ""
             if check is not None and check.draft_id == draft.draft_id:
                 inputs["completeness"] = check.verdict
+            # Ticket 09: the gate's own answer, read from the row ticket 07's
+            # payload now lives in. Same staleness discipline as the verdict —
+            # a refusal from a previous draft must not describe this book, and
+            # an absent row leaves the cover at 待核验 instead of becoming a
+            # claim. The payload shape is what ``build_report_document``'s
+            # ``safety=`` parameter already expects; ``_safety_status`` only
+            # copies it, no sentence is derived here or downstream.
+            safety_row = runs_repo.get_plan_safety(conversation_id)
+            if safety_row is not None and safety_row.draft_id == draft.draft_id:
+                inputs["safety"] = safety_row.to_payload()
         arrangements = runs_repo.get_plan_arrangements(conversation_id)
         if arrangements is not None:
             merged.update(arrangements.as_values())
@@ -1615,6 +1625,13 @@ class RunOrchestrator:
                     runs_repo.clear_route_selection(req.conversation_id)
                     runs_repo.clear_plan_arrangements(req.conversation_id)
                     runs_repo.clear_completeness_check(req.conversation_id)
+                    # Ticket 09: the safety row is unfinished plan state too —
+                    # a cancelled plan must not leave its last gate answer for
+                    # the next draft to inherit (ticket 06 landmine 7's rule).
+                    # PUBLISHED artifact versions are deliberately KEPT: they
+                    # are evidence of what was handed out, and old artifacts
+                    # keep their own download/expiry rules (AC5).
+                    runs_repo.clear_plan_safety(req.conversation_id)
                 else:
                     if route_reference is not None and record is not None:
                         runs_repo.save_route_selection(
@@ -1675,6 +1692,52 @@ class RunOrchestrator:
                     "chat_v2: completeness check persistence failed for conversation=%s",
                     req.conversation_id,
                 )
+
+        # Ticket 09 (ticket 07's record, finally a row): the deterministic route
+        # gate's answer for THIS research turn is stored so the PDF cover's
+        # 安全门 line can read it at export time instead of staying 待核验
+        # (ticket 08 left this gap). Everything stored is the leaf's own answer,
+        # verbatim — the refusal is :meth:`PlanSafety.to_payload` copied as it
+        # rode the event; the pass record names only what the gate itself said
+        # (status ``recommended``) and carries an empty message, which
+        # ``report_pdf._safety_status`` renders with its pre-existing 未拦截
+        # wording. No safety sentence is derived here or in ``report_pdf``; the
+        # row decides nothing about report eligibility — ``render_report`` stays
+        # the sole authority.
+        if (
+            runs_repo is not None
+            and req.conversation_id
+            and record is not None
+            and intent == "plan_research_route"
+            and stage is not PlanDraftStage.CANCELLED
+        ):
+            gate_answer: dict[str, Any] | None = None
+            if safety is not None:
+                gate_answer = safety.to_payload()
+            elif research.status == "ok" and research.result is not None:
+                gate_answer = {
+                    "hard_stop": False,
+                    "codes": [],
+                    "formal_route_plan_allowed": True,
+                    "message": "",
+                    "comparison_id": research.result.comparison_id,
+                    "comparison_status": research.result.status,
+                    "gate_reasons": [],
+                    "required_action": research.result.required_action or "",
+                }
+            if gate_answer is not None:
+                try:
+                    runs_repo.save_plan_safety(
+                        conversation_id=req.conversation_id,
+                        draft_id=record.draft_id,
+                        payload=gate_answer,
+                        recorded_by_run_id=run_id or "",
+                    )
+                except Exception:
+                    logger.exception(
+                        "chat_v2: plan safety persistence failed for conversation=%s",
+                        req.conversation_id,
+                    )
 
         # Ticket 02 AC3: the summary is rendered from the fields that were just
         # stored, and it travels INSIDE the draft state so a later restore can
