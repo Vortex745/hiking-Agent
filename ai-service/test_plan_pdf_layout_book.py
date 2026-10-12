@@ -285,7 +285,126 @@ def test_the_risk_sweep_actually_stressed_a_page_boundary() -> None:
     assert started_mid_page, "no case put the risk block against a boundary"
 
 
+# ---- The cover reads what the plan flow recorded ---------------------------
+
+
+def test_the_export_flow_covers_with_the_stored_status_and_arrangements(tmp_path) -> None:
+    """The document the flow hands the renderer carries the recorded status.
+
+    The cover is only worth having if a real export fills it: the verdict row and
+    the arrangement row are read at document time, and the user's free-text budget
+    still becomes no number.
+    """
+    from types import SimpleNamespace
+
+    from agent_v2.computer import LocalNativeComputer
+    from agent_v2.memory_service import MemoryService
+    from agent_v2.persistence import CheckpointsStore, ControlStore
+    from agent_v2.plan_workflow import evaluate_plan_completeness
+    from agent_v2.repositories.memory import MemoryStore
+    from agent_v2.run_orchestration import ChatFlowRequest, RunOrchestrator
+    from agent_v2.runs import RunRepository
+    from api.chat_v2 import _cleanup_sandbox
+
+    settings = SimpleNamespace(agent_v2_enabled=True, openai_api_key="test", openai_model="test",
+                               agent_v2_state_dir=str(tmp_path), route_compare_data_mode="offline",
+                               route_decision_provider="deterministic")
+    repo = RunRepository(control=ControlStore(str(tmp_path / "control.sqlite")),
+                         checkpoints=CheckpointsStore(str(tmp_path / "checkpoints.sqlite")))
+    memory = MemoryService(MemoryStore(str(tmp_path / "memory.sqlite")))
+    owner = memory.resolve_subject(None)
+    memory.claim_conversation(owner.subject_id, "conv-cover")
+    arrangements = {"meeting_time": "07:30", "meeting_point": "山谷停车场", "leader": "领队乙",
+                    "transport": "自驾往返", "accommodation": "无", "budget": "全队AA，油费另计",
+                    "emergency_contact": "13800000000", "retreat_plan": "原路返回至停车场"}
+    draft = repo.save_plan_draft(conversation_id="conv-cover", stage="final_reviewed",
+                                 destination_or_route="演示山谷环线", activity_date="2026-10-18",
+                                 participants=6)
+    repo.save_plan_arrangements(conversation_id="conv-cover", draft_id=draft.draft_id,
+                                arrangements=arrangements)
+    verdict = evaluate_plan_completeness(destination_or_route="演示山谷环线", activity_date="2026-10-18",
+                                         participants=6, arrangements=arrangements)
+    repo.save_completeness_check(conversation_id="conv-cover", draft_id=draft.draft_id, verdict=verdict)
+
+    contents: list[str] = []
+
+    class RecordingComputer(LocalNativeComputer):
+        def generate_pdf(self, workspace_path, content, filename):
+            contents.append(content)
+            return super().generate_pdf(workspace_path, content, filename)
+
+    computer = RecordingComputer()
+
+    async def kernel(**kw):
+        compare = next(t for t in kw["extra_tools"] if t.name == "route_compare")
+        report = next(t for t in kw["extra_tools"] if t.name == "report_export")
+        output = await compare.execute(compare.args_schema.model_validate({"candidates": [
+            {"name": "演示林间环线", "city": "演示城市", "origin": "起点", "destination": "终点"}]}))
+        comparison_id = json.loads(output.output)["comparison_id"]
+        await report.execute(report.args_schema.model_validate({"comparison_id": comparison_id}))
+        return "模型正文不应进入结构化计划书", []
+
+    orchestrator = RunOrchestrator(settings=settings, runs_repo=repo, memory=memory, kernel_turn=kernel,
+                                   computer_factory=lambda *args: computer, sandbox_cleanup=_cleanup_sandbox)
+
+    async def pause():
+        return [e async for e in orchestrator.stream_chat(ChatFlowRequest(
+            message="导出比较报告", request_id="cover-test", conversation_id="conv-cover",
+            profile_id="route_plan"), subject_id=owner.subject_id)]
+
+    events = asyncio.run(pause())
+    approval = repo.list_pending_approvals_for_run(events[-1].run_id)[0]
+    orchestrator.resolve_approval_decision(approval.approval_id, decision="approve",
+                                           decision_request_id="cover-approve")
+
+    async def resume():
+        return [e async for e in orchestrator.stream_resume(run_id=events[-1].run_id,
+                                                            from_seq=events[-1].sequence)]
+
+    asyncio.run(resume())
+    assert contents, "the approved export must reach the renderer"
+    document = json.loads(contents[0])
+    cover = {line["label"]: line["value"] for line in document["cover"]["status_lines"]}
+    metadata = {row["label"]: row["value"] for row in document["plan_metadata"]}
+
+    assert cover["草案类型"] == "正式路线计划"
+    assert cover["审阅结论"] != "待核验"
+    assert metadata["集合时间"] == "07:30" and metadata["应急联络"] == "13800000000"
+    assert metadata["费用预算"] == "全队AA，油费另计"
+    # Free text is carried as text: no amount and no total is read out of it.
+    assert document["budget_total"] == "待确认"
+    assert document["budget_note"] == "全队AA，油费另计"
+
+
+def test_a_stale_verdict_row_does_not_become_the_cover_status(tmp_path) -> None:
+    """The verdict counts only while it belongs to the draft on record."""
+    from agent_v2.persistence import CheckpointsStore, ControlStore
+    from agent_v2.plan_workflow import evaluate_plan_completeness
+    from agent_v2.run_orchestration import _pdf_plan_status_inputs
+    from agent_v2.runs import RunRepository
+
+    repo = RunRepository(control=ControlStore(str(tmp_path / "control.sqlite")),
+                         checkpoints=CheckpointsStore(str(tmp_path / "checkpoints.sqlite")))
+    verdict = evaluate_plan_completeness(destination_or_route="演示山谷", activity_date="2026-10-18",
+                                         participants=6, arrangements=None)
+    first = repo.save_plan_draft(conversation_id="conv-stale", stage="first_reviewed",
+                                 destination_or_route="演示山谷", activity_date="2026-10-18",
+                                 participants=6)
+    repo.save_completeness_check(conversation_id="conv-stale", draft_id=first.draft_id, verdict=verdict)
+    assert _pdf_plan_status_inputs(repo, "conv-stale")["completeness"] == verdict.verdict
+
+    # A verdict written for another draft generation must not describe this one
+    # (the row is scoped by ``draft_id``; the flow re-decides, this only reads).
+    repo.save_completeness_check(conversation_id="conv-stale", draft_id="another-draft",
+                                 verdict=verdict)
+    inputs = _pdf_plan_status_inputs(repo, "conv-stale")
+    assert "completeness" not in inputs
+    assert inputs["plan_type"] == "route_plan"
+    assert _pdf_plan_status_inputs(None, "") == {"plan_type": "route_plan"}
+
+
 # ---- The rename coupling: one vocabulary for both stories ------------------
+
 
 
 @pytest.mark.parametrize("heading", ["行程时间线", "行程安排"])

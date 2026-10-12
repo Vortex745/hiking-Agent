@@ -367,6 +367,52 @@ def synthesize_terminal_type(snapshot: RunSnapshot | None) -> str | None:
 # Artifact profile plan filename (was adapter-global ``_ARTIFACT_FILENAME``).
 _ARTIFACT_FILENAME = "hiking-plan.pdf"
 
+
+def _pdf_plan_status_inputs(runs_repo: Any, conversation_id: str) -> dict[str, Any]:
+    """The plan side of the PDF cover, read from the rows the plan flow wrote.
+
+    Ticket 08's layout states a status, so this reads only what is on record and
+    each read is best-effort — a row that is not there leaves the cover line at
+    待核验 instead of becoming a claim:
+
+    * 草案类型 is ``route_plan`` because the book is built from a comparison the
+      gate has just re-run (``render_report`` is called before this at both
+      sites); it is the one thing the document itself can evidence;
+    * the rule verdict counts only while it belongs to the draft on record, so a
+      stale row cannot describe a newer plan (ticket 07's discipline);
+    * the arrangement record is merged over ``plan_details`` by the document
+      builder, which is where an absent field stays 待确认.
+
+    Nothing here reads or implies ``report_allowed`` — eligibility stays
+    :func:`route_compare.service.render_report`'s alone. The safety record has no
+    row yet (ticket 07 carries it on the event payload), so the cover's 安全门
+    line stays 待核验 until the approval ticket owns that read.
+    """
+    inputs: dict[str, Any] = {"plan_type": "route_plan"}
+    if runs_repo is None or not conversation_id:
+        return inputs
+    merged: dict[str, str] = {}
+    try:
+        draft = runs_repo.get_plan_draft(conversation_id)
+        check = runs_repo.get_completeness_check(conversation_id)
+        if draft is not None:
+            merged["destination_or_route"] = draft.destination_or_route or ""
+            merged["activity_date"] = draft.activity_date or ""
+            merged["participants"] = f"{draft.participants} 人" if draft.participants else ""
+            if check is not None and check.draft_id == draft.draft_id:
+                inputs["completeness"] = check.verdict
+        arrangements = runs_repo.get_plan_arrangements(conversation_id)
+        if arrangements is not None:
+            merged.update(arrangements.as_values())
+    except Exception:
+        logger.exception(
+            "chat_v2: plan status rows unread for the PDF cover (conversation=%s); "
+            "the cover renders them as 待核验", conversation_id)
+        return inputs
+    if any(merged.values()):
+        inputs["arrangements"] = merged
+    return inputs
+
 # cowork resume filenames + caps (were adapter globals; Ticket 40).
 _COWORK_STUB_FILENAME = "cowork-output.txt"
 _COWORK_BASH_MAX_OUTPUT_BYTES = 1_048_576  # 1 MiB per stream
@@ -3129,7 +3175,10 @@ class RunOrchestrator:
                     from route_compare.service import render_report
                     report_result = ComparisonResult.model_validate(report)
                     render_report(report_result)
-                    plan_content = json.dumps(build_report_document(report_result), ensure_ascii=False)
+                    plan_content = json.dumps(build_report_document(
+                        report_result,
+                        **_pdf_plan_status_inputs(runs_repo, run.conversation_id)),
+                        ensure_ascii=False)
                     has_route_report = True
                     break
 
@@ -3943,7 +3992,9 @@ class RunOrchestrator:
             report_content = render_report(report_result)
             async for envelope in self._stream_artifact_flow(req, resolve_profile("artifact"),
                 run_id=run_id, emit=emit, report_content=report_content,
-                pdf_document=build_report_document(report_result)):
+                pdf_document=build_report_document(
+                    report_result,
+                    **_pdf_plan_status_inputs(self._runs_repo, req.conversation_id))):
                 yield envelope
             return
 
