@@ -236,8 +236,15 @@ def test_every_stage_renders_a_summary():
 
     ``draft_summary`` is what the plan flow emits and what a later restore
     re-reads, so every member of the stage vocabulary has to be covered —
-    either by the minimal-draft preview or by its stage copy.
+    either by a stage copy in :data:`STAGE_MESSAGE` or, for the stages whose
+    text IS the draft (ticket 02's ``minimal_draft``, ticket 05's two review
+    stages), by the render of the stored fields.
     """
+    field_rendered = {
+        PlanDraftStage.MINIMAL_DRAFT,
+        PlanDraftStage.AWAITING_FIRST_REVIEW,
+        PlanDraftStage.FIRST_REVIEWED,
+    }
     for stage in PlanDraftStage:
         rendered = draft_summary(
             stage=stage,
@@ -246,8 +253,8 @@ def test_every_stage_renders_a_summary():
             participants=12,
         )
         assert rendered.strip(), f"stage {stage.value} renders an empty summary"
-        if stage is PlanDraftStage.MINIMAL_DRAFT:
-            assert "四姑娘山长坪沟" in rendered
+        if stage in field_rendered:
+            assert "四姑娘山长坪沟" in rendered and "2026-11-08" in rendered
         else:
             assert STAGE_MESSAGE[stage] == rendered
 

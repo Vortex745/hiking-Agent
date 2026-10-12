@@ -71,6 +71,19 @@ export type V2PlanIntent =
    * GENERIC DRAFT. The only intent allowed to name a draft type, and the only
    * type it may name is generic_draft — a client can never declare route_plan. */
   | 'plan_generic_draft'
+  /* Ticket 05 AC2: after reading the missing-field list, 「直接生成草案」 — stop
+   * collecting and ask for the first summary. Carries no fields: an
+   * arrangement the user did not supply has no way to travel with this click,
+   * which is AC4 at the wire. */
+  | 'plan_first_review'
+  /* Ticket 05 AC2: the other answer, 「继续补充」 — reopen the form. Also
+   * carries no fields; collecting happens in the dialog, not in a decision. */
+  | 'plan_more_input'
+  /* Ticket 05 AC3/AC5: confirm the FIRST summary. The only thing this can
+   * confirm is what the user themselves supplied, and the server refuses it
+   * unless a first summary is actually pending, so a click can never record
+   * approval of a draft the user has not been shown. */
+  | 'plan_confirm_arrangements'
 
 /**
  * Ticket 04 AC5: what kind of draft the server is holding. Derived server-side
@@ -115,6 +128,15 @@ export type V2PlanDraftStage =
    * between a generic draft and cancelling. Like awaiting_confirmation this
    * stage opens NO dialog — it is answered by a structured intent. */
   | 'awaiting_generic_choice'
+  /* Ticket 05 AC1/AC2: the user read the missing-field list and chose
+   * 「直接生成草案」, so the FIRST summary is on screen awaiting their
+   * confirmation. Like the two parked stages above, it opens no dialog of its
+   * own — it is answered by a structured intent (继续补充 / 确认安排). */
+  | 'awaiting_first_review'
+  /* Ticket 05 AC3/AC5: the first summary was confirmed, for the arrangements
+   * the user supplied and for nothing else. Durable and auditable — it is the
+   * record that the confirmation happened, on which draft, on which turn. */
+  | 'first_reviewed'
   | 'cancelled'
 
 /** The three fields the entry dialog collects. Absent values stay absent. */
@@ -122,6 +144,23 @@ export interface V2PlanDraftFields {
   destination_or_route: string
   activity_date: string
   participants: number | null
+}
+
+/**
+ * Ticket 05 AC1: one field the draft does not hold.
+ *
+ * ``key`` is the stable field name (an arrangement key of the plan record, or a
+ * route-fact dimension), ``label`` is the server's own display label and
+ * ``status`` is one of the two markers the server uses — 待确认 for an
+ * arrangement the user has not supplied, 待核验 for a route fact the gate cannot
+ * certify. The UI renders these verbatim and never translates them: the labels
+ * live in ``plan_workflow.ARRANGEMENT_FIELDS`` / ``FACT_DIMENSIONS``, and a
+ * second copy here is exactly the parallel list that would drift.
+ */
+export interface V2PlanMissingField {
+  key: string
+  label: string
+  status: string
 }
 
 export interface V2PlanDraftState {
@@ -154,6 +193,14 @@ export interface V2PlanDraftState {
    * verified values, so a restored draft shows exactly what the stream showed.
    */
   route_selection: V2PlanRouteReference | null
+  /**
+   * Ticket 05 AC1: the 缺失字段清单 the server enumerated for this draft — every
+   * arrangement still 待确认 and every route-fact dimension still 待核验, in the
+   * renderer's own order. It is the same list the ``summary`` above spells out,
+   * in the shape a panel can show, so the checklist the user decides from
+   * survives a refresh instead of being a render-time-only string.
+   */
+  missing_fields: V2PlanMissingField[]
   draft: V2PlanDraftFields
 }
 
@@ -162,6 +209,8 @@ export const V2_PLAN_DRAFT_STAGES: ReadonlySet<V2PlanDraftStage> = new Set([
   'awaiting_input',
   'minimal_draft',
   'awaiting_generic_choice',
+  'awaiting_first_review',
+  'first_reviewed',
   'cancelled',
 ])
 

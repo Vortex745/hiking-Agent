@@ -138,6 +138,9 @@ const PLAN_INTENT_LABELS: Record<V2PlanIntent, string> = {
   plan_select_route: '选用该路线进入计划书草稿',
   plan_research_route: '研究该目的地的路线资料',
   plan_generic_draft: '继续生成通用草案',
+  plan_first_review: '直接生成草案',
+  plan_more_input: '继续补充缺失字段',
+  plan_confirm_arrangements: '确认我提供的安排',
 }
 
 /**
@@ -162,6 +165,8 @@ const PLAN_STAGE_LABELS: Record<V2PlanDraftStage, string> = {
   awaiting_input: '等你填写基本信息',
   minimal_draft: '最小草稿已生成，可继续修改',
   awaiting_generic_choice: '路线资料不足，等你选择通用草案或取消',
+  awaiting_first_review: '第一次摘要等你确认，可继续补充缺失字段',
+  first_reviewed: '第一次摘要已确认（只含你本人提供的安排）',
   cancelled: '已取消',
 }
 
@@ -1738,6 +1743,26 @@ function SuperAgent() {
     void handleSend('', { intent: 'plan_generic_draft', planType: 'generic_draft' })
   }, [handleSend])
 
+  // Ticket 05 AC2: the two answers to the missing-field list, and the answer to
+  // the first summary. All three are plain conversational turns that carry a
+  // whitelisted intent and NOTHING else — no fields (the server reads the
+  // stored arrangements), no route reference, no draft type, and never the
+  // tool-approval pause with its 300 s TTL and sandbox lease. A click here must
+  // not be able to hand the server a date, a cost, a phone number or a retreat
+  // point it would then present as the user's (AC4), which is why these sends
+  // have no place to put one.
+  const handleGenerateDraftNow = useCallback(() => {
+    void handleSend('', { intent: 'plan_first_review' })
+  }, [handleSend])
+
+  const handleContinueSupplementing = useCallback(() => {
+    void handleSend('', { intent: 'plan_more_input' })
+  }, [handleSend])
+
+  const handleConfirmArrangements = useCallback(() => {
+    void handleSend('', { intent: 'plan_confirm_arrangements' })
+  }, [handleSend])
+
   const handlePlanDialogDismiss = useCallback(() => {    // AC2: closing the dialog parks the draft — nothing leaves the page, so
     // the conversation keeps its stored stage and the 恢复草稿 panel takes
     // over. Cancelling has its own action below; conflating the two would
@@ -1947,7 +1972,20 @@ function SuperAgent() {
               <p className="mt-1 text-xs text-text-muted">
                 草案类型：{PLAN_TYPE_LABELS[planDraft.plan_type]}
               </p>
-              <div className="mt-3 flex justify-end gap-2">
+              {/* Ticket 05 AC1: the 缺失字段清单, shown as the server enumerated
+                  it. Labels and markers come from the payload, never from a list
+                  this page keeps — the same two vocabularies the summary is
+                  rendered from (plan_workflow.ARRANGEMENT_FIELDS /
+                  FACT_DIMENSIONS), so panel and summary cannot disagree. */}
+              {planDraft.missing_fields.length > 0 && (
+                <p className="mt-1 text-xs text-text-muted">
+                  缺失字段：
+                  {planDraft.missing_fields
+                    .map(field => `${field.label}（${field.status}）`)
+                    .join('、')}
+                </p>
+              )}
+              <div className="mt-3 flex flex-wrap justify-end gap-2">
                 {/* Ticket 04 AC1: research only makes sense once the free
                     destination exists, i.e. on a submitted draft with no route
                     basis attached yet. A draft already backed by a selected,
@@ -1958,10 +1996,37 @@ function SuperAgent() {
                     研究路线资料
                   </Button>
                 )}
+                {/* Ticket 05 AC2: the two answers to the missing-field list.
+                    直接生成草案 moves to the first summary; 继续补充 reopens the
+                    form through the server, so the decision is recorded rather
+                    than being a local click. */}
+                {planDraft.stage === 'minimal_draft' && (
+                  <Button variant="ghost" size="sm" disabled={isSending} onClick={handleGenerateDraftNow}>
+                    直接生成草案
+                  </Button>
+                )}
+                {planDraft.stage === 'awaiting_first_review' && (
+                  <Button variant="ghost" size="sm" disabled={isSending} onClick={handleContinueSupplementing}>
+                    继续补充
+                  </Button>
+                )}
                 <Button variant="ghost" size="sm" disabled={isSending} onClick={handlePlanDialogCancel}>
                   取消草稿
                 </Button>
-                <Button variant="accent" size="sm" onClick={handleRestorePlanDraft}>
+                {/* Ticket 05 AC3: the affirmative at the review stage confirms
+                    only the arrangements the user supplied — the server refuses
+                    this intent unless a first summary is actually pending, and
+                    the summary it confirms lists every field still 待确认. */}
+                {planDraft.stage === 'awaiting_first_review' && (
+                  <Button variant="accent" size="sm" disabled={isSending} onClick={handleConfirmArrangements}>
+                    确认我提供的安排
+                  </Button>
+                )}
+                <Button
+                  variant={planDraft.stage === 'awaiting_first_review' ? 'ghost' : 'accent'}
+                  size="sm"
+                  onClick={handleRestorePlanDraft}
+                >
                   恢复草稿
                 </Button>
               </div>

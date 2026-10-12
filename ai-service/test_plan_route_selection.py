@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -383,8 +384,13 @@ def test_no_comparison_result_means_no_route_facts_anywhere(plan_repo):
     assert "路线核验事实" not in summary
     assert "待核验" in summary
     assert "来源 [" not in summary
-    # No number that could be read as a distance or an ascent.
-    assert "km" not in summary and "爬升" not in summary.replace("距离 / 爬升 / 天气 / 路况 / 风险", "")
+    # No number that could be read as a distance or an ascent. Ticket 05
+    # itemised the unverified dimensions from ``FACT_DIMENSIONS`` instead of the
+    # old paraphrased blanket line, so the labels are now named — each one with
+    # its 待核验 marker and never with a value, which is the assertion below.
+    assert "km" not in summary
+    assert "- 爬升：待核验（无服务器证据）" in summary
+    assert not re.search(r"(距离|爬升|耗时|天气)[:：]\s*[\d.]", summary)
     assert result["repo"].get_route_selection(CONVERSATION) is None
 
 

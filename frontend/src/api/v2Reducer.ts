@@ -37,6 +37,7 @@ import type {
   V2PlanDraftStage,
   V2PlanRouteReference,
   V2PlanType,
+  V2PlanMissingField,
 } from './chatV2'
 import { TERMINAL_V2_EVENT_TYPES, V2_PLAN_DRAFT_STAGES, V2_PLAN_TYPES } from './chatV2'
 
@@ -493,6 +494,31 @@ function readPlanType(value: unknown, reference: V2PlanRouteReference | null): V
   return reference ? 'route_plan' : 'generic_draft'
 }
 
+/**
+ * Ticket 05 AC1: read the server's 缺失字段清单. Each entry must carry the key,
+ * the label and the status as non-empty strings, or it is dropped — a field
+ * this reader cannot name is a field the UI would have to guess a marker for,
+ * and guessing whether something is 待确认 or 待核验 is the AC4 failure mode.
+ * A payload from a server that predates the list is an empty list, never a
+ * fabricated one.
+ */
+function readMissingPlanFields(value: unknown): V2PlanMissingField[] {
+  if (!Array.isArray(value)) return []
+  const fields: V2PlanMissingField[] = []
+  for (const raw of value) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
+    const entry = raw as Record<string, unknown>
+    const key = entry['key']
+    const label = entry['label']
+    const status = entry['status']
+    if (typeof key !== 'string' || !key) continue
+    if (typeof label !== 'string' || !label) continue
+    if (typeof status !== 'string' || !status) continue
+    fields.push({ key, label, status })
+  }
+  return fields
+}
+
 export function readPlanDraftState(
   payload: Record<string, unknown>,
 ): V2PlanDraftState | null {
@@ -522,6 +548,12 @@ export function readPlanDraftState(
     // draft has no reference — a half-read pointer would render a route the
     // server never issued, which is the AC4 failure this reader exists to stop.
     route_selection: routeSelection,
+    // Ticket 05 AC1: the server's missing-field enumeration. This is the SAME
+    // reader for the SSE payload and for the durable localStorage mirror, so a
+    // checklist that survived a refresh is still the checklist the summary
+    // spells out — and a malformed entry is dropped rather than guessed into a
+    // 待确认 / 待核验 state the server never claimed.
+    missing_fields: readMissingPlanFields(payload['missing_fields']),
     draft: {
       destination_or_route:
         typeof draft['destination_or_route'] === 'string' ? draft['destination_or_route'] : '',

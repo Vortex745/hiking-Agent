@@ -94,6 +94,7 @@ from agent_v2.plan_workflow import (
     classify_plan_request,
     draft_summary,
     evaluate_plan_intent,
+    missing_plan_fields,
 )
 from agent_v2.profiles import (
     CapabilityProfile,
@@ -1331,7 +1332,17 @@ class RunOrchestrator:
             route_reference = (selection_input.comparison_id, selection_input.candidate_id)
         elif (
             stored_selection is not None
-            and stage in (PlanDraftStage.MINIMAL_DRAFT, PlanDraftStage.AWAITING_GENERIC_CHOICE)
+            and stage in (
+                PlanDraftStage.MINIMAL_DRAFT,
+                PlanDraftStage.AWAITING_GENERIC_CHOICE,
+                # Ticket 05 AC3: the first summary is the review-grade render of
+                # this same draft, so it must keep showing the route basis. Skip
+                # a review stage here and the summary the user confirms prints
+                # 待核验 for facts the draft actually holds — and the missing-field
+                # list would name dimensions the gate certified.
+                PlanDraftStage.AWAITING_FIRST_REVIEW,
+                PlanDraftStage.FIRST_REVIEWED,
+            )
             and stored_selection.draft_id == (stored.draft_id if stored else None)
         ):
             # Reuse, not trust: the stored reference is only a pointer, so this
@@ -1411,6 +1422,17 @@ class RunOrchestrator:
             participants=participants,
             route=route_basis,
         )
+        # Ticket 05 AC1: the same enumeration the summary spells out, in the
+        # shape a panel can show and a later turn can diff. Derived from the
+        # stored arrangements plus the basis the leaf just re-read — never from
+        # what the client sent, and never scored (completeness is ticket 06) —
+        # so the checklist and the text cannot name different fields.
+        missing_fields = missing_plan_fields(
+            destination_or_route=destination,
+            activity_date=activity_date,
+            participants=participants,
+            route=route_basis,
+        )
 
         yield emit("plan.draft_state", {
             "stage": stage.value,
@@ -1429,6 +1451,14 @@ class RunOrchestrator:
                 {"comparison_id": route_reference[0], "candidate_id": route_reference[1]}
                 if route_reference else None
             ),
+            # Ticket 05 AC1/AC5: the 缺失字段清单. Each entry is a field the draft
+            # does NOT hold, marked 待确认 (arrangement) or 待核验 (route fact);
+            # an empty list would mean nothing is missing, which is why nothing
+            # here ever fills an entry with a value it did not read.
+            "missing_fields": [
+                {"key": field.key, "label": field.label, "status": field.status}
+                for field in missing_fields
+            ],
             "draft": {
                 "destination_or_route": destination,
                 "activity_date": activity_date,

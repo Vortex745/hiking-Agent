@@ -26,7 +26,11 @@ The contract this module owns:
   gate (:mod:`agent_v2.route_tools`).
 * **Draft preview rendering** (:func:`render_minimal_draft`) — user
   arrangements only; anything the user has not given stays 待确认, and no
-  route fact is ever produced here (docs/plan-pdf-format.md).
+  route fact is ever produced here (docs/plan-pdf-format.md). The same
+  function renders ticket 05's first summary, split into what the user
+  supplied and the 缺失字段清单 (:func:`missing_plan_fields`) that is still
+  blank — the first confirmation covers the supplied half only, and the
+  unfilled half never gets a value from the system.
 * **Route basis rendering** (:func:`render_route_basis`) — the verified side
   of the same draft, in its own section and always with its source
   provenance. Facts the gate cannot certify stay absent, which renders as
@@ -60,6 +64,12 @@ PlanIntent = Literal[
     # question the two ways the user is allowed to answer it.
     "plan_research_route",
     "plan_generic_draft",
+    # Ticket 05: the two answers to "these fields are still missing" — keep
+    # collecting, or generate the draft now — plus the confirmation of the
+    # first summary that only ever covers what the user supplied.
+    "plan_first_review",
+    "plan_more_input",
+    "plan_confirm_arrangements",
 ]
 
 #: The only intents a client may send, derived from :data:`PlanIntent` so the
@@ -115,6 +125,16 @@ class PlanDraftStage(str, Enum):
     #: ``awaiting_confirmation`` this stage opens no dialog: it is answered by
     #: a structured intent.
     AWAITING_GENERIC_CHOICE = "awaiting_generic_choice"
+    #: Ticket 05 AC1/AC2: the user has seen which fields are still missing and
+    #: chose 直接生成草案, so the FIRST summary is on screen and awaiting their
+    #: confirmation. Like the two parked stages above it, this stage opens no
+    #: dialog — it is answered by a structured intent (继续补充 / 确认摘要).
+    AWAITING_FIRST_REVIEW = "awaiting_first_review"
+    #: Ticket 05 AC3/AC5: the first summary was confirmed. The record says the
+    #: user confirmed *the arrangements they themselves supplied* — it is not a
+    #: claim about route facts, about completeness, or about any field the
+    #: system left 待确认 (that would be invention, docs/plan-pdf-format.md).
+    FIRST_REVIEWED = "first_reviewed"
     CANCELLED = "cancelled"
 
 
@@ -288,6 +308,14 @@ class PlanBlockReason:
     PLAN_TYPE_NOT_ALLOWED = "plan_type_not_allowed"
     INVALID_PLAN_TYPE = "invalid_plan_type"
     GENERIC_DRAFT_WITHOUT_PENDING = "generic_draft_without_pending"
+    # Ticket 05 — the missing-field decisions and the first confirmation are
+    # structured steps too. ``ARRANGEMENTS_NOT_PENDING`` is the AC3/AC5 guard:
+    # a confirmation only exists for a summary the user was actually shown, so
+    # the flow can never record approval of arrangements that were never
+    # reviewed.
+    FIRST_REVIEW_WITHOUT_DRAFT = "first_review_without_draft"
+    SUPPLEMENT_WITHOUT_DRAFT = "supplement_without_draft"
+    ARRANGEMENTS_NOT_PENDING = "arrangements_not_pending"
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,6 +354,20 @@ _INTENTS_THAT_SELECT_ROUTES: frozenset[str] = frozenset({"plan_select_route"})
 #: ``plan_generic_draft`` is the only intent that may declare a draft type,
 #: and it declares exactly one: the client cannot claim ``route_plan``.
 _INTENTS_THAT_DECLARE_PLAN_TYPE: frozenset[str] = frozenset({"plan_generic_draft"})
+#: Ticket 05: the stages from which the user is allowed to ask for the first
+#: summary. Only a submitted draft has arrangements to summarise, so
+#: ``minimal_draft`` is the single source (``awaiting_generic_choice`` is a
+#: parked research turn answered by ticket 04's two exits, and promoting a
+#: draft the user has not settled would reopen that question).
+_FIRST_REVIEW_SOURCE_STAGES: frozenset[PlanDraftStage] = frozenset(
+    {PlanDraftStage.MINIMAL_DRAFT}
+)
+#: Ticket 05: the stages 「继续补充」 is offered on — the ones that show the
+#: missing-field list. The draft is still unfinished in both, which is exactly
+#: why reopening the form is legal from either.
+_SUPPLEMENT_SOURCE_STAGES: frozenset[PlanDraftStage] = frozenset(
+    {PlanDraftStage.MINIMAL_DRAFT, PlanDraftStage.AWAITING_FIRST_REVIEW}
+)
 
 #: User-facing text per stable rejection reason. The machine-readable
 #: ``reason`` is what clients branch on; this is only what the user reads.
@@ -364,6 +406,16 @@ BLOCK_MESSAGE: dict[str, str] = {
     ),
     PlanBlockReason.GENERIC_DRAFT_WITHOUT_PENDING: (
         "当前没有等待决定的资料不足情形，无法直接生成通用草案。"
+    ),
+    PlanBlockReason.FIRST_REVIEW_WITHOUT_DRAFT: (
+        "还没有提交任何安排，无法生成第一次摘要。请先填写并提交目的地或路线、活动日期和参与人数。"
+    ),
+    PlanBlockReason.SUPPLEMENT_WITHOUT_DRAFT: (
+        "当前没有可继续补充的草稿安排，请先创建计划书。"
+    ),
+    PlanBlockReason.ARRANGEMENTS_NOT_PENDING: (
+        "当前没有等待确认的第一次摘要。生成草案后才会请你确认本人填写的安排，"
+        "未经摘要确认不会记录任何同意。"
     ),
 }
 
@@ -476,6 +528,35 @@ def evaluate_plan_intent(
             return PlanTransition("blocked", reason=PlanBlockReason.GENERIC_DRAFT_WITHOUT_PENDING)
         return PlanTransition("ok", stage=PlanDraftStage.MINIMAL_DRAFT, plan_type="generic_draft")
 
+    if intent == "plan_first_review":
+        # AC1/AC2: 「直接生成草案」 — the user has read the missing-field list and
+        # decided to stop collecting. This is the only move that produces the
+        # FIRST summary, and it is a stage move, never a claim: the summary it
+        # lands on is rendered from the stored arrangements plus the re-read
+        # route basis, so nothing here (or on the wire) can add a field the user
+        # did not supply (AC4).
+        if current_stage not in _FIRST_REVIEW_SOURCE_STAGES:
+            return PlanTransition("blocked", reason=PlanBlockReason.FIRST_REVIEW_WITHOUT_DRAFT)
+        return PlanTransition("ok", stage=PlanDraftStage.AWAITING_FIRST_REVIEW)
+
+    if intent == "plan_more_input":
+        # AC2: 「继续补充」 — the other answer to the missing-field list. It reopens
+        # the form (ticket 01's ``awaiting_input``) and collects nothing itself,
+        # so a user who wants to fill more never has to cancel and start over.
+        if current_stage not in _SUPPLEMENT_SOURCE_STAGES:
+            return PlanTransition("blocked", reason=PlanBlockReason.SUPPLEMENT_WITHOUT_DRAFT)
+        return PlanTransition("ok", stage=PlanDraftStage.AWAITING_INPUT)
+
+    if intent == "plan_confirm_arrangements":
+        # AC3/AC5: the first summary is confirmed, and only the first summary.
+        # Requiring ``awaiting_first_review`` is what makes the stored record
+        # honest: the draft can only say "the user confirmed the arrangements we
+        # showed them", never "the user approved a plan" (that is ticket 07's
+        # final review), and never anything about a field still marked 待确认.
+        if current_stage is not PlanDraftStage.AWAITING_FIRST_REVIEW:
+            return PlanTransition("blocked", reason=PlanBlockReason.ARRANGEMENTS_NOT_PENDING)
+        return PlanTransition("ok", stage=PlanDraftStage.FIRST_REVIEWED)
+
     if intent == "plan_create":
         # Re-entry from any stage is legal: the dialog is idempotent and a
         # user may want to start the arrangements over.
@@ -512,6 +593,35 @@ def evaluate_plan_intent(
 #: boundary in docs/plan-pdf-format.md; they are never interchangeable.
 UNCONFIRMED = "待确认"
 UNVERIFIED = "待核验"
+
+#: The user-arrangement record, in display order and with the labels the plan
+#: document uses (docs/plan-pdf-format.md: 日期、集合、人数、领队、交通住宿、
+#: 应急联系、撤退安排…). Every key but ``destination_or_route`` is a field of
+#: :class:`route_compare.models.PlanDetails`, which is the arrangement record
+#: the seam contract names — and ``test_plan_missing_fields_first_review.py``
+#: pins that, so this cannot become a parallel list of made-up fields.
+#:
+#: The tuple is the SINGLE source for both halves of ticket 05: the lines
+#: :func:`render_minimal_draft` draws and the 缺失字段清单
+#: :func:`missing_plan_fields` enumerates. A field added here appears in the
+#: draft and in the missing list in the same render, and a field removed
+#: disappears from both. Only the three fields ticket 01's
+#: :class:`PlanDraftInput` collects have storage today, so the rest render
+#: 待确认 — an absent arrangement is reported as absent and never filled
+#: (spec AC4).
+ARRANGEMENT_FIELDS: tuple[tuple[str, str], ...] = (
+    ("destination_or_route", "目的地或路线"),
+    ("activity_date", "活动日期"),
+    ("participants", "参与人数"),
+    ("meeting_time", "集合时间"),
+    ("meeting_point", "集合地点"),
+    ("leader", "领队"),
+    ("transport", "交通"),
+    ("accommodation", "住宿"),
+    ("budget", "费用预算"),
+    ("emergency_contact", "应急联络"),
+    ("retreat_plan", "撤退方案"),
+)
 
 #: What the flow says per stage. Deterministic strings, so the entry path
 #: contains no model-generated claims (ticket 06 keeps it that way).
@@ -564,6 +674,16 @@ def draft_summary(
     cannot be dressed up as a formal route plan even by a caller that asked for
     that label, because the marker is derived from ``route``, never passed in.
 
+    Ticket 05 adds the two review stages, and they are rendered by the SAME
+    function as the draft preview rather than by a second renderer: the first
+    summary is the draft preview re-organised into "what you supplied" and
+    "what is still missing", so the 待确认 / 待核验 boundary, the 草案类型 marker
+    and the missing-field list cannot disagree with the draft they summarise.
+    ``awaiting_first_review`` asks the user to confirm; ``first_reviewed``
+    records that they did — and only for the arrangements they themselves
+    supplied (AC3), which is why the confirmed render still lists every
+    unfilled field instead of quietly dropping it.
+
     Nothing is invented: the summary is a pure function of the stored fields
     plus the caller's re-read basis, so editing a field and re-rendering is
     the same call.
@@ -573,7 +693,15 @@ def draft_summary(
             destination_or_route=destination_or_route,
             activity_date=activity_date,
             participants=participants,
-            route_attached=route is not None,
+            route=route,
+        )
+    elif stage in (PlanDraftStage.AWAITING_FIRST_REVIEW, PlanDraftStage.FIRST_REVIEWED):
+        base = render_minimal_draft(
+            destination_or_route=destination_or_route,
+            activity_date=activity_date,
+            participants=participants,
+            route=route,
+            review="confirmed" if stage is PlanDraftStage.FIRST_REVIEWED else "pending",
         )
     else:
         base = STAGE_MESSAGE[stage]
@@ -582,12 +710,89 @@ def draft_summary(
     return f"{base}\n\n{render_route_basis(route)}"
 
 
+def _arrangement_values(
+    *,
+    destination_or_route: str,
+    activity_date: str,
+    participants: int | None,
+) -> dict[str, str]:
+    """The draft's arrangement record as stored: a value, or empty.
+
+    Every key of :data:`ARRANGEMENT_FIELDS` is present, and only the three the
+    entry dialog collects can ever be non-empty. That is AC4 in code form: this
+    function has no parameter for a date, a cost, a phone number or a retreat
+    point, so there is no path by which one of them becomes a value here.
+    """
+    values = {key: "" for key, _label in ARRANGEMENT_FIELDS}
+    values["destination_or_route"] = (destination_or_route or "").strip()
+    values["activity_date"] = (activity_date or "").strip()
+    values["participants"] = f"{participants} 人" if participants else ""
+    return values
+
+
+@dataclass(frozen=True, slots=True)
+class MissingPlanField:
+    """One field the draft does not hold (ticket 05 AC1).
+
+    ``status`` is one of the two markers and nothing else: :data:`UNCONFIRMED`
+    for an arrangement the user has not supplied, :data:`UNVERIFIED` for a route
+    fact the gate cannot certify. There is no third state — an "inferred",
+    "defaulted" or "assumed" field would be the invention the spec forbids
+    (docs/plan-pdf-format.md: 未知安排留空显示"待确认"，未知事实显示"待核验").
+    """
+
+    key: str
+    label: str
+    status: str
+
+
+def missing_plan_fields(
+    *,
+    destination_or_route: str,
+    activity_date: str,
+    participants: int | None,
+    route: RouteBasis | None = None,
+) -> tuple[MissingPlanField, ...]:
+    """The 缺失字段清单, derived from the two existing vocabularies (AC1).
+
+    Nothing is counted, scored or weighted here — ticket 05 only reports what is
+    absent, and ticket 06 owns completeness. The list is built from
+    :data:`ARRANGEMENT_FIELDS` (the user's own record) and
+    :data:`FACT_DIMENSIONS` (the dimensions a route fact can answer), the same
+    two tuples the renderers already draw from, so the list cannot drift away
+    from the draft it describes:
+
+    * an arrangement is missing when the stored value is empty;
+    * a fact dimension is missing when the caller's re-read basis holds no
+      certified line for it — which is all seven of them when there is no basis
+      at all, and never includes one the gate just certified.
+    """
+    values = _arrangement_values(
+        destination_or_route=destination_or_route,
+        activity_date=activity_date,
+        participants=participants,
+    )
+    missing = [
+        MissingPlanField(key, label, UNCONFIRMED)
+        for key, label in ARRANGEMENT_FIELDS
+        if not values[key]
+    ]
+    certified = {line.field for line in route.facts} if route is not None else set()
+    missing += [
+        MissingPlanField(field, label, UNVERIFIED)
+        for field, label, _unit in FACT_DIMENSIONS
+        if field not in certified
+    ]
+    return tuple(missing)
+
+
 def render_minimal_draft(
     *,
     destination_or_route: str,
     activity_date: str,
     participants: int | None,
-    route_attached: bool = False,
+    route: RouteBasis | None = None,
+    review: Literal["pending", "confirmed"] | None = None,
 ) -> str:
     """Render the previewable minimal draft (spec AC1 "可预览的最小草稿").
 
@@ -597,48 +802,111 @@ def render_minimal_draft(
     cannot produce a distance, an ascent, a weather claim or a price even
     if asked (docs/plan-pdf-format.md 内容边界).
 
-    ``route_attached`` is ticket 03's only exception, and it is a pointer
-    rather than a value: when the caller has re-read a certified route basis
-    it renders that basis as a separate section below, so the blanket
-    "facts 待核验" line would otherwise contradict it. The arrangements stay
-    待确认 and the closing disclaimer still says the draft is unreviewed —
-    ``route_attached`` never promotes a 草案 to a 路书.
+    ``route`` is ticket 03's exception and ticket 04's type marker, read for
+    what it is: when the caller has re-read a certified route basis the blanket
+    "facts 待核验" line becomes a pointer to the section rendered below, and
+    ``route is None`` IS the ``generic_draft`` case. The flag is derived from
+    the evidence the caller re-read, never from a claim, and the same line
+    appears in the streamed text, the payload's summary and a restored draft
+    because this is the only place it is written.
 
-    Ticket 04 AC5: that flag is also what the draft's *type* is marked from.
-    ``route_attached=False`` IS the ``generic_draft`` case — no verified route
-    basis — so the label is derived from the evidence the caller re-read, never
-    from a claim, and the same line appears in the streamed text, the payload's
-    summary and a restored draft because this is the only place it is written.
+    ``review`` is ticket 05: the same draft drawn as the FIRST summary, split
+    into what the user supplied and what is still missing. AC3 is the reason
+    for the split — the first summary confirms only 用户填写的安排和输入, so the
+    supplied block is the whole of what a confirmation can cover, and the
+    missing block stays on screen (as an explicit 缺失字段清单 heading in the
+    draft render, and as the 尚未填写 section in the review render) so nobody
+    can read a blank as an agreement. AC4 is enforced by construction rather
+    than by copy: the only values this function can print come from
+    :func:`_arrangement_values`, which returns an empty string for every field
+    the draft does not hold, and from the caller's re-read basis.
+
+    ``review="confirmed"`` is the render the draft carries after
+    ``plan_confirm_arrangements``: the same two sections, restated as what the
+    user did and did not approve, so the stored stage and the streamed text
+    agree about the scope of the confirmation (AC5).
     """
-    def arrangement(value: str) -> str:
-        return value.strip() or UNCONFIRMED
+    values = _arrangement_values(
+        destination_or_route=destination_or_route,
+        activity_date=activity_date,
+        participants=participants,
+    )
+    route_attached = route is not None
+    missing = missing_plan_fields(
+        destination_or_route=destination_or_route,
+        activity_date=activity_date,
+        participants=participants,
+        route=route,
+    )
+    arrangement_lines = [
+        f"- {label}：{values[key] or UNCONFIRMED}" for key, label in ARRANGEMENT_FIELDS
+    ]
+    # Ticket 05 AC1: the route-fact dimensions are itemised with the labels from
+    # :data:`FACT_DIMENSIONS` — the vocabulary the comparison card and
+    # :func:`render_route_basis` already use — instead of a paraphrased blanket
+    # line that named 路况 but never 地图 / 开放状态. One vocabulary means the
+    # 缺失字段清单 and the draft can never disagree about which dimensions are
+    # still unverified, and a certified one is never listed as missing.
+    def gap_line(field: MissingPlanField) -> str:
+        marker = (
+            f"{UNVERIFIED}（无服务器证据）" if field.status == UNVERIFIED else UNCONFIRMED
+        )
+        return f"- {field.label}：{marker}"
 
-    people = f"{participants} 人" if participants else UNCONFIRMED
-    facts_line = (
-        f"- 距离 / 爬升 / 天气 / 路况 / 风险：见下方「路线核验事实」（未列出者仍为{UNVERIFIED}）"
-        if route_attached
-        else f"- 距离 / 爬升 / 天气 / 路况 / 风险：{UNVERIFIED}（需要服务器证据）"
+    missing_lines = [gap_line(field) for field in missing]
+    missing_fact_lines = [gap_line(field) for field in missing if field.status == UNVERIFIED]
+    facts_pointer_line = (
+        "- " + " / ".join(label for _field, label, _unit in FACT_DIMENSIONS)
+        + f"：见下方「路线核验事实」（未列出者仍为{UNVERIFIED}）"
     )
-    closing = (
-        "以上用户安排仍为待确认；路线事实由服务器读取并保留来源，两者分开保存，"
-        "整份草稿尚未通过计划审核。"
-        if route_attached
-        else "以上只是用户填写的安排草案，不是已核验的路线计划。"
+    type_line = (
+        "- 草案类型：route_plan（正式路线计划草案，仍需计划审核）" if route_attached
+        else "- 草案类型：generic_draft（通用草案，不是路线计划）"
     )
-    return "\n".join([
-        ("**最小计划草稿（路线草案 · 依据已核验路线事实）**" if route_attached
-         else "**最小计划草稿（通用草案 · 无已核验路线依据）**"),
-        ("- 草案类型：route_plan（正式路线计划草案，仍需计划审核）" if route_attached
-         else "- 草案类型：generic_draft（通用草案，不是路线计划）"),
-        f"- 目的地或路线：{arrangement(destination_or_route)}",
-        f"- 活动日期：{arrangement(activity_date)}",
-        f"- 参与人数：{people}",
-        f"- 集合时间 / 集合地点：{UNCONFIRMED}",
-        f"- 领队 / 交通 / 住宿：{UNCONFIRMED}",
-        f"- 费用预算 / 应急联络 / 撤退方案：{UNCONFIRMED}",
-        facts_line,
-        closing,
-    ])
+
+    if review is None:
+        closing = (
+            "以上用户安排仍为待确认；路线事实由服务器读取并保留来源，两者分开保存，"
+            "整份草稿尚未通过计划审核。"
+            if route_attached
+            else "以上只是用户填写的安排草案，不是已核验的路线计划。"
+        )
+        return "\n".join([
+            ("**最小计划草稿（路线草案 · 依据已核验路线事实）**" if route_attached
+             else "**最小计划草稿（通用草案 · 无已核验路线依据）**"),
+            type_line,
+            *arrangement_lines,
+            *(
+                [facts_pointer_line] if route_attached
+                else missing_fact_lines or [f"- 路线事实：{UNVERIFIED}（无服务器证据）"]
+            ),
+            closing,
+        ])
+
+    supplied_lines = [line for line in arrangement_lines
+                      if not line.endswith(f"：{UNCONFIRMED}")]
+    title = (
+        "**第一次摘要（已确认：仅确认由你本人提供的安排）**" if review == "confirmed"
+        else "**第一次摘要确认（只确认由你本人提供的安排）**"
+    )
+    sections = [
+        title,
+        type_line,
+        "**由你提供的安排（本摘要只确认这些）**",
+        *(supplied_lines or ["- （尚无填写：以下缺失清单即全部字段）"]),
+        "**尚未填写的字段（缺失清单 · 等你补充，系统不会代填）**",
+        *(missing_lines or ["- 无缺失字段"]),
+    ]
+    if route_attached:
+        sections.append(facts_pointer_line)
+    sections.append(
+        "你已确认以上由你本人提供的安排。未填写的字段仍为待确认，路线事实仍以服务器核验结果为准："
+        "本次确认不代表这些安排已补齐，也不代表计划完整或已通过安全审核。"
+        if review == "confirmed"
+        else "以上未填写的字段一律留空：系统不会替你补充日期、费用、联系电话或撤退地点。"
+        "你可以选择「继续补充」，或确认本摘要只反映你本人提供的安排与输入。"
+    )
+    return "\n".join(sections)
 
 
 # ---- Verified route basis (ticket 03) --------------------------------------

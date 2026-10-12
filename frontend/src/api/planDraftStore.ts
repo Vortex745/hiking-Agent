@@ -34,10 +34,24 @@ const MAX_STORED_DRAFTS = 50
  * an unfinished form. ``awaiting_confirmation`` is deliberately absent: that
  * stage is answered by the confirm prompt, and opening a form from it would
  * bypass spec AC2. ``cancelled`` is terminal.
+ *
+ * Ticket 04's ``awaiting_generic_choice`` is absent for the same reason
+ * ``awaiting_confirmation`` is: it is answered by its own choice panel, so
+ * making it reopenable would stack two absolutely-positioned ``top-16``
+ * panels on top of each other.
+ *
+ * Ticket 05's two review stages ARE in the set, deliberately: the draft they
+ * carry has unfinished arrangements by definition (that is the missing-field
+ * list), the user must be able to reopen the form to fill them, and 取消草稿
+ * has to reach the server from either stage. Unlike the parked research stage
+ * they render no second panel — the review affordances live inside this one
+ * panel, so nothing stacks.
  */
 export const OPEN_PLAN_DRAFT_STAGES: ReadonlySet<V2PlanDraftStage> = new Set([
   'awaiting_input',
   'minimal_draft',
+  'awaiting_first_review',
+  'first_reviewed',
 ])
 
 /** A cancelled draft is terminal: nothing durable, nothing restorable. */
@@ -144,6 +158,12 @@ export function isSamePlanDraft(
     // the user is supposed to see silently disappears after a refresh.
     && a.plan_type === b.plan_type
     && isSameRouteSelection(a.route_selection, b.route_selection)
+    // Ticket 05 AC1: the missing-field list is compared like every other field.
+    // Skip it and a draft whose gaps just changed (one arrangement filled in,
+    // a route basis re-read) looks like "no change" to the restore effect, so
+    // the checklist the user is deciding from silently keeps the OLD entries
+    // after a refresh.
+    && isSameMissingFields(a.missing_fields, b.missing_fields)
     && a.draft.destination_or_route === b.draft.destination_or_route
     && a.draft.activity_date === b.draft.activity_date
     && a.draft.participants === b.draft.participants
@@ -163,4 +183,23 @@ function isSameRouteSelection(
   if (a === b) return true
   if (!a || !b) return false
   return a.comparison_id === b.comparison_id && a.candidate_id === b.candidate_id
+}
+
+/**
+ * Ticket 05 AC1: the missing-field list compared entry by entry, in order. The
+ * key is what identifies an entry (the label and status come from the same
+ * server render), so equality is key + status: a field that moved from 待确认
+ * to filled, or a fact the gate stopped certifying, is a change the user has to
+ * see.
+ */
+function isSameMissingFields(
+  a: V2PlanDraftState['missing_fields'],
+  b: V2PlanDraftState['missing_fields'],
+): boolean {
+  if (a === b) return true
+  if (a.length !== b.length) return false
+  return a.every((entry, index) => {
+    const other = b[index]
+    return entry.key === other.key && entry.status === other.status
+  })
 }

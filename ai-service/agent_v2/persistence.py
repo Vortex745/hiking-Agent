@@ -429,6 +429,8 @@ _VALID_PLAN_DRAFT_STAGES: frozenset[str] = frozenset(
         "awaiting_input",
         "minimal_draft",
         "awaiting_generic_choice",
+        "awaiting_first_review",
+        "first_reviewed",
         "cancelled",
     }
 )
