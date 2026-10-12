@@ -90,9 +90,11 @@ from agent_v2.observability import CapacityExceeded
 from agent_v2.permissions import PermissionDecision, PermissionGate
 from agent_v2.plan_workflow import (
     BLOCK_MESSAGE,
+    SUPPLEMENT_ARRANGEMENT_KEYS,
     PlanDraftStage,
     classify_plan_request,
     draft_summary,
+    evaluate_plan_completeness,
     evaluate_plan_intent,
     missing_plan_fields,
 )
@@ -1209,6 +1211,17 @@ class RunOrchestrator:
         )
         current_stage = PlanDraftStage(stored.stage) if stored else None
 
+        # Ticket 06 AC1/AC5: the supplementary arrangements are read from their
+        # own row (a fresh submit carries them in ``draft_input``, every later
+        # turn restores them from storage — the client never re-sends them). This
+        # is the record the completeness rules judge; ``None`` means nothing was
+        # ever submitted, so every arrangement stays 待确认, never guessed.
+        stored_arrangements = (
+            runs_repo.get_plan_arrangements(req.conversation_id)
+            if runs_repo is not None and req.conversation_id
+            else None
+        )
+
         if entry.route == "ask_confirmation":
             # AC2: an ambiguous request never opens the flow. The stage
             # exists so a later ``plan_confirm`` has something to confirm —
@@ -1219,6 +1232,26 @@ class RunOrchestrator:
             selection_input = None
         else:
             intent = entry.intent or "plan_create"
+            # Ticket 06 AC3/AC4: the review gate needs the rule verdict as an
+            # input, and it fails CLOSED. The supplement-vs-review decision is
+            # route-independent (only missing CORE arrangements or an invalid
+            # format can bounce the click), so this pre-resolution verdict — read
+            # off the stored draft and the stored arrangements — is the honest
+            # gate. The verdict stored and emitted below is re-run with the
+            # resolved route basis.
+            gate_completeness = (
+                evaluate_plan_completeness(
+                    destination_or_route=stored.destination_or_route,
+                    activity_date=stored.activity_date,
+                    participants=stored.participants,
+                    arrangements=(
+                        stored_arrangements.as_values() if stored_arrangements else None
+                    ),
+                    route=None,
+                )
+                if stored is not None
+                else None
+            )
             transition = evaluate_plan_intent(
                 intent=intent,
                 current_stage=current_stage,
@@ -1226,6 +1259,7 @@ class RunOrchestrator:
                 conversation_id=req.conversation_id,
                 route_selection=req.route_selection,
                 plan_type=req.plan_type,
+                completeness=gate_completeness,
             )
             if transition.blocked:
                 mark_terminal_safe(runs_repo, run_id, "error")
@@ -1257,6 +1291,18 @@ class RunOrchestrator:
             fields.participants if fields is not None
             else (stored.participants if stored else None)
         )
+
+        # Ticket 06 AC1/AC5: the arrangement record the rules judge on THIS turn.
+        # A submit carries the freshly collected eight; any later turn restores
+        # them from the row. ``None`` (never submitted at all) is kept distinct
+        # from the all-empty record: AC2 says an arrangement that was never
+        # submitted has no claim to match against the evidence.
+        if fields is not None:
+            arrangement_values: dict[str, str] | None = fields.arrangements.as_values()
+        elif stored_arrangements is not None:
+            arrangement_values = stored_arrangements.as_values()
+        else:
+            arrangement_values = None
 
         # Ticket 04 AC1/AC2/AC3: a research turn asks the leaf the one question
         # the pure rules cannot answer — is there verifiable material behind this
@@ -1389,21 +1435,74 @@ class RunOrchestrator:
         # it. Written only after the draft row exists, because the reference is
         # meaningless without the draft it points into; a cancel removes it with
         # the rest of the unfinished plan state (ticket 02 AC4).
+        # Ticket 06 widens the cancel contract to the two NEW rows: the
+        # collected arrangements and the saved verdict go with the draft, so a
+        # cancelled plan cannot leave a verdict (or a filled 集合时间) behind for
+        # the next draft to inherit.
         if runs_repo is not None and req.conversation_id:
             try:
                 if stage is PlanDraftStage.CANCELLED:
                     runs_repo.clear_route_selection(req.conversation_id)
-                elif route_reference is not None and record is not None:
-                    runs_repo.save_route_selection(
-                        conversation_id=req.conversation_id,
-                        draft_id=record.draft_id,
-                        comparison_id=route_reference[0],
-                        candidate_id=route_reference[1],
-                        selected_by_run_id=run_id or "",
-                    )
+                    runs_repo.clear_plan_arrangements(req.conversation_id)
+                    runs_repo.clear_completeness_check(req.conversation_id)
+                else:
+                    if route_reference is not None and record is not None:
+                        runs_repo.save_route_selection(
+                            conversation_id=req.conversation_id,
+                            draft_id=record.draft_id,
+                            comparison_id=route_reference[0],
+                            candidate_id=route_reference[1],
+                            selected_by_run_id=run_id or "",
+                        )
+                    # A submit rewrites the whole supplementary record: the form
+                    # sends all eight fields every time, so an omitted one is
+                    # cleared back to absent rather than silently kept.
+                    if fields is not None and record is not None and arrangement_values:
+                        runs_repo.save_plan_arrangements(
+                            conversation_id=req.conversation_id,
+                            draft_id=record.draft_id,
+                            arrangements=arrangement_values,
+                            updated_by_run_id=run_id or "",
+                        )
             except Exception:
                 logger.exception(
                     "chat_v2: plan route selection persistence failed for conversation=%s",
+                    req.conversation_id,
+                )
+
+        # Ticket 06 AC1/AC5: one deterministic pass over the fields exactly as
+        # they were just stored, with the route basis the leaf re-read above —
+        # the same inputs the summary and the checklist render from, so the
+        # verdict, the text and the saved row can never describe different
+        # drafts. ``None`` while the conversation has no arrangement record and
+        # no draft row yet (the form-open turn); the review gate fails closed on
+        # it — a missing rule input is never a passing one.
+        completeness = None
+        if arrangement_values is not None or record is not None:
+            completeness = evaluate_plan_completeness(
+                destination_or_route=destination,
+                activity_date=activity_date,
+                participants=participants,
+                arrangements=arrangement_values,
+                route=route_basis,
+            )
+        if (
+            runs_repo is not None
+            and req.conversation_id
+            and completeness is not None
+            and record is not None
+            and stage is not PlanDraftStage.CANCELLED
+        ):
+            try:
+                runs_repo.save_completeness_check(
+                    conversation_id=req.conversation_id,
+                    draft_id=record.draft_id,
+                    verdict=completeness,
+                    checked_by_run_id=run_id or "",
+                )
+            except Exception:
+                logger.exception(
+                    "chat_v2: completeness check persistence failed for conversation=%s",
                     req.conversation_id,
                 )
 
@@ -1414,25 +1513,45 @@ class RunOrchestrator:
         # Ticket 03: the verified route basis is rendered by the same call, in
         # its own section, so a restored draft cannot show facts the live one
         # did not (or the other way round) and the arrangements/facts split is
-        # the renderer's, not any component's.
+        # the renderer's, not any component's. Ticket 06 passes the collected
+        # arrangements and the verdict in: a bounce to 补充流程 says WHY with the
+        # stable reason codes, and the review summary shows the arrangements the
+        # user actually supplied (drawn from the record, never from the client).
         summary = draft_summary(
             stage=stage,
             destination_or_route=destination,
             activity_date=activity_date,
             participants=participants,
             route=route_basis,
+            arrangements=arrangement_values,
+            completeness=completeness,
         )
-        # Ticket 05 AC1: the same enumeration the summary spells out, in the
-        # shape a panel can show and a later turn can diff. Derived from the
-        # stored arrangements plus the basis the leaf just re-read — never from
-        # what the client sent, and never scored (completeness is ticket 06) —
-        # so the checklist and the text cannot name different fields.
+        # Ticket 05 AC1 / ticket 06 AC3: the same enumeration the summary spells
+        # out, in the shape a panel can show and a later turn can diff — now read
+        # over the collected arrangements too, so a supplied one LEAVES the list
+        # and an absent one stays 待确认. Never derived from what the client sent,
+        # never scored.
         missing_fields = missing_plan_fields(
             destination_or_route=destination,
             activity_date=activity_date,
             participants=participants,
             route=route_basis,
+            arrangements=arrangement_values,
         )
+
+        # Ticket 06 AC1/AC5: the draft's own record. The eight supplementary
+        # arrangements travel inside ``draft`` so the restore UX reads them from
+        # the same object it reads the three minimal fields from. The key is
+        # present only once the user has actually filled something: an
+        # all-absent record keeps the ticket-01 draft shape rather than echoing
+        # eight empty strings on every turn.
+        draft_obj: dict[str, Any] = {
+            "destination_or_route": destination,
+            "activity_date": activity_date,
+            "participants": participants,
+        }
+        if arrangement_values and any(v.strip() for v in arrangement_values.values()):
+            draft_obj["arrangements"] = dict(arrangement_values)
 
         yield emit("plan.draft_state", {
             "stage": stage.value,
@@ -1459,11 +1578,13 @@ class RunOrchestrator:
                 {"key": field.key, "label": field.label, "status": field.status}
                 for field in missing_fields
             ],
-            "draft": {
-                "destination_or_route": destination,
-                "activity_date": activity_date,
-                "participants": participants,
-            },
+            # Ticket 06 AC1/AC4/AC5: the deterministic verdict, emitted verbatim
+            # from the same record that was just stored and that the summary
+            # renders — so the wire, the row and the text agree. Codes, keys and
+            # labels only: no route fact, no report flag (AC6). Absent until
+            # there is a draft for the rules to judge.
+            **({"rules": completeness.to_payload()} if completeness is not None else {}),
+            "draft": draft_obj,
         })
 
         text = summary

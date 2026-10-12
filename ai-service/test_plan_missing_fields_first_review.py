@@ -49,6 +49,7 @@ from agent_v2.plan_workflow import (
     BLOCK_MESSAGE,
     FACT_DIMENSIONS,
     PLAN_INTENTS,
+    SUPPLEMENT_ARRANGEMENT_KEYS,
     PlanDraftInput,
     PlanDraftStage,
     RouteBasis,
@@ -56,6 +57,7 @@ from agent_v2.plan_workflow import (
     UNCONFIRMED,
     UNVERIFIED,
     draft_summary,
+    evaluate_plan_completeness,
     evaluate_plan_intent,
     missing_plan_fields,
     render_minimal_draft,
@@ -189,17 +191,41 @@ def _req(request_id: str, *, message: str = "生成行程", intent: str | None =
     )
 
 
-def _submit(request_id: str) -> ChatFlowRequest:
+def _submit(request_id: str, *, arrangements: dict[str, str] | None = None) -> ChatFlowRequest:
+    payload: dict[str, Any] = {
+        "destination_or_route": _DESTINATION,
+        "activity_date": _DATE,
+        "participants": _PEOPLE,
+    }
+    # Ticket 06 turned 集合时间/集合地点/应急联络 into CORE arrangements: 「直接
+    # 生成草案」 over a draft missing one bounces to 补充流程 (fail-closed AC3).
+    # The review-flow tests below need a draft that clears the gate, so they pass
+    # the core in; the missing-field-list tests keep the bare submit.
+    if arrangements is not None:
+        payload["arrangements"] = arrangements
     return _req(
         request_id,
         message="提交草稿",
         intent="plan_create",
-        plan_input=PlanDraftInput.model_validate({
-            "destination_or_route": _DESTINATION,
-            "activity_date": _DATE,
-            "participants": _PEOPLE,
-        }),
+        plan_input=PlanDraftInput.model_validate(payload),
     )
+
+
+#: The three arrangements ticket 06 marks core — filled in a valid format, the
+#: draft can reach the first summary; missing one bounces the click to 补充流程.
+_CORE = {
+    "meeting_time": "08:30",
+    "meeting_point": "长坪沟景区北门停车场",
+    "emergency_contact": "13800000000",
+}
+
+
+def _supplement(**overrides: str) -> dict[str, str]:
+    """The supplementary record with only the core filled by default."""
+    values = {key: "" for key in SUPPLEMENT_ARRANGEMENT_KEYS}
+    values.update(_CORE)
+    values.update(overrides)
+    return values
 
 
 def _draft_events(events):
@@ -223,6 +249,7 @@ def _evaluate(intent, stage=None, **kwargs):
         intent=intent, current_stage=stage, plan_input=kwargs.get("plan_input"),
         conversation_id=kwargs.get("conversation_id", "conv-05"),
         route_selection=kwargs.get("route_selection"), plan_type=kwargs.get("plan_type"),
+        completeness=kwargs.get("completeness"),
     )
 
 
@@ -245,8 +272,19 @@ def test_the_first_review_intents_are_whitelisted_and_derive_from_one_list():
 
 
 def test_direct_generation_moves_a_submitted_draft_to_the_first_review():
-    """AC2: 「直接生成草案」 is the decision that produces the first summary."""
-    transition = _evaluate("plan_first_review", PlanDraftStage.MINIMAL_DRAFT)
+    """AC2: 「直接生成草案」 is the decision that produces the first summary.
+
+    Ticket 06 makes the verdict a required input and fails the gate CLOSED: the
+    move only reaches the summary once the CORE arrangements are present, so the
+    draft here is judged with them filled (a core-missing draft bounces to 补充
+    流程 — ticket 06's own test covers that branch)."""
+    ready = evaluate_plan_completeness(
+        destination_or_route=_DESTINATION, activity_date=_DATE, participants=_PEOPLE,
+        arrangements=_supplement(), route=None,
+    )
+    assert ready.verdict != "supplement_required"
+    transition = _evaluate("plan_first_review", PlanDraftStage.MINIMAL_DRAFT,
+                           completeness=ready)
 
     assert transition.status == "ok"
     assert transition.stage is PlanDraftStage.AWAITING_FIRST_REVIEW
@@ -424,9 +462,13 @@ def test_the_first_summary_shows_the_missing_list_and_the_payload_agrees(plan_re
 
 
 def _reviewed(plan_repo) -> dict:
-    """Submit the arrangements, then answer the list with 直接生成草案."""
+    """Submit the arrangements, then answer the list with 直接生成草案.
+
+    Ticket 06 requires the core arrangements filled for the click to reach the
+    summary (a core-missing draft bounces to 补充流程), so the submit carries them.
+    """
     return _drive(plan_repo,
-                  _submit("req-submit"),
+                  _submit("req-submit", arrangements=_supplement()),
                   _req("req-review", message="直接生成草案", intent="plan_first_review"))
 
 
@@ -455,15 +497,18 @@ def test_continuing_to_supplement_reopens_the_form_and_keeps_the_draft(plan_repo
     involved: the park/cancel split from ticket 02 still holds.
     """
     result = _drive(plan_repo,
-                    _submit("req-submit"),
+                    _submit("req-submit", arrangements=_supplement()),
                     _req("req-review", message="直接生成草案", intent="plan_first_review"),
                     _req("req-more", message="继续补充", intent="plan_more_input"))
     events = result["streams"][2]
     payload = _draft_payload(events)
 
     assert payload["stage"] == "awaiting_input"
+    # The stored arrangements survive the trip and come back from the row on the
+    # reopened form (ticket 06 AC5) — so the draft now carries them too.
     assert payload["draft"] == {
         "destination_or_route": _DESTINATION, "activity_date": _DATE, "participants": _PEOPLE,
+        "arrangements": _supplement(),
     }
     stored = result["repo"].get_plan_draft(CONVERSATION)
     assert (stored.stage, stored.destination_or_route) == ("awaiting_input", _DESTINATION)
@@ -578,7 +623,7 @@ def test_confirming_the_first_summary_is_recorded_with_its_scope(plan_repo):
     every gap — deleting them from the text would read as an approval of them.
     """
     result = _drive(plan_repo,
-                    _submit("req-submit"),
+                    _submit("req-submit", arrangements=_supplement()),
                     _req("req-review", message="直接生成草案", intent="plan_first_review"),
                     _req("req-confirm", message="确认安排", intent="plan_confirm_arrangements"))
     events = result["streams"][2]
@@ -679,7 +724,13 @@ def test_the_renderer_has_no_parameter_a_value_could_be_smuggled_through():
     reach the summary is by being in the draft row or certified by the gate.
     """
     params = set(inspect.signature(render_minimal_draft).parameters)
-    assert params == {"destination_or_route", "activity_date", "participants", "route", "review"}
+    # Ticket 06 adds ``arrangements`` — but it is a mapping read only for the
+    # enumerated ARRANGEMENT_FIELDS keys (see ``_arrangement_values``), so no
+    # smuggled route fact / derived time / computed cost can enter through it.
+    assert params == {
+        "destination_or_route", "activity_date", "participants", "route", "review",
+        "arrangements",
+    }
     assert not (params & set(_MUST_STAY_BLANK))
 
 
@@ -687,9 +738,14 @@ def test_the_renderer_has_no_parameter_a_value_could_be_smuggled_through():
 
 
 def _confirm_flow(plan_repo) -> dict:
-    """Submit → 直接生成草案 → 确认安排, the three turns one user actually does."""
+    """Submit → 直接生成草案 → 确认安排, the three turns one user actually does.
+
+    Ticket 06: the submit carries the core arrangements so the review reaches
+    ``awaiting_first_review`` (a core-missing draft bounces the click back to the
+    form) — the confirmation is then a real confirmation of a shown summary.
+    """
     return _drive(plan_repo,
-                  _submit("req-submit"),
+                  _submit("req-submit", arrangements=_supplement()),
                   _req("req-review", message="直接生成草案", intent="plan_first_review"),
                   _req("req-confirm", message="确认安排", intent="plan_confirm_arrangements"))
 
@@ -891,14 +947,19 @@ def test_the_missing_list_and_the_review_stages_reach_the_client_over_http(flow)
         "destination_or_route": _DESTINATION,
         "activity_date": _DATE,
         "participants": _PEOPLE,
+        # Ticket 06: the core arrangements arrive nested in plan_input, and the
+        # review gate only reaches the summary once they are present.
+        "arrangements": _supplement(),
     })
     frames = _http_send(flow, "req-http-review", message="直接生成草案",
                         intent="plan_first_review")
     payload = _draft_frames(frames)[-1]["payload"]
 
     assert payload["stage"] == "awaiting_first_review"
+    # The three core arrangements were supplied, so they LEAVE the checklist;
+    # the still-missing non-core arrangements lead it (ticket 06 AC3).
     assert [entry["key"] for entry in payload["missing_fields"]][:3] == [
-        "meeting_time", "meeting_point", "leader",
+        "leader", "transport", "accommodation",
     ]
     assert payload["summary"] == "".join(
         f["payload"]["content"] for f in frames if f["type"] == "text")

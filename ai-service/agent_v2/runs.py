@@ -29,8 +29,10 @@ from agent_v2.persistence import (
     ApprovalRecord,
     ArtifactRecord,
     CheckpointsStore,
+    CompletenessCheckRecord,
     ControlStore,
     EffectRecord,
+    PlanArrangementsRecord,
     PlanDraftRecord,
     RouteSelectionRecord,
     RunAlreadyTerminal,
@@ -331,6 +333,77 @@ class RunRepository:
     def clear_route_selection(self, conversation_id: str) -> int:
         """Drop the conversation's route reference (cancelled / replaced draft)."""
         return self.control.clear_route_selection(conversation_id)
+
+    # -- supplementary arrangements (Ticket 06) ---------------------
+
+    def save_plan_arrangements(
+        self,
+        *,
+        conversation_id: str,
+        draft_id: str,
+        arrangements: dict[str, str],
+        updated_by_run_id: str = "",
+    ) -> PlanArrangementsRecord:
+        """Upsert the conversation's eight collected supplementary arrangements.
+
+        Ticket 06 gave the 待确认 list real input and real storage; the row lives
+        in its own table (an added ``plan_drafts`` column would silently not
+        exist on a pre-existing database) and flows reach it only through here,
+        never through :class:`ControlStore`. The mapping is read only for the
+        enumerated keys, so a route fact or a derived value cannot be stored
+        alongside the user's own arrangements (spec AC6).
+        """
+        return self.control.upsert_plan_arrangements(
+            conversation_id=conversation_id,
+            draft_id=draft_id,
+            arrangements=arrangements,
+            updated_by_run_id=updated_by_run_id,
+        )
+
+    def get_plan_arrangements(self, conversation_id: str) -> PlanArrangementsRecord | None:
+        """The collected arrangements, or ``None`` before any supplementary submit."""
+        return self.control.get_plan_arrangements(conversation_id)
+
+    def clear_plan_arrangements(self, conversation_id: str) -> int:
+        """Drop the conversation's arrangement row (cancelled / replaced draft)."""
+        return self.control.clear_plan_arrangements(conversation_id)
+
+    # -- completeness verdict (Ticket 06 AC5) -----------------------
+
+    def save_completeness_check(
+        self,
+        *,
+        conversation_id: str,
+        draft_id: str,
+        verdict: Any,
+        checked_by_run_id: str = "",
+    ) -> CompletenessCheckRecord:
+        """Persist a deterministic completeness verdict (spec AC5).
+
+        ``verdict`` is an :class:`agent_v2.plan_workflow.PlanCompleteness`; the
+        facade unpacks its stable codes and ordered keys into the row, keeping
+        the domain object out of the storage layer. The stored row is what makes
+        the rule result restorable and auditable — a fresh repository over the
+        same database reads the same verdict back, with no model in the loop.
+        """
+        return self.control.upsert_completeness_check(
+            conversation_id=conversation_id,
+            draft_id=draft_id,
+            verdict=verdict.verdict,
+            reasons=list(verdict.reasons),
+            missing_core_keys=list(verdict.missing_core_keys),
+            missing_non_core_keys=list(verdict.missing_non_core_keys),
+            invalid_format_keys=list(verdict.invalid_format_keys),
+            checked_by_run_id=checked_by_run_id,
+        )
+
+    def get_completeness_check(self, conversation_id: str) -> CompletenessCheckRecord | None:
+        """The saved verdict, or ``None`` before the rules first ran for this draft."""
+        return self.control.get_completeness_check(conversation_id)
+
+    def clear_completeness_check(self, conversation_id: str) -> int:
+        """Drop the conversation's saved verdict (cancelled / replaced draft)."""
+        return self.control.clear_completeness_check(conversation_id)
 
     def mark_run_done(self, run_id: str) -> None:
         """Transition a running run to ``done`` terminal.

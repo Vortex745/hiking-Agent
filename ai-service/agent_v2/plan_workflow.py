@@ -586,7 +586,21 @@ def evaluate_plan_intent(
         # did not supply (AC4).
         if current_stage not in _FIRST_REVIEW_SOURCE_STAGES:
             return PlanTransition("blocked", reason=PlanBlockReason.FIRST_REVIEW_WITHOUT_DRAFT)
-        return PlanTransition("ok", stage=PlanDraftStage.AWAITING_FIRST_REVIEW)
+        # Ticket 06 AC3: the click cannot open a summary over a draft that is
+        # missing a CORE arrangement — it bounces to the supplement flow instead,
+        # and the move is still decided here, with the rule's verdict as an
+        # input. The gate also fails CLOSED (AC1): no verdict, no review — a
+        # missing rule input is never treated as a passing one, so a flow that
+        # forgot to run the rules cannot silently honour the click.
+        if completeness is None:
+            return PlanTransition("blocked", reason=PlanBlockReason.FIRST_REVIEW_WITHOUT_DRAFT)
+        if completeness.supplement_required:
+            return PlanTransition(
+                "ok", stage=PlanDraftStage.AWAITING_INPUT, completeness=completeness
+            )
+        return PlanTransition(
+            "ok", stage=PlanDraftStage.AWAITING_FIRST_REVIEW, completeness=completeness
+        )
 
     if intent == "plan_more_input":
         # AC2: 「继续补充」 — the other answer to the missing-field list. It reopens
@@ -993,12 +1007,17 @@ def evaluate_plan_completeness(
     )
 
     matches: list[PlanEvidenceMatch] = []
+    # AC2: a match compares a *claim* against the server's evidence. Without a
+    # submitted arrangement record there is no claim to check at all — even the
+    # three entry-form fields are presence answers here, not evidence claims —
+    # so every dimension-mapped arrangement reports ``arrangement_absent``.
+    record_submitted = arrangements is not None
     for key, label in ARRANGEMENT_FIELDS:
         fact_fields = ARRANGEMENT_EVIDENCE_FIELDS.get(key, ())
         if not fact_fields:
             matches.append(PlanEvidenceMatch(key, label, (), "not_applicable", ()))
             continue
-        if not values[key]:
+        if not record_submitted or not values[key]:
             matches.append(PlanEvidenceMatch(key, label, fact_fields, "arrangement_absent", ()))
             continue
         sources = tuple(

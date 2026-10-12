@@ -320,6 +320,59 @@ CREATE TABLE IF NOT EXISTS plan_route_selections (
 
 CREATE INDEX IF NOT EXISTS idx_plan_route_selections_draft
 ON plan_route_selections(draft_id);
+
+-- Ticket 06: the supplementary arrangements the entry dialog now collects
+-- (集合时间/集合地点/领队/交通/住宿/费用预算/应急联络/撤退方案). Its own table
+-- for the same reason ticket 03's reference is: ``ControlStore.__init__`` only
+-- runs ``CREATE TABLE IF NOT EXISTS``, so eight new ``plan_drafts`` columns
+-- would silently not exist on an existing database. Every column defaults to
+-- the empty string — an arrangement the user never filled stays absent, never
+-- invented (docs/plan-pdf-format.md: 未知安排留空显示"待确认"). There is no
+-- column for a route fact, a derived time or a computed cost: the shape of the
+-- table is AC6, so a value outside the arrangement vocabulary cannot be stored
+-- here even by mistake.
+CREATE TABLE IF NOT EXISTS plan_arrangements (
+    conversation_id TEXT PRIMARY KEY,
+    draft_id TEXT NOT NULL,
+    meeting_time TEXT NOT NULL DEFAULT '',
+    meeting_point TEXT NOT NULL DEFAULT '',
+    leader TEXT NOT NULL DEFAULT '',
+    transport TEXT NOT NULL DEFAULT '',
+    accommodation TEXT NOT NULL DEFAULT '',
+    budget TEXT NOT NULL DEFAULT '',
+    emergency_contact TEXT NOT NULL DEFAULT '',
+    retreat_plan TEXT NOT NULL DEFAULT '',
+    updated_by_run_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_arrangements_draft
+ON plan_arrangements(draft_id);
+
+-- Ticket 06 AC5: the deterministic completeness verdict is a ROW, not a render.
+-- Stored beside the draft it judged (draft_id) and the run that computed it
+-- (checked_by_run_id) so a restore or an audit can answer "what did the rules
+-- decide, on which draft, on which turn" without re-running anything and
+-- without a model. Only codes, keys and the verdict travel: no route fact, no
+-- value, no report-eligibility flag — the safety gate stays with
+-- :func:`route_compare.service.render_report` (AC6). JSON arrays hold the
+-- stable reason codes and the missing/format keys in their verdict order.
+CREATE TABLE IF NOT EXISTS plan_completeness_checks (
+    conversation_id TEXT PRIMARY KEY,
+    draft_id TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    reasons_json TEXT NOT NULL DEFAULT '[]',
+    missing_core_json TEXT NOT NULL DEFAULT '[]',
+    missing_non_core_json TEXT NOT NULL DEFAULT '[]',
+    invalid_format_json TEXT NOT NULL DEFAULT '[]',
+    checked_by_run_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_completeness_checks_draft
+ON plan_completeness_checks(draft_id);
 """
 
 
@@ -473,6 +526,69 @@ class RouteSelectionRecord:
     comparison_id: str
     candidate_id: str
     selected_by_run_id: str
+    created_at: str
+    updated_at: str
+
+
+#: The eight supplementary arrangements ticket 06 collects, in the checklist
+#: order :data:`agent_v2.plan_workflow.ARRANGEMENT_FIELDS` uses for them. Kept
+#: here (not imported) so the storage boundary owns its own column list and a
+#: key outside it is refused rather than silently dropped.
+_PLAN_ARRANGEMENT_KEYS: tuple[str, ...] = (
+    "meeting_time", "meeting_point", "leader", "transport",
+    "accommodation", "budget", "emergency_contact", "retreat_plan",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PlanArrangementsRecord:
+    """Snapshot of a plan_arrangements row (Ticket 06 AC1/AC5).
+
+    A value per supplementary arrangement, empty string when the user never
+    filled it in — which is exactly the 待确认 state, and never an invented one.
+    There are deliberately no fields for a route fact, a derived time or a
+    computed cost: the record's shape is the AC6 boundary, so nothing outside
+    the arrangement vocabulary can be stored here even by a mistaken caller.
+    """
+
+    conversation_id: str
+    draft_id: str
+    meeting_time: str
+    meeting_point: str
+    leader: str
+    transport: str
+    accommodation: str
+    budget: str
+    emergency_contact: str
+    retreat_plan: str
+    updated_by_run_id: str
+    created_at: str
+    updated_at: str
+
+    def as_values(self) -> dict[str, str]:
+        """The eight arrangements as the completeness rules read them."""
+        return {key: getattr(self, key) for key in _PLAN_ARRANGEMENT_KEYS}
+
+
+@dataclass(frozen=True, slots=True)
+class CompletenessCheckRecord:
+    """Snapshot of a plan_completeness_checks row (Ticket 06 AC5).
+
+    The saved verdict as data: the code, the ordered reason codes and the
+    ordered missing/format keys. ``reasons`` and the key tuples are the stable
+    machine values, so a restore can re-show the reasons without re-deciding
+    anything and an auditor can grep them. No field carries a route fact or a
+    report-eligibility flag (AC6).
+    """
+
+    conversation_id: str
+    draft_id: str
+    verdict: str
+    reasons: tuple[str, ...]
+    missing_core_keys: tuple[str, ...]
+    missing_non_core_keys: tuple[str, ...]
+    invalid_format_keys: tuple[str, ...]
+    checked_by_run_id: str
     created_at: str
     updated_at: str
 
@@ -1275,6 +1391,220 @@ class ControlStore:
         try:
             cursor = self._conn.execute(
                 "DELETE FROM plan_route_selections WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return cursor.rowcount
+
+    # -- supplementary arrangements (Ticket 06) ------------------------
+
+    def upsert_plan_arrangements(
+        self,
+        *,
+        conversation_id: str,
+        draft_id: str,
+        arrangements: dict[str, str],
+        updated_by_run_id: str = "",
+    ) -> PlanArrangementsRecord:
+        """Store the conversation's eight supplementary arrangements.
+
+        One row per conversation, replaced whole (AC3): a submit that omits a
+        field clears it back to the empty string rather than keeping an older
+        value, because the entry form re-sends the full record every time and a
+        stale arrangement would be a claim the user did not just make. Only
+        :data:`_PLAN_ARRANGEMENT_KEYS` are read from the mapping and every value
+        is coerced to ``str`` — a non-string (a number, a flag) is refused, never
+        quietly stringified into the checklist. An empty ``conversation_id`` or
+        ``draft_id`` is refused so a row can never point at nothing.
+        """
+        if not (conversation_id or "").strip():
+            raise ValueError("invalid plan arrangements conversation_id")
+        if not (draft_id or "").strip():
+            raise ValueError("invalid plan arrangements draft_id")
+        for key in arrangements:
+            if key not in _PLAN_ARRANGEMENT_KEYS:
+                raise ValueError(f"unknown plan arrangement key: {key!r}")
+        for key, value in arrangements.items():
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"plan arrangement {key!r} must be a string, got {type(value).__name__}"
+                )
+
+        now = _now_iso()
+        existing = self.get_plan_arrangements(conversation_id)
+        values = [arrangements.get(key, "") for key in _PLAN_ARRANGEMENT_KEYS]
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute(
+                "INSERT INTO plan_arrangements "
+                "(conversation_id, draft_id, meeting_time, meeting_point, leader, transport, "
+                " accommodation, budget, emergency_contact, retreat_plan, updated_by_run_id, "
+                " created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(conversation_id) DO UPDATE SET "
+                " draft_id = excluded.draft_id, "
+                " meeting_time = excluded.meeting_time, "
+                " meeting_point = excluded.meeting_point, "
+                " leader = excluded.leader, "
+                " transport = excluded.transport, "
+                " accommodation = excluded.accommodation, "
+                " budget = excluded.budget, "
+                " emergency_contact = excluded.emergency_contact, "
+                " retreat_plan = excluded.retreat_plan, "
+                " updated_by_run_id = excluded.updated_by_run_id, "
+                " updated_at = excluded.updated_at",
+                (conversation_id, draft_id, *values, updated_by_run_id,
+                 existing.created_at if existing else now, now),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        record = self.get_plan_arrangements(conversation_id)
+        assert record is not None  # just wrote it
+        return record
+
+    def get_plan_arrangements(self, conversation_id: str) -> PlanArrangementsRecord | None:
+        """The conversation's collected arrangements, or ``None`` when never submitted.
+
+        ``None`` is the honest pre-submit state: no row means the user has not
+        filled the supplementary record yet, so every arrangement is 待确认 and
+        the completeness rules read an absent record, never a guessed one.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM plan_arrangements WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return PlanArrangementsRecord(
+            conversation_id=row["conversation_id"],
+            draft_id=row["draft_id"],
+            **{key: row[key] for key in _PLAN_ARRANGEMENT_KEYS},
+            updated_by_run_id=row["updated_by_run_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def clear_plan_arrangements(self, conversation_id: str) -> int:
+        """Drop the conversation's arrangement row; return the removed count.
+
+        Ticket 02 AC4's cancel contract, widened to the new state: cancelling a
+        plan clears the unfinished arrangements with the rest, so a reopened
+        draft never inherits a value the user cancelled away.
+        """
+        self._conn.execute("BEGIN")
+        try:
+            cursor = self._conn.execute(
+                "DELETE FROM plan_arrangements WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return cursor.rowcount
+
+    # -- completeness verdict (Ticket 06 AC5) --------------------------
+
+    def upsert_completeness_check(
+        self,
+        *,
+        conversation_id: str,
+        draft_id: str,
+        verdict: str,
+        reasons: list[str],
+        missing_core_keys: list[str],
+        missing_non_core_keys: list[str],
+        invalid_format_keys: list[str],
+        checked_by_run_id: str = "",
+    ) -> CompletenessCheckRecord:
+        """Save the deterministic verdict so it is restorable and auditable.
+
+        The rules' answer travels as data (codes + ordered keys + the verdict
+        string), beside the ``draft_id`` it judged and the run that computed it.
+        Replaced in place per conversation: a draft has one current verdict, and
+        an older one is superseded the moment the fields change (spec AC5).
+        Nothing here is a route fact or a report decision (AC6) — those stay in
+        ``plan_route_selections`` and the comparison gate respectively.
+        """
+        if not (conversation_id or "").strip():
+            raise ValueError("invalid completeness check conversation_id")
+        if not (draft_id or "").strip():
+            raise ValueError("invalid completeness check draft_id")
+        if not (verdict or "").strip():
+            raise ValueError("invalid completeness check verdict")
+
+        now = _now_iso()
+        existing = self.get_completeness_check(conversation_id)
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute(
+                "INSERT INTO plan_completeness_checks "
+                "(conversation_id, draft_id, verdict, reasons_json, missing_core_json, "
+                " missing_non_core_json, invalid_format_json, checked_by_run_id, "
+                " created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(conversation_id) DO UPDATE SET "
+                " draft_id = excluded.draft_id, "
+                " verdict = excluded.verdict, "
+                " reasons_json = excluded.reasons_json, "
+                " missing_core_json = excluded.missing_core_json, "
+                " missing_non_core_json = excluded.missing_non_core_json, "
+                " invalid_format_json = excluded.invalid_format_json, "
+                " checked_by_run_id = excluded.checked_by_run_id, "
+                " updated_at = excluded.updated_at",
+                (
+                    conversation_id,
+                    draft_id,
+                    verdict,
+                    json.dumps(list(reasons), ensure_ascii=False),
+                    json.dumps(list(missing_core_keys), ensure_ascii=False),
+                    json.dumps(list(missing_non_core_keys), ensure_ascii=False),
+                    json.dumps(list(invalid_format_keys), ensure_ascii=False),
+                    checked_by_run_id,
+                    existing.created_at if existing else now,
+                    now,
+                ),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        record = self.get_completeness_check(conversation_id)
+        assert record is not None  # just wrote it
+        return record
+
+    def get_completeness_check(self, conversation_id: str) -> CompletenessCheckRecord | None:
+        """The conversation's saved verdict, or ``None`` before the rules first ran."""
+        row = self._conn.execute(
+            "SELECT * FROM plan_completeness_checks WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return CompletenessCheckRecord(
+            conversation_id=row["conversation_id"],
+            draft_id=row["draft_id"],
+            verdict=row["verdict"],
+            reasons=tuple(json.loads(row["reasons_json"])),
+            missing_core_keys=tuple(json.loads(row["missing_core_json"])),
+            missing_non_core_keys=tuple(json.loads(row["missing_non_core_json"])),
+            invalid_format_keys=tuple(json.loads(row["invalid_format_json"])),
+            checked_by_run_id=row["checked_by_run_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def clear_completeness_check(self, conversation_id: str) -> int:
+        """Drop the conversation's saved verdict (cancelled / replaced draft)."""
+        self._conn.execute("BEGIN")
+        try:
+            cursor = self._conn.execute(
+                "DELETE FROM plan_completeness_checks WHERE conversation_id = ?",
                 (conversation_id,),
             )
             self._conn.execute("COMMIT")

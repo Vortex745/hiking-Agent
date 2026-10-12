@@ -97,6 +97,12 @@ _CORE_ARRANGEMENTS = {
 FRONTEND = Path(__file__).resolve().parents[1] / "frontend"
 
 
+def _cap(field) -> int | None:
+    """The max_length constraint declared on a pydantic model field."""
+    caps = [m.max_length for m in field.metadata if hasattr(m, "max_length")]
+    return caps[0] if caps else None
+
+
 def _ts(path: str) -> str:
     return (FRONTEND / path).read_text(encoding="utf-8")
 
@@ -488,7 +494,7 @@ def test_the_core_split_is_one_vocabulary_with_the_checklist():
 
     verdict = _verdict(arrangements=_arrangements(**_CORE_ARRANGEMENTS))
     kinds = {f.key: f for f in verdict.fields}
-    assert {f.key for f in verdict.fields if f.core} == core
+    assert {f.key for f in verdict.fields if f.core and f.kind == "arrangement"} == core
     assert kinds["weather"].kind == "route_fact" and kinds["weather"].core is True
     assert kinds["transport"].kind == "arrangement" and kinds["transport"].core is False
 
