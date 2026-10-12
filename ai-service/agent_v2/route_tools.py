@@ -16,6 +16,8 @@ from agent_v2.kernel_tools import BoundedDomainTool
 from agent_v2.plan_workflow import (
     FACT_DIMENSIONS,
     PlanBlockReason,
+    PlanSafety,
+    PlanSafetyReason,
     RouteBasis,
     RouteFactLine,
     format_fact_value,
@@ -25,7 +27,7 @@ from route_compare.fixtures import fixture_candidates
 from route_compare.models import (CompareParams, CandidateAssessment, ComparisonResult, Contract,
                                   PlanDetails, RouteCandidate, RouteQuery)
 from route_compare.providers import ProviderConfig, select_provider
-from route_compare.service import assess_candidate, compare_routes, render_report
+from route_compare.service import (SEVERE, assess_candidate, compare_routes, render_report)
 
 AMAP_OPERATIONS = {
     ("amap_map", "geocode"): "maps_geo",
@@ -122,13 +124,21 @@ class RouteSelectionOutcome:
 
 @dataclass(frozen=True, slots=True)
 class RouteResearchOutcome:
-    """Result of one route-research turn for a draft's free destination (04).
+    """Result of one route-research turn for a draft's free destination (04/07).
 
     Same ``status``/``reason`` discipline as :class:`RouteSelectionOutcome`,
     with one extra honest case: ``unavailable`` means research could not run
     at all (no data source configured), which is NOT the same statement as
     ``insufficient`` (it ran and nothing was verifiable). Only ``ok`` may be
     labelled a route plan, and the label comes from the gate's own answer.
+
+    Ticket 07 splits the refusal in two, because 资料不足 and 危险封闭 are
+    different answers and the UI must not offer the same exit for both:
+    ``insufficient`` is thin material (the user may still choose a generic
+    draft), ``blocked`` is the deterministic gate saying ``no_go`` — a hard
+    stop, carried with the gate's own :class:`PlanSafety` record. ``reason`` is
+    still ``ComparisonResult.status`` verbatim, so ``no_go`` is readable straight
+    off the leaf and nothing here re-decides a threshold.
 
     ``result`` is the stored :class:`route_compare.models.ComparisonResult`
     itself — candidates, sources, gaps and all — so the caller persists and
@@ -137,14 +147,85 @@ class RouteResearchOutcome:
     qualify" is the informative answer (spec AC2/AC3).
     """
 
-    status: Literal["ok", "insufficient", "unavailable"]
+    status: Literal["ok", "insufficient", "blocked", "unavailable"]
     result: ComparisonResult | None = None
     reason: str | None = None
     gaps: tuple[str, ...] = ()
+    safety: PlanSafety | None = None
 
     @property
     def insufficient(self) -> bool:
         return self.status != "ok"
+
+    @property
+    def hard_stop(self) -> bool:
+        """AC2: did the gate refuse the route itself, rather than the material?"""
+        return self.safety is not None and self.safety.hard_stop
+
+
+def _danger_codes(assessment: CandidateAssessment) -> tuple[str, ...]:
+    """Which of the gate's own words fired — not a second threshold (07 AC5).
+
+    :func:`route_compare.service.assess_candidate` reaches ``no_go`` from three
+    shapes (severe weather, a closed trail, a high/severe risk) and reports them
+    as one sentence. Naming which one fired means re-reading the *same* published
+    word list (:data:`route_compare.service.SEVERE`) against the *same* certified
+    fact values the gate tested, so the explanation is derived from the gate's
+    vocabulary and evidence only. A fact the gate nulled cannot name a reason, so
+    an unsupported value falls back to the plain ``no_go`` rather than inventing a
+    more specific claim than the evidence supports.
+    """
+    facts = assessment.candidate.facts
+    fired: list[str] = []
+    weather = facts.get("weather")
+    if weather is not None and any(word in str(weather.value).lower() for word in SEVERE):
+        fired.append(PlanSafetyReason.SEVERE_WEATHER)
+    trail = facts.get("trail_status")
+    if trail is not None and any(word in str(trail.value).lower() for word in SEVERE):
+        fired.append(PlanSafetyReason.ROUTE_CLOSED)
+    return tuple(fired) or (PlanSafetyReason.NO_GO,)
+
+
+def _safety_of(result: ComparisonResult) -> PlanSafety | None:
+    """The gate's refusal as data (ticket 07 AC2/AC5), read off its own answer.
+
+    Nothing is judged here: ``risk_status == "no_go"`` is the hard stop because
+    :func:`route_compare.service.assess_candidate` said so, and
+    ``evidence_status != "complete"`` / a non-clear risk is the evidence-gate
+    failure. ``report_allowed`` is never consulted to decide — it is only carried
+    along inside ``result``, and :func:`route_compare.service.render_report`
+    re-runs the gate on the stored object every time (seam contract invariant 4).
+    """
+    codes: list[str] = []
+    reasons: list[str] = []
+    action = ""
+    hard_stop = False
+    for assessment in result.candidates:
+        if assessment.risk_status == "no_go":
+            hard_stop = True
+            codes.extend(_danger_codes(assessment))
+            reasons.extend(assessment.reasons)
+            action = assessment.required_action or action
+    if not hard_stop and not (
+        result.status == "recommended" and result.report_allowed
+    ):
+        codes.append(PlanSafetyReason.EVIDENCE_GATE_FAILED)
+        reasons.extend(
+            reason for a in result.candidates for reason in a.reasons
+            if a.evidence_status != "complete" or a.risk_status != "clear"
+        )
+        action = next((a.required_action for a in result.candidates
+                       if a.required_action), "") or result.required_action or ""
+    if not codes:
+        return None
+    return PlanSafety(
+        hard_stop=hard_stop,
+        codes=tuple(dict.fromkeys(codes)),
+        comparison_id=result.comparison_id,
+        comparison_status=result.status,
+        gate_reasons=tuple(dict.fromkeys(reasons)),
+        required_action=action,
+    )
 
 
 def _research_query(destination_or_route: str) -> dict:
@@ -339,10 +420,17 @@ class RouteSession:
         result = ComparisonResult.model_validate(raw)
         gaps = tuple(dict.fromkeys(
             reason for assessment in result.candidates for reason in assessment.reasons))
+        safety = _safety_of(result)
         if result.status == "recommended":
             return RouteResearchOutcome("ok", result=result, gaps=gaps)
+        if safety is not None and safety.hard_stop:
+            # Ticket 07 AC2: the gate refused the route, not the volume of material.
+            # A separate status so the caller cannot offer 资料不足's exit for it,
+            # with the comparison's own status kept verbatim as the reason.
+            return RouteResearchOutcome("blocked", result=result, reason=result.status,
+                                        gaps=gaps, safety=safety)
         return RouteResearchOutcome("insufficient", result=result,
-                                    reason=result.status, gaps=gaps)
+                                    reason=result.status, gaps=gaps, safety=safety)
 
 
 class RouteCompareTool(BoundedDomainTool):

@@ -124,7 +124,7 @@ def _ts_callback(source: str, name: str) -> str:
     raise AssertionError(f"unbalanced useCallback for {name}")
 
 
-def _settings() -> SimpleNamespace:
+def _settings(scenario: str = "complete") -> SimpleNamespace:
     return SimpleNamespace(
         agent_v2_enabled=True,
         openai_api_key="sk-test",
@@ -133,7 +133,7 @@ def _settings() -> SimpleNamespace:
         agent_v2_state_dir="/tmp/unused",
         route_compare_data_mode="offline",
         route_decision_provider="deterministic",
-        route_compare_demo_scenario="complete",
+        route_compare_demo_scenario=scenario,
     )
 
 
@@ -147,7 +147,8 @@ def plan_repo(tmp_path):
     store.close()
 
 
-def _drive(repo: RunRepository, *requests: ChatFlowRequest) -> dict[str, Any]:
+def _drive(repo: RunRepository, *requests: ChatFlowRequest,
+           scenario: str = "complete") -> dict[str, Any]:
     kernel_calls: list[str] = []
 
     async def fake_kernel(**kwargs):
@@ -155,7 +156,7 @@ def _drive(repo: RunRepository, *requests: ChatFlowRequest) -> dict[str, Any]:
         return "普通回答。", []
 
     orchestrator = RunOrchestrator(
-        settings=_settings(), runs_repo=repo, memory=_FakeMemory(),
+        settings=_settings(scenario), runs_repo=repo, memory=_FakeMemory(),
         kernel_turn=fake_kernel,
     )
 
@@ -1035,7 +1036,7 @@ def flow(tmp_path, monkeypatch):
 
     subject = memory.resolve_subject(None)
     yield SimpleNamespace(app=app, repo=repo, memory=memory, subject=subject,
-                          model_calls=model_calls)
+                          settings=settings, model_calls=model_calls)
     repo.close()
     memory.close()
 
@@ -1116,3 +1117,268 @@ def test_a_final_review_decision_cannot_carry_an_arrangement_over_http(flow, int
     })
     assert smuggled.status_code == 422
     assert flow.repo.resolve_run_id(f"req-extra-{intent}") is None
+
+
+# ---- AC2: the leaf's 危险封闭 split, and the hard stop in the flow ----------
+
+
+def _danger_submit(request_id: str = "req-submit") -> ChatFlowRequest:
+    """A draft whose destination the offline fixtures DO hold.
+
+    notes-05 landmine 7: researching an unknown place name produces
+    ``insufficient_evidence``, not ``no_go`` — the severe-weather fixture only
+    speaks for the demo route it is built from.
+    """
+    return _req(request_id, message="提交草稿", intent="plan_create",
+                plan_input=PlanDraftInput.model_validate({
+                    "destination_or_route": _DEMO_ROUTE, "activity_date": _DATE,
+                    "participants": _PEOPLE, "arrangements": _supplement()}))
+
+
+def _research(destination: str, scenario: str) -> Any:
+    session = RouteSession(settings=_settings(scenario), run_id="leaf-07", audit_sink=None)
+    return asyncio.run(session.research_destination(destination))
+
+
+@pytest.mark.parametrize("scenario,expected_status", [
+    ("severe_weather", "blocked"),
+    ("partial", "insufficient"),
+    ("empty", "insufficient"),
+    ("caution", "insufficient"),
+])
+def test_the_leaf_splits_danger_from_merely_thin_material(scenario, expected_status):
+    """The split ticket 04 left open, made in the LEAF's status/reason.
+
+    ``reason`` keeps ``ComparisonResult.status`` verbatim, so ``no_go`` stays
+    distinguishable from ``insufficient_evidence`` exactly as the gate said it;
+    what changes is that a refusal is now its own status rather than a shared
+    parking lot. The leaf judges nothing new — it reads ``assess_candidate``.
+    """
+    outcome = _research(_DEMO_ROUTE, scenario)
+
+    assert outcome.status == expected_status
+    assert outcome.result is not None
+    assert outcome.result.report_allowed is False, "AC2: the gate owns eligibility"
+    assert outcome.safety is not None
+    assert outcome.safety.hard_stop is (scenario == "severe_weather")
+    assert outcome.safety.blocks_formal_route_plan is True
+    assert outcome.safety.comparison_id == outcome.result.comparison_id
+    assert outcome.safety.comparison_status == outcome.result.status
+
+    if scenario == "severe_weather":
+        assert outcome.reason == "no_go"
+        assert PlanSafetyReason.SEVERE_WEATHER in outcome.safety.codes
+        assert any("禁止推荐" in line for line in outcome.safety.gate_reasons), \
+            "the gate's own words, copied"
+        assert "取消该路线" in outcome.safety.required_action
+    else:
+        assert PlanSafetyReason.EVIDENCE_GATE_FAILED in outcome.safety.codes
+
+
+def test_a_gate_passed_research_carries_no_safety_record():
+    """The negative half: nothing refused, so nothing to report."""
+    outcome = _research(_DEMO_ROUTE, "complete")
+
+    assert outcome.status == "ok"
+    assert outcome.safety is None
+
+
+def test_a_dangerous_research_lands_on_the_hard_stop_and_says_why(plan_repo):
+    """AC2/AC5 through the seam: the stage, the payload and the event record."""
+    result = _drive(plan_repo, _danger_submit(),
+                    _req("req-research", message="研究路线资料",
+                         intent="plan_research_route"),
+                    scenario="severe_weather")
+    events = result["streams"][1]
+    payload = _draft_payload(events)
+
+    assert payload["stage"] == "blocked_safety"
+    assert payload["plan_type"] == "generic_draft", "never promoted to a route plan"
+    assert payload["route_selection"] is None
+    assert result["repo"].get_route_selection(CONVERSATION) is None
+    assert payload["safety"]["hard_stop"] is True
+    assert PlanSafetyReason.SEVERE_WEATHER in payload["safety"]["codes"]
+    assert SAFETY_MESSAGE[PlanSafetyReason.SEVERE_WEATHER] in payload["safety"]["message"]
+    assert payload["safety"]["comparison_status"] == "no_go"
+    assert payload["safety"]["formal_route_plan_allowed"] is False
+    assert "危险封闭" in payload["summary"] and "正式路线计划" in payload["summary"]
+    assert payload["summary"] == _texts(events)
+    assert result["kernel_calls"] == []
+
+    stored = result["repo"].get_events_since(run_id=events[-1].run_id, from_seq=0)
+    record = [e for e in stored if e["type"] == "plan.draft_state"][0]["payload"]
+    assert record["safety"]["codes"] == payload["safety"]["codes"], \
+        "the reason is in the event record, not only in the stream"
+
+
+@pytest.mark.parametrize("intent,plan_type", [
+    ("plan_generic_draft", "generic_draft"),
+    ("plan_first_review", None),
+    ("plan_final_review", None),
+    ("plan_confirm_final", None),
+])
+def test_the_hard_stop_refuses_every_advancing_click_in_the_flow(plan_repo, intent,
+                                                                 plan_type):
+    """AC2: no click walks past 危险封闭, including the generic-draft escape."""
+    reached = _drive(plan_repo, _danger_submit(),
+                     _req("req-research", message="研究路线资料",
+                          intent="plan_research_route"),
+                     scenario="severe_weather")
+    assert reached["repo"].get_plan_draft(CONVERSATION).stage == "blocked_safety"
+
+    result = _drive(reached["repo"], _req("req-advance", intent=intent,
+                                          plan_type=plan_type))
+    events = result["streams"][0]
+
+    assert [e["reason"] for e in _errors(events)] == ["safety_blocked"]
+    assert _draft_events(events) == [], "a refusal stores no new state"
+    assert result["repo"].get_plan_draft(CONVERSATION).stage == "blocked_safety"
+
+
+def test_a_re_searched_destination_is_judged_again_from_scratch(plan_repo):
+    """The exits are the honest ones: cancel, or change the route and re-verify."""
+    reached = _drive(plan_repo, _danger_submit(),
+                     _req("req-research", message="研究路线资料",
+                          intent="plan_research_route"),
+                     scenario="severe_weather")
+
+    after_cancel = _drive(reached["repo"],
+                          _req("req-cancel", message="先不用了", intent="plan_cancel"))
+    assert _draft_payload(after_cancel["streams"][0])["stage"] == "cancelled"
+
+    reentry = _drive(reached["repo"], _danger_submit("req-reopen"),
+                     _req("req-research2", message="研究路线资料",
+                          intent="plan_research_route"),
+                     scenario="complete")
+    assert _draft_payload(reentry["streams"][1])["stage"] == "minimal_draft", \
+        "the gate got the last word again, on the new material"
+
+
+def test_a_dangerous_state_reaches_the_client_and_stays_there_over_http(flow):
+    """AC5 on the wire, and AC2 at the boundary: the generic-draft click is refused."""
+    flow.settings.route_compare_demo_scenario = "severe_weather"
+    _http_send(flow, "req-http-submit", intent="plan_create", plan_input={
+        "destination_or_route": _DEMO_ROUTE,
+        "activity_date": _DATE,
+        "participants": _PEOPLE,
+        "arrangements": _supplement(),
+    })
+    frames = _http_send(flow, "req-http-research", message="研究路线资料",
+                        intent="plan_research_route")
+    payload = _draft_frames(frames)[-1]["payload"]
+
+    assert payload["stage"] == "blocked_safety"
+    assert payload["safety"]["hard_stop"] is True
+    assert PlanSafetyReason.SEVERE_WEATHER in payload["safety"]["codes"]
+
+    refused = _http_send(flow, "req-http-generic", message="继续生成通用草案",
+                         intent="plan_generic_draft", plan_type="generic_draft")
+    assert refused[-1]["type"] == "error"
+    assert refused[-1]["payload"]["reason"] == "safety_blocked"
+    assert _draft_frames(refused) == []
+    assert flow.model_calls == []
+
+
+# ---- Frontend wiring, pinned from the sources (no test runner exists) ------
+
+
+def test_the_final_review_intents_and_stages_are_on_both_sides_of_the_wire():
+    """AC1/AC4's vocabulary: one list on the server, mirrored exactly in TS."""
+    wire = _ts("src/api/chatV2.ts")
+    assert _ts_union_members(wire, "V2PlanIntent") == set(PLAN_INTENTS)
+    assert _ts_union_members(wire, "V2PlanDraftStage") == {s.value for s in PlanDraftStage}
+    assert _ts_string_set_literal(wire, "V2_PLAN_DRAFT_STAGES") == {
+        s.value for s in PlanDraftStage}
+
+    page = _ts("src/pages/SuperAgent.tsx")
+    for intent in sorted(PLAN_INTENTS):
+        assert f"{intent}:" in page, f"PLAN_INTENT_LABELS has no label for {intent}"
+    for stage in sorted(s.value for s in PlanDraftStage):
+        assert f"{stage}:" in page, f"PLAN_STAGE_LABELS has no label for {stage}"
+
+
+def test_the_safety_record_has_all_four_frontend_homes():
+    """Notes-06's rule for a new draft payload field, applied to ``safety``.
+
+    ``V2PlanDraftState`` (compile time) + the reader (the single validator for
+    BOTH the SSE payload and the localStorage mirror) + ``isSamePlanDraft`` (which
+    decides whether a restore is a no-op) + the panel that shows it. Miss the
+    third and a safety block that appeared after a refresh reads as "no change",
+    so the panel keeps the OLD (absent) refusal — the one piece of state a user
+    must never read stale, because it is the difference between 可继续 and 已阻止.
+    """
+    wire = _ts("src/api/chatV2.ts")
+    reducer = _ts("src/api/v2Reducer.ts")
+    store = _ts("src/api/planDraftStore.ts")
+    page = _ts("src/pages/SuperAgent.tsx")
+
+    assert "export interface V2PlanSafety" in wire
+    assert "safety: V2PlanSafety | null" in wire, "required in state, optional on the wire"
+    assert "safety: readPlanSafety(payload['safety'])" in reducer
+    assert "isSamePlanSafety(a.safety, b.safety)" in store
+    assert "planDraft.safety" in page and "阻止原因：" in page
+
+    # An unknown code is dropped rather than rendered as an unexplained string,
+    # and no code list here may drift from the server's.
+    assert "V2_PLAN_SAFETY_CODES" in reducer
+    from agent_v2.plan_workflow import SAFETY_MESSAGE
+
+    codes_block = re.search(
+        r"V2_PLAN_SAFETY_CODES: readonly string\[\] = \[(.*?)\]", wire, re.S)
+    assert codes_block, "the reader's code list is declared once, in chatV2.ts"
+    assert set(re.findall(r"'([^']+)'", codes_block.group(1))) == set(SAFETY_MESSAGE)
+
+
+def test_the_page_offers_the_second_summary_and_treats_danger_as_no_choice():
+    """AC1/AC2/AC4 in the UI, pinned by reading the handlers and the panels.
+
+    查看最终摘要 is offered only on ``first_reviewed`` and 确认最终摘要 only while
+    the second summary is pending (the server refuses both elsewhere), each send
+    carries the whitelisted intent ALONE, the ``blocked_safety`` panel offers no
+    generic-draft affordance at all, and the final-review stages are reopenable
+    inside the ONE existing panel while the hard stop keeps its own — so no second
+    ``top-16`` panel stacks on this one (notes-04 landmine 5).
+    """
+    page = _ts("src/pages/SuperAgent.tsx")
+    store = _ts("src/api/planDraftStore.ts")
+
+    final = _ts_callback(page, "handleShowFinalSummary")
+    confirm = _ts_callback(page, "handleConfirmFinalSummary")
+    assert "intent: 'plan_final_review'" in final
+    assert "intent: 'plan_confirm_final'" in confirm
+    for handler in (final, confirm):
+        for smuggled in ("planInput", "planType", "routeSelection", "profileId", "approval",
+                         "arrangements"):
+            assert smuggled not in handler
+    for name in ("handleShowFinalSummary", "handleConfirmFinalSummary"):
+        assert f"onClick={{{name}}}" in page, name
+
+    assert "planDraft.stage === 'first_reviewed'" in page
+    assert "planDraft.stage === 'awaiting_final_review'" in page
+    assert "查看最终摘要" in page and "确认最终摘要" in page
+
+    # The hard stop: no 继续生成通用草案 inside the blocked_safety panel.
+    danger_panel = page[page.index("planDraft?.stage === 'blocked_safety'"):]
+    danger_panel = danger_panel[:danger_panel.index("planDraft && !planDialogOpen")]
+    assert "继续生成通用草案" not in danger_panel
+    assert "handlePlanDecline" in danger_panel, "取消 is the plan_cancel exit"
+    assert "handleRestorePlanDraft" in danger_panel, "修改安排 reopens the form locally"
+
+    open_block = store[store.index("OPEN_PLAN_DRAFT_STAGES"):store.index("isDurablePlanDraftStage")]
+    assert "'awaiting_final_review'" in open_block and "'final_reviewed'" in open_block
+    assert "'blocked_safety'" not in open_block, "answered by its own panel, not a reopened form"
+
+
+def test_the_safety_panel_adds_no_new_tailwind_class():
+    """AGENTS.md's Tailwind rule, checked the only way this repo can.
+
+    There is no frontend test runner and the dev server may not be relied on, so
+    the classes the new panels use are pinned against a generated stylesheet
+    instead of a screenshot: every utility the ticket 07 markup introduces must
+    already be produced by this project's own config.
+    """
+    page = _ts("src/pages/SuperAgent.tsx")
+    for cls in ("max-w-sm", "rounded-md", "border-border", "text-text-muted",
+                "text-xs", "mt-1", "mt-3", "justify-end", "gap-2", "flex-wrap",
+                "font-medium", "dark:border-white/10", "dark:bg-[#1e1f20]"):
+        assert cls in page, cls

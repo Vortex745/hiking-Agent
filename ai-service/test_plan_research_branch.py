@@ -69,7 +69,13 @@ SUBJECT_ID = "sub-plan-04"
 KNOWN_DESTINATION = "演示林间环线"
 UNKNOWN_DESTINATION = "雨崩上村"
 
-RESEARCH_SCENARIOS = ("partial", "empty", "caution", "severe_weather")
+#: The research scenarios that are thin material rather than danger: missing
+#: weather/risk (``partial``), no facts at all (``empty``), moderate risk
+#: (``caution``) — each parks the draft for ticket 04's choice. ``severe_weather``
+#: used to be in this list; ticket 07 split it out because the gate's ``no_go`` is
+#: a hard stop (``blocked_safety``), pinned in
+#: ``test_plan_final_review_and_safety_gate.py``.
+THIN_RESEARCH_SCENARIOS = ("partial", "empty", "caution")
 
 #: Ticket 04 adds ``tool_result`` to the plan stream: the research candidates
 #: are the server's own evidence, and the existing comparison card is the only
@@ -247,7 +253,7 @@ def test_research_success_yields_route_candidates_that_carry_their_sources(plan_
 # ---- AC3: insufficient material never becomes a formal route plan ----------
 
 
-@pytest.mark.parametrize("scenario", RESEARCH_SCENARIOS)
+@pytest.mark.parametrize("scenario", THIN_RESEARCH_SCENARIOS)
 def test_insufficient_research_parks_the_draft_for_a_choice_instead_of_a_plan(
     plan_repo, scenario
 ):
@@ -255,10 +261,15 @@ def test_insufficient_research_parks_the_draft_for_a_choice_instead_of_a_plan(
 
     Every scenario here is real fixture material that
     :func:`route_compare.service.assess_candidate` refuses — missing weather or
-    risk (``partial``), no facts at all (``empty``), moderate risk (``caution``)
-    and severe weather (``severe_weather``) — so the flow reacts to the existing
-    deterministic gate, not to a second threshold invented for the plan path.
-    The draft parks for the user's choice, and nothing labels it a route plan.
+    risk (``partial``), no facts at all (``empty``), moderate risk (``caution``) —
+    so the flow reacts to the existing deterministic gate, not to a second
+    threshold invented for the plan path. The draft parks for the user's choice,
+    and nothing labels it a route plan.
+
+    Ticket 07 moved ``severe_weather`` out of this list: the gate's ``no_go`` is a
+    hard stop (``blocked_safety``), not the 资料不足 choice, because offering
+    「继续生成通用草案」 for a dangerous route launders the refusal. See
+    ``test_plan_final_review_and_safety_gate.py`` for that branch.
     """
     result = _drive(plan_repo, _submit("req-submit"),
                     _req("req-research", message="研究路线资料", intent="plan_research_route"),
