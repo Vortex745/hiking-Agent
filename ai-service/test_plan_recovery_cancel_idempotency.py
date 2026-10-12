@@ -660,6 +660,170 @@ def _available(frames: list[dict]) -> list[dict]:
     return [f for f in frames if f["type"] == "artifact.available"]
 
 
+# ---- AC5: the terminal, the draft rows and the artifact rows agree ---------
+
+def _drive_plan_turn_with_cancel(flow, request_id: str, stop_at: str) -> list[str]:
+    """Run one plan turn, cancelling the run as soon as ``stop_at`` arrives.
+
+    A cancel through the API is what a user pressing 取消 during a live plan
+    turn looks like: the run row turns terminal while the flow is mid-body, so
+    the stream has to agree with it instead of quietly finishing.
+    """
+
+    async def drive() -> list[str]:
+        orchestrator = chat_api._build_run_orchestrator(flow.app.state.agent_v2_runtime)
+        stream = orchestrator.stream_chat(
+            ChatFlowRequest(**{**SUBMIT_PAYLOAD, "request_id": request_id}),
+            subject_id=flow.subject.subject_id,
+        )
+        types: list[str] = []
+        async for envelope in stream:
+            types.append(envelope.type)
+            if envelope.type == stop_at:
+                flow.repo.request_cancel(
+                    run_id=envelope.run_id, idempotency_key=f"mid-{request_id}")
+        return types
+
+    return asyncio.run(drive())
+
+
+def test_a_plan_turn_cancelled_mid_body_ends_cancelled_and_publishes_nothing(
+    flow
+):
+    """AC5: the stream's terminal is the run row's terminal, always.
+
+    The cancel lands after the stage was computed but before the turn finished.
+    The run must end ``cancelled`` on BOTH sides of the triangle (event log +
+    run row) and deliver neither the reply text nor a side effect — the same
+    rule the chat and rag streams already follow, which the plan stream was
+    missing: ``mark_terminal_safe`` swallows ``RunAlreadyTerminal`` by design,
+    so the row stayed ``cancelled`` while the client was handed ``done``.
+    """
+    types = _drive_plan_turn_with_cancel(flow, "req-mid-cancel", "plan.draft_state")
+
+    assert types[-1] == "cancelled"
+    run_id = flow.repo.resolve_run_id("req-mid-cancel")
+    assert flow.repo.get_run(run_id).status == "cancelled"
+    assert "text" not in types and "done" not in types
+    # Nothing downstream of a plan turn ran: no artifact, no version row, no
+    # sandbox. The draft row the turn had already committed is exactly what the
+    # log delivered, so mirror, log and row still describe one stage.
+    assert flow.repo.list_artifacts_for_run(run_id) == []
+    assert flow.repo.list_plan_artifact_versions(CONV) == []
+    assert flow.repo.get_sandbox_lease(run_id) is None
+    stored = flow.repo.get_plan_draft(CONV)
+    assert stored is not None and stored.stage == "minimal_draft"
+    logged = [e for e in flow.repo.get_events_since(run_id=run_id, from_seq=0)
+              if e["type"] == "plan.draft_state"]
+    assert logged[-1]["payload"]["stage"] == stored.stage
+    assert flow.repo.get_run(run_id).status == "cancelled"
+    # The cancelled turn leaves no assistant reply behind either.
+    snapshot = flow.repo.get_snapshot(run_id)
+    assert [m["role"] for m in snapshot.messages] == ["user"]
+
+
+def test_an_early_cancel_stops_a_plan_turn_before_any_draft_is_written(flow):
+    """AC5, the other interruption point: cancel before the commit commits nothing.
+
+    The same request cancelled at ``run_started`` must not move the conversation
+    at all — the triangle then reads: cancelled run, no draft row, no event
+    beyond the start frame.
+    """
+    types = _drive_plan_turn_with_cancel(flow, "req-early-cancel", "run_started")
+
+    assert types == ["run_started", "cancelled"]
+    run_id = flow.repo.resolve_run_id("req-early-cancel")
+    assert flow.repo.get_run(run_id).status == "cancelled"
+    assert flow.repo.get_plan_draft(CONV) is None
+    assert flow.repo.get_events_since(run_id=run_id, from_seq=0)[-1]["type"] == "cancelled"
+
+
+def test_the_plan_book_records_agree_after_a_rejected_approval(flow, monkeypatch):
+    """AC5 across the whole triangle, for the interruption that publishes nothing.
+
+    Rejecting the PDF approval ends the run ``done`` with no artifact, no
+    version row and an untouched draft: "which artifact is current" must not be
+    able to point at a phantom.
+    """
+    produced: list[str] = []
+    _install_route_plan_model(monkeypatch, flow, meeting_point="长坪沟北门")
+    monkeypatch.setattr(chat_api, "_build_artifact_computer",
+                        lambda *a, **k: _recording_computer(produced))
+    _post_sse(flow.app, flow.subject, _submit("req-reject"))
+
+    async def run():
+        async with _client(flow.app, flow.subject) as client:
+            paused = _frames(await client.post(
+                "/api/v2/chat/sse", json=_export_payload("req-reject-book")))
+            approval = next(e["payload"] for e in paused if e["type"] == "approval.required")
+            decided = await client.post(
+                f"/api/v2/approvals/{approval['approval_id']}/decision",
+                json={"decision": "reject", "decision_request_id": "dec-reject"})
+            resumed = _frames(await client.post(
+                f"/api/v2/chat/resume/{paused[-1]['run_id']}",
+                params={"from_seq": paused[-1]["sequence"]}))
+            return paused, decided, resumed
+
+    paused, decided, resumed = asyncio.run(run())
+    assert decided.status_code == 200
+    run_id = paused[-1]["run_id"]
+    assert resumed[-1]["type"] == "done"
+    assert flow.repo.get_run(run_id).status == "done"
+    assert flow.repo.get_snapshot(run_id).terminal_type == "done"
+    assert produced == []
+    assert flow.repo.list_artifacts_for_run(run_id) == []
+    assert flow.repo.list_plan_artifact_versions(CONV) == []
+    assert flow.repo.get_current_plan_artifact_version(CONV) is None
+    # The draft is untouched by the refusal — still the stage the last plan turn
+    # wrote, and no safety/verdict row was cleared by a rejection.
+    assert flow.repo.get_plan_draft(CONV).stage == "minimal_draft"
+    # A refusal ends the run for good, so the preserved sandbox has to go with
+    # it: the lease is no longer active, the workspace is off the disk, and the
+    # capacity slot the pause kept reserved comes back. Nothing else ever
+    # reclaimed it — the sweep only looks at ``paused`` runs, and this one is
+    # ``done``.
+    lease = flow.repo.get_sandbox_lease(run_id)
+    assert lease is not None and lease.status == "destroyed"
+    import os
+    assert not os.path.isdir(lease.workspace_path)
+    assert flow.app.state.agent_v2_runtime.capacity.snapshot()["active_sandboxes"] == 0
+
+
+def test_the_version_history_outlives_the_run_and_reports_unavailable_not_repaired(
+    flow, monkeypatch
+):
+    """AC5's last shape: a deleted run must not make the history a lie.
+
+    The version table carries no FK to ``runs`` on purpose (ticket 09), so when
+    the run row is swept the artifact row CASCADEs away while the history row
+    stays. The answer then is 已过期/不可用 through the download rules — the
+    pointer is NOT repaired, because rewriting history to hide a gone artifact
+    would lose the evidence that a version was ever published.
+    """
+    produced: list[str] = []
+    frames = _pause_plan_book(flow, monkeypatch, request_id="req-gone",
+                              meeting_point="长坪沟北门", produced=produced)
+    payload = _available(frames[1])[0]["payload"]
+    run_id = frames[1][-1]["run_id"]
+    assert flow.repo.get_artifact(payload["artifact_id"]) is not None
+
+    flow.repo.control._conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
+    flow.repo.control._conn.commit()
+
+    assert flow.repo.get_artifact(payload["artifact_id"]) is None
+    versions = flow.repo.list_plan_artifact_versions(CONV)
+    assert [v.revision for v in versions] == [1]
+    current = flow.repo.get_current_plan_artifact_version(CONV)
+    assert current is not None and current.artifact_id == payload["artifact_id"]
+
+    async def download():
+        async with _client(flow.app, flow.subject) as client:
+            return await client.get(f"/api/v2/artifacts/{payload['artifact_id']}")
+
+    gone = asyncio.run(download())
+    assert gone.status_code == 404  # unreadable, not repaired, not 500
+
+
 # ---- AC2: a duplicate request cannot publish a second PDF ------------------
 
 def test_replaying_a_published_plan_book_request_publishes_nothing_new(flow, monkeypatch):

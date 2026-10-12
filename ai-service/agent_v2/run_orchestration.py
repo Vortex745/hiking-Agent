@@ -1899,6 +1899,24 @@ class RunOrchestrator:
             "draft": draft_obj,
         })
 
+        # Ticket 10 AC5: a cancel that landed while this turn was computing ends
+        # the stream here. Without this guard the plan flow was the one stream in
+        # the module that ignored the run row: ``mark_terminal_safe`` swallows
+        # ``RunAlreadyTerminal`` by design, so the row stayed ``cancelled`` while
+        # the client was handed ``done`` plus a reply nobody asked for — the
+        # terminal event, the run row and the draft row have to agree after every
+        # interruption (chat and rag already re-check before their terminal).
+        # The draft row the turn had already written stays written, and honestly
+        # so: its ``plan.draft_state`` frame is in the log and on the wire above,
+        # so log, row and client mirror describe one stage. What a cancelled turn
+        # must not do is deliver a reply or reach a terminal the row contradicts.
+        if is_cancelled(runs_repo, run_id):
+            yield emit("cancelled", {
+                "code": "cancelled",
+                "message": "运行已被取消。",
+            })
+            return
+
         text = summary
         envelope = emit("text", {"content": text})
         self._persist_plan_reply(req, run_id, envelope, text)
@@ -1906,7 +1924,6 @@ class RunOrchestrator:
 
         mark_terminal_safe(runs_repo, run_id, "done")
         yield emit("done", {})
-
     def _resolve_route_reference(
         self,
         req: ChatFlowRequest,
@@ -3095,6 +3112,35 @@ class RunOrchestrator:
 
     # -- snapshot / event reads (Ticket 40) --
 
+    def _discard_preserved_sandbox(self, runs_repo: RunRepository | None, run_id: str) -> None:
+        """Destroy a sandbox whose run will never continue.
+
+        A pause keeps the lease ``active`` on purpose so the approved resume
+        reuses the SAME sandbox (spec AC4). When the decision comes back as a
+        refusal instead, nothing else ever cleans it: the expired-paused sweep
+        only selects runs still in ``paused`` (this run is about to end ``done``),
+        and :meth:`LeaseSet.release` keeps the capacity slot reserved while the
+        lease is ``active`` — so a rejected PDF approval leaked the workspace
+        directory and a sandbox slot permanently.
+
+        Cleanup goes through the same two hooks the flows' own ``finally`` blocks
+        use, so the lease is recorded the same way (``destroyed``, or ``failed``
+        with the reason when removal raises) instead of being silently renamed.
+        """
+        if runs_repo is None or self._computer_factory is None or self._sandbox_cleanup is None:
+            return
+        lease = runs_repo.get_sandbox_lease(run_id)
+        if lease is None or lease.status != "active":
+            return
+        try:
+            computer = self._computer_factory(lease.sandbox_type)
+        except Exception:
+            logger.exception(
+                "run_orchestration: could not build a computer to discard the "
+                "sandbox of run_id=%s; the lease is left for the operator", run_id)
+            return
+        self._sandbox_cleanup(computer, lease.workspace_path, runs_repo, run_id)
+
     def load_snapshot(self, run_id: str) -> RunSnapshot | None:
         """Read the product-facing run snapshot (or ``None``)."""
         if self._runs_repo is None:
@@ -3273,6 +3319,10 @@ class RunOrchestrator:
                     "status": resolved.status,
                     "message": "用户已拒绝操作，运行将结束。",
                 })
+            # Ticket 10 AC4: a refusal ends the run with no side effect, so the
+            # sandbox the pause deliberately preserved has nothing left to wait
+            # for. It must go now — see :meth:`_discard_preserved_sandbox`.
+            self._discard_preserved_sandbox(runs_repo, run_id)
             mark_terminal_safe(runs_repo, run_id, "done")
             yield emit("done", {
                 "code": "rejected",
