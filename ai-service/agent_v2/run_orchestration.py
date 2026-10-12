@@ -92,6 +92,7 @@ from agent_v2.plan_workflow import (
     BLOCK_MESSAGE,
     SUPPLEMENT_ARRANGEMENT_KEYS,
     PlanDraftStage,
+    RecordedCompleteness,
     classify_plan_request,
     draft_summary,
     evaluate_plan_completeness,
@@ -1221,6 +1222,29 @@ class RunOrchestrator:
             if runs_repo is not None and req.conversation_id
             else None
         )
+        # Ticket 07 AC4: the SECOND summary (and, from ticket 09 on, PDF approval)
+        # requires the rules' answer to be ON RECORD for this draft, not merely
+        # computable: the row answers "what did the rules decide, on which draft,
+        # on which run". It is a precondition only — the decision below is made on
+        # the verdict recomputed from the stored fields, because a row is superseded
+        # the moment an arrangement changes and trusting it would let a draft that
+        # lost 集合时间 since that run read as review-ready.
+        stored_check = (
+            runs_repo.get_completeness_check(req.conversation_id)
+            if runs_repo is not None and req.conversation_id
+            else None
+        )
+        recorded_completeness = (
+            RecordedCompleteness(
+                draft_id=stored_check.draft_id,
+                verdict=stored_check.verdict,
+                reasons=stored_check.reasons,
+                checked_by_run_id=stored_check.checked_by_run_id,
+            )
+            if stored_check is not None and stored is not None
+            and stored_check.draft_id == stored.draft_id
+            else None
+        )
 
         if entry.route == "ask_confirmation":
             # AC2: an ambiguous request never opens the flow. The stage
@@ -1260,6 +1284,7 @@ class RunOrchestrator:
                 route_selection=req.route_selection,
                 plan_type=req.plan_type,
                 completeness=gate_completeness,
+                recorded_completeness=recorded_completeness,
             )
             if transition.blocked:
                 mark_terminal_safe(runs_repo, run_id, "error")
@@ -1306,13 +1331,15 @@ class RunOrchestrator:
 
         # Ticket 04 AC1/AC2/AC3: a research turn asks the leaf the one question
         # the pure rules cannot answer — is there verifiable material behind this
-        # free destination? The answer picks between the two stages the
-        # transition named (``stage`` when material passed the gate, its
-        # ``fallback_stage`` when it did not), so the state machine still owns
-        # every move and "not enough evidence" is a fact reported by the gate,
-        # not a judgement made here. Research that could not run at all is a
-        # stable error that stores nothing: calling that 资料不足 would be a false
-        # statement about the destination.
+        # free destination? The answer picks between the stages the transition
+        # named (``stage`` when material passed the gate, ``fallback_stage`` when
+        # it merely was thin, ``blocked_stage`` when the deterministic gate
+        # refused it outright), so the state machine still owns every move and
+        # "not enough evidence" / "dangerous" are facts reported by the gate, not
+        # judgements made here. Research that could not run at all is a stable
+        # error that stores nothing: calling that 资料不足 would be a false statement
+        # about the destination.
+        safety = None
         if intent == "plan_research_route":
             research = await self._research_route(req, run_id, destination)
             if research.status == "unavailable":
@@ -1338,7 +1365,14 @@ class RunOrchestrator:
                     "route_comparison": research.result.model_dump(),
                 })
             if research.status != "ok" and transition.fallback_stage is not None:
-                stage = transition.fallback_stage
+                # Ticket 07 AC2: 危险封闭 first — the gate refusing the route is a
+                # hard stop, not the 资料不足 choice ticket 04 parks on. Both stages
+                # are named by the pure layer; this only reads the leaf's answer.
+                safety = getattr(research, "safety", None)
+                if safety is not None and safety.hard_stop and transition.blocked_stage:
+                    stage = transition.blocked_stage
+                else:
+                    stage = transition.fallback_stage
 
         # Ticket 03 AC1/AC4: resolve the route reference BEFORE anything is
         # written. A selection the comparison leaf cannot honour is a stable
@@ -1388,6 +1422,12 @@ class RunOrchestrator:
                 # list would name dimensions the gate certified.
                 PlanDraftStage.AWAITING_FIRST_REVIEW,
                 PlanDraftStage.FIRST_REVIEWED,
+                # Ticket 07 AC1: the SECOND summary must show 路线核验结果, so it
+                # re-reads the same way. Skip these two and the final summary the
+                # user confirms prints 待核验 for facts the draft holds — the exact
+                # silent bug notes-04/05/06 each warn about, one stage later.
+                PlanDraftStage.AWAITING_FINAL_REVIEW,
+                PlanDraftStage.FINAL_REVIEWED,
             )
             and stored_selection.draft_id == (stored.draft_id if stored else None)
         ):
@@ -1525,6 +1565,7 @@ class RunOrchestrator:
             route=route_basis,
             arrangements=arrangement_values,
             completeness=completeness,
+            safety=safety,
         )
         # Ticket 05 AC1 / ticket 06 AC3: the same enumeration the summary spells
         # out, in the shape a panel can show and a later turn can diff — now read
@@ -1584,6 +1625,13 @@ class RunOrchestrator:
             # labels only: no route fact, no report flag (AC6). Absent until
             # there is a draft for the rules to judge.
             **({"rules": completeness.to_payload()} if completeness is not None else {}),
+            # Ticket 07 AC2/AC5: the deterministic gate's refusal, emitted verbatim
+            # from the leaf's own record — the stable block code, its readable copy
+            # and the gate's reason lines. Absent when the gate refused nothing, so
+            # no turn can imply a safety claim the comparison never made; it rides
+            # this same event into ``run_events`` for the audit and into the
+            # localStorage mirror for the panel after a refresh.
+            **({"safety": safety.to_payload()} if safety is not None else {}),
             "draft": draft_obj,
         })
 

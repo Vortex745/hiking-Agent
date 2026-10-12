@@ -673,3 +673,446 @@ def test_the_hard_stop_stage_renders_the_safety_reason_and_nothing_else():
         comparison_status="confirmation_required",
     ))
     assert PlanSafetyReason.EVIDENCE_GATE_FAILED in review
+
+
+# ---- AC1/AC4: the two turns, driven through the flow -----------------------
+
+
+def _seed_comparison(repo: RunRepository, conversation_id: str,
+                     *, scenario: str = "complete",
+                     request_id: str = "req-compare") -> dict:
+    """A gate-passed comparison persisted as its own run's ``tool_result``.
+
+    Copied from tickets 03-05's harness: this is the only shape
+    :meth:`RouteSession.load_result` can find, so the final review re-reads real
+    stored evidence rather than a fixture dict. The demo route name is deliberate
+    (notes-05 landmine 7) — the offline fixtures only know it.
+    """
+    run_id, _ = repo.create_run_idempotent(
+        request_id=request_id,
+        conversation_id=conversation_id,
+        profile_id="route_plan",
+        user_message="比较演示路线",
+    )
+    session = RouteSession(settings=_settings(), run_id=run_id, audit_sink=None)
+    result = asyncio.run(session.compare([
+        {"name": _DEMO_ROUTE, "city": "演示城市", "origin": "起点", "destination": "终点"},
+    ]))
+    repo.persist_event(
+        run_id=run_id, sequence=1, event_type="tool_result",
+        request_id=request_id, conversation_id=conversation_id,
+        payload={"route_comparison": result},
+    )
+    return result
+
+
+def _basis_of(plan_repo, comparison_id: str, candidate_id: str):
+    session = RouteSession(settings=_settings(), run_id="reader", audit_sink=None,
+                           runs_repo=plan_repo, conversation_id=CONVERSATION)
+    return session.select_candidate(comparison_id, candidate_id)
+
+
+def _turns_to_first_reviewed(*, after_submit=()) -> list[ChatFlowRequest]:
+    """The turns a user actually does before a final review is even askable.
+
+    ``after_submit`` is where a route selection belongs: it is only honoured on a
+    ``minimal_draft``, i.e. before 直接生成草案.
+    """
+    return [
+        _submit("req-submit", arrangements=_supplement()),
+        *after_submit,
+        _req("req-review", message="直接生成草案", intent="plan_first_review"),
+        _req("req-confirm", message="确认安排", intent="plan_confirm_arrangements"),
+    ]
+
+
+def _turns_to_final_review(*, after_submit=()) -> list[ChatFlowRequest]:
+    return [
+        *_turns_to_first_reviewed(after_submit=after_submit),
+        _req("req-final", message="查看最终摘要", intent="plan_final_review"),
+    ]
+
+
+def _turns_to_final_confirmed(*, after_submit=()) -> list[ChatFlowRequest]:
+    return [
+        *_turns_to_final_review(after_submit=after_submit),
+        _req("req-confirm-final", message="确认最终摘要", intent="plan_confirm_final"),
+    ]
+
+
+def _to_first_reviewed(plan_repo, *, after_submit=()) -> dict:
+    return _drive(plan_repo, *_turns_to_first_reviewed(after_submit=after_submit))
+
+
+def _to_final_review(plan_repo, *, after_submit=()) -> dict:
+    return _drive(plan_repo, *_turns_to_final_review(after_submit=after_submit))
+
+
+def _to_final_confirmed(plan_repo, *, after_submit=()) -> dict:
+    return _drive(plan_repo, *_turns_to_final_confirmed(after_submit=after_submit))
+
+
+def test_the_second_summary_is_produced_by_its_own_turn(plan_repo):
+    """AC1 through the seam: the turn lands on the stage whose text IS the summary."""
+    result = _to_final_review(plan_repo)
+    events = result["streams"][3]
+    payload = _draft_payload(events)
+
+    assert payload["stage"] == "awaiting_final_review"
+    assert payload["intent"] == "plan_final_review"
+    assert payload["summary"] == _texts(events)
+    assert "最终摘要" in payload["summary"]
+    assert payload["plan_type"] == "generic_draft"
+    # AC1's four inputs, all from the server: route result, arrangements, gaps, type.
+    assert payload["missing_fields"] and payload["draft"]["arrangements"]["meeting_time"] == "08:30"
+    assert payload["rules"] is not None and payload["rules"]["verdict"]
+    assert result["kernel_calls"] == []
+
+
+def test_the_second_summary_keeps_showing_the_route_basis_it_points_at(plan_repo):
+    """AC1's route half, and notes-06's documented silent bug, one stage later.
+
+    Forget the two new stages in the flow's stored-reference re-read condition and
+    the final summary prints 待核验 for facts the draft actually holds — a user
+    confirming a plan built on gaps the server never denied having.
+    """
+    comparison = _seed_comparison(plan_repo, CONVERSATION)
+    candidate = comparison["candidates"][0]["candidate"]
+    result = _to_final_review(
+        plan_repo,
+        after_submit=(_req("req-select", message="选用该路线", intent="plan_select_route",
+                           route_selection={"comparison_id": comparison["comparison_id"],
+                                            "candidate_id": candidate["id"]}),),
+    )
+    events = result["streams"][-1]
+    payload = _draft_payload(events)
+
+    outcome = _basis_of(plan_repo, comparison["comparison_id"], candidate["id"])
+    assert outcome.status == "ok" and outcome.basis is not None
+    certified = {line.field for line in outcome.basis.facts}
+    listed = {entry["key"] for entry in payload["missing_fields"]}
+
+    assert certified and not (certified & listed)
+    assert "**路线核验事实" in payload["summary"]
+    assert payload["plan_type"] == "route_plan"
+    assert payload["route_selection"] == {
+        "comparison_id": comparison["comparison_id"], "candidate_id": candidate["id"]}
+    for field, label, _unit in FACT_DIMENSIONS:
+        if field in certified:
+            assert f"{label}：{UNVERIFIED}" not in payload["summary"], label
+
+
+def test_the_final_confirmation_is_recorded_and_names_what_it_covered(plan_repo):
+    """AC4/AC5: the explicit confirmation is the durable record, gaps and all."""
+    result = _to_final_confirmed(plan_repo)
+    events = result["streams"][-1]
+    payload = _draft_payload(events)
+
+    assert payload["stage"] == "final_reviewed"
+    assert payload["intent"] == "plan_confirm_final"
+    assert payload["summary"] == _texts(events)
+    assert "已明确确认本次最终摘要" in payload["summary"]
+    assert "PDF 审批" in payload["summary"]
+    assert "不代表" in payload["summary"], "the scope of the confirmation is stated"
+    assert payload["missing_fields"], "confirming does not fill a single gap"
+    assert result["kernel_calls"] == []
+
+    stored = result["repo"].get_plan_draft(CONVERSATION)
+    assert stored.stage == "final_reviewed"
+
+
+@pytest.mark.parametrize("intent,reason", [
+    ("plan_final_review", "first_review_not_confirmed"),
+    ("plan_confirm_final", "final_review_not_pending"),
+])
+def test_a_second_summary_or_its_confirmation_cannot_jump_the_queue(
+    plan_repo, intent, reason
+):
+    """AC4's guard at the flow level: no summary shown, no approval recorded."""
+    result = _drive(plan_repo,
+                    _submit("req-submit", arrangements=_supplement()),
+                    _req("req-jump", message="查看最终摘要", intent=intent))
+    events = result["streams"][1]
+
+    assert [e["reason"] for e in _errors(events)] == [reason]
+    assert _draft_events(events) == [], "a refusal shows no draft state"
+    assert result["repo"].get_plan_draft(CONVERSATION).stage == "minimal_draft"
+
+
+def test_a_second_summary_without_the_stored_rule_verdict_is_refused(plan_repo):
+    """AC4 fails CLOSED on the record: no stored verdict, no final review.
+
+    The row is deleted after the fact here to stand in for a conversation written
+    by a build that ran no rules — the click must not be honoured from the stage
+    alone.
+    """
+    reached = _to_first_reviewed(plan_repo)
+    assert reached["repo"].get_plan_draft(CONVERSATION).stage == "first_reviewed"
+    reached["repo"].clear_completeness_check(CONVERSATION)
+
+    result = _drive(reached["repo"], _req("req-final", message="查看最终摘要",
+                                          intent="plan_final_review"))
+    events = result["streams"][0]
+
+    assert [e["reason"] for e in _errors(events)] == ["final_review_without_verdict"]
+    assert _draft_events(events) == []
+
+
+def test_a_stale_recorded_verdict_never_carries_the_final_review(plan_repo):
+    """The row is a precondition, never the answer (notes-06's recompute rule).
+
+    The stored verdict still says 可审阅 while 集合时间 has since been cleared, so
+    trusting the row would honour the click. The fresh verdict bounces it to the
+    form with ticket 06's reason codes instead.
+    """
+    reached = _to_first_reviewed(plan_repo)
+    repo = reached["repo"]
+    draft = repo.get_plan_draft(CONVERSATION)
+    stale = repo.get_completeness_check(CONVERSATION)
+    assert stale is not None and stale.verdict != "supplement_required"
+
+    emptied = {**_supplement(), "meeting_time": ""}
+    repo.save_plan_arrangements(conversation_id=CONVERSATION, draft_id=draft.draft_id,
+                                arrangements=emptied, updated_by_run_id="req-tamper")
+
+    result = _drive(repo, _req("req-final", message="查看最终摘要",
+                               intent="plan_final_review"))
+    events = result["streams"][0]
+    payload = _draft_payload(events)
+
+    assert payload["stage"] == "awaiting_input", "the fresh verdict decides, not the row"
+    assert payload["rules"]["verdict"] == "supplement_required"
+    assert "core_arrangements_missing" in json.dumps(payload["rules"])
+    assert repo.get_completeness_check(CONVERSATION).verdict == "supplement_required"
+
+
+def test_a_final_confirmation_cannot_be_recorded_twice(plan_repo):
+    """AC4: re-confirmation goes through a NEW summary, never a repeat click."""
+    confirmed = _to_final_confirmed(plan_repo)
+    result = _drive(confirmed["repo"], _req("req-again", message="再确认一次",
+                                            intent="plan_confirm_final"))
+    events = result["streams"][0]
+
+    assert [e["reason"] for e in _errors(events)] == ["final_review_not_pending"]
+    assert _draft_events(events) == []
+
+
+def test_a_missing_ordinary_arrangement_never_reads_as_a_safety_block(plan_repo):
+    """AC3 kept apart from AC2 at the flow level: a gap bounces, it does not block.
+
+    缺少 撤退方案 (non-core) still gets a reviewable draft; 缺少 集合时间 goes back
+    to the form. Neither of those is ``blocked_safety``, which only the
+    deterministic gate can put a draft on.
+    """
+    result = _drive(plan_repo,
+                    _submit("req-submit", arrangements=_supplement(retreat_plan="")),
+                    _req("req-review", message="直接生成草案", intent="plan_first_review"),
+                    _req("req-confirm", message="确认安排", intent="plan_confirm_arrangements"),
+                    _req("req-final", message="查看最终摘要", intent="plan_final_review"))
+    payload = _draft_payload(result["streams"][-1])
+
+    assert payload["stage"] == "awaiting_final_review"
+    assert "retreat_plan" in [entry["key"] for entry in payload["missing_fields"]]
+    assert payload["plan_type"] == "generic_draft", "AC3: a generic draft, not a plan"
+    assert "待确认" in payload["summary"] or UNCONFIRMED in payload["summary"]
+
+
+def test_a_final_review_turn_is_inert_and_never_an_approval_pause(plan_repo):
+    """The ruling, one stage later: a confirmation is a conversational turn.
+
+    No ``run.paused``, no approval row, no artifact, no sandbox lease and no model
+    call on either final-review turn — 进入 PDF 审批 is a stage the user reached,
+    and the approval machinery (300 s TTL + lease) stays ticket 09's.
+    """
+    result = _to_final_confirmed(plan_repo)
+    for stream in result["streams"][3:]:
+        run_id = stream[-1].run_id
+        assert set(e.type for e in stream if e.type != "tool_result") <= PLAN_FLOW_EVENT_TYPES
+        assert "run.paused" not in [e.type for e in stream]
+        assert result["repo"].list_approvals_for_run(run_id) == []
+        assert result["repo"].list_artifacts_for_run(run_id) == []
+        assert result["repo"].get_sandbox_lease(run_id) is None
+    assert result["kernel_calls"] == []
+
+
+def test_the_second_summary_and_its_confirmation_survive_their_run(plan_repo):
+    """AC5: what the user confirmed is readable from the events after the fact."""
+    result = _to_final_confirmed(plan_repo)
+    repo = result["repo"]
+    events = result["streams"][-1]
+    run_id = events[-1].run_id
+
+    stored = repo.get_events_since(run_id=run_id, from_seq=0)
+    draft_states = [e for e in stored if e["type"] == "plan.draft_state"]
+    assert [e["payload"]["stage"] for e in draft_states] == ["final_reviewed"]
+    assert draft_states[0]["payload"]["intent"] == "plan_confirm_final"
+
+    history = [m.content for m in repo.checkpoints.get_messages(conversation_id=CONVERSATION)
+               if m.role == "assistant"]
+    assert draft_states[0]["payload"]["summary"] in history, \
+        "the audit text says what was confirmed"
+    assert any("最终摘要" in content and "PDF 审批" in content for content in history)
+
+
+def test_a_final_review_turn_reports_no_safety_block_when_the_gate_refused_nothing(plan_repo):
+    """AC5's negative half: no refusal, no invented reason.
+
+    ``safety`` is absent (the reader materialises it as ``null``) whenever the gate
+    refused nothing, so the panel cannot render a block the server never claimed —
+    and a draft the user reached ``final_reviewed`` with is exactly that case.
+    """
+    result = _to_final_review(plan_repo)
+    payload = _draft_payload(result["streams"][-1])
+
+    assert "safety" not in payload
+    assert payload["stage"] == "awaiting_final_review"
+
+
+@pytest.mark.parametrize("step", [3, 4])
+def test_cancelling_still_works_from_either_final_stage(plan_repo, step):
+    """The park/cancel split survives the new stages (ticket 02's rule)."""
+    requests = [
+        _submit("req-submit", arrangements=_supplement()),
+        _req("req-review", message="直接生成草案", intent="plan_first_review"),
+        _req("req-confirm", message="确认安排", intent="plan_confirm_arrangements"),
+        _req("req-final", message="查看最终摘要", intent="plan_final_review"),
+        _req("req-confirm-final", message="确认最终摘要", intent="plan_confirm_final"),
+    ][:step] + [_req("req-cancel", message="先不用了", intent="plan_cancel")]
+    result = _drive(plan_repo, *requests)
+    events = result["streams"][-1]
+
+    assert _draft_payload(events)["stage"] == "cancelled"
+    assert result["repo"].get_plan_draft(CONVERSATION).stage == "cancelled"
+
+
+# ---- The HTTP boundary ------------------------------------------------------
+
+import api.chat_v2 as chat_api  # noqa: E402
+from fastapi import FastAPI  # noqa: E402
+from httpx import ASGITransport, AsyncClient  # noqa: E402
+
+from agent_v2 import kernel  # noqa: E402
+from agent_v2.memory_service import MemoryService  # noqa: E402
+from agent_v2.repositories.memory import MemoryStore  # noqa: E402
+from api.memory_v2 import SUBJECT_COOKIE_NAME, memory_v2_router  # noqa: E402
+
+HTTP_CONVERSATION = "conv-plan-07-http"
+
+
+@pytest.fixture
+def flow(tmp_path, monkeypatch):
+    """``POST /api/v2/chat/sse`` over ASGI with a fake kernel."""
+    settings = SimpleNamespace(
+        agent_v2_enabled=True,
+        openai_api_key="test",
+        openai_model="test",
+        agent_v2_cowork_policy="disabled",
+        agent_v2_state_dir=str(tmp_path),
+        route_compare_data_mode="offline",
+        route_decision_provider="deterministic",
+        route_compare_demo_scenario="complete",
+    )
+    monkeypatch.setattr(chat_api, "settings", settings)
+
+    repo = RunRepository(
+        control=ControlStore(str(tmp_path / "control.sqlite")),
+        checkpoints=CheckpointsStore(str(tmp_path / "checkpoints.sqlite")),
+    )
+    memory = MemoryService(MemoryStore(str(tmp_path / "memory.sqlite")))
+
+    app = FastAPI()
+    app.state.agent_v2_runtime = SimpleNamespace(runs=repo, memory=memory)
+    app.include_router(chat_api.chat_v2_router, prefix="/api/v2")
+    app.include_router(memory_v2_router, prefix="/api/v2")
+
+    model_calls: list[str] = []
+
+    async def fake_model(**kwargs):
+        model_calls.append(kwargs["message"])
+        return "好的。", []
+
+    monkeypatch.setattr(kernel, "run_chat_turn", fake_model)
+
+    subject = memory.resolve_subject(None)
+    yield SimpleNamespace(app=app, repo=repo, memory=memory, subject=subject,
+                          model_calls=model_calls)
+    repo.close()
+    memory.close()
+
+
+def _post(app, subject, payload):
+    async def run():
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test",
+            cookies={SUBJECT_COOKIE_NAME: subject.token},
+        ) as client:
+            return await client.post("/api/v2/chat/sse", json=payload)
+    return asyncio.run(run())
+
+
+def _frames(response) -> list[dict]:
+    assert response.status_code == 200, response.text
+    return [json.loads(line[6:]) for line in response.text.splitlines()
+            if line.startswith("data: ")]
+
+
+def _http_send(flow, request_id: str, **extra):
+    body = {"message": "生成行程", "request_id": request_id,
+            "conversation_id": HTTP_CONVERSATION, **extra}
+    return _frames(_post(flow.app, flow.subject, body))
+
+
+def _draft_frames(frames):
+    return [f for f in frames if f["type"] == "plan.draft_state"]
+
+
+def test_the_second_summary_and_its_confirmation_reach_the_client_over_http(flow):
+    """AC1/AC4/AC5 on the wire, with no model in sight.
+
+    A restore after a refresh reads exactly this payload shape, so the final
+    review stage has to survive the HTTP boundary — and neither turn may fall
+    through to the kernel or open an approval.
+    """
+    _http_send(flow, "req-http-submit", intent="plan_create", plan_input={
+        "destination_or_route": _DESTINATION,
+        "activity_date": _DATE,
+        "participants": _PEOPLE,
+        "arrangements": _supplement(),
+    })
+    _http_send(flow, "req-http-review", message="直接生成草案", intent="plan_first_review")
+    _http_send(flow, "req-http-confirm", message="确认安排", intent="plan_confirm_arrangements")
+
+    frames = _http_send(flow, "req-http-final", message="查看最终摘要",
+                        intent="plan_final_review")
+    payload = _draft_frames(frames)[-1]["payload"]
+    assert payload["stage"] == "awaiting_final_review"
+    assert "最终摘要" in payload["summary"]
+    assert payload["summary"] == "".join(
+        f["payload"]["content"] for f in frames if f["type"] == "text")
+
+    confirmed = _http_send(flow, "req-http-confirm-final", message="确认最终摘要",
+                           intent="plan_confirm_final")
+    assert _draft_frames(confirmed)[-1]["payload"]["stage"] == "final_reviewed"
+    assert flow.model_calls == []
+
+
+@pytest.mark.parametrize("intent", ["plan_final_review", "plan_confirm_final"])
+def test_a_final_review_decision_cannot_carry_an_arrangement_over_http(flow, intent):
+    """AC4 at the boundary: the decision click has nowhere to put a value."""
+    frames = _http_send(flow, f"req-smuggle-{intent}", intent=intent, plan_input={
+        "destination_or_route": _DESTINATION,
+        "activity_date": _DATE,
+        "participants": _PEOPLE,
+    })
+    assert frames[-1]["type"] == "error", frames[-1]
+    assert frames[-1]["payload"]["reason"] == "plan_input_not_allowed"
+    assert _draft_frames(frames) == []
+
+    smuggled = _post(flow.app, flow.subject, {
+        "message": "确认最终摘要", "request_id": f"req-extra-{intent}",
+        "conversation_id": HTTP_CONVERSATION, "intent": intent,
+        "meeting_time": "08:00", "budget": 300, "emergency_contact": "13800000000",
+        "report_allowed": True,
+    })
+    assert smuggled.status_code == 422
+    assert flow.repo.resolve_run_id(f"req-extra-{intent}") is None
