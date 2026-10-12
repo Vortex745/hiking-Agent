@@ -395,6 +395,26 @@ def test_expiry_still_bites_old_generations_after_regeneration(tmp_path):
     assert gone.status_code == 410
 
 
+def test_a_sandbox_creation_failure_on_a_regeneration_attempt_stays_fail_closed(tmp_path):
+    """AC1: the regeneration attempt provisions the sandbox the same way and
+    fails CLOSED — a ComputerError becomes a terminal error event and the run
+    NEVER falls back to a host-side render. (LocalNative injects the failure at
+    create_workspace; the flow must stop before any approval or tool_call.)"""
+    repo = _repo(tmp_path)
+    orch = _e2e_orchestrator(tmp_path, repo, LocalNativeComputer(failure_mode="creation"),
+                             ["# 计划"])
+    req = ChatFlowRequest(
+        message="重新生成计划书", request_id="req-nodevice",
+        conversation_id="conv-nodevice", profile_id="artifact",
+    )
+    items = asyncio.run(_stream(orch, req))
+    types = [e.type for e in items]
+    assert types[-1] == "error"
+    assert items[-1].payload["code"] == "sandbox_creation_failed"
+    assert "tool_call" not in types and "approval.required" not in types
+    assert repo.list_artifacts_for_run(items[0].run_id) == []
+
+
 def test_a_failed_render_publishes_nothing(tmp_path):
     """AC2: a failed render publishes no half-artifact.
 
