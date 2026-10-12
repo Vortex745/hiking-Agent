@@ -139,12 +139,48 @@ export type V2PlanDraftStage =
   | 'first_reviewed'
   | 'cancelled'
 
-/** The three fields the entry dialog collects. Absent values stay absent. */
+/** The three fields the entry dialog has always made mandatory. */
 export interface V2PlanDraftFields {
   destination_or_route: string
   activity_date: string
   participants: number | null
+  /**
+   * Ticket 06 AC1: the eight supplementary arrangements the dialog now collects.
+   * Optional on SUBMIT — leaving every one blank is a valid draft (they stay
+   * 待确认); it is the completeness rules that change, not what the form demands.
+   */
+  arrangements?: V2PlanArrangementFields
 }
+
+/**
+ * Ticket 06 AC1: the supplementary arrangement record — exactly
+ * ``plan_workflow.SUPPLEMENT_ARRANGEMENT_KEYS``, the arrangement fields of
+ * ``route_compare.models.PlanDetails`` plus the user's own free-text 费用预算.
+ * The keys are pinned server-side against that record, so this cannot become a
+ * second vocabulary; an unfilled field is the empty string, never a guess.
+ */
+export interface V2PlanArrangementFields {
+  meeting_time: string
+  meeting_point: string
+  leader: string
+  transport: string
+  accommodation: string
+  budget: string
+  emergency_contact: string
+  retreat_plan: string
+}
+
+/** The one list the readers build the record from — keys outside it are dropped. */
+export const V2_PLAN_ARRANGEMENT_KEYS: readonly (keyof V2PlanArrangementFields)[] = [
+  'meeting_time',
+  'meeting_point',
+  'leader',
+  'transport',
+  'accommodation',
+  'budget',
+  'emergency_contact',
+  'retreat_plan',
+]
 
 /**
  * Ticket 05 AC1: one field the draft does not hold.
@@ -162,6 +198,64 @@ export interface V2PlanMissingField {
   label: string
   status: string
 }
+
+/**
+ * Ticket 06 AC1/AC4/AC5: one reason the rules still need a human, as the server
+ * sent it — the stable machine code beside its readable copy. The UI branches on
+ * ``code`` and displays ``message`` verbatim; neither is re-derived client-side,
+ * mirroring ``PlanBlockReason`` + ``BLOCK_MESSAGE``.
+ */
+export interface V2PlanReviewReason {
+  code: string
+  message: string
+}
+
+/** One gap the rule verdict names (missing core / missing non-core entry). */
+export interface V2PlanRuleGap {
+  key: string
+  label: string
+}
+
+/** One filled-but-unusable arrangement: the key, its label, and how to fix it. */
+export interface V2PlanFormatIssue {
+  key: string
+  label: string
+  message: string
+}
+
+/**
+ * Ticket 06 AC2: how one arrangement stands against the server's evidence —
+ * explicit fields and a source status, never a sentence. ``source_ids`` only
+ * ever names sources the gate issued; an empty list claims no evidence.
+ */
+export interface V2PlanEvidenceMatch {
+  arrangement_key: string
+  arrangement_label: string
+  fact_fields: string[]
+  status: string
+  source_ids: string[]
+}
+
+/**
+ * Ticket 06: the deterministic completeness verdict on the wire. Codes, keys and
+ * labels only — no route fact, no derived value, and no report-eligibility flag
+ * (AC6: the safety gate stays with the comparison service, not with this
+ * record). ``null`` on a payload a server produced before the rules ran.
+ */
+export interface V2PlanCompletenessRules {
+  verdict: 'complete' | 'confirmation_required' | 'supplement_required'
+  reasons: V2PlanReviewReason[]
+  missing_core: V2PlanRuleGap[]
+  missing_non_core: V2PlanRuleGap[]
+  format_issues: V2PlanFormatIssue[]
+  matches: V2PlanEvidenceMatch[]
+}
+
+export const V2_PLAN_VERDICTS: ReadonlySet<V2PlanCompletenessRules['verdict']> = new Set([
+  'complete',
+  'confirmation_required',
+  'supplement_required',
+])
 
 export interface V2PlanDraftState {
   stage: V2PlanDraftStage
@@ -201,7 +295,25 @@ export interface V2PlanDraftState {
    * survives a refresh instead of being a render-time-only string.
    */
   missing_fields: V2PlanMissingField[]
-  draft: V2PlanDraftFields
+  /**
+   * Ticket 06 AC1/AC4/AC5: the completeness verdict for exactly this draft —
+   * the same record the server stored and the summary rendered from, so the
+   * panel, the text and a post-refresh restore can never disagree. ``null``
+   * when no draft existed for the rules to judge (or an older server).
+   */
+  rules: V2PlanCompletenessRules | null
+  draft: {
+    destination_or_route: string
+    activity_date: string
+    participants: number | null
+    /**
+     * Ticket 06 AC1/AC5: the collected supplementary arrangements, always
+     * materialised to all eight keys by ``readPlanArrangements`` (absent or
+     * malformed → empty strings — an unfilled arrangement is 待确认, never a
+     * guess, and a hand-edited mirror entry cannot smuggle a new key in).
+     */
+    arrangements: V2PlanArrangementFields
+  }
 }
 
 export const V2_PLAN_DRAFT_STAGES: ReadonlySet<V2PlanDraftStage> = new Set([

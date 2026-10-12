@@ -21,7 +21,13 @@
  *    dropped, so a draft can never leak into another conversation.
  */
 
-import type { V2PlanDraftStage, V2PlanDraftState } from './chatV2'
+import type {
+  V2PlanArrangementFields,
+  V2PlanCompletenessRules,
+  V2PlanDraftStage,
+  V2PlanDraftState,
+} from './chatV2'
+import { V2_PLAN_ARRANGEMENT_KEYS } from './chatV2'
 import { readPlanDraftState } from './v2Reducer'
 
 const PLAN_DRAFTS_KEY = 'ai-hiking-agent-plan-drafts'
@@ -164,6 +170,15 @@ export function isSamePlanDraft(
     // the checklist the user is deciding from silently keeps the OLD entries
     // after a refresh.
     && isSameMissingFields(a.missing_fields, b.missing_fields)
+    // Ticket 06 AC5: the collected arrangements are compared field by field.
+    // Skip them and a just-filled 集合时间 looks like "no change" to the restore
+    // effect, so after a refresh the form and the panel keep showing the OLD
+    // (empty) record — the same silent-stale bug class as the checklist above.
+    && isSameArrangements(a.draft.arrangements, b.draft.arrangements)
+    // Ticket 06 AC5: the verdict travels the same way. A supplement_required →
+    // confirmation_required flip after filling a core arrangement is exactly
+    // what the user needs to see without a reload.
+    && isSameCompletenessRules(a.rules, b.rules)
     && a.draft.destination_or_route === b.draft.destination_or_route
     && a.draft.activity_date === b.draft.activity_date
     && a.draft.participants === b.draft.participants
@@ -202,4 +217,48 @@ function isSameMissingFields(
     const other = b[index]
     return entry.key === other.key && entry.status === other.status
   })
+}
+
+/**
+ * Ticket 06 AC1/AC5: the supplementary arrangement record compared key by key
+ * over the enumeration — not over ``Object.keys`` of the stored object, so a
+ * hand-edited localStorage entry with an extra key cannot make two drafts
+ * "differ" on a field the server never had, and a missing key reads as the
+ * empty string it is.
+ */
+function isSameArrangements(a: V2PlanArrangementFields, b: V2PlanArrangementFields): boolean {
+  if (a === b) return true
+  return V2_PLAN_ARRANGEMENT_KEYS.every(key => a[key] === b[key])
+}
+
+/**
+ * Ticket 06 AC4/AC5: the verdict compared by its stable codes — verdict value,
+ * reason codes, gap keys, format-issue keys, match statuses. Labels and
+ * messages come from the same server render as the codes, so diffing the codes
+ * is diffing the verdict; re-rendering the panel on identical codes would be
+ * pure churn.
+ */
+function isSameCompletenessRules(
+  a: V2PlanCompletenessRules | null,
+  b: V2PlanCompletenessRules | null,
+): boolean {
+  if (a === b) return true
+  if (!a || !b) return false
+  if (a.verdict !== b.verdict) return false
+  if (a.reasons.length !== b.reasons.length) return false
+  if (!a.reasons.every((reason, index) => reason.code === b.reasons[index].code)) return false
+  const sameGaps = (x: V2PlanCompletenessRules['missing_core'], y: V2PlanCompletenessRules['missing_core']) =>
+    x.length === y.length && x.every((gap, index) => gap.key === y[index].key)
+  if (!sameGaps(a.missing_core, b.missing_core)) return false
+  if (!sameGaps(a.missing_non_core, b.missing_non_core)) return false
+  if (a.format_issues.length !== b.format_issues.length) return false
+  if (!a.format_issues.every((issue, index) => issue.key === b.format_issues[index].key)) return false
+  if (a.matches.length !== b.matches.length) return false
+  return a.matches.every(
+    (match, index) =>
+      match.arrangement_key === b.matches[index].arrangement_key
+      && match.status === b.matches[index].status
+      && match.source_ids.length === b.matches[index].source_ids.length
+      && match.source_ids.every((id, i) => id === b.matches[index].source_ids[i]),
+  )
 }

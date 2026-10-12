@@ -1,10 +1,11 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type ChangeEvent } from 'react'
 import Button from './Button'
 import X from 'reicon-react/icons/X'
-import type { V2PlanDraftFields } from '../api/chatV2'
+import type { V2PlanArrangementFields, V2PlanDraftFields } from '../api/chatV2'
+import { V2_PLAN_ARRANGEMENT_KEYS } from '../api/chatV2'
 
 /**
- * Ticket 01 — 计划书入口弹窗.
+ * Ticket 01 — 计划书入口弹窗; ticket 06 widened the collection.
  *
  * There is no reusable Dialog in this project (the only real modal is the
  * image preview in ``GeminiThread.tsx``), so this component imitates that
@@ -12,18 +13,34 @@ import type { V2PlanDraftFields } from '../api/chatV2'
  * inset-0 z-[100]`` over a blurred scrim, ``role="dialog"`` +
  * ``aria-modal="true"``, and an Escape listener bound while open.
  *
- * It collects exactly the three minimal draft fields the spec names —
- * 目的地或路线 / 活动日期 / 参与人数 — and nothing else. The checks below
- * mirror the server's (:class:`agent_v2.plan_workflow.PlanDraftInput`) so
- * a typo is caught locally, while the server stays the authority: a draft
- * that bypasses them is still rejected with a stable reason. Values the
- * user leaves empty stay empty — the form never prefills an invented
- * arrangement (docs/plan-pdf-format.md: 未知安排留空，显示"待确认").
+ * It collects the three minimal draft fields the spec has always made
+ * mandatory — 目的地或路线 / 活动日期 / 参与人数 — plus ticket 06's eight
+ * supplementary arrangements, all optional. Nothing here prefills a value: an
+ * empty arrangement stays empty and comes back as 待确认 on the server
+ * (docs/plan-pdf-format.md: 未知安排留空，显示"待确认"). The field list is the
+ * server's enumeration (``SUPPLEMENT_ARRANGEMENT_KEYS``), not a local one, and
+ * format verdicts stay server-side: a 「明天一早」 集合时间 is a legal submission
+ * the completeness rules reject with a stable reason, so the form and the rule
+ * never disagree about what "filled" means.
  */
 
 const MAX_DESTINATION = 120
 const MAX_PARTICIPANTS = 10000
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/
+
+/**
+ * The eight supplementary arrangements, each DECLARED with its literal input
+ * name below. A field the form declares but the server does not enumerate is
+ * refused at the wire (``PlanArrangementInput`` is ``extra="forbid"``), and a
+ * field the server enumerates but the form never draws can only ever be
+ * 待确认 — both directions are the drift this dialog exists to prevent, so the
+ * names are written out rather than generated from a list.
+ */
+function emptyArrangements(): V2PlanArrangementFields {
+  const arrangements = {} as V2PlanArrangementFields
+  for (const key of V2_PLAN_ARRANGEMENT_KEYS) arrangements[key] = ''
+  return arrangements
+}
 
 /** Field-class convention copied from ``LlmConfig.tsx`` (label grid + h-10 input). */
 const LABEL_CLASS = 'grid gap-1.5'
@@ -92,11 +109,42 @@ export function validatePlanDraftFields(values: {
   return errors
 }
 
+/**
+ * One optional supplementary arrangement. Deliberately no local format check:
+ * 「明天一早」 is a legal submission whose fate — 待补充 / 格式未通过 — is the
+ * server's deterministic rule (``plan_workflow.arrangement_format_issues``),
+ * never a rewrite this component could invent.
+ */
+const SupplementField = ({
+  label, name, placeholder, value, onChange,
+}: {
+  label: string
+  name: string
+  placeholder: string
+  value: string
+  onChange: (event: ChangeEvent<HTMLInputElement>) => void
+}) => (
+  <label className={LABEL_CLASS}>
+    <span className={LABEL_TEXT_CLASS}>{label}</span>
+    <input
+      className={INPUT_CLASS}
+      name={name}
+      type="text"
+      placeholder={placeholder}
+      value={value}
+      onChange={onChange}
+    />
+  </label>
+)
+
 export const PlanDraftDialog = ({ open, onDismiss, onCancel, onSubmit, initial, busy = false, summary }: PlanDraftDialogProps) => {
   const [destinationOrRoute, setDestinationOrRoute] = useState(initial?.destination_or_route ?? '')
   const [activityDate, setActivityDate] = useState(initial?.activity_date ?? '')
   const [participants, setParticipants] = useState(
     initial?.participants == null ? '' : String(initial.participants),
+  )
+  const [arrangements, setArrangements] = useState<V2PlanArrangementFields>(
+    initial?.arrangements ?? emptyArrangements(),
   )
   const [errors, setErrors] = useState<FieldErrors>({})
 
@@ -118,6 +166,7 @@ export const PlanDraftDialog = ({ open, onDismiss, onCancel, onSubmit, initial, 
     setDestinationOrRoute(initial?.destination_or_route ?? '')
     setActivityDate(initial?.activity_date ?? '')
     setParticipants(initial?.participants == null ? '' : String(initial.participants))
+    setArrangements(initial?.arrangements ?? emptyArrangements())
     setErrors({})
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open])
@@ -132,12 +181,21 @@ export const PlanDraftDialog = ({ open, onDismiss, onCancel, onSubmit, initial, 
     })
     setErrors(nextErrors)
     if (Object.keys(nextErrors).length > 0) return
+    // Every supplementary field goes, trimmed — an empty one is a deliberate
+    // 待确认, and the server's rules (not this form) decide formats.
+    const trimmed = {} as V2PlanArrangementFields
+    for (const key of V2_PLAN_ARRANGEMENT_KEYS) trimmed[key] = arrangements[key].trim()
     onSubmit({
       destination_or_route: destinationOrRoute.trim(),
       activity_date: activityDate,
       participants: Number(participants),
+      arrangements: trimmed,
     })
   }
+
+  const setArrangement = (key: keyof V2PlanArrangementFields) =>
+    (event: ChangeEvent<HTMLInputElement>) =>
+      setArrangements(current => ({ ...current, [key]: event.target.value }))
 
   return (
     <div
@@ -238,6 +296,46 @@ export const PlanDraftDialog = ({ open, onDismiss, onCancel, onSubmit, initial, 
               <span className="text-xs text-red-500" role="alert">{errors.participants}</span>
             )}
           </label>
+
+          {/* Ticket 06 AC1/AC3: the eight supplementary arrangements. All
+              optional, all sent as typed (or left absent); existence is the
+              server's 待确认 question and the format verdict is the server's
+              rule, never a local rewrite of what the user wrote. */}
+          <div className="grid gap-4">
+            <p className="text-xs text-text-muted">其他安排（可留空；留空即待确认）</p>
+            <SupplementField
+              label="集合时间" name="meeting_time" placeholder="例如：08:30（HH:MM）"
+              value={arrangements.meeting_time} onChange={setArrangement('meeting_time')}
+            />
+            <SupplementField
+              label="集合地点" name="meeting_point" placeholder="例如：长坪沟景区北门停车场"
+              value={arrangements.meeting_point} onChange={setArrangement('meeting_point')}
+            />
+            <SupplementField
+              label="应急联络" name="emergency_contact" placeholder="例如：可拨打的电话号码"
+              value={arrangements.emergency_contact} onChange={setArrangement('emergency_contact')}
+            />
+            <SupplementField
+              label="领队" name="leader" placeholder="可留空，留空即待确认"
+              value={arrangements.leader} onChange={setArrangement('leader')}
+            />
+            <SupplementField
+              label="交通" name="transport" placeholder="可留空，留空即待确认"
+              value={arrangements.transport} onChange={setArrangement('transport')}
+            />
+            <SupplementField
+              label="住宿" name="accommodation" placeholder="可留空，留空即待确认"
+              value={arrangements.accommodation} onChange={setArrangement('accommodation')}
+            />
+            <SupplementField
+              label="费用预算" name="budget" placeholder="例如：300 元/人（系统不会替你估算）"
+              value={arrangements.budget} onChange={setArrangement('budget')}
+            />
+            <SupplementField
+              label="撤退方案" name="retreat_plan" placeholder="可留空，留空即待确认"
+              value={arrangements.retreat_plan} onChange={setArrangement('retreat_plan')}
+            />
+          </div>
 
           <div className="mt-1 flex justify-end gap-2">
             <Button variant="ghost" size="md" onClick={onCancel ?? onDismiss} disabled={busy}>

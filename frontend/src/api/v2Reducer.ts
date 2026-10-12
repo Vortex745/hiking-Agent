@@ -38,8 +38,20 @@ import type {
   V2PlanRouteReference,
   V2PlanType,
   V2PlanMissingField,
+  V2PlanArrangementFields,
+  V2PlanCompletenessRules,
+  V2PlanEvidenceMatch,
+  V2PlanFormatIssue,
+  V2PlanReviewReason,
+  V2PlanRuleGap,
 } from './chatV2'
-import { TERMINAL_V2_EVENT_TYPES, V2_PLAN_DRAFT_STAGES, V2_PLAN_TYPES } from './chatV2'
+import {
+  TERMINAL_V2_EVENT_TYPES,
+  V2_PLAN_ARRANGEMENT_KEYS,
+  V2_PLAN_DRAFT_STAGES,
+  V2_PLAN_TYPES,
+  V2_PLAN_VERDICTS,
+} from './chatV2'
 
 export interface V2ToolTrace {
   type: 'tool_call' | 'tool_result' | 'artifact_progress'
@@ -519,6 +531,103 @@ function readMissingPlanFields(value: unknown): V2PlanMissingField[] {
   return fields
 }
 
+/**
+ * Ticket 06 AC1/AC5: read the collected supplementary arrangements. Only the
+ * eight enumerated keys are taken, and only as strings — an absent, malformed
+ * or hand-edited entry yields the empty string for that field, which is the
+ * server's own 待确认 state rather than a guessed value. A key outside the
+ * enumeration (a smuggled distance or budget total) is dropped, not drawn.
+ */
+function readPlanArrangements(value: unknown): V2PlanArrangementFields {
+  const record = value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
+  const arrangements = {} as V2PlanArrangementFields
+  for (const key of V2_PLAN_ARRANGEMENT_KEYS) {
+    const entry = record[key]
+    arrangements[key] = typeof entry === 'string' ? entry : ''
+  }
+  return arrangements
+}
+
+function readStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+}
+
+/**
+ * Ticket 06 AC4/AC5: read the completeness verdict. An unknown verdict is
+ * ``null`` — the panel then says nothing — because guessing a verdict would be
+ * re-deciding a rule client-side. Reason/gap/format entries need their stable
+ * code/key as a non-empty string or they are dropped, exactly like
+ * ``readMissingPlanFields``: a code this reader cannot name is a code no UI
+ * copy exists for.
+ */
+function readPlanRules(value: unknown): V2PlanCompletenessRules | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const rules = value as Record<string, unknown>
+  const verdict = rules['verdict']
+  if (typeof verdict !== 'string' || !V2_PLAN_VERDICTS.has(verdict as V2PlanCompletenessRules['verdict'])) {
+    return null
+  }
+  const reasons: V2PlanReviewReason[] = []
+  if (Array.isArray(rules['reasons'])) {
+    for (const raw of rules['reasons']) {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
+      const entry = raw as Record<string, unknown>
+      if (typeof entry['code'] !== 'string' || !entry['code']) continue
+      if (typeof entry['message'] !== 'string' || !entry['message']) continue
+      reasons.push({ code: entry['code'], message: entry['message'] })
+    }
+  }
+  const gaps = (key: string): V2PlanRuleGap[] => {
+    const out: V2PlanRuleGap[] = []
+    const rawList = Array.isArray(rules[key]) ? rules[key] as unknown[] : []
+    for (const raw of rawList) {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
+      const entry = raw as Record<string, unknown>
+      if (typeof entry['key'] !== 'string' || !entry['key']) continue
+      out.push({ key: entry['key'], label: typeof entry['label'] === 'string' ? entry['label'] : entry['key'] })
+    }
+    return out
+  }
+  const formatIssues: V2PlanFormatIssue[] = []
+  const rawIssues = Array.isArray(rules['format_issues']) ? rules['format_issues'] as unknown[] : []
+  for (const raw of rawIssues) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
+    const entry = raw as Record<string, unknown>
+    if (typeof entry['key'] !== 'string' || !entry['key']) continue
+    if (typeof entry['message'] !== 'string' || !entry['message']) continue
+    formatIssues.push({
+      key: entry['key'],
+      label: typeof entry['label'] === 'string' ? entry['label'] : entry['key'],
+      message: entry['message'],
+    })
+  }
+  const matches: V2PlanEvidenceMatch[] = []
+  const rawMatches = Array.isArray(rules['matches']) ? rules['matches'] as unknown[] : []
+  for (const raw of rawMatches) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
+    const entry = raw as Record<string, unknown>
+    if (typeof entry['arrangement_key'] !== 'string' || !entry['arrangement_key']) continue
+    if (typeof entry['status'] !== 'string' || !entry['status']) continue
+    matches.push({
+      arrangement_key: entry['arrangement_key'],
+      arrangement_label: typeof entry['arrangement_label'] === 'string' ? entry['arrangement_label'] : entry['arrangement_key'],
+      fact_fields: readStringArray(entry['fact_fields']),
+      status: entry['status'],
+      source_ids: readStringArray(entry['source_ids']),
+    })
+  }
+  return {
+    verdict: verdict as V2PlanCompletenessRules['verdict'],
+    reasons,
+    missing_core: gaps('missing_core'),
+    missing_non_core: gaps('missing_non_core'),
+    format_issues: formatIssues,
+    matches,
+  }
+}
+
 export function readPlanDraftState(
   payload: Record<string, unknown>,
 ): V2PlanDraftState | null {
@@ -554,6 +663,10 @@ export function readPlanDraftState(
     // spells out — and a malformed entry is dropped rather than guessed into a
     // 待确认 / 待核验 state the server never claimed.
     missing_fields: readMissingPlanFields(payload['missing_fields']),
+    // Ticket 06 AC5: the verdict, read by the same strict reader for the SSE
+    // payload and the durable mirror. Unknown verdict → null (say nothing),
+    // never a guessed one.
+    rules: readPlanRules(payload['rules']),
     draft: {
       destination_or_route:
         typeof draft['destination_or_route'] === 'string' ? draft['destination_or_route'] : '',
@@ -561,6 +674,11 @@ export function readPlanDraftState(
       participants: typeof participants === 'number' && Number.isFinite(participants)
         ? participants
         : null,
+      // Ticket 06 AC1/AC5: the collected supplementary arrangements. Absent on
+      // a server that predates them, malformed in a hand-edited mirror, or
+      // simply not filled in — all read as the all-empty record, never as a
+      // partially guessed one.
+      arrangements: readPlanArrangements(draft['arrangements']),
     },
   }
 }

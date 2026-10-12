@@ -170,6 +170,19 @@ const PLAN_STAGE_LABELS: Record<V2PlanDraftStage, string> = {
   cancelled: '已取消',
 }
 
+/**
+ * Ticket 06 AC3/AC4: the completeness verdict, translated for the panel from
+ * the server's stable value. The reason CODES stay untranslated (they are the
+ * machine vocabulary, ``PlanReviewReason``), and this copy deliberately says
+ * nothing about safety or report eligibility — that stays with the comparison
+ * gate (AC6), never with a rule verdict.
+ */
+const PLAN_RULE_VERDICT_LABELS: Record<'complete' | 'confirmation_required' | 'supplement_required', string> = {
+  complete: '字段与格式规则均已通过（仍不代表安全放行）',
+  confirmation_required: '可生成草案，但仍有待确认/待核验清单',
+  supplement_required: '缺少核心安排，请先在表单补齐',
+}
+
 const STORAGE_KEY = 'ai-hiking-agent-chat'
 const SESSIONS_KEY = 'ai-hiking-agent-sessions'
 const CHAT_ID_KEY = 'ai-hiking-agent-chat-id'
@@ -1983,6 +1996,24 @@ function SuperAgent() {
                   {planDraft.missing_fields
                     .map(field => `${field.label}（${field.status}）`)
                     .join('、')}
+                </p>
+              )}
+              {/* Ticket 06 AC3/AC4/AC5: the deterministic verdict, shown exactly
+                  as the server decided and stored it. The stable reason codes
+                  travel beside their readable copy so what the panel shows, the
+                  summary prints and the audit row holds are one render — and the
+                  直接生成草案 bounce to the form explains itself. */}
+              {planDraft.rules && (
+                <p className="mt-1 text-xs text-text-muted">
+                  规则结论：{PLAN_RULE_VERDICT_LABELS[planDraft.rules.verdict]}
+                  {planDraft.rules.format_issues.length > 0 &&
+                    ` · 格式未通过：${planDraft.rules.format_issues
+                      .map(issue => `${issue.label}（${issue.message}）`)
+                      .join('；')}`}
+                  {planDraft.rules.reasons.length > 0 &&
+                    ` · 需人工确认：${planDraft.rules.reasons
+                      .map(reason => `${reason.code}（${reason.message}）`)
+                      .join('；')}`}
                 </p>
               )}
               <div className="mt-3 flex flex-wrap justify-end gap-2">
