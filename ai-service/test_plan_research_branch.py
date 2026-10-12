@@ -477,6 +477,9 @@ def test_research_and_generic_draft_are_whitelisted_intents():
         "plan_select_route", "plan_research_route", "plan_generic_draft",
         # Ticket 05's three review steps; see test_plan_missing_fields_first_review.
         "plan_first_review", "plan_more_input", "plan_confirm_arrangements",
+        # Ticket 07's two final-review steps; see
+        # test_plan_final_review_and_safety_gate.
+        "plan_final_review", "plan_confirm_final",
     }
     assert PLAN_TYPES == set(get_args(PlanType)) == {"route_plan", "generic_draft"}
     assert set(get_args(PlanIntent)) == PLAN_INTENTS

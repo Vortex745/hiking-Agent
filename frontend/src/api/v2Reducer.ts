@@ -40,6 +40,7 @@ import type {
   V2PlanMissingField,
   V2PlanArrangementFields,
   V2PlanCompletenessRules,
+  V2PlanSafety,
   V2PlanEvidenceMatch,
   V2PlanFormatIssue,
   V2PlanReviewReason,
@@ -49,6 +50,7 @@ import {
   TERMINAL_V2_EVENT_TYPES,
   V2_PLAN_ARRANGEMENT_KEYS,
   V2_PLAN_DRAFT_STAGES,
+  V2_PLAN_SAFETY_CODES,
   V2_PLAN_TYPES,
   V2_PLAN_VERDICTS,
 } from './chatV2'
@@ -628,8 +630,36 @@ function readPlanRules(value: unknown): V2PlanCompletenessRules | null {
   }
 }
 
-export function readPlanDraftState(
-  payload: Record<string, unknown>,
+/**
+ * Ticket 07 AC2/AC5: read the gate's refusal. An unknown or malformed record is
+ * `null` — the panel then says nothing about safety, because guessing a block
+ * reason would be re-deciding the gate client-side (and guessing the *absence* of
+ * one would silently un-block a dangerous draft). Codes outside
+ * ``V2_PLAN_SAFETY_CODES`` are dropped rather than rendered as an unexplained
+ * string, and the gate's own reason lines are kept only as strings.
+ */
+function readPlanSafety(value: unknown): V2PlanSafety | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const safety = value as Record<string, unknown>
+  const rawCodes = Array.isArray(safety['codes']) ? safety['codes'] as unknown[] : []
+  const codes = rawCodes.filter(
+    (code): code is string => typeof code === 'string' && V2_PLAN_SAFETY_CODES.includes(code),
+  )
+  if (codes.length === 0) return null
+  return {
+    codes,
+    hard_stop: safety['hard_stop'] === true,
+    formal_route_plan_allowed: safety['formal_route_plan_allowed'] !== false,
+    message: typeof safety['message'] === 'string' ? safety['message'] : '',
+    comparison_id: typeof safety['comparison_id'] === 'string' ? safety['comparison_id'] : '',
+    comparison_status:
+      typeof safety['comparison_status'] === 'string' ? safety['comparison_status'] : '',
+    gate_reasons: readStringArray(safety['gate_reasons']),
+    required_action: typeof safety['required_action'] === 'string' ? safety['required_action'] : '',
+  }
+}
+
+export function readPlanDraftState(  payload: Record<string, unknown>,
 ): V2PlanDraftState | null {
   const stage = payload['stage']
   if (typeof stage !== 'string' || !V2_PLAN_DRAFT_STAGES.has(stage as V2PlanDraftStage)) {
@@ -667,6 +697,11 @@ export function readPlanDraftState(
     // payload and the durable mirror. Unknown verdict → null (say nothing),
     // never a guessed one.
     rules: readPlanRules(payload['rules']),
+    // Ticket 07 AC5: the gate's refusal, read by the same strict reader for the
+    // SSE payload and the durable mirror, so a safety block explained in the
+    // thread is still explained after a refresh — and an unknown code never
+    // becomes an invented reason.
+    safety: readPlanSafety(payload['safety']),
     draft: {
       destination_or_route:
         typeof draft['destination_or_route'] === 'string' ? draft['destination_or_route'] : '',

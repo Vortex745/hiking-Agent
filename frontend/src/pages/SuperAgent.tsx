@@ -141,6 +141,9 @@ const PLAN_INTENT_LABELS: Record<V2PlanIntent, string> = {
   plan_first_review: '直接生成草案',
   plan_more_input: '继续补充缺失字段',
   plan_confirm_arrangements: '确认我提供的安排',
+  /* Ticket 07 AC1/AC4: the second summary and its explicit confirmation. */
+  plan_final_review: '查看最终摘要',
+  plan_confirm_final: '确认最终摘要并进入 PDF 审批',
 }
 
 /**
@@ -167,6 +170,10 @@ const PLAN_STAGE_LABELS: Record<V2PlanDraftStage, string> = {
   awaiting_generic_choice: '路线资料不足，等你选择通用草案或取消',
   awaiting_first_review: '第一次摘要等你确认，可继续补充缺失字段',
   first_reviewed: '第一次摘要已确认（只含你本人提供的安排）',
+  /* Ticket 07: the second summary, its confirmation, and the safety hard stop. */
+  awaiting_final_review: '最终摘要等你确认，确认后才会进入 PDF 审批',
+  final_reviewed: '最终摘要已确认，可进入 PDF 审批（仍需审批通过才生成）',
+  blocked_safety: '安全门判定危险封闭，已阻止正式路线计划',
   cancelled: '已取消',
 }
 
@@ -1776,6 +1783,20 @@ function SuperAgent() {
     void handleSend('', { intent: 'plan_confirm_arrangements' })
   }, [handleSend])
 
+  // Ticket 07 AC1/AC4: the second summary and its confirmation. Same discipline
+  // as ticket 05's — a whitelisted intent ALONE, no fields, no draft type, no
+  // route reference, and never the tool-approval pause (that machinery is ticket
+  // 09's PDF approval, with its 300 s TTL and sandbox lease; a user reading a
+  // final summary for six minutes would expire it). This click enters 进入 PDF
+  // 审批 by moving the draft's stage; it generates no PDF of its own.
+  const handleShowFinalSummary = useCallback(() => {
+    void handleSend('', { intent: 'plan_final_review' })
+  }, [handleSend])
+
+  const handleConfirmFinalSummary = useCallback(() => {
+    void handleSend('', { intent: 'plan_confirm_final' })
+  }, [handleSend])
+
   const handlePlanDialogDismiss = useCallback(() => {    // AC2: closing the dialog parks the draft — nothing leaves the page, so
     // the conversation keeps its stored stage and the 恢复草稿 panel takes
     // over. Cancelling has its own action below; conflating the two would
@@ -1961,6 +1982,52 @@ function SuperAgent() {
               </div>
             </div>
           )}
+          {/* Ticket 07 AC2/AC5: 危险封闭 is a hard stop, not a choice. The gate
+              refused the route outright (no_go / 严重天气 / 路线关闭), so there is
+              NO 继续生成通用草案 affordance here — that is ticket 04's answer to
+              thin material, and offering it for a dangerous route would launder
+              the refusal into an advancing plan. The block reason is shown from
+              the server's own record (stable code + its copy + the gate's own
+              reason lines), never from a sentence this page writes, and both
+              exits are the ones the state machine honours: 取消 sends
+              plan_cancel, 修改安排 reopens the form locally (inert, ticket 02) so
+              a different destination can be judged again. */}
+          {planDraft?.stage === 'blocked_safety' && (
+            <div className="absolute left-4 right-4 top-16 z-50 ml-auto max-w-sm rounded-md border border-border bg-white p-4 text-sm text-text-primary shadow-xl dark:border-white/10 dark:bg-[#1e1f20]">
+              <div className="font-medium">安全门已阻止正式路线计划</div>
+              <p className="mt-1 text-xs text-text-muted">
+                {PLAN_STAGE_LABELS.blocked_safety}
+                {planDraft.draft.destination_or_route
+                  ? `：${planDraft.draft.destination_or_route}`
+                  : ''}
+              </p>
+              {planDraft.safety && (
+                <p className="mt-1 text-xs text-text-muted">
+                  阻止原因：{planDraft.safety.codes.join('、')}
+                  {planDraft.safety.message ? ` · ${planDraft.safety.message}` : ''}
+                  {planDraft.safety.comparison_status
+                    ? ` · 比较结果：${planDraft.safety.comparison_status}`
+                    : ''}
+                  {planDraft.safety.required_action
+                    ? ` · 需要采取的行动：${planDraft.safety.required_action}`
+                    : ''}
+                </p>
+              )}
+              {planDraft.safety && planDraft.safety.gate_reasons.length > 0 && (
+                <p className="mt-1 text-xs text-text-muted">
+                  核验给出的原因：{planDraft.safety.gate_reasons.join('；')}
+                </p>
+              )}
+              <div className="mt-3 flex justify-end gap-2">
+                <Button variant="ghost" size="sm" disabled={isSending} onClick={handlePlanDecline}>
+                  取消
+                </Button>
+                <Button variant="accent" size="sm" onClick={handleRestorePlanDraft}>
+                  修改安排
+                </Button>
+              </div>
+            </div>
+          )}
           {/* Ticket 02 AC2: the restore affordance. A draft in an open stage
               survives a refresh or a conversation switch (conversation-keyed
               store), and this panel is how the user gets it back — reopening
@@ -2016,6 +2083,20 @@ function SuperAgent() {
                       .join('；')}`}
                 </p>
               )}
+              {/* Ticket 07 AC2/AC5: the gate's refusal, beside the draft it
+                  refused. Shown verbatim from the payload the server emitted (and
+                  re-read from the durable mirror after a refresh), so a
+                  正式路线计划 that is NOT possible explains itself instead of just
+                  failing to appear. No record, no claim: an absent safety object
+                  renders nothing, and this page never infers a block from a
+                  missing one. */}
+              {planDraft.safety && (
+                <p className="mt-1 text-xs text-text-muted">
+                  安全门：{planDraft.safety.codes.join('、')}
+                  {planDraft.safety.message ? ` · ${planDraft.safety.message}` : ''}
+                  {planDraft.safety.hard_stop ? ' · 已阻止正式路线计划' : ''}
+                </p>
+              )}
               <div className="mt-3 flex flex-wrap justify-end gap-2">
                 {/* Ticket 04 AC1: research only makes sense once the free
                     destination exists, i.e. on a submitted draft with no route
@@ -2053,8 +2134,28 @@ function SuperAgent() {
                     确认我提供的安排
                   </Button>
                 )}
+                {/* Ticket 07 AC1/AC4: the second summary is asked for only once the
+                    first one is confirmed, and the explicit confirmation is offered
+                    only while that second summary is pending — the server refuses
+                    both otherwise, so a click can never record approval of a plan
+                    the user was never shown, and can never reach PDF approval
+                    without reading it. */}
+                {planDraft.stage === 'first_reviewed' && (
+                  <Button variant="accent" size="sm" disabled={isSending} onClick={handleShowFinalSummary}>
+                    查看最终摘要
+                  </Button>
+                )}
+                {planDraft.stage === 'awaiting_final_review' && (
+                  <Button variant="accent" size="sm" disabled={isSending} onClick={handleConfirmFinalSummary}>
+                    确认最终摘要
+                  </Button>
+                )}
                 <Button
-                  variant={planDraft.stage === 'awaiting_first_review' ? 'ghost' : 'accent'}
+                  variant={
+                    planDraft.stage === 'awaiting_first_review'
+                    || planDraft.stage === 'awaiting_final_review'
+                      ? 'ghost' : 'accent'
+                  }
                   size="sm"
                   onClick={handleRestorePlanDraft}
                 >

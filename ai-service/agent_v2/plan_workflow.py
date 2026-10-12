@@ -70,6 +70,12 @@ PlanIntent = Literal[
     "plan_first_review",
     "plan_more_input",
     "plan_confirm_arrangements",
+    # Ticket 07: the SECOND summary — 「查看最终摘要」 shows the verified route
+    # results, the user's own arrangements, the missing items and the plan type;
+    # 「确认最终摘要」 is the explicit confirmation that opens PDF approval. Both
+    # are plain conversational turns and both carry no fields at all.
+    "plan_final_review",
+    "plan_confirm_final",
 ]
 
 #: The only intents a client may send, derived from :data:`PlanIntent` so the
@@ -135,6 +141,24 @@ class PlanDraftStage(str, Enum):
     #: claim about route facts, about completeness, or about any field the
     #: system left 待确认 (that would be invention, docs/plan-pdf-format.md).
     FIRST_REVIEWED = "first_reviewed"
+    #: Ticket 07 AC1/AC4: the FIRST summary was confirmed and the user asked for
+    #: the second one, so the final review is on screen and awaiting an explicit
+    #: confirmation. It is the only stage 进入 PDF 审批 may be reached from — and
+    #: like every review stage it opens no dialog: it is answered by a structured
+    #: intent (查看最终摘要 / 确认最终摘要).
+    AWAITING_FINAL_REVIEW = "awaiting_final_review"
+    #: Ticket 07 AC4: the user explicitly confirmed the SECOND summary. This is
+    #: the record that the confirmation happened, on which draft, on which turn —
+    #: and it is the door PDF approval (ticket 09) walks through, never a claim
+    #: about safety clearance, completeness, or report eligibility.
+    FINAL_REVIEWED = "final_reviewed"
+    #: Ticket 07 AC2: the deterministic gate refused the route outright (no_go:
+    #: 严重天气、封闭路线、高风险). A hard stop, NOT a choice: ticket 04's
+    #: 资料不足 branch offers 「继续生成通用草案」 and this one does not, because
+    #: laundering a dangerous route into any advancing plan is the failure this
+    #: stage exists to prevent. The only exits are 取消 and a re-submitted form,
+    #: which the gate judges again from scratch.
+    BLOCKED_SAFETY = "blocked_safety"
     CANCELLED = "cancelled"
 
 
@@ -363,6 +387,13 @@ class PlanBlockReason:
     FIRST_REVIEW_WITHOUT_DRAFT = "first_review_without_draft"
     SUPPLEMENT_WITHOUT_DRAFT = "supplement_without_draft"
     ARRANGEMENTS_NOT_PENDING = "arrangements_not_pending"
+    # Ticket 07 — the second summary, its explicit confirmation, and the safety
+    # hard stop. ``SAFETY_BLOCKED`` is the AC5 carrier: the same stable code the
+    # event record holds is what the panel explains to the user.
+    FIRST_REVIEW_NOT_CONFIRMED = "first_review_not_confirmed"
+    FINAL_REVIEW_WITHOUT_VERDICT = "final_review_without_verdict"
+    FINAL_REVIEW_NOT_PENDING = "final_review_not_pending"
+    SAFETY_BLOCKED = "safety_blocked"
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,6 +409,13 @@ class PlanTransition:
     pure rules cannot see, so the rules name BOTH stages the turn may land on
     and the flow picks between them with the leaf's own answer. The decision
     stays here — the flow never invents a stage.
+
+    ``blocked_stage`` is ticket 07 extending that same mechanism to the leaf's
+    *third* answer: when the deterministic gate refused the route outright
+    (``no_go``), the turn does not land on the 资料不足 choice ticket 04 parks on,
+    it lands on the hard stop. Naming the stage here is what keeps
+    :func:`evaluate_plan_intent` the only transition decider — the flow reads the
+    leaf's status and picks among stages this layer already named.
     """
 
     status: Literal["ok", "blocked"]
@@ -386,6 +424,7 @@ class PlanTransition:
     draft_input: PlanDraftInput | None = None
     route_selection: RouteSelectionInput | None = None
     fallback_stage: PlanDraftStage | None = None
+    blocked_stage: PlanDraftStage | None = None
     plan_type: str | None = None
     completeness: "PlanCompleteness | None" = None
 
@@ -416,6 +455,31 @@ _FIRST_REVIEW_SOURCE_STAGES: frozenset[PlanDraftStage] = frozenset(
 _SUPPLEMENT_SOURCE_STAGES: frozenset[PlanDraftStage] = frozenset(
     {PlanDraftStage.MINIMAL_DRAFT, PlanDraftStage.AWAITING_FIRST_REVIEW}
 )
+#: Ticket 07: the second summary is asked for only once the FIRST one is
+#: confirmed. ``first_reviewed`` is ticket 05's record that the user read and
+#: confirmed their own arrangements, and the stored rule verdict (see
+#: :class:`RecordedCompleteness`) has to be on record beside it — so a final
+#: review can never be built on a draft nobody reviewed, and can never be
+#: honoured from a stale row the fields have since superseded.
+_FINAL_REVIEW_SOURCE_STAGES: frozenset[PlanDraftStage] = frozenset(
+    {PlanDraftStage.FIRST_REVIEWED}
+)
+#: Ticket 07 AC4: the confirmation exists only while that summary is pending.
+#: A repeat click from ``final_reviewed`` is refused — re-confirmation has to go
+#: through a NEW summary (ticket 05's rule, applied one stage later).
+_FINAL_CONFIRM_SOURCE_STAGES: frozenset[PlanDraftStage] = frozenset(
+    {PlanDraftStage.AWAITING_FINAL_REVIEW}
+)
+#: Ticket 07 AC2: the stage the deterministic gate's 危险封闭 answer parks on. No
+#: advancing intent is honoured from it, whatever else its stage set says, so the
+#: hard stop cannot be walked through by a click that means 资料不足.
+_DANGEROUS_STAGES: frozenset[PlanDraftStage] = frozenset({PlanDraftStage.BLOCKED_SAFETY})
+#: The intents 危险封闭 refuses. 取消, 重新填写 and 研究路线资料 are deliberately
+#: absent: the first two are the user's exits, and re-researching a destination
+#: is how the gate gets a chance to say otherwise.
+_ADVANCING_INTENTS: frozenset[str] = frozenset({
+    "plan_first_review", "plan_generic_draft", "plan_final_review", "plan_confirm_final",
+})
 
 #: User-facing text per stable rejection reason. The machine-readable
 #: ``reason`` is what clients branch on; this is only what the user reads.
@@ -465,7 +529,196 @@ BLOCK_MESSAGE: dict[str, str] = {
         "当前没有等待确认的第一次摘要。生成草案后才会请你确认本人填写的安排，"
         "未经摘要确认不会记录任何同意。"
     ),
+    PlanBlockReason.FIRST_REVIEW_NOT_CONFIRMED: (
+        "还没有确认过第一次摘要。第二次摘要只在它之后出现："
+        "先确认本人提供的安排，再查看并确认最终摘要。"
+    ),
+    PlanBlockReason.FINAL_REVIEW_WITHOUT_VERDICT: (
+        "本次会话还没有可用的完整度规则结论，无法生成或确认第二次摘要。"
+        "规则结论缺失时一律按未通过处理，不会放行。"
+    ),
+    PlanBlockReason.FINAL_REVIEW_NOT_PENDING: (
+        "当前没有等待确认的第二次摘要。进入 PDF 审批必须先查看并最终确认摘要，"
+        "未经确认不会进入任何审批环节。"
+    ),
+    PlanBlockReason.SAFETY_BLOCKED: (
+        "确定性安全门判定该路线处于危险封闭状态（严重天气、封闭路线或高风险），"
+        "已阻止正式路线计划。你只能取消本次计划书，或修改目的地/路线后重新核验。"
+    ),
 }
+
+
+@dataclass(frozen=True, slots=True)
+class RecordedCompleteness:
+    """The rules' answer as it is ON RECORD (ticket 07 AC4's precondition).
+
+    Ticket 06 stores one verdict per conversation in ``plan_completeness_checks``,
+    scoped to the draft it judged and the run that computed it. This is that row
+    seen from the domain: *which* draft it judges and *what* it concluded — no
+    field value, no route fact, no report flag (06 AC6 survives the trip).
+
+    Deliberately NOT the thing the decision is made from: :func:`evaluate_plan_intent`
+    requires a record to exist (the audit chain: the rules really ran on this
+    draft) and then decides on the *recomputed* verdict, because a stored row is
+    superseded the moment the fields change. Trusting the row would let a draft
+    that lost 集合时间 since that run read as review-ready.
+    """
+
+    draft_id: str
+    verdict: str
+    reasons: tuple[str, ...] = ()
+    checked_by_run_id: str = ""
+
+
+class PlanSafetyReason:
+    """Why the deterministic gate refused (ticket 07 AC2/AC5).
+
+    Stable, machine-readable values — the :class:`PlanBlockReason` discipline, so
+    a client branches on the code and shows :data:`SAFETY_MESSAGE` beside it, and
+    an event record explains itself long after the turn. They are NOT a second
+    decider: ``no_go`` / ``severe_weather`` / ``route_closed`` name the gate's own
+    ``risk_status == "no_go"`` answer (split only by which word in
+    :data:`route_compare.service.SEVERE` fired, so the *explanation* is the gate's
+    vocabulary too), and ``evidence_gate_failed`` names its
+    ``evidence_status != "complete"`` / non-clear answer. Nothing here re-derives a
+    threshold, and no member implies ``report_allowed`` — that stays
+    :func:`route_compare.service.render_report`'s authority.
+    """
+
+    NO_GO = "no_go"
+    SEVERE_WEATHER = "severe_weather"
+    ROUTE_CLOSED = "route_closed"
+    EVIDENCE_GATE_FAILED = "evidence_gate_failed"
+
+
+#: The readable copy beside each stable code, never reworded — only added.
+SAFETY_MESSAGE: dict[str, str] = {
+    PlanSafetyReason.NO_GO: (
+        "确定性安全门判定该路线危险封闭（严重天气、封闭路线或高风险条件），"
+        "已阻止生成正式路线计划。"
+    ),
+    PlanSafetyReason.SEVERE_WEATHER: (
+        "该日期存在雷暴、台风、暴雨、暴雪或大风预警等严重天气，安全门禁止据此出计划。"
+    ),
+    PlanSafetyReason.ROUTE_CLOSED: (
+        "官方或资料来源显示路线封闭，安全门禁止据此出计划。"
+    ),
+    PlanSafetyReason.EVIDENCE_GATE_FAILED: (
+        "天气、开放状态或风险资料不足或未通过时效核验，正式路线计划被阻止；"
+        "缺口仍为待核验，可继续通用草案。"
+    ),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class PlanSafety:
+    """The gate's own refusal, carried as data (ticket 07 AC2/AC5).
+
+    Built by the route leaf from the :class:`route_compare.models.ComparisonResult`
+    it already produced: ``codes`` are the stable names, ``gate_reasons`` and
+    ``required_action`` are the gate's own strings copied verbatim (this module has
+    no parameter by which a caller could write a safety sentence), and
+    ``comparison_status`` is the comparison's status untouched. ``hard_stop`` is the
+    AC2/AC3 split in one boolean: a dangerous route refuses *everything* advancing
+    (``no_go``), while a missing-evidence answer refuses only the formal route plan
+    and leaves ticket 04's generic-draft choice standing.
+    """
+
+    hard_stop: bool
+    codes: tuple[str, ...] = ()
+    comparison_id: str = ""
+    comparison_status: str = ""
+    gate_reasons: tuple[str, ...] = ()
+    required_action: str = ""
+
+    @property
+    def blocks_formal_route_plan(self) -> bool:
+        """AC2: no formal route plan may be built on this answer.
+
+        True for the hard stop AND for an evidence-gate failure — which is exactly
+        the case the derived ``plan_type`` already refuses, stated here so the
+        refusal is *named* in the record instead of only implied by an absent basis.
+        """
+        return self.hard_stop or PlanSafetyReason.EVIDENCE_GATE_FAILED in self.codes
+
+    def to_payload(self) -> dict[str, Any]:
+        """The wire shape (AC5): codes, the gate's own copy, and its own reasons."""
+        return {
+            "hard_stop": self.hard_stop,
+            "codes": list(self.codes),
+            "formal_route_plan_allowed": not self.blocks_formal_route_plan,
+            "message": "；".join(
+                SAFETY_MESSAGE[code] for code in self.codes if code in SAFETY_MESSAGE
+            ),
+            "comparison_id": self.comparison_id,
+            "comparison_status": self.comparison_status,
+            "gate_reasons": list(self.gate_reasons),
+            "required_action": self.required_action,
+        }
+
+
+def safety_lines(safety: PlanSafety) -> str:
+    """The refusal as deterministic copy, in one place (ticket 07 AC5).
+
+    Rendered from the record the gate produced, so the streamed text, the
+    ``plan.draft_state`` payload and the stored event cannot describe different
+    refusals. The only sentences here are :data:`SAFETY_MESSAGE` and the gate's own
+    reason lines — never a paraphrase that could soften 禁止推荐 into 建议谨慎.
+    """
+    lines = ["**安全门结论（由 route_compare 的确定性核验给出，本模块只转述）**"]
+    if safety.codes:
+        lines.append(
+            "- 阻止原因："
+            + "、".join(f"{code}（{SAFETY_MESSAGE.get(code, code)}）" for code in safety.codes)
+        )
+    if safety.comparison_status:
+        lines.append(
+            f"- 比较结果：{safety.comparison_status}"
+            + (f"（comparison_id={safety.comparison_id}）" if safety.comparison_id else "")
+        )
+    for reason in safety.gate_reasons:
+        lines.append(f"- 核验给出的原因：{reason}")
+    if safety.required_action:
+        lines.append(f"- 需要采取的行动：{safety.required_action}")
+    lines.append(
+        "- 结论：危险封闭已阻止正式路线计划，只能取消本次计划书或修改目的地/路线后重新核验。"
+        if safety.hard_stop
+        else (
+            "- 结论：证据/安全门未通过，正式路线计划被阻止；未通过核验的路线事实仍为待核验，"
+            "你可以继续生成通用草案或取消。"
+            if safety.blocks_formal_route_plan
+            else "- 结论：路线资料已通过确定性核验。"
+        )
+    )
+    return "\n".join(lines)
+
+
+def pdf_approval_block_reason(
+    *,
+    stage: PlanDraftStage | None,
+    recorded_completeness: RecordedCompleteness | None,
+    safety: PlanSafety | None,
+) -> str | None:
+    """AC4's door, as one pure question: may this draft enter PDF approval?
+
+    ``None`` means yes. Ticket 09 owns the approval itself (the existing artifact
+    lifecycle and the tool-approval machinery), and calls this instead of
+    re-deciding anything: the answer is three facts already owned elsewhere — the
+    stage :func:`evaluate_plan_intent` wrote, the verdict ticket 06 stored, and the
+    refusal the deterministic gate produced. There is deliberately no
+    ``report_allowed`` parameter: that claim belongs to
+    :func:`route_compare.service.render_report` and nothing here may accept it from
+    a client.
+    """
+    if stage is PlanDraftStage.BLOCKED_SAFETY:
+        return PlanBlockReason.SAFETY_BLOCKED
+    if safety is not None and safety.hard_stop and safety.codes:
+        return safety.codes[0]
+    if stage is not PlanDraftStage.FINAL_REVIEWED:
+        return PlanBlockReason.FINAL_REVIEW_NOT_PENDING
+    if recorded_completeness is None:
+        return PlanBlockReason.FINAL_REVIEW_WITHOUT_VERDICT
+    return None
 
 
 def evaluate_plan_intent(
@@ -477,6 +730,8 @@ def evaluate_plan_intent(
     route_selection: RouteSelectionInput | dict | None = None,
     plan_type: str | None = None,
     completeness: "PlanCompleteness | None" = None,
+    recorded_completeness: "RecordedCompleteness | None" = None,
+    safety: "PlanSafety | None" = None,
 ) -> PlanTransition:
     """Decide what a structured intent may do, given the current stage.
 
@@ -534,6 +789,13 @@ def evaluate_plan_intent(
         else:
             return PlanTransition("blocked", reason=PlanBlockReason.INVALID_ROUTE_SELECTION)
 
+    if intent in _ADVANCING_INTENTS and current_stage in _DANGEROUS_STAGES:
+        # Ticket 07 AC2: 危险封闭 is a hard stop, checked before any stage set, so
+        # no advancing click walks through it. The refusal is a stable reason the
+        # event record and the panel both explain, and the shape of the input is
+        # judged first on purpose — a smuggled field is still plan_input_not_allowed.
+        return PlanTransition("blocked", reason=PlanBlockReason.SAFETY_BLOCKED)
+
     if intent == "plan_select_route":
         # AC1/AC3: verified route facts join a draft that already holds the
         # user's arrangements. Selecting into ``awaiting_input`` (nothing
@@ -568,6 +830,10 @@ def evaluate_plan_intent(
             "ok",
             stage=PlanDraftStage.MINIMAL_DRAFT,
             fallback_stage=PlanDraftStage.AWAITING_GENERIC_CHOICE,
+            # Ticket 07 AC2: the leaf's third answer. Material that is merely thin
+            # parks on the choice; material the gate refused outright parks on the
+            # hard stop. Both stages are named HERE, so the flow still only picks.
+            blocked_stage=PlanDraftStage.BLOCKED_SAFETY,
         )
 
     if intent == "plan_generic_draft":
@@ -619,6 +885,51 @@ def evaluate_plan_intent(
         if current_stage is not PlanDraftStage.AWAITING_FIRST_REVIEW:
             return PlanTransition("blocked", reason=PlanBlockReason.ARRANGEMENTS_NOT_PENDING)
         return PlanTransition("ok", stage=PlanDraftStage.FIRST_REVIEWED)
+
+    if intent == "plan_final_review":
+        # Ticket 07 AC1/AC4: 「查看最终摘要」 — the SECOND summary, the one that
+        # shows the verified route results beside the user's own arrangements, the
+        # missing items and the plan type. It is reachable only from the stage that
+        # proves the first summary was confirmed, and only with the rules' answer
+        # both recomputed AND on record; the guard order is the safety property,
+        # because a final review built on an unreviewed first summary would be a
+        # second confirmation of nothing.
+        if current_stage not in _FINAL_REVIEW_SOURCE_STAGES:
+            return PlanTransition(
+                "blocked", reason=PlanBlockReason.FIRST_REVIEW_NOT_CONFIRMED
+            )
+        # AC4 fails CLOSED, exactly like ticket 06's review gate: no fresh verdict,
+        # or no stored row for this draft, means the rules never decided anything
+        # here, and a missing rule input is never a passing one.
+        if completeness is None or recorded_completeness is None:
+            return PlanTransition(
+                "blocked", reason=PlanBlockReason.FINAL_REVIEW_WITHOUT_VERDICT
+            )
+        # AC3 vs AC2 kept apart: an ordinary missing arrangement is ticket 06's
+        # bounce (补充流程 + the stable reason codes), NOT a safety block, and NOT
+        # a second decider. The dangerous case never reaches this branch — the
+        # stage guard above refused it with ``safety_blocked``.
+        if completeness.supplement_required:
+            return PlanTransition(
+                "ok", stage=PlanDraftStage.AWAITING_INPUT, completeness=completeness
+            )
+        return PlanTransition(
+            "ok", stage=PlanDraftStage.AWAITING_FINAL_REVIEW, completeness=completeness
+        )
+
+    if intent == "plan_confirm_final":
+        # Ticket 07 AC4: the explicit confirmation, and the only move that reaches
+        # ``final_reviewed`` — the stage 进入 PDF 审批 is read from. Requiring
+        # ``awaiting_final_review`` is what makes the record honest: a click cannot
+        # confirm a summary the user was never shown, and a second click on an
+        # already-confirmed plan cannot re-open the door (05's rule, one stage on).
+        if current_stage not in _FINAL_CONFIRM_SOURCE_STAGES:
+            return PlanTransition("blocked", reason=PlanBlockReason.FINAL_REVIEW_NOT_PENDING)
+        if completeness is None or recorded_completeness is None:
+            return PlanTransition(
+                "blocked", reason=PlanBlockReason.FINAL_REVIEW_WITHOUT_VERDICT
+            )
+        return PlanTransition("ok", stage=PlanDraftStage.FINAL_REVIEWED)
 
     if intent == "plan_create":
         # Re-entry from any stage is legal: the dialog is idempotent and a
@@ -1116,6 +1427,15 @@ STAGE_MESSAGE: dict[PlanDraftStage, str] = {
         "因此不会据此生成正式路线计划。你可以继续生成「通用草案」，或取消本次计划书；"
         "未通过核验的路线事实仍为待核验。"
     ),
+    # Ticket 07 AC2/AC5: the hard stop says what was refused and what the user's
+    # two exits are. It never names 通用草案 (that is 04's answer to thin material,
+    # not to danger) and it never prints a value: the explanation beside it comes
+    # from :func:`safety_lines`, i.e. from the gate's own strings.
+    PlanDraftStage.BLOCKED_SAFETY: (
+        "确定性安全门判定该目的地/路线处于危险封闭状态（严重天气、封闭路线或高风险），"
+        "已阻止生成正式路线计划，本次不提供通用草案。你可以取消本次计划书，"
+        "或修改目的地/路线后重新核验；阻止结论与原因由服务器给出并记录在事件里。"
+    ),
 }
 
 
@@ -1128,6 +1448,7 @@ def draft_summary(
     route: RouteBasis | None = None,
     arrangements: dict[str, str] | None = None,
     completeness: PlanCompleteness | None = None,
+    safety: PlanSafety | None = None,
 ) -> str:
     """The draft summary for a stage and the fields stored with it (Ticket 02 AC3).
 
@@ -1175,14 +1496,29 @@ def draft_summary(
             route=route,
             arrangements=arrangements,
         )
-    elif stage in (PlanDraftStage.AWAITING_FIRST_REVIEW, PlanDraftStage.FIRST_REVIEWED):
+    elif stage in (
+        # Ticket 05's two stages, and ticket 07's two, are the SAME render with a
+        # different ``review`` scope: the second summary is the draft re-organised
+        # for a final look at 路线核验结果 + 用户安排 + 缺失项 + 计划类型, so the
+        # 待确认 / 待核验 boundary and the 草案类型 marker cannot drift between the
+        # two confirmations (AC1) — and there is still no parameter that could
+        # carry a value the draft does not hold.
+        PlanDraftStage.AWAITING_FIRST_REVIEW, PlanDraftStage.FIRST_REVIEWED,
+        PlanDraftStage.AWAITING_FINAL_REVIEW, PlanDraftStage.FINAL_REVIEWED,
+    ):
+        review_mode = {
+            PlanDraftStage.AWAITING_FIRST_REVIEW: "pending",
+            PlanDraftStage.FIRST_REVIEWED: "confirmed",
+            PlanDraftStage.AWAITING_FINAL_REVIEW: "final_pending",
+            PlanDraftStage.FINAL_REVIEWED: "final_confirmed",
+        }[stage]
         base = render_minimal_draft(
             destination_or_route=destination_or_route,
             activity_date=activity_date,
             participants=participants,
             route=route,
             arrangements=arrangements,
-            review="confirmed" if stage is PlanDraftStage.FIRST_REVIEWED else "pending",
+            review=review_mode,
         )
         # Ticket 06 AC4: the summary the user confirms also carries the rule's
         # answer beside it, so 待确认 (arrangement), 待核验 (fact) and "these are
@@ -1190,6 +1526,19 @@ def draft_summary(
         # three vocabularies that can disagree.
         if completeness is not None:
             base = f"{base}\n\n{completeness_lines(completeness)}"
+        # Ticket 07 AC2/AC5: what the gate refused is said in the same text the
+        # user confirms, in the gate's own words — a final summary that hid a
+        # refusal would otherwise read as an approved plan.
+        if safety is not None:
+            base = f"{base}\n\n{safety_lines(safety)}"
+    elif stage is PlanDraftStage.BLOCKED_SAFETY:
+        # AC5: the hard stop explains itself. Without the refusal lines the stage
+        # copy says 危险封闭 without the gate's reason, its required action, or the
+        # comparison it came from — and the event record would be the only place a
+        # reviewer could find out why no plan exists.
+        base = STAGE_MESSAGE[stage]
+        if safety is not None:
+            base = f"{base}\n\n{safety_lines(safety)}"
     elif stage is PlanDraftStage.AWAITING_INPUT and completeness is not None:
         # Ticket 06 AC3: 直接生成草案 over a draft missing a core arrangement
         # lands HERE — on the supplement flow — and the copy has to say why, or
@@ -1298,7 +1647,7 @@ def render_minimal_draft(
     activity_date: str,
     participants: int | None,
     route: RouteBasis | None = None,
-    review: Literal["pending", "confirmed"] | None = None,
+    review: Literal["pending", "confirmed", "final_pending", "final_confirmed"] | None = None,
     arrangements: dict[str, str] | None = None,
 ) -> str:
     """Render the previewable minimal draft (spec AC1 "可预览的最小草稿").
@@ -1394,27 +1743,55 @@ def render_minimal_draft(
 
     supplied_lines = [line for line in arrangement_lines
                       if not line.endswith(f"：{UNCONFIRMED}")]
-    title = (
-        "**第一次摘要（已确认：仅确认由你本人提供的安排）**" if review == "confirmed"
-        else "**第一次摘要确认（只确认由你本人提供的安排）**"
+    is_final = review in ("final_pending", "final_confirmed")
+    if review == "confirmed":
+        title = "**第一次摘要（已确认：仅确认由你本人提供的安排）**"
+    elif review == "pending":
+        title = "**第一次摘要确认（只确认由你本人提供的安排）**"
+    elif review == "final_confirmed":
+        title = "**最终摘要（已确认：可进入 PDF 审批）**"
+    else:
+        title = "**最终摘要确认（PDF 生成前的第二次摘要）**"
+    supplied_heading = (
+        "**由你提供的安排（本人填写，逐项列出）**" if is_final
+        else "**由你提供的安排（本摘要只确认这些）**"
+    )
+    missing_heading = (
+        f"**尚未填写的字段（待确认 / {UNVERIFIED}清单 · 进入 PDF 审批前请核对）**" if is_final
+        else "**尚未填写的字段（缺失清单 · 等你补充，系统不会代填）**"
     )
     sections = [
         title,
         type_line,
-        "**由你提供的安排（本摘要只确认这些）**",
+        supplied_heading,
         *(supplied_lines or ["- （尚无填写：以下缺失清单即全部字段）"]),
-        "**尚未填写的字段（缺失清单 · 等你补充，系统不会代填）**",
+        missing_heading,
         *(missing_lines or ["- 无缺失字段"]),
     ]
     if route_attached:
         sections.append(facts_pointer_line)
-    sections.append(
-        "你已确认以上由你本人提供的安排。未填写的字段仍为待确认，路线事实仍以服务器核验结果为准："
-        "本次确认不代表这些安排已补齐，也不代表计划完整或已通过安全审核。"
-        if review == "confirmed"
-        else "以上未填写的字段一律留空：系统不会替你补充日期、费用、联系电话或撤退地点。"
-        "你可以选择「继续补充」，或确认本摘要只反映你本人提供的安排与输入。"
-    )
+    if is_final:
+        final_closing = (
+            "你已经确认第一次摘要中的本人安排，以上是第二次（最终）摘要："
+            "路线核验结果由服务器复核并保持来源，未填写的字段仍为待确认，"
+            "未通过核验的路线事实仍为待核验。"
+            + (
+                "你已明确确认本次最终摘要，计划书可进入 PDF 审批环节；"
+                "未经这份确认不会进入审批，且本确认不代表计划完整、安排已补齐或已通过安全审核。"
+                if review == "final_confirmed"
+                else "确认以上内容后才会进入 PDF 审批；不确认可以继续补充或取消本次计划书，"
+                "系统不会替你生成 PDF，也不会替你判断风险。"
+            )
+        )
+        sections.append(final_closing)
+    else:
+        sections.append(
+            "你已确认以上由你本人提供的安排。未填写的字段仍为待确认，路线事实仍以服务器核验结果为准："
+            "本次确认不代表这些安排已补齐，也不代表计划完整或已通过安全审核。"
+            if review == "confirmed"
+            else "以上未填写的字段一律留空：系统不会替你补充日期、费用、联系电话或撤退地点。"
+            "你可以选择「继续补充」，或确认本摘要只反映你本人提供的安排与输入。"
+        )
     return "\n".join(sections)
 
 

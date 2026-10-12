@@ -484,6 +484,14 @@ _VALID_PLAN_DRAFT_STAGES: frozenset[str] = frozenset(
         "awaiting_generic_choice",
         "awaiting_first_review",
         "first_reviewed",
+        # Ticket 07: the second summary and its explicit confirmation, plus the
+        # hard stop the deterministic gate's no_go answer parks on. Same reason as
+        # above for listing them here: the store is the boundary that refuses a
+        # stage this build does not know, so a new member has to arrive in all six
+        # places at once (see test_plan_draft_restore.py's pinned cross-checks).
+        "awaiting_final_review",
+        "final_reviewed",
+        "blocked_safety",
         "cancelled",
     }
 )

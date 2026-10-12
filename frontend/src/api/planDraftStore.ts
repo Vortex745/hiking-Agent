@@ -26,6 +26,7 @@ import type {
   V2PlanCompletenessRules,
   V2PlanDraftStage,
   V2PlanDraftState,
+  V2PlanSafety,
 } from './chatV2'
 import { V2_PLAN_ARRANGEMENT_KEYS } from './chatV2'
 import { readPlanDraftState } from './v2Reducer'
@@ -52,12 +53,23 @@ const MAX_STORED_DRAFTS = 50
  * has to reach the server from either stage. Unlike the parked research stage
  * they render no second panel — the review affordances live inside this one
  * panel, so nothing stacks.
+ *
+ * Ticket 07's two final-review stages follow the same reasoning and are in the
+ * set for the same reasons: a confirmed second summary still holds 待确认 items
+ * (the confirmation covers what the user supplied, never the gaps), the user can
+ * still be asked to reopen the form and fix one, and 取消草稿 must stay reachable.
+ * ``blocked_safety`` is deliberately NOT in the set, exactly like
+ * ``awaiting_generic_choice``: it is answered by its own hard-stop panel, so
+ * making it reopenable would stack two ``top-16`` panels — and its 取消 goes
+ * through that panel's own ``plan_cancel`` affordance.
  */
 export const OPEN_PLAN_DRAFT_STAGES: ReadonlySet<V2PlanDraftStage> = new Set([
   'awaiting_input',
   'minimal_draft',
   'awaiting_first_review',
   'first_reviewed',
+  'awaiting_final_review',
+  'final_reviewed',
 ])
 
 /** A cancelled draft is terminal: nothing durable, nothing restorable. */
@@ -179,6 +191,11 @@ export function isSamePlanDraft(
     // confirmation_required flip after filling a core arrangement is exactly
     // what the user needs to see without a reload.
     && isSameCompletenessRules(a.rules, b.rules)
+    // Ticket 07 AC5: the gate's refusal is diffed too. Skip it and a draft that
+    // just became blocked (or just stopped being one) looks like "no change" to
+    // the restore effect, so after a refresh the panel keeps showing the OLD
+    // safety state — the one piece of state a user must never read stale.
+    && isSamePlanSafety(a.safety, b.safety)
     && a.draft.destination_or_route === b.draft.destination_or_route
     && a.draft.activity_date === b.draft.activity_date
     && a.draft.participants === b.draft.participants
@@ -229,6 +246,24 @@ function isSameMissingFields(
 function isSameArrangements(a: V2PlanArrangementFields, b: V2PlanArrangementFields): boolean {
   if (a === b) return true
   return V2_PLAN_ARRANGEMENT_KEYS.every(key => a[key] === b[key])
+}
+
+/**
+ * Ticket 07 AC5: the safety record compared by the parts that carry meaning —
+ * whether this is a hard stop, whether the formal route plan is refused, and the
+ * stable codes in order. A new comparison id with the same codes is a new
+ * refusal the user should see, so the id is part of the diff; the prose
+ * (``message`` / ``gate_reasons``) comes from the same server render as the codes,
+ * so re-rendering on identical codes with identical ids would be pure churn.
+ */
+function isSamePlanSafety(a: V2PlanSafety | null, b: V2PlanSafety | null): boolean {
+  if (a === b) return true
+  if (!a || !b) return false
+  return a.hard_stop === b.hard_stop
+    && a.formal_route_plan_allowed === b.formal_route_plan_allowed
+    && a.comparison_id === b.comparison_id
+    && a.codes.length === b.codes.length
+    && a.codes.every((code, index) => code === b.codes[index])
 }
 
 /**

@@ -244,6 +244,10 @@ def test_every_stage_renders_a_summary():
         PlanDraftStage.MINIMAL_DRAFT,
         PlanDraftStage.AWAITING_FIRST_REVIEW,
         PlanDraftStage.FIRST_REVIEWED,
+        # Ticket 07: the second summary is the same field render with a final
+        # ``review=`` scope, so it names the stored arrangements too.
+        PlanDraftStage.AWAITING_FINAL_REVIEW,
+        PlanDraftStage.FINAL_REVIEWED,
     }
     for stage in PlanDraftStage:
         rendered = draft_summary(

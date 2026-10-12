@@ -84,6 +84,17 @@ export type V2PlanIntent =
    * unless a first summary is actually pending, so a click can never record
    * approval of a draft the user has not been shown. */
   | 'plan_confirm_arrangements'
+  /* Ticket 07 AC1/AC4: 「查看最终摘要」 — ask for the SECOND summary, the one that
+   * shows the verified route results beside the user's own arrangements, the
+   * missing items and the plan type. The server refuses it before the first
+   * summary is confirmed and without a stored rule verdict, so a final review
+   * can never be built on an unreviewed draft. */
+  | 'plan_final_review'
+  /* Ticket 07 AC4: confirm the SECOND summary. This is the explicit user
+   * confirmation that 进入 PDF 审批 depends on, and the only intent that reaches
+   * `final_reviewed` — it generates no PDF itself (that is the approval and
+   * artifact lifecycle's business). */
+  | 'plan_confirm_final'
 
 /**
  * Ticket 04 AC5: what kind of draft the server is holding. Derived server-side
@@ -137,6 +148,19 @@ export type V2PlanDraftStage =
    * the user supplied and for nothing else. Durable and auditable — it is the
    * record that the confirmation happened, on which draft, on which turn. */
   | 'first_reviewed'
+  /* Ticket 07 AC1/AC4: the SECOND summary is on screen, awaiting an explicit
+   * confirmation. It is reached only from `first_reviewed` and only once the
+   * stored rule verdict is on record. */
+  | 'awaiting_final_review'
+  /* Ticket 07 AC4: the user explicitly confirmed the final summary. This is the
+   * only stage 进入 PDF 审批 may be read from, and it claims nothing about
+   * completeness, route verification or safety clearance. */
+  | 'final_reviewed'
+  /* Ticket 07 AC2: the deterministic gate refused the route outright (no_go:
+   * severe weather, closed trail, high risk). A hard stop, NOT 资料不足: unlike
+   * awaiting_generic_choice it offers no generic-draft escape, only 取消 or a
+   * re-submitted destination for the gate to judge again. */
+  | 'blocked_safety'
   | 'cancelled'
 
 /** The three fields the entry dialog has always made mandatory. */
@@ -257,6 +281,39 @@ export const V2_PLAN_VERDICTS: ReadonlySet<V2PlanCompletenessRules['verdict']> =
   'supplement_required',
 ])
 
+/**
+ * Ticket 07 AC2/AC5: the deterministic gate's own refusal, as the server sent it.
+ *
+ * ``codes`` are the stable machine values (``no_go`` / ``severe_weather`` /
+ * ``route_closed`` / ``evidence_gate_failed``) and ``message`` is their readable
+ * copy — the UI branches on the code and prints the copy verbatim, exactly like
+ * the reason codes above. ``gateReasons`` / ``requiredAction`` are the gate's own
+ * strings, copied, never paraphrased, so the panel cannot soften 禁止推荐 into
+ * advice. ``hardStop`` is the AC2/AC3 split: a dangerous route refuses every
+ * advancing step, while an evidence-gate failure refuses only the formal route
+ * plan and leaves ticket 04's generic-draft choice standing. There is
+ * deliberately no ``report_allowed`` field: eligibility stays
+ * ``route_compare.service.render_report``'s authority (AC6, ticket 06's rule).
+ */
+export interface V2PlanSafety {
+  hard_stop: boolean
+  formal_route_plan_allowed: boolean
+  codes: string[]
+  message: string
+  comparison_id: string
+  comparison_status: string
+  gate_reasons: string[]
+  required_action: string
+}
+
+/** The stable safety codes this build knows how to explain. */
+export const V2_PLAN_SAFETY_CODES: readonly string[] = [
+  'no_go',
+  'severe_weather',
+  'route_closed',
+  'evidence_gate_failed',
+]
+
 export interface V2PlanDraftState {
   stage: V2PlanDraftStage
   draft_id: string
@@ -302,6 +359,13 @@ export interface V2PlanDraftState {
    * when no draft existed for the rules to judge (or an older server).
    */
   rules: V2PlanCompletenessRules | null
+  /**
+   * Ticket 07 AC2/AC5: the deterministic gate's refusal beside this draft — the
+   * stable block code, its readable copy and the gate's own reason lines. `null`
+   * when the gate refused nothing (or an older server), which is why the panel
+   * never infers a safety state from an absent value: no record, no claim.
+   */
+  safety: V2PlanSafety | null
   draft: {
     destination_or_route: string
     activity_date: string
@@ -323,6 +387,9 @@ export const V2_PLAN_DRAFT_STAGES: ReadonlySet<V2PlanDraftStage> = new Set([
   'awaiting_generic_choice',
   'awaiting_first_review',
   'first_reviewed',
+  'awaiting_final_review',
+  'final_reviewed',
+  'blocked_safety',
   'cancelled',
 ])
 
