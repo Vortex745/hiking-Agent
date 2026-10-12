@@ -97,6 +97,7 @@ def _resume_orchestrator(
     computer: _FakeComputer,
     cleanups: list[Any],
     export_calls: list[dict[str, Any]] | None = None,
+    kernel_turn=None,
 ):
     async def fake_kernel(**kwargs: Any) -> tuple[str, list[dict[str, Any]]]:
         return ("# 计划", [])
@@ -116,7 +117,7 @@ def _resume_orchestrator(
     return RunOrchestrator(
         settings=_settings(),
         runs_repo=repo,
-        kernel_turn=fake_kernel,
+        kernel_turn=kernel_turn or fake_kernel,
         artifact_export=fake_export,
         computer_factory=lambda *a, **k: computer,
         sandbox_cleanup=lambda *a, **k: cleanups.append(k),
@@ -220,12 +221,34 @@ def test_approved_pdf_resume_executes_and_completes_with_cleanup(tmp_path):
     assert len(computer.pdfs) == 1
     ws, content, filename = computer.pdfs[0]
     assert ws == "/ws/" + run_id and filename == "hiking-plan.pdf"
+    assert content == "# 计划"  # Render the generated plan, never the original request.
     assert export_calls[0]["workspace_path"] == ws
     assert len(cleanups) == 1
     run = repo.get_run(run_id)
     assert run is not None and run.status == "done"
     effect = repo.list_effects_for_run(run_id)[0]
     assert effect.status == EffectStatus.COMMITTED.value
+
+
+def test_plan_generation_failure_does_not_export_request_text_or_repeat_model(tmp_path):
+    from agent_v2.kernel import KernelModelFailure
+
+    calls = []
+    async def failing_kernel(**kwargs):
+        calls.append(kwargs)
+        raise KernelModelFailure("model_failed", "模型失败")
+
+    repo = _repo(tmp_path)
+    computer = _FakeComputer()
+    orch = _resume_orchestrator(repo, computer, [], kernel_turn=failing_kernel)
+    run_id, approval_id = _run_pause_flow(orch, repo, "pdf-model-failed")
+    repo.resolve_approval(approval_id=approval_id, status="approved", decision_request_id="decision-failed")
+    first = _stream_resume(orch, run_id)
+    assert first[-1].type == "error"
+    assert computer.pdfs == []
+    assert repo.list_effects_for_run(run_id)[0].status == EffectStatus.FAILED.value
+    assert _stream_resume(orch, run_id)[-1].type == "error"
+    assert len(calls) == 1
 
 
 def test_resume_with_lost_sandbox_lease_fails_closed(tmp_path):

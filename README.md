@@ -36,7 +36,7 @@ AI Hiking 将 React 前端、Go API Gateway 和 Python FastAPI AI Service 组合
 
 不要把 `.env`、API Key、SSH Key、Cookie 或第三方平台 Token 提交到仓库。模型、Embedding、Rerank、高德地图和 Feishu 等密钥应只存在于本地 `.env`、GitHub Secrets 或服务器运行环境中。
 
-`/llm-config` 会把浏览器侧模型配置保存在 localStorage，并随请求发送给后端；它不会把密钥写入仓库。
+`/llm-config` 仅用于临时测试模型列表和延迟。API Key 不会写入 localStorage，聊天请求使用 AI Service 的服务端环境变量配置。
 
 ## 背景
 
@@ -240,21 +240,27 @@ AI Service：
 ```bash
 cd ai-service
 python -m compileall -q .
-python -m pytest tests -q
+python -m pytest -q
+```
+
+首次启动前安装完整依赖（包含仓库内固定版本的 UniHarness）：
+
+```bash
+python -m pip install -r requirements.txt
+python -m pip install -e ../third_party/uniharness/libs/uniharness
 ```
 
 ## 部署
 
 ### GitHub Actions
 
-`main` 分支推送会触发 `.github/workflows/deploy.yml`：
+`main` 分支推送会触发 `.github/workflows/deploy.yml` 验证流水线：
 
-1. 校验前端、Gateway、AI Service 语法和生产 Compose 文件。
-2. 构建 `ai-service`、`gateway`、`frontend` 三个镜像。
-3. 推送到 Docker Hub 仓库 `zijinn123/ai-hiking`。
-4. 发布 pgvector 的 runtime 镜像副本。
-5. 通过 SSH 上传 `docker-compose.prod.yml` 和生产 `.env`。
-6. 在服务器上拉取 `sha-*` 镜像并重启服务。
+1. 构建前端并运行 Gateway 测试。
+2. 安装完整 AI Service 依赖，运行 pytest 和 Python 编译检查。
+3. 校验生产 Compose，并构建三个服务镜像（AI Service 使用仓库内固定的 UniHarness fork）。
+
+本流水线只做验证和构建，不自动推送镜像或部署生产环境。
 
 需要的 GitHub Secrets：
 
@@ -279,6 +285,15 @@ DOCKERHUB_IMAGE=zijinn123/ai-hiking IMAGE_TAG=latest docker compose -f docker-co
 
 生产 Compose 只包含应用服务和 Postgres。会话与长期记忆由 Agent v2 的 SQLite 存储持有（需要为实例配置持久卷），不再依赖外部 Redis。
 
+生产默认开启 `AGENT_V2_ENABLED=true`，AI Service 使用 `/ready` 作为容器就绪探针。当前 `remote_e2b` 仍是明确标注的开发占位实现；需要真实多租户沙箱时，应接入 E2B 客户端后再开放 artifact/cowork 能力。
+
+本地演示知识库（无需 Embedding API）：
+
+```bash
+cd ai-service
+python scripts/seed_rag.py
+```
+
 ### CloudBase
 
 前端生产环境默认 API 地址配置在 `frontend/src/api/config.ts`：
@@ -299,7 +314,7 @@ https://gateway-262534-6-1364947792.sh.run.tcloudbase.com/api/v1
 
 ### Agent 提示缺少 API Key
 
-检查 `.env` 中的 `OPENAI_API_KEY`，或在 `/llm-config` 中配置可用模型参数。
+检查仓库根目录 `.env` 中的 `OPENAI_API_KEY` 和 `OPENAI_BASE_URL`。`/llm-config` 的密钥只用于临时测速，不会改变服务端聊天配置。
 
 ### RAG 没有检索结果
 

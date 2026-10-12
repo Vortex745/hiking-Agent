@@ -47,6 +47,7 @@ resume keeps the sandbox alive when the CAS winner is still executing.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -423,7 +424,7 @@ async def drive_effect(
     all_events: list[dict[str, Any]],
     has_tool_call: bool,
     has_tool_result_ok: bool,
-    execute: Callable[[], dict[str, Any]],
+    execute: Callable[[], Any],
     emit: EmitLike,
     outcome: EffectDriveResult,
 ) -> AsyncGenerator[Any, None]:
@@ -473,11 +474,11 @@ async def drive_effect(
             "tool": copy.tool_name,
             "message": copy.crash_unknown_message,
         })
+        mark_terminal_safe(runs_repo, run_id, "error")
         yield emit("error", {
             "code": "effect_outcome_unknown",
             "message": copy.crash_error_message,
         })
-        mark_terminal_safe(runs_repo, run_id, "error")
         return
 
     # Prior terminal failure — don't re-execute (spec AC3).
@@ -494,11 +495,11 @@ async def drive_effect(
             "status": "error",
             "content": f"{copy.tool_result_failure_prefix}{reason}",
         })
+        mark_terminal_safe(runs_repo, run_id, "error")
         yield emit("error", {
             "code": copy.failure_code,
             "message": f"{copy.error_failure_prefix}{reason}",
         })
-        mark_terminal_safe(runs_repo, run_id, "error")
         return
 
     # Prior outcome_unknown — needs human review, terminate.
@@ -509,11 +510,11 @@ async def drive_effect(
             "tool": copy.tool_name,
             "message": copy.unknown_message,
         })
+        mark_terminal_safe(runs_repo, run_id, "error")
         yield emit("error", {
             "code": "effect_outcome_unknown",
             "message": copy.unknown_message,
         })
-        mark_terminal_safe(runs_repo, run_id, "error")
         return
 
     # Prior committed — recover result from stored effect (spec AC2).
@@ -579,8 +580,8 @@ async def drive_effect(
                     })
                     err_code = copy.failure_code
                     err_msg = f"{copy.error_failure_prefix}{reason}"
-                yield emit("error", {"code": err_code, "message": err_msg})
                 mark_terminal_safe(runs_repo, run_id, "error")
+                yield emit("error", {"code": err_code, "message": err_msg})
             else:
                 # ``executing`` — the other executor is still in flight.
                 # Do NOT modify the effect (Ticket 12 review H1).
@@ -600,6 +601,8 @@ async def drive_effect(
         })
         try:
             result = execute()
+            if inspect.isawaitable(result):
+                result = await result
         except SandboxTimeoutError as exc:
             runs_repo.mark_effect_failed(effect_key, reason=str(exc))
             outcome.status = "failed"
@@ -608,11 +611,11 @@ async def drive_effect(
                 "status": "timeout",
                 "content": f"{copy.tool_result_timeout_prefix}{exc}",
             })
+            mark_terminal_safe(runs_repo, run_id, "error")
             yield emit("error", {
                 "code": "sandbox_timeout",
                 "message": f"{copy.timeout_error_message_prefix}{exc}",
             })
-            mark_terminal_safe(runs_repo, run_id, "error")
             return
         except ComputerError as exc:
             runs_repo.mark_effect_failed(effect_key, reason=str(exc))
@@ -622,11 +625,11 @@ async def drive_effect(
                 "status": "error",
                 "content": f"{copy.tool_result_failure_prefix}{exc}",
             })
+            mark_terminal_safe(runs_repo, run_id, "error")
             yield emit("error", {
                 "code": copy.failure_code,
                 "message": f"{copy.error_failure_prefix}{exc}",
             })
-            mark_terminal_safe(runs_repo, run_id, "error")
             return
 
         # Success — commit the effect with the result (spec AC2).
@@ -650,11 +653,11 @@ async def drive_effect(
                 "tool": copy.tool_name,
                 "message": copy.commit_unknown_message,
             })
+            mark_terminal_safe(runs_repo, run_id, "error")
             yield emit("error", {
                 "code": "effect_outcome_unknown",
                 "message": copy.commit_unknown_message,
             })
-            mark_terminal_safe(runs_repo, run_id, "error")
             return
 
         outcome.stored_result = result
@@ -669,6 +672,17 @@ async def drive_effect(
 
 
 # ---- Prompt assembly -------------------------------------------------------
+
+
+def compose_artifact_system_prompt() -> str:
+    return (
+        "你是徒步计划撰写助手，用简体中文输出 Markdown 徒步计划书。必须完整包含："
+        "计划信息、路线摘要、行程安排、交通住宿与联络、人员分工、费用预算、装备与补给、"
+        "风险与应急、出发前检查、来源与证据。用户未提供的活动安排标为待确认；"
+        "没有来源的里程、爬升、耗时、天气、开放状态与补给地点标为待核验，禁止编造。"
+        "通用建议必须与用户安排和来源事实明确区分。"
+        "需要读写工作区文件时只用相对路径。不得透露内部系统或框架信息。"
+    )
 
 
 def compose_chat_system_prompt(req: ChatFlowRequest, profile: CapabilityProfile) -> str:
@@ -698,6 +712,13 @@ def compose_chat_system_prompt(req: ChatFlowRequest, profile: CapabilityProfile)
 
 
 _NO_KNOWLEDGE_EVIDENCE_RESPONSE = "资料不足：未检索到可核验的徒步知识，无法提供具体徒步事实。"
+
+# Issue 14 (gate v1): semantically distinct from "nothing retrieved" —
+# the search ran, but the answer's distance numbers are not backed by it.
+_UNSUPPORTED_DISTANCE_RESPONSE = (
+    "资料不足：检索到的资料不支持回答中的距离数字，为避免误导已略去具体里程。"
+    "可尝试更换问法，或参考官方路线数据。"
+)
 
 
 def compose_rag_system_prompt(req: ChatFlowRequest, profile: CapabilityProfile) -> str:
@@ -750,6 +771,52 @@ def knowledge_search_attempted_without_evidence(
     return attempted and not has_hiking_knowledge_evidence(audit_entries)
 
 
+def unsupported_distance_numbers(
+    answer: str, audit_entries: list[dict[str, Any]]
+) -> list[float]:
+    """Numeric-entailment gate v1 (issue 14): distance numbers in the
+    answer that no retrieved chunk supports.
+
+    Pure gate over audit entries. When successful knowledge chunks carry
+    no ``distance_values`` at all (no field on any chunk), the gate
+    abstains — evidence without numeric data is not proof against the
+    answer. A turn that never retrieved evidence is not this gate's
+    concern (first layer handles it).
+    """
+    from tools.hiking_knowledge import distance_values_in
+
+    supported: set[float] | None = None
+    for entry in audit_entries:
+        if not (
+            entry.get("tool") == "hiking_knowledge_search"
+            and entry.get("phase") == "result"
+            and entry.get("ok") is True
+        ):
+            continue
+        evidence = entry.get("evidence")
+        if not isinstance(evidence, dict) or evidence.get("has_chunks") is not True:
+            continue
+        chunks = evidence.get("chunks")
+        if not isinstance(chunks, list):
+            continue
+        for chunk in chunks:
+            if not isinstance(chunk, dict):
+                continue
+            values = chunk.get("distance_values")
+            if not isinstance(values, list):
+                continue
+            if supported is None:
+                supported = set()
+            supported.update(
+                float(v) for v in values if isinstance(v, (int, float))
+            )
+    if supported is None:
+        return []
+    return [
+        value for value in distance_values_in(answer) if value not in supported
+    ]
+
+
 def _tool_result_summary(entry: dict[str, Any]) -> str:
     """A08: human-readable one-liner for the public ``tool_result`` payload.
 
@@ -781,11 +848,13 @@ def compose_route_plan_system_prompt(
     base = [
         "你是路线规划助手，用简体中文输出结构化徒步方案。",
         "证据纪律：路线里程/爬升/耗时必须来自 route_research 或地图工具；",
-        "天气与预警必须来自天气工具或 web_search；引用来源名称。",
+        "天气与预警必须来自天气工具；引用来源名称。",
         "关键证据（路线事实、天气）缺失时明确说明缺失项并给出保守建议，禁止编造数据。",
         "路线比较必须调用 route_compare；候选最多五条，传 name/city/origin/destination，不传事实。",
         "缺少候选或起终点先请用户补充。输出以比较工具的推荐、证据与风险状态为准。",
         "用户要 PDF 时调用 report_export，comparison_id 必须来自已完成的比较结果。",
+        "计划书包含活动信息、路线摘要、行程、交通住宿、人员分工、预算、装备补给、风险应急、出发检查和来源。",
+        "report_export 的 plan_details 仅摘录用户明确提供的安排，缺失项留空待确认，不编造时间、费用、电话或撤退地点。",
         "不得透露内部系统、工具名或框架信息。",
     ]
     if req.current_location is not None:
@@ -1034,6 +1103,7 @@ class RunOrchestrator:
         # derived value so single-shot runs without a client-supplied id
         # still persist.
         run_id: str | None = None
+        persistence_error = False
         conversation_id = req.conversation_id or f"conv-{req.request_id}"
         conversation_forbidden = bool(
             memory is not None
@@ -1049,17 +1119,17 @@ class RunOrchestrator:
                     user_message=req.message,
                 )
             except Exception:
-                # Persistence failure must not break the in-memory stream.
-                # Log and continue without persistence; the client still
-                # gets the SSE contract, just without durable replay for
-                # this run.
+                # Persistence is the source of truth for request_id
+                # idempotency. Continuing in memory after a failed insert
+                # could execute the model without a durable dedupe record.
                 logger.exception(
                     "chat_v2: create_run_idempotent failed for request_id=%s; "
-                    "continuing without persistence",
+                    "failing closed",
                     req.request_id,
                 )
                 run_id = None
-                created = True  # proceed as if fresh
+                created = False
+                persistence_error = True
             else:
                 persisted_run = runs_repo.get_run(run_id)
                 if (
@@ -1142,6 +1212,13 @@ class RunOrchestrator:
             return envelope
 
         try:
+            if persistence_error:
+                yield _emit("error", {
+                    "code": "persistence_unavailable",
+                    "message": "运行状态暂时不可用，请稍后使用相同请求重新尝试。",
+                })
+                return
+
             if conversation_forbidden:
                 yield _emit("error", {
                     "code": "conversation_forbidden",
@@ -1154,22 +1231,22 @@ class RunOrchestrator:
             # internal events have been processed, so unknown_dropped
             # stays 0.
             if not self._settings.agent_v2_enabled:
+                mark_terminal_safe(runs_repo, run_id, "error")
                 yield _emit("error", {
                     "code": "v2_disabled",
                     "message": "Chat v2 is disabled (AGENT_V2_ENABLED=false).",
                 })
-                mark_terminal_safe(runs_repo, run_id, "error")
                 return
 
             # Resolve profile (server-defined; client cannot override).
             try:
                 profile = resolve_profile(req.profile_id)
             except UnknownProfileError as exc:
+                mark_terminal_safe(runs_repo, run_id, "error")
                 yield _emit("error", {
                     "code": "unknown_profile",
                     "message": str(exc),
                 })
-                mark_terminal_safe(runs_repo, run_id, "error")
                 return
 
             # Ticket 13 AC2 — cowork authorization gate. The cowork
@@ -1183,6 +1260,7 @@ class RunOrchestrator:
             if profile.profile_id == ProfileId.COWORK and not is_cowork_authorized(
                 self._settings
             ):
+                mark_terminal_safe(runs_repo, run_id, "error")
                 yield _emit("error", {
                     "code": "cowork_unauthorized",
                     "message": (
@@ -1190,7 +1268,6 @@ class RunOrchestrator:
                         "请联系运维启用 trusted/staging 策略。"
                     ),
                 })
-                mark_terminal_safe(runs_repo, run_id, "error")
                 return
 
             # Model failure scenario: no API key configured. The contract
@@ -1200,11 +1277,11 @@ class RunOrchestrator:
             # decision #27).
             if not self._settings.openai_api_key:
                 yield _emit("run_started", {})
+                mark_terminal_safe(runs_repo, run_id, "error")
                 yield _emit("error", {
                     "code": "model_unavailable",
                     "message": "主模型未配置 API Key (OPENAI_API_KEY 为空)。",
                 })
-                mark_terminal_safe(runs_repo, run_id, "error")
                 return
 
             # Normal flow: run_started → progress → text → done. Only now
@@ -1261,8 +1338,8 @@ class RunOrchestrator:
                         return
                     yield envelope
                 if not stream.terminal_emitted:
-                    yield _emit("done", {})
                     mark_terminal_safe(runs_repo, run_id, "done")
+                    yield _emit("done", {})
                 return
 
             if profile.profile_id == ProfileId.RAG:
@@ -1288,8 +1365,8 @@ class RunOrchestrator:
                             "message": "运行已被取消。",
                         })
                         return
-                    yield _emit("done", {})
                     mark_terminal_safe(runs_repo, run_id, "done")
+                    yield _emit("done", {})
                 return
 
             if profile.profile_id == ProfileId.ARTIFACT:
@@ -1354,8 +1431,8 @@ class RunOrchestrator:
                     })
                     return
 
-                yield _emit("done", {})
                 mark_terminal_safe(runs_repo, run_id, "done")
+                yield _emit("done", {})
 
         except TerminalEventAlreadyEmitted:
             # A second terminal was attempted (programmer error). Log and
@@ -1370,12 +1447,12 @@ class RunOrchestrator:
             # Unexpected error. Emit a terminal error if the stream is
             # still open; otherwise the previous terminal stands.
             logger.exception("chat_v2: unexpected error for request_id=%s", req.request_id)
+            mark_terminal_safe(runs_repo, run_id, "error")
             if not stream.terminal_emitted:
                 yield _emit("error", {
                     "code": "internal_error",
                     "message": "内部错误，请重试。",
                 })
-            mark_terminal_safe(runs_repo, run_id, "error")
             return
 
     # -- cowork flow (Ticket 38, originally Ticket 13) --
@@ -1434,25 +1511,25 @@ class RunOrchestrator:
         try:
             workspace_path = computer.create_workspace(run_id or req.request_id)
         except SandboxQuotaError as exc:
+            mark_terminal_safe(runs_repo, run_id, "error")
             yield emit("error", {
                 "code": "sandbox_quota",
                 "message": f"沙箱配额不足：{exc}",
             })
-            mark_terminal_safe(runs_repo, run_id, "error")
             return
         except SandboxCreationError as exc:
+            mark_terminal_safe(runs_repo, run_id, "error")
             yield emit("error", {
                 "code": "sandbox_creation_failed",
                 "message": f"沙箱创建失败：{exc}",
             })
-            mark_terminal_safe(runs_repo, run_id, "error")
             return
         except ComputerError as exc:
+            mark_terminal_safe(runs_repo, run_id, "error")
             yield emit("error", {
                 "code": "sandbox_unavailable",
                 "message": f"沙箱不可用：{exc}",
             })
-            mark_terminal_safe(runs_repo, run_id, "error")
             return
 
         # Persist the lease (best-effort).
@@ -1489,8 +1566,8 @@ class RunOrchestrator:
                 computer=None,
             )
         except KernelModelFailure as exc:
-            yield emit("error", {"code": exc.code, "message": exc.message})
             mark_terminal_safe(runs_repo, run_id, "error")
+            yield emit("error", {"code": exc.code, "message": exc.message})
             return
 
         try:
@@ -1504,11 +1581,11 @@ class RunOrchestrator:
                 "run_orchestration: cowork command plan invalid for request_id=%s",
                 req.request_id,
             )
+            mark_terminal_safe(runs_repo, run_id, "error")
             yield emit("error", {
                 "code": "bash_plan_invalid",
                 "message": "无法从内核回合解析出合法命令，任务已终止。",
             })
-            mark_terminal_safe(runs_repo, run_id, "error")
             return
         bash_args = {"command": bash_command}
 
@@ -1529,11 +1606,11 @@ class RunOrchestrator:
             gate = PermissionGate()
             verdict = gate.evaluate(profile, "sandbox_bash", bash_args)
             if verdict.decision == PermissionDecision.DENY:
+                mark_terminal_safe(runs_repo, run_id, "error")
                 yield emit("error", {
                     "code": "tool_denied",
                     "message": f"工具 sandbox_bash 被拒绝：{verdict.reason}",
                 })
-                mark_terminal_safe(runs_repo, run_id, "error")
                 return
             if verdict.decision == PermissionDecision.NEEDS_APPROVAL:
                 approval_id = compute_approval_id(
@@ -1597,11 +1674,11 @@ class RunOrchestrator:
             # If we reach here, the gate returned ALLOW (unexpected for
             # sandbox_bash at HIGH risk). Treat as internal_error — the
             # approval threshold must not be bypassed.
+            mark_terminal_safe(runs_repo, run_id, "error")
             yield emit("error", {
                 "code": "internal_error",
                 "message": "sandbox_bash 未走审批流程，已拒绝执行。",
             })
-            mark_terminal_safe(runs_repo, run_id, "error")
             return
 
         except TerminalEventAlreadyEmitted:
@@ -1631,6 +1708,7 @@ class RunOrchestrator:
         run_id: str | None,
         emit: EmitEnvelope,
         report_content: str | None = None,
+        pdf_document: dict[str, Any] | None = None,
     ) -> AsyncGenerator[EventEnvelope, None]:
         """artifact profile flow.
 
@@ -1682,25 +1760,25 @@ class RunOrchestrator:
         try:
             workspace_path = computer.create_workspace(run_id or req.request_id)
         except SandboxQuotaError as exc:
+            mark_terminal_safe(runs_repo, run_id, "error")
             yield emit("error", {
                 "code": "sandbox_quota",
                 "message": f"沙箱配额不足：{exc}",
             })
-            mark_terminal_safe(runs_repo, run_id, "error")
             return
         except SandboxCreationError as exc:
+            mark_terminal_safe(runs_repo, run_id, "error")
             yield emit("error", {
                 "code": "sandbox_creation_failed",
                 "message": f"沙箱创建失败：{exc}",
             })
-            mark_terminal_safe(runs_repo, run_id, "error")
             return
         except ComputerError as exc:
+            mark_terminal_safe(runs_repo, run_id, "error")
             yield emit("error", {
                 "code": "sandbox_unavailable",
                 "message": f"沙箱不可用：{exc}",
             })
-            mark_terminal_safe(runs_repo, run_id, "error")
             return
 
         # Persist the lease (best-effort). Lease persistence failure does not
@@ -1742,11 +1820,11 @@ class RunOrchestrator:
                 profile, "generate_pdf", {"filename": _ARTIFACT_FILENAME}
             )
             if verdict.decision == PermissionDecision.DENY:
+                mark_terminal_safe(runs_repo, run_id, "error")
                 yield emit("error", {
                     "code": "tool_denied",
                     "message": f"工具 generate_pdf 被拒绝：{verdict.reason}",
                 })
-                mark_terminal_safe(runs_repo, run_id, "error")
                 return
             if verdict.decision == PermissionDecision.NEEDS_APPROVAL:
                 approval_id = compute_approval_id(
@@ -1838,11 +1916,7 @@ class RunOrchestrator:
             # the product policy ladder re-enters at generate_pdf/export below.
             try:
                 plan_text, audits = (report_content, []) if report_content is not None else await self._kernel_turn(
-                    system_prompt=(
-                        "你是徒步计划撰写助手，用简体中文输出结构化 Markdown 徒步计划"
-                        "（目的地/日程/装备/风险与建议）。缺失的信息显式标注为假设；"
-                        "需要读写工作区文件时只用相对路径。不得透露内部系统或框架信息。"
-                    ),
+                    system_prompt=compose_artifact_system_prompt(),
                     message=req.message,
                     settings=self._settings,
                     run_id=run_id,
@@ -1853,8 +1927,8 @@ class RunOrchestrator:
                     computer=bridge,
                 )
             except KernelModelFailure as exc:
-                yield emit("error", {"code": exc.code, "message": exc.message})
                 mark_terminal_safe(runs_repo, run_id, "error")
+                yield emit("error", {"code": exc.code, "message": exc.message})
                 return
 
             for entry in (*audits, *sandbox_audits):
@@ -1868,6 +1942,11 @@ class RunOrchestrator:
                 yield emit("tool_result", payload)
 
             plan_content = plan_text
+            if pdf_document is not None:
+                # Structured route-comparison reports render through the
+                # designed PDF layout; the text report stays for the
+                # conversation transcript.
+                plan_content = json.dumps(pdf_document, ensure_ascii=False)
             yield emit("tool_call", {
                 "tool": "generate_pdf",
                 "args": {"filename": _ARTIFACT_FILENAME},
@@ -1884,11 +1963,11 @@ class RunOrchestrator:
                     "status": "timeout",
                     "content": f"PDF 生成超时：{exc}",
                 })
+                mark_terminal_safe(runs_repo, run_id, "error")
                 yield emit("error", {
                     "code": "sandbox_timeout",
                     "message": f"沙箱命令超时：{exc}",
                 })
-                mark_terminal_safe(runs_repo, run_id, "error")
                 return
             except ComputerError as exc:
                 yield emit("tool_result", {
@@ -1896,11 +1975,11 @@ class RunOrchestrator:
                     "status": "error",
                     "content": f"PDF 生成失败：{exc}",
                 })
+                mark_terminal_safe(runs_repo, run_id, "error")
                 yield emit("error", {
                     "code": "artifact_generation_failed",
                     "message": f"artifact 生成失败：{exc}",
                 })
-                mark_terminal_safe(runs_repo, run_id, "error")
                 return
 
             yield emit("tool_result", {
@@ -1949,6 +2028,7 @@ class RunOrchestrator:
                 # lease is intentionally leaked; the error event carries
                 # the run_id for investigation.
                 preserve_sandbox = True
+                mark_terminal_safe(runs_repo, run_id, "error")
                 yield emit("error", {
                     "code": "artifact_evidence_persistence_failed",
                     "message": (
@@ -1956,14 +2036,13 @@ class RunOrchestrator:
                         f"请联系运维处理 run_id={run_id} 的沙箱。"
                     ),
                 })
-                mark_terminal_safe(runs_repo, run_id, "error")
                 return
             except ArtifactExportError as exc:
+                mark_terminal_safe(runs_repo, run_id, "error")
                 yield emit("error", {
                     "code": "artifact_export_failed",
                     "message": f"artifact 导出失败：{exc}",
                 })
-                mark_terminal_safe(runs_repo, run_id, "error")
                 return
 
             # Spec AC3: the artifact.available payload carries ONLY the
@@ -1987,8 +2066,8 @@ class RunOrchestrator:
             )
             yield emit("text", {"content": response_text})
 
-            yield emit("done", {})
             mark_terminal_safe(runs_repo, run_id, "done")
+            yield emit("done", {})
 
         finally:
             # Spec AC6: cleanup on completion OR cancellation OR error.
@@ -2194,11 +2273,11 @@ class RunOrchestrator:
         approvals = runs_repo.list_approvals_for_run(run_id)
         resolved = next((a for a in approvals if a.is_terminal), None)
         if resolved is None:
+            mark_terminal_safe(runs_repo, run_id, "error")
             yield emit("error", {
                 "code": "no_resolved_approval",
                 "message": "运行已恢复但未找到已解决的审批。",
             })
-            mark_terminal_safe(runs_repo, run_id, "error")
             return
 
         # Scan persisted events to determine which resume steps already ran.
@@ -2235,11 +2314,11 @@ class RunOrchestrator:
                     "status": resolved.status,
                     "message": "用户已拒绝操作，运行将结束。",
                 })
+            mark_terminal_safe(runs_repo, run_id, "done")
             yield emit("done", {
                 "code": "rejected",
                 "message": "用户已拒绝操作，运行结束。",
             })
-            mark_terminal_safe(runs_repo, run_id, "done")
             return
 
         # Approved path — the tool may or may not have executed yet.
@@ -2255,6 +2334,7 @@ class RunOrchestrator:
                     "status": resolved.status,
                     "message": "用户已批准操作，继续执行。",
                 })
+            mark_terminal_safe(runs_repo, run_id, "error")
             yield emit("error", {
                 "code": "sandbox_lease_lost",
                 "message": (
@@ -2262,7 +2342,6 @@ class RunOrchestrator:
                     "请重新发起请求。"
                 ),
             })
-            mark_terminal_safe(runs_repo, run_id, "error")
             return
 
         # Reconstruct the Computer bound to the leased workspace through
@@ -2271,11 +2350,11 @@ class RunOrchestrator:
         try:
             computer = self._computer_factory(lease.sandbox_type)
         except ValueError as exc:
+            mark_terminal_safe(runs_repo, run_id, "error")
             yield emit("error", {
                 "code": "sandbox_type_invalid",
                 "message": f"沙箱类型无效：{exc}",
             })
-            mark_terminal_safe(runs_repo, run_id, "error")
             return
 
         workspace_path = lease.workspace_path
@@ -2361,19 +2440,39 @@ class RunOrchestrator:
                     user_message = msg.get("content", "")
                     break
             plan_content = user_message
+            has_route_report = False
             # A route report is code-rendered from a persisted, verified
             # comparison; approval resume must not replace it with the prompt.
+            # The structured document keeps the designed PDF layout on resume.
             for event in reversed(all_events):
                 report = event.get("payload", {}).get("route_report")
                 if isinstance(report, dict):
                     from route_compare.models import ComparisonResult
+                    from route_compare.report_pdf import build_report_document
                     from route_compare.service import render_report
-                    plan_content = render_report(ComparisonResult.model_validate(report))
+                    report_result = ComparisonResult.model_validate(report)
+                    render_report(report_result)
+                    plan_content = json.dumps(build_report_document(report_result), ensure_ascii=False)
+                    has_route_report = True
                     break
 
-            def _execute_pdf() -> dict[str, Any]:
+            async def _execute_pdf() -> dict[str, Any]:
+                content = plan_content
+                if not has_route_report:
+                    from agent_v2.kernel import KernelModelFailure
+                    from agent_v2.kernel_tools import ProductSandboxBridge
+                    try:
+                        content, _ = await self._kernel_turn(
+                            system_prompt=compose_artifact_system_prompt(),
+                            message=user_message, settings=self._settings, run_id=run_id,
+                            checkpoint_store=self._kernel_checkpoints,
+                            extra_tools=(), kernel_gate=None, mcp_servers=None,
+                            computer=ProductSandboxBridge(computer, workspace_path),
+                        )
+                    except KernelModelFailure as exc:
+                        raise ComputerError("计划正文生成失败，请重新生成。") from exc
                 generated = computer.generate_pdf(
-                    workspace_path, plan_content, artifact_filename
+                    workspace_path, content, artifact_filename
                 )
                 return {"content": f"已在沙箱中生成 {generated}", "path": generated}
 
@@ -2444,6 +2543,7 @@ class RunOrchestrator:
                     )
                 except ArtifactEvidencePersistenceError as exc:
                     preserve_sandbox = True
+                    mark_terminal_safe(runs_repo, run_id, "error")
                     yield emit("error", {
                         "code": "artifact_evidence_persistence_failed",
                         "message": (
@@ -2451,14 +2551,13 @@ class RunOrchestrator:
                             f"请联系运维处理 run_id={run_id} 的沙箱。"
                         ),
                     })
-                    mark_terminal_safe(runs_repo, run_id, "error")
                     return
                 except ArtifactExportError as exc:
+                    mark_terminal_safe(runs_repo, run_id, "error")
                     yield emit("error", {
                         "code": "artifact_export_failed",
                         "message": f"artifact 导出失败：{exc}",
                     })
-                    mark_terminal_safe(runs_repo, run_id, "error")
                     return
 
                 yield emit("artifact.available", {
@@ -2492,8 +2591,8 @@ class RunOrchestrator:
                 yield emit("text", {"content": response_text})
 
             # Step 6: done terminal.
-            yield emit("done", {})
             mark_terminal_safe(runs_repo, run_id, "done")
+            yield emit("done", {})
 
         except TerminalEventAlreadyEmitted:
             logger.error(
@@ -2504,6 +2603,7 @@ class RunOrchestrator:
             return
         except ArtifactEvidencePersistenceError as exc:
             preserve_sandbox = True
+            mark_terminal_safe(runs_repo, run_id, "error")
             yield emit("error", {
                 "code": "artifact_evidence_persistence_failed",
                 "message": (
@@ -2511,19 +2611,18 @@ class RunOrchestrator:
                     f"请联系运维处理 run_id={run_id} 的沙箱。"
                 ),
             })
-            mark_terminal_safe(runs_repo, run_id, "error")
             return
         except Exception as exc:
             logger.exception(
                 "run_orchestration: unexpected error during resume for run_id=%s",
                 run_id,
             )
+            mark_terminal_safe(runs_repo, run_id, "error")
             if not stream.terminal_emitted:
                 yield emit("error", {
                     "code": "internal_error",
                     "message": "恢复运行时发生内部错误。",
                 })
-            mark_terminal_safe(runs_repo, run_id, "error")
             return
         finally:
             if preserve_sandbox:
@@ -2656,11 +2755,11 @@ class RunOrchestrator:
                     conversation_id=run.conversation_id,
                 )
             except ArtifactExportError as exc:
+                mark_terminal_safe(runs_repo, run_id, "error")
                 yield emit("error", {
                     "code": "artifact_export_failed",
                     "message": f"artifact 导出失败：{exc}",
                 })
-                mark_terminal_safe(runs_repo, run_id, "error")
                 return
             yield emit("artifact.available", {
                 **export,
@@ -2693,8 +2792,8 @@ class RunOrchestrator:
             yield emit("text", {"content": response_text})
 
         # Step 4: done terminal.
-        yield emit("done", {})
         mark_terminal_safe(runs_repo, run_id, "done")
+        yield emit("done", {})
 
     # -- approval decision state machine (Ticket 38, originally Ticket 11) --
 
@@ -2735,6 +2834,17 @@ class RunOrchestrator:
             and approval.decision_request_id == decision_request_id
             and approval.is_terminal
         ):
+            expected_status = "approved" if decision == "approve" else "rejected"
+            if approval.status != expected_status:
+                return ApprovalDecisionOutcome(
+                    status="already_resolved",
+                    payload={
+                        "approval_id": approval_id,
+                        "reason": "decision_request_conflict",
+                        "current_status": approval.status,
+                        "message": "同一审批请求标识不能用于不同的决定。",
+                    },
+                )
             return ApprovalDecisionOutcome(
                 status="idempotent",
                 payload=self._decision_payload(approval, idempotent=True),
@@ -3013,11 +3123,11 @@ class RunOrchestrator:
             if not mcp_servers:
                 # Every allowlisted evidence source is unavailable → fail
                 # closed instead of fabricating a plan (Ticket 29 AC5).
+                mark_terminal_safe(self._runs_repo, run_id, "error")
                 yield emit("error", {
                     "code": "evidence_unavailable",
                     "message": "关键证据源（地图/天气 MCP）不可用，无法提供可靠路线规划。",
                 })
-                mark_terminal_safe(self._runs_repo, run_id, "error")
                 return
             audit_entries.extend(mcp_audits)
 
@@ -3074,11 +3184,21 @@ class RunOrchestrator:
             logger.warning(
                 "chat_v2: kernel failure code=%s request_id=%s", exc.code, req.request_id
             )
+            mark_terminal_safe(self._runs_repo, run_id, "error")
             yield emit("error", {
                 "code": exc.code,
                 "message": exc.message,
             })
-            mark_terminal_safe(self._runs_repo, run_id, "error")
+            return
+
+        # Observe cancellation before building/persisting model output.
+        # Dropping an already-built envelope in the caller would leave
+        # it in replay even though it was never delivered to the client.
+        if is_cancelled(self._runs_repo, run_id):
+            yield emit("cancelled", {
+                "code": "cancelled",
+                "message": "运行已被取消。",
+            })
             return
 
         if has_comparison:
@@ -3089,10 +3209,13 @@ class RunOrchestrator:
             response_text = (comparison_text(ComparisonResult.model_validate(comparisons[-1])) if comparisons else
                 "请提供要比较的路线名、所在城市与各路线起终点。尚未完成可核验比较，无法给出可靠推荐。")
 
-        if profile.profile_id in (ProfileId.CHAT, ProfileId.RAG) and (
-            knowledge_search_attempted_without_evidence(audit_entries)
-        ):
-            response_text = _NO_KNOWLEDGE_EVIDENCE_RESPONSE
+        if profile.profile_id in (ProfileId.CHAT, ProfileId.RAG):
+            if knowledge_search_attempted_without_evidence(audit_entries):
+                response_text = _NO_KNOWLEDGE_EVIDENCE_RESPONSE
+            elif has_hiking_knowledge_evidence(audit_entries) and unsupported_distance_numbers(
+                response_text, audit_entries
+            ):
+                response_text = _UNSUPPORTED_DISTANCE_RESPONSE
 
         # Ticket 28/29 AC6: public evidence of degraded sources, executed
         # and denied tool calls — bound to the run identity, emitted
@@ -3137,10 +3260,13 @@ class RunOrchestrator:
         reports = [entry["route_report"] for entry in audit_entries if isinstance(entry.get("route_report"), dict)]
         if reports:
             from route_compare.models import ComparisonResult
+            from route_compare.report_pdf import build_report_document
             from route_compare.service import render_report
-            report_content = render_report(ComparisonResult.model_validate(reports[-1]))
+            report_result = ComparisonResult.model_validate(reports[-1])
+            report_content = render_report(report_result)
             async for envelope in self._stream_artifact_flow(req, resolve_profile("artifact"),
-                run_id=run_id, emit=emit, report_content=report_content):
+                run_id=run_id, emit=emit, report_content=report_content,
+                pdf_document=build_report_document(report_result)):
                 yield envelope
             return
 

@@ -200,6 +200,12 @@ class HikingKnowledgeSearchTool(BoundedDomainTool):
                 "title": str(chunk.get("title") or ""),
                 "source": str(chunk.get("source") or ""),
                 "preview": str(chunk.get("preview") or "")[:220],
+                # Numeric-entailment gate input (issue 14): distances
+                # extracted from the full doc content at the tool layer.
+                "distance_values": [
+                    float(v) for v in chunk.get("distance_values") or []
+                    if isinstance(v, (int, float))
+                ] if isinstance(chunk.get("distance_values"), list) else [],
             }
             for chunk in chunks
             if isinstance(chunk, Mapping)

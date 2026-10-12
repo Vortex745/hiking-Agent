@@ -37,7 +37,11 @@ def test_sourced_report_survives_approval_resume_and_isolated_download(tmp_path)
         output = await compare.execute(compare.args_schema.model_validate({"candidates": [
             {"name":"演示林间环线", "city":"演示城市", "origin":"起点", "destination":"终点"}]}))
         result = json.loads(output.output)
-        await report.execute(report.args_schema.model_validate({"comparison_id": result["comparison_id"]}))
+        await report.execute(report.args_schema.model_validate({"comparison_id": result["comparison_id"],
+            "plan_details": {"activity_date": "2026-10-18", "meeting_time": "08:00",
+                "meeting_point": "游客中心", "participants": 4, "leader": "领队甲",
+                "itinerary": [{"time": "08:00", "activity": "集合与装备检查"}],
+                "budget": [{"item": "交通", "amount_yuan": 200}]}}))
         return "模型不应参与报告正文生成", []
     orchestrator = RunOrchestrator(settings=settings, runs_repo=repo, memory=memory,
         kernel_turn=kernel, computer_factory=lambda *args: computer, sandbox_cleanup=_cleanup_sandbox)
@@ -53,8 +57,17 @@ def test_sourced_report_survives_approval_resume_and_isolated_download(tmp_path)
         return [e async for e in orchestrator.stream_resume(run_id=events[-1].run_id, from_seq=events[-1].sequence)]
     resumed = asyncio.run(resume())
     assert resumed[-1].type == "done"
-    assert "offline_fixture" in contents[0]
-    assert "confidence" in contents[0]
+    # The PDF renderer receives the structured document (designed layout),
+    # not the plain render_report text dump.
+    document = json.loads(contents[0])
+    assert document["kind"] == "route_comparison_report"
+    assert document["status_label"] == "已核验推荐"
+    assert document["rows"][0]["badge"] == "推荐"
+    assert {item["label"]: item["value"] for item in document["plan_metadata"]}["活动日期"] == "2026-10-18"
+    assert document["user_itinerary"][0]["focus"] == "集合与装备检查"
+    assert document["budget_total"] == "200 元"
+    assert any(entry["tool"] == "offline_fixture"
+               for group in document["sources"] for entry in group["entries"])
     assert "模型不应" not in contents[0]
     artifact = next(e.payload for e in resumed if e.type == "artifact.available")
     assert "storage_path" not in artifact

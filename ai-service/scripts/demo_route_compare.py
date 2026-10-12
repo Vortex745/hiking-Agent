@@ -20,13 +20,24 @@ from config import settings
 async def demo(args):
     state_dir = args.output_dir.resolve()
     state_dir.mkdir(parents=True, exist_ok=True)
+    candidates = [{"name": name, "city": "演示城市", "origin": "起点", "destination": "终点"}
+                  for name in ("演示林间环线", "演示山脊路线")]
+    if args.data_mode == "live":
+        path = args.candidates_json
+        if not path.is_file():
+            raise SystemExit(f"live 模式候选文件不存在或不可读：{path}")
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, list) or not loaded or not all(
+                isinstance(c, dict) and str(c.get("name") or "").strip() for c in loaded):
+            raise SystemExit("--candidates-json 必须为非空 JSON 数组，且每项含非空 name 字段")
+        candidates = loaded
     config = SimpleNamespace(**vars(settings))
     config.agent_v2_enabled = True
     # The scripted demo kernel does not call the chat model. The selected
     # decision provider still uses the real configured model/key; no fallback.
     config.openai_api_key = settings.openai_api_key or ("offline-demo-router" if args.provider != "llm" else "")
     config.route_decision_provider = args.provider
-    config.route_compare_data_mode = "offline"
+    config.route_compare_data_mode = args.data_mode
     config.route_compare_demo_scenario = args.scenario
     config.agent_v2_state_dir = str(state_dir)
     repo = RunRepository(control=ControlStore(str(state_dir / "control.sqlite")),
@@ -38,9 +49,7 @@ async def demo(args):
         nonlocal comparison
         tools = {tool.name: tool for tool in kw["extra_tools"]}
         tool = tools["route_compare"]
-        output = await tool.execute(tool.args_schema.model_validate({"candidates": [
-            {"name": name, "city": "演示城市", "origin": "起点", "destination": "终点"}
-            for name in ("演示林间环线", "演示山脊路线")]}))
+        output = await tool.execute(tool.args_schema.model_validate({"candidates": candidates}))
         comparison = json.loads(output.output)
         if args.pdf:
             report = tools["report_export"]
@@ -52,7 +61,8 @@ async def demo(args):
     orchestrator = RunOrchestrator(settings=config, runs_repo=repo, memory=memory, kernel_turn=kernel,
                                   computer_factory=lambda *a: LocalNativeComputer(), sandbox_cleanup=cleanup)
     request_id = "demo-" + str(uuid4())
-    events = [e async for e in orchestrator.stream_chat(ChatFlowRequest(message="比较离线演示路线",
+    events = [e async for e in orchestrator.stream_chat(ChatFlowRequest(
+        message="比较离线演示路线" if args.data_mode == "offline" else "比较候选路线",
         request_id=request_id, conversation_id=request_id, profile_id="route_plan"), subject_id=subject.subject_id)]
     if args.approve_pdf and events[-1].type == "run.paused":
         approval = repo.list_pending_approvals_for_run(events[-1].run_id)[0]
@@ -60,10 +70,13 @@ async def demo(args):
         events.extend([e async for e in orchestrator.stream_resume(run_id=events[-1].run_id, from_seq=events[-1].sequence)])
     artifacts = [e.payload for e in events if e.type == "artifact.available"]
     output = {"comparison": comparison, "event_types": [e.type for e in events], "artifacts": artifacts,
-              "note": "Explicit offline routing + synthetic data. llm/external decisions use real providers; no credential output."}
+              "data_mode": args.data_mode,
+              "note": ("Synthetic offline data; real MCP data via LiveTools in live mode. "
+                       "llm/external decisions use real providers; no credential output.")}
     (state_dir / "demo.json").write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps({"status": comparison["status"] if comparison else "error",
-                      "provider": args.provider, "artifacts": artifacts, "output": str(state_dir / "demo.json")}, ensure_ascii=False))
+                      "provider": args.provider, "data_mode": args.data_mode,
+                      "artifacts": artifacts, "output": str(state_dir / "demo.json")}, ensure_ascii=False))
     memory.close()
     return 0 if comparison and events[-1].type in {"done", "run.paused"} else 1
 
@@ -72,10 +85,17 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--provider", choices=["llm", "external", "deterministic"], default="deterministic")
     parser.add_argument("--scenario", choices=["complete", "partial", "empty", "severe_weather", "caution"], default="complete")
+    parser.add_argument("--data-mode", choices=["offline", "live"], default="offline",
+                        help="offline 用合成样例（默认，行为不变）；live 走真实 MCP 取数链路")
+    parser.add_argument("--candidates-json", type=Path,
+                        help="live 模式必填：候选路线 JSON 文件（数组，每项含 name/city/origin/destination）")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--pdf", action="store_true")
     parser.add_argument("--approve-pdf", action="store_true", help="Explicitly approve the demo PDF operation")
-    return asyncio.run(demo(parser.parse_args()))
+    args = parser.parse_args()
+    if args.data_mode == "live" and args.candidates_json is None:
+        parser.error("--data-mode live 需要 --candidates-json（真实候选路线）")
+    return asyncio.run(demo(args))
 
 
 if __name__ == "__main__":

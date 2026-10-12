@@ -402,7 +402,7 @@ function LlmConfig() {
               </div>
               <div>
                 <h1 className="text-[24px] font-bold text-text-primary">LLM 配置</h1>
-                <p className="text-sm text-text-secondary">大模型、Embedding 与 Rerank 参数</p>
+                <p className="text-sm text-text-secondary">大模型、Embedding 与 Rerank 参数；聊天运行时使用服务端配置</p>
               </div>
             </div>
 
@@ -521,7 +521,7 @@ function LlmConfig() {
               </label>
 
               <label className="grid gap-1.5">
-                <span className="text-xs font-semibold text-text-secondary">API Key</span>
+                  <span className="text-xs font-semibold text-text-secondary">API Key（仅本页测速）</span>
                 <div className="flex items-center gap-2 rounded-sm border border-border bg-bg-body px-3 transition-[border-color,background-color] duration-150 ease-[var(--ease-out)] focus-within:border-primary-light focus-within:bg-white dark:border-white/10 dark:focus-within:bg-[#1e1f20]">
                   <Key className="h-4 w-4 text-text-muted" />
                   <input
@@ -574,7 +574,7 @@ function LlmConfig() {
               </label>
 
               <label className="grid gap-1.5">
-                <span className="text-xs font-semibold text-text-secondary">API Key</span>
+                  <span className="text-xs font-semibold text-text-secondary">API Key（仅本页测速）</span>
                 <div className="flex items-center gap-2 rounded-sm border border-border bg-bg-body px-3 transition-[border-color,background-color] duration-150 ease-[var(--ease-out)] focus-within:border-primary-light focus-within:bg-white dark:border-white/10 dark:focus-within:bg-[#1e1f20]">
                   <Key className="h-4 w-4 text-text-muted" />
                   <input
@@ -642,7 +642,7 @@ function LlmConfig() {
               </label>
 
               <label className="grid gap-1.5">
-                <span className="text-xs font-semibold text-text-secondary">API Key</span>
+                  <span className="text-xs font-semibold text-text-secondary">API Key（仅本页测速）</span>
                 <div className="flex items-center gap-2 rounded-sm border border-border bg-bg-body px-3 transition-[border-color,background-color] duration-150 ease-[var(--ease-out)] focus-within:border-primary-light focus-within:bg-white dark:border-white/10 dark:focus-within:bg-[#1e1f20]">
                   <Key className="h-4 w-4 text-text-muted" />
                   <input

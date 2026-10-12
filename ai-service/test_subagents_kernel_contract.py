@@ -15,6 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(REPO_ROOT / ".env")
 
 from agent_v2.kernel_tools import build_subagent_definitions
+from agent_v2.profiles import resolve_profile
 
 
 class _ProfileId:
@@ -35,8 +36,8 @@ class _SettingsDisabled:
 
 
 _ROUTE_SURFACE = {
-    "hiking_knowledge_search", "route_research", "web_search",
-    "web_scraping", "gear_checklist", "risk_assessment", "memory_search",
+    "hiking_knowledge_search", "route_research", "web_scraping",
+    "gear_checklist", "memory_search",
 }
 
 
@@ -78,6 +79,16 @@ def test_unknown_role_cannot_exist_by_construction():
         extra_tool_names=_ROUTE_SURFACE, available_mcp_servers={"amap_weather", "amap_map"},
     )
     assert set(defs) <= {"researcher", "route_planner", "artifact_writer"}
+
+
+def test_route_plan_hides_redundant_direct_tools():
+    route_plan = resolve_profile("route_plan")
+    chat = resolve_profile("chat")
+
+    assert "web_search" not in route_plan.allowed_tools
+    assert "risk_assessment" not in route_plan.allowed_tools
+    assert "web_scraping" in route_plan.allowed_tools
+    assert "risk_assessment" in chat.allowed_tools
 
 
 # ---------------------------------------------------------------------------

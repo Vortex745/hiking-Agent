@@ -80,6 +80,31 @@ class CandidateAssessment(Contract):
     required_action: str | None = None
 
 
+class PlanStage(Contract):
+    time: str = Field(max_length=100)
+    activity: str = Field(max_length=300)
+
+
+class BudgetItem(Contract):
+    item: str = Field(min_length=1, max_length=100)
+    amount_yuan: float = Field(ge=0, le=1000000)
+
+
+class PlanDetails(Contract):
+    """User arrangements, distinct from independently verified route facts."""
+    activity_date: str = Field(default="", max_length=100)
+    meeting_time: str = Field(default="", max_length=100)
+    meeting_point: str = Field(default="", max_length=300)
+    participants: int | None = Field(default=None, ge=1, le=10000)
+    leader: str = Field(default="", max_length=100)
+    transport: str = Field(default="", max_length=500)
+    accommodation: str = Field(default="", max_length=500)
+    emergency_contact: str = Field(default="", max_length=300)
+    retreat_plan: str = Field(default="", max_length=500)
+    itinerary: list[PlanStage] = Field(default_factory=list, max_length=30)
+    budget: list[BudgetItem] = Field(default_factory=list, max_length=20)
+
+
 class ComparisonResult(Contract):
     comparison_id: str
     status: Literal["recommended", "confirmation_required", "insufficient_evidence", "no_go", "provider_unavailable"]
@@ -93,6 +118,7 @@ class ComparisonResult(Contract):
     generated_at: str
     report_allowed: bool = False
     data_mode: Literal["live", "offline"] = "live"
+    plan_details: PlanDetails = Field(default_factory=PlanDetails)
 
     @model_validator(mode="after")
     def validate_report(self):

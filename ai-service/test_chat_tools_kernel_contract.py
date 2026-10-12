@@ -132,12 +132,14 @@ def test_knowledge_search_audit_records_whether_traceable_evidence_exists():
     assert result.output
     # Spec #13 phase 2 (T05): evidence additionally carries bounded chunk
     # summaries for the RAG-page documents panel; has_chunks/sources stay
-    # authoritative for the grounding gate.
+    # authoritative for the grounding gate. Issue 14: summaries always carry
+    # distance_values (empty when the tool layer supplied none) as the
+    # numeric-entailment gate input.
     evidence = sink[-1]["evidence"]
     assert evidence["has_chunks"] is True
     assert evidence["sources"] == ["hiking-safety.md"]
     assert evidence["chunks"] == [
-        {"title": "徒步安全", "source": "hiking-safety.md", "preview": ""}
+        {"title": "徒步安全", "source": "hiking-safety.md", "preview": "", "distance_values": []}
     ]
 
 

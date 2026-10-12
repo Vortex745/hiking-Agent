@@ -89,6 +89,15 @@ function normalizeSecret(value: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
 }
 
+function withoutSecrets(settings: LlmSettings): LlmSettings {
+  return {
+    ...settings,
+    llm: { ...settings.llm, apiKey: '' },
+    embedding: { ...settings.embedding, apiKey: '' },
+    rerank: { ...settings.rerank, apiKey: '' },
+  }
+}
+
 function normalizeNumber(value: unknown, fallback: number, min: number, max: number): number {
   const parsed = typeof value === 'number' ? value : Number(value)
   if (!Number.isFinite(parsed)) return fallback
@@ -143,7 +152,13 @@ export function loadLlmSettings(storage: StorageLike | null = browserStorage()):
   try {
     const raw = storage.getItem(LLM_SETTINGS_STORAGE_KEY)
     if (!raw) return DEFAULT_LLM_SETTINGS
-    return normalizeLlmSettings(JSON.parse(raw))
+    const normalized = normalizeLlmSettings(JSON.parse(raw))
+    // Migrate older versions that persisted provider secrets in localStorage.
+    const sanitized = withoutSecrets(normalized)
+    if (JSON.stringify(normalized) !== JSON.stringify(sanitized)) {
+      storage.setItem(LLM_SETTINGS_STORAGE_KEY, JSON.stringify(sanitized))
+    }
+    return sanitized
   } catch {
     return DEFAULT_LLM_SETTINGS
   }
@@ -155,7 +170,9 @@ export function saveLlmSettings(value: unknown, storage: StorageLike | null = br
     updatedAt: new Date().toISOString(),
   }
 
-  storage?.setItem(LLM_SETTINGS_STORAGE_KEY, JSON.stringify(settings))
+  // API keys are used only for the explicit model-list/speed-test request.
+  // Chat v2 reads server-side credentials and never consumes this object.
+  storage?.setItem(LLM_SETTINGS_STORAGE_KEY, JSON.stringify(withoutSecrets(settings)))
   return settings
 }
 

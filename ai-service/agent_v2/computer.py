@@ -30,7 +30,9 @@ read via :meth:`Computer.read_artifact_bytes`.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import os
 import shutil
 import tempfile
 import time
@@ -47,60 +49,506 @@ logger = logging.getLogger("ai-service.agent_v2.computer")
 SandboxType = Literal["local_native", "wsl_localvm", "remote_e2b"]
 
 
-def _render_pdf_bytes(content: str) -> bytes:
-    """Render text into a valid PDF document.
+_PDF_FONT_DIRS = [
+    r"C:\Windows\Fonts",
+    "/usr/share/fonts/truetype",
+    "/usr/share/fonts/opentype/noto",
+    "/usr/share/fonts",
+    str(Path(__file__).resolve().parent.parent / "assets" / "fonts"),
+]
+_PDF_FONT_PAIRS = [
+    # (regular file, bold file or None) — first existing pair wins.
+    ("msyh.ttc", "msyhbd.ttc"),
+    ("NotoSansCJK-Regular.ttc", "NotoSansCJK-Bold.ttc"),
+    ("NotoSansSC-Regular.otf", "NotoSansSC-Bold.otf"),
+    ("simhei.ttf", None),
+    ("wqy-microhei.ttc", None),
+]
 
-    The sandbox implementation is intentionally small, but returning a text
-    file with a ``.pdf`` suffix makes artifact MIME validation meaningless.
+_PDF_BRAND = "AI Hiking"
+_PDF_PRIMARY = "#15803d"
+_PDF_PRIMARY_DARK = "#14532d"
+_PDF_PRIMARY_BG = "#f0fdf4"
+_PDF_TEXT = "#1f2937"
+_PDF_MUTED = "#6b7280"
+_PDF_BORDER = "#e5e7eb"
+_PDF_ZEBRA = "#f8fafc"
+_PDF_AMBER_BG = "#fffbeb"
+_PDF_AMBER_BORDER = "#f59e0b"
+_PDF_AMBER_TEXT = "#92400e"
+_PDF_LINK = "#1d4ed8"
+
+
+def _register_pdf_font() -> tuple[str, str]:
+    """Register a Unicode CJK font pair (regular, bold) with usable Latin glyphs.
+
+    STSong-Light renders ASCII with broken spacing (``reco m mended``), so a
+    real TTF/TTC (Microsoft YaHei / Noto Sans CJK / SimHei) is preferred; the
+    CID font stays as the deterministic fallback for minimal environments.
+    Returns ``(regular_font_name, bold_font_name)``.
+    """
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    override = os.getenv("AI_HIKING_PDF_FONT")
+    candidates: list[tuple[Path, Path | None]] = []
+    if override:
+        override_path = Path(override)
+        bold_guess = override_path.with_name(override_path.stem + "-Bold" + override_path.suffix)
+        candidates.append((override_path, bold_guess if bold_guess.exists() else None))
+    for regular_name, bold_name in _PDF_FONT_PAIRS:
+        for base in _PDF_FONT_DIRS:
+            regular = Path(base) / regular_name
+            if regular.exists():
+                bold = (Path(base) / bold_name) if bold_name else None
+                candidates.append((regular, bold if bold and bold.exists() else None))
+                break
+
+    for regular_path, bold_path in candidates:
+        try:
+            regular_name = "PdfCJK"
+            kwargs: dict[str, Any] = {}
+            if regular_path.suffix.lower() == ".ttc":
+                kwargs["subfontIndex"] = 0
+            pdfmetrics.registerFont(TTFont(regular_name, str(regular_path), **kwargs))
+            bold_name = regular_name + "-Bold"
+            if bold_path:
+                bold_kwargs = {"subfontIndex": 0} if bold_path.suffix.lower() == ".ttc" else {}
+                try:
+                    pdfmetrics.registerFont(TTFont(bold_name, str(bold_path), **bold_kwargs))
+                except Exception:
+                    bold_name = regular_name
+            else:
+                bold_name = regular_name
+            pdfmetrics.registerFontFamily(regular_name, normal=regular_name, bold=bold_name,
+                                          italic=regular_name, boldItalic=bold_name)
+            return regular_name, bold_name
+        except Exception:
+            continue
+
+    try:
+        pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+        return "STSong-Light", "STSong-Light"
+    except Exception:
+        logger.warning("STSong-Light is unavailable; using Helvetica for PDF text")
+        return "Helvetica", "Helvetica"
+
+
+def _pdf_footer(canvas: Any, doc: Any) -> None:
+    """Brand + page number footer on every page."""
+    from reportlab.lib.colors import HexColor
+
+    canvas.saveState()
+    width, _height = doc.pagesize
+    canvas.setStrokeColor(HexColor(_PDF_BORDER))
+    canvas.setLineWidth(0.6)
+    canvas.line(18 * 2.83465, 14 * 2.83465 + 10, width - 18 * 2.83465, 14 * 2.83465 + 10)
+    canvas.setFont(doc._pdf_font_regular, 7.5)
+    canvas.setFillColor(HexColor(_PDF_MUTED))
+    if canvas.getPageNumber() > 1:
+        canvas.drawString(18 * 2.83465, _height - 12 * 2.83465,
+                          getattr(doc, "_pdf_title", _PDF_BRAND))
+        canvas.drawRightString(width - 18 * 2.83465, _height - 12 * 2.83465, "活动计划 / 资料附录")
+    canvas.drawString(18 * 2.83465, 14 * 2.83465, _PDF_BRAND + " · 自动生成，仅供出行参考")
+    canvas.drawRightString(width - 18 * 2.83465, 14 * 2.83465, f"第 {canvas.getPageNumber()} 页")
+    canvas.restoreState()
+
+
+def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
+    """Render the structured report as a complete, evidence-aware plan book."""
+    from reportlab.lib import colors
+    from reportlab.lib.colors import HexColor
+    from reportlab.lib.enums import TA_LEFT, TA_CENTER
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.platypus import HRFlowable, KeepTogether, Paragraph, Spacer, Table, TableStyle
+    from xml.sax.saxutils import escape
+
+    regular, bold = doc._pdf_font_regular, doc._pdf_font_bold
+    # ReportLab frames reserve six points on either side inside the margins.
+    page_width = doc.width - 12
+    mm = page_width / 174
+
+    def style(name: str, **kw: Any) -> ParagraphStyle:
+        kw.setdefault("fontName", regular)
+        kw.setdefault("alignment", TA_LEFT)
+        kw.setdefault("wordWrap", "CJK")
+        return ParagraphStyle(name, **kw)
+
+    title = style("PlanTitle", fontName=bold, fontSize=20, leading=25, textColor=colors.white)
+    subtitle = style("PlanSubtitle", fontSize=10, leading=14, textColor=HexColor("#dcfce7"))
+    meta = style("PlanMeta", fontSize=8.2, leading=12, textColor=HexColor("#dcfce7"))
+    section = style("PlanSection", fontName=bold, fontSize=12.5, leading=16,
+                    textColor=HexColor(_PDF_PRIMARY_DARK), spaceBefore=12, spaceAfter=4, keepWithNext=True)
+    body = style("PlanBody", fontSize=9.5, leading=14, textColor=HexColor(_PDF_TEXT))
+    small = style("PlanSmall", fontSize=8.2, leading=12, textColor=HexColor(_PDF_MUTED))
+    table_head = style("PlanTableHead", fontName=bold, fontSize=8.4, leading=11, textColor=colors.white)
+    table_cell = style("PlanTableCell", fontSize=8.4, leading=12, textColor=HexColor(_PDF_TEXT))
+    table_cell_bold = style("PlanTableCellBold", fontName=bold, fontSize=8.6, leading=12, textColor=HexColor(_PDF_TEXT))
+    status = style("PlanStatus", fontName=bold, fontSize=15, leading=19, textColor=HexColor(_PDF_PRIMARY))
+    callout = style("PlanCallout", fontName=bold, fontSize=9, leading=13, textColor=HexColor(_PDF_AMBER_TEXT))
+    center_cell = style("PlanCenterCell", fontSize=8.2, leading=11, alignment=TA_CENTER, textColor=HexColor(_PDF_TEXT))
+
+    def p(value: Any, style_obj: ParagraphStyle = table_cell) -> Paragraph:
+        text = escape(str(value if value not in (None, "") else "待核验")).replace("\n", "<br/>")
+        return Paragraph(text, style_obj)
+
+    def section_title(number: str, label: str) -> list[Any]:
+        rule = HRFlowable(width="100%", thickness=0.8, color=HexColor(_PDF_PRIMARY), spaceAfter=6)
+        rule.keepWithNext = True
+        return [Paragraph(f"{number}  {escape(label)}", section), rule]
+
+    def styled_table(rows: list[list[Any]], widths: list[float], *, header: bool = True,
+                     highlight_rows: set[int] | None = None) -> Table:
+        table = Table(rows, colWidths=[width * mm for width in widths], repeatRows=1 if header else 0,
+                      splitByRow=1, splitInRow=1, hAlign="LEFT")
+        commands: list[tuple[Any, ...]] = [
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("GRID", (0, 0), (-1, -1), 0.45, HexColor(_PDF_BORDER)),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]
+        if header:
+            commands.append(("BACKGROUND", (0, 0), (-1, 0), HexColor(_PDF_PRIMARY)))
+        for index in range(1 if header else 0, len(rows)):
+            if highlight_rows and index in highlight_rows:
+                commands.append(("BACKGROUND", (0, index), (-1, index), HexColor(_PDF_PRIMARY_BG)))
+            elif index % 2 == 0:
+                commands.append(("BACKGROUND", (0, index), (-1, index), HexColor(_PDF_ZEBRA)))
+        table.setStyle(TableStyle(commands))
+        return table
+
+    story: list[Any] = []
+    generated = "生成时间：" + str(data.get("generated_at", "待核验"))
+    cid = str(data.get("comparison_id", ""))
+    cid_text = cid[:44] + ("…" if len(cid) > 44 else "")
+    title_table = Table([[Paragraph(escape(data.get("title", "AI Hiking 徒步计划书")), title)],
+                         [Paragraph(escape(data.get("subtitle", "证据核验版徒步计划书")), subtitle)],
+                         [Paragraph(escape(generated + ("　·　计划编号：" + cid_text if cid_text else "")), meta)]],
+                        colWidths=[page_width])
+    title_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), HexColor(_PDF_PRIMARY_DARK)),
+        ("BACKGROUND", (0, 1), (-1, 2), HexColor(_PDF_PRIMARY)),
+        ("LEFTPADDING", (0, 0), (-1, -1), 14), ("RIGHTPADDING", (0, 0), (-1, -1), 14),
+        ("TOPPADDING", (0, 0), (-1, 0), 13), ("BOTTOMPADDING", (0, 0), (-1, 0), 5),
+        ("TOPPADDING", (0, 1), (-1, 1), 1), ("BOTTOMPADDING", (0, 1), (-1, 1), 2),
+        ("TOPPADDING", (0, 2), (-1, 2), 2), ("BOTTOMPADDING", (0, 2), (-1, 2), 10),
+    ]))
+    story.extend([title_table, Spacer(1, 9)])
+
+    summary_rows: list[list[Any]] = []
+    if data.get("offline_disclaimer"):
+        summary_rows.append([Paragraph("离线演示：合成数据，不可用于真实出行。", callout), ""])
+    recommendation = str(data.get("recommended") or "暂未形成可执行推荐")
+    summary_rows.append([
+        Paragraph(escape(str(data.get("status_label", "待核验"))), status),
+        p(f"推荐路线：{recommendation}\n活动安排需逐项确认；路线状态需在出发前重新核验。", body),
+    ])
+    if data.get("alternatives"):
+        summary_rows.append([Paragraph("备选路线", table_cell_bold), p("、".join(map(str, data["alternatives"])), body)])
+    summary = Table(summary_rows, colWidths=[48 * mm, 126 * mm], hAlign="LEFT")
+    summary_commands: list[tuple[Any, ...]] = [
+        ("BOX", (0, 0), (-1, -1), 0.75, HexColor(_PDF_BORDER)),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10), ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+    ]
+    if data.get("offline_disclaimer"):
+        summary_commands += [("SPAN", (0, 0), (-1, 0)), ("BACKGROUND", (0, 0), (-1, 0), HexColor(_PDF_AMBER_BG)),
+                             ("LINEBELOW", (0, 0), (-1, 0), 0.7, HexColor(_PDF_AMBER_BORDER))]
+    summary_commands += [("BACKGROUND", (0, -1), (-1, -1), HexColor(_PDF_PRIMARY_BG))]
+    summary.setStyle(TableStyle(summary_commands))
+    story.extend([summary, Spacer(1, 3)])
+
+    # 1. Plan metadata + route overview -----------------------------------
+    story.extend(section_title("01", "计划信息"))
+    metadata = data.get("plan_metadata", [])
+    metadata_rows: list[list[Any]] = []
+    for index in range(0, len(metadata), 2):
+        left = metadata[index]
+        right = metadata[index + 1] if index + 1 < len(metadata) else {"label": "", "value": ""}
+        metadata_rows.append([p(left.get("label", ""), table_cell_bold), p(left.get("value", "")),
+                              p(right.get("label", ""), table_cell_bold), p(right.get("value", ""))])
+    if metadata_rows:
+        story.append(styled_table(metadata_rows, [28, 59, 28, 59], header=False))
+    story.append(Spacer(1, 4))
+    story.extend(section_title("02", "路线摘要"))
+    overview = data.get("route_overview", [])
+    overview_rows: list[list[Any]] = []
+    for index in range(0, len(overview), 2):
+        left = overview[index]
+        right = overview[index + 1] if index + 1 < len(overview) else {"label": "", "value": ""}
+        overview_rows.append([p(left.get("label", ""), table_cell_bold), p(left.get("value", "")),
+                              p(right.get("label", ""), table_cell_bold), p(right.get("value", ""))])
+    if overview_rows:
+        story.append(styled_table(overview_rows, [28, 59, 28, 59], header=False))
+    story.append(Spacer(1, 2))
+    story.append(Paragraph("事实字段来自路线证据；显示“待核验”的字段不得在出发前视为已确认。", small))
+
+    # 2. Itinerary ---------------------------------------------------------
+    story.extend(section_title("03", "行程安排"))
+    itinerary_note = ("以下为用户提供的安排，执行前需确认。" if data.get("user_itinerary") else
+                      "以下为通用行程模板，日期、时间与途经点待确认；不代表已核验的分段行程。")
+    story.append(Paragraph(itinerary_note, small))
+    story[-1].keepWithNext = True
+    itinerary = [[p("阶段", table_head), p("时间参考", table_head), p("执行重点", table_head), p("完成检查", table_head)]]
+    itinerary += [[p(row.get("stage"), table_cell_bold), p(row.get("window")), p(row.get("focus")), p(row.get("checkpoint"))]
+                  for row in (data.get("user_itinerary") or data.get("itinerary", []))]
+    story.append(styled_table(itinerary, [27, 28, 65, 54]))
+
+    story.extend(section_title("04", "交通住宿与联络"))
+    logistics = [[p(row.get("label"), table_cell_bold), p(row.get("value"))]
+                 for row in data.get("logistics", [])]
+    if logistics:
+        story.append(styled_table(logistics, [35, 139], header=False))
+    story.extend(section_title("05", "人员分工"))
+    roles = [[p("岗位", table_head), p("人员", table_head), p("职责建议", table_head)]]
+    roles += [[p(row.get("role")), p(row.get("person")), p(row.get("duty"))] for row in data.get("roles", [])]
+    story.append(styled_table(roles, [30, 40, 104]))
+    story.extend(section_title("06", "费用预算"))
+    budget = [[p("费用项目", table_head), p("金额", table_head), p("依据", table_head)]]
+    budget += [[p(row.get("item")), p(row.get("amount")), p(row.get("basis"))] for row in data.get("budget", [])]
+    story.append(styled_table(budget, [75, 50, 49]))
+    story.extend([Spacer(1, 4), p("已列预算合计：" + str(data.get("budget_total", "待确认")), body)])
+
+    # 3. Equipment ---------------------------------------------------------
+    story.extend(section_title("07", "装备与补给"))
+    gear = [[p("类别", table_head), p("物品", table_head), p("优先级", table_head), p("出发前状态", table_head)]]
+    gear += [[p(row.get("category"), table_cell_bold), p(row.get("item")), p(row.get("priority"), center_cell),
+              p(row.get("status"), center_cell)] for row in data.get("equipment", [])]
+    story.append(styled_table(gear, [25, 77, 30, 42]))
+
+    # 4. Risk --------------------------------------------------------------
+    risk_rows = [[p("触发条件", table_head), p("处置动作", table_head), p("级别", table_head)]]
+    risk_rows += [[p(row.get("trigger")), p(row.get("action")), p(row.get("severity"), center_cell)]
+                  for row in data.get("risk_controls", [])]
+    story.append(KeepTogether(section_title("08", "风险与应急") + [styled_table(risk_rows, [53, 82, 39])]))
+    if data.get("required_action"):
+        action_table = Table([[Paragraph("出发前必须完成：" + escape(str(data["required_action"])), callout)]], colWidths=[page_width])
+        action_table.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), HexColor(_PDF_AMBER_BG)),
+                                          ("BOX", (0, 0), (-1, -1), 0.65, HexColor(_PDF_AMBER_BORDER)),
+                                          ("LEFTPADDING", (0, 0), (-1, -1), 8), ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                                          ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 7)]))
+        story.extend([Spacer(1, 6), action_table])
+
+    # 5. Checklist ---------------------------------------------------------
+    story.extend(section_title("09", "出发前检查"))
+    checklist = [[p("检查项", table_head), p("负责人", table_head), p("状态", table_head)]]
+    checklist += [[p(row.get("item")), p(row.get("owner"), center_cell), p(row.get("status"), center_cell)]
+                  for row in data.get("checklist", [])]
+    story.append(styled_table(checklist, [107, 31, 36]))
+
+    # 6. Comparison appendix ------------------------------------------------
+    rows = data.get("rows", [])
+    if rows:
+        story.extend(section_title("10", "候选路线对比"))
+        # Use one route per row and short labels so nine columns remain legible.
+        columns = ["路线"] + [str(c).strip() for c in data.get("columns", [])] + ["资料", "风险"]
+        table_data: list[list[Any]] = [[p(c, table_head) for c in columns]]
+        for row in rows:
+            name = str(row.get("name", "待核验")) + (" ★" if row.get("badge") == "推荐" else "")
+            table_data.append([p(name, table_cell_bold)] + [p(cell) for cell in row.get("cells", [])] +
+                              [p(row.get("evidence")), p(row.get("risk"))])
+        remaining = 174 - 34
+        col_widths = [34] + [remaining / max(1, len(columns) - 1)] * (len(columns) - 1)
+        story.append(styled_table(table_data, col_widths, highlight_rows={i for i, row in enumerate(rows, 1) if row.get("highlight")}))
+
+    notes = [str(n) for n in data.get("notes", []) if n]
+    if notes:
+        story.extend(section_title("11", "排序依据与说明"))
+        for note in notes:
+            story.append(Paragraph("•　" + escape(note), body))
+            story.append(Spacer(1, 2))
+    else:
+        story.extend(section_title("11", "排序依据与说明"))
+        story.append(p("仅对证据齐全且通过安全校验的候选排序；具体偏好说明待确认。", body))
+
+    # Sources are retained as an appendix and can split across pages.
+    source_groups = data.get("sources", [])
+    if source_groups:
+        story.extend(section_title("12", "来源与证据"))
+        for group in source_groups:
+            story.append(Paragraph(escape("来源 — " + str(group.get("candidate", "待核验"))), table_cell_bold))
+            for entry in group.get("entries", []):
+                url = str(entry.get("url", ""))
+                header = f"[{escape(str(entry.get('id', '')))}] {escape(str(entry.get('tool', '')))}"
+                if url:
+                    header += f'　<font color="{_PDF_LINK}">{escape(url)}</font>'
+                source_card = Table([[Paragraph(header, small)],
+                                     [Paragraph(escape(str(entry.get("excerpt", "待核验"))), small)],
+                                     [Paragraph("观测时间：" + escape(str(entry.get("observed_at", "待核验"))), small)]],
+                                    colWidths=[page_width], splitInRow=1)
+                source_card.setStyle(TableStyle([("BOX", (0, 0), (-1, -1), 0.45, HexColor(_PDF_BORDER)),
+                                                 ("LEFTPADDING", (0, 0), (-1, -1), 8), ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                                                 ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]))
+                story.extend([source_card, Spacer(1, 4)])
+    story.append(Spacer(1, 5))
+    story.append(Paragraph("内容规范：事实仅来自证据；建议项需由领队在出发前逐项确认。", small))
+    story.append(Paragraph("领队确认：________________    确认日期：________________", small))
+    return story
+
+
+def _text_story(doc: Any, content: str) -> list[Any]:
+    """Parse Markdown into print elements and retain missing sections as open items."""
+    import mistune
+    from reportlab.lib.colors import HexColor
+    from reportlab.lib.enums import TA_LEFT
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.platypus import Paragraph, Spacer, Table, TableStyle
+    from xml.sax.saxutils import escape
+
+    regular, bold = doc._pdf_font_regular, doc._pdf_font_bold
+
+    def style(name: str, **kw: Any) -> ParagraphStyle:
+        return ParagraphStyle(name, alignment=TA_LEFT, wordWrap="CJK", **kw)
+
+    h1 = style("H1", fontName=bold, fontSize=16, leading=22, textColor=HexColor(_PDF_PRIMARY_DARK), spaceBefore=6, spaceAfter=4)
+    h2 = style("H2", fontName=bold, fontSize=13, leading=18, textColor=HexColor(_PDF_PRIMARY_DARK), spaceBefore=10, spaceAfter=5, keepWithNext=True)
+    h3 = style("H3", fontName=bold, fontSize=11.5, leading=16, spaceBefore=6, spaceAfter=2, keepWithNext=True)
+    body = style("Body", fontName=regular, fontSize=10, leading=16, textColor=HexColor(_PDF_TEXT))
+    bullet = style("Bullet", fontName=regular, fontSize=10, leading=16, leftIndent=12, textColor=HexColor(_PDF_TEXT))
+
+    def inline(nodes: list[dict[str, Any]], *, markup: bool = True) -> str:
+        parts = []
+        for node in nodes:
+            kind = node["type"]
+            text = escape(node.get("raw", "")) if markup else node.get("raw", "")
+            if "children" in node:
+                text = inline(node["children"], markup=markup)
+            if markup and kind in {"strong", "emphasis"}:
+                tag = "b" if kind == "strong" else "i"
+                text = f"<{tag}>{text}</{tag}>"
+            if kind in {"softbreak", "linebreak"}:
+                text = "<br/>" if markup else " "
+            parts.append(text)
+        return "".join(parts)
+
+    def blocks(nodes: list[dict[str, Any]]) -> list[Any]:
+        rendered = []
+        for node in nodes:
+            kind = node["type"]
+            children = node.get("children", [])
+            if kind == "heading":
+                rendered.append(Paragraph(inline(children), h3))
+                rendered[-1].keepWithNext = True
+            elif kind in {"paragraph", "block_text"}:
+                rendered.append(Paragraph(inline(children) or "&nbsp;", body))
+            elif kind == "list":
+                for index, item in enumerate(children, 1):
+                    label = f"{index}. " if node.get("attrs", {}).get("ordered") else "•　"
+                    item_nodes = item.get("children", [])
+                    if not item_nodes:
+                        continue
+                    first, *rest = item_nodes
+                    rendered.append(Paragraph(label + inline(first.get("children", [])), bullet))
+                    rendered.extend(blocks(rest))
+            elif kind == "table":
+                head, table_body = children
+                rows = [head["children"]] + [row["children"] for row in table_body["children"]]
+                cell_style = style("MarkdownCell", fontName=regular, fontSize=9, leading=13)
+                cells = [[Paragraph(inline(cell.get("children", [])), cell_style) for cell in row] for row in rows]
+                table = Table(cells, colWidths=[(doc.width - 12) / len(rows[0])] * len(rows[0]),
+                              repeatRows=1, splitInRow=1)
+                table.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), HexColor(_PDF_PRIMARY_BG)),
+                    ("GRID", (0, 0), (-1, -1), 0.45, HexColor(_PDF_BORDER)),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ]))
+                rendered.append(table)
+            elif children:
+                rendered.extend(blocks(children))
+            elif node.get("raw"):
+                rendered.append(Paragraph(escape(node["raw"]).replace("\n", "<br/>"), body))
+            if kind != "blank_line":
+                rendered.append(Spacer(1, 4))
+        return rendered
+
+    sections = [
+        ("计划信息", ("活动信息", "目的地", "基本信息"), "待确认：活动日期、集合时间与地点、人数、活动目标。"),
+        ("路线摘要", ("路线概况", "路线规划", "路线信息"), "待核验：起终点、里程、爬升、耗时、天气与开放状态。"),
+        ("行程安排", ("日程", "行程", "时间安排"), "待确认：逐日安排、途经点、补给与最晚下撤时间。"),
+        ("交通住宿与联络", ("交通", "住宿", "后勤安排"), "待确认：往返交通、住宿、紧急联系人与撤退交通。"),
+        ("人员分工", ("队伍", "组织分工"), "待确认：领队、导航、收队和急救联络负责人。"),
+        ("费用预算", ("预算", "费用"), "待确认：交通、住宿门票、餐食补给、保险与费用分摊。"),
+        ("装备与补给", ("装备", "装备清单", "补给"), "待确认：防滑鞋、雨具、保暖层、头灯、手机充电宝、急救包、饮水和食品。"),
+        ("风险与应急", ("风险", "风险预案", "安全", "应急"), "通用建议：恶劣天气或封闭路线取消出行；身体不适或迷路时停止前进，在安全位置联系领队或当地救援。"),
+        ("出发前检查", ("检查清单", "注意事项", "建议"), "待确认：最新天气与开放状态、离线地图、装备自检和对外联络；垃圾全部带离。"),
+        ("来源与证据", ("来源", "参考资料"), "待核验：本草案未完成路线证据校验；请补充可靠资料和查询时间。"),
+    ]
+    grouped: dict[str, list[dict[str, Any]]] = {label: [] for label, _, _ in sections}
+    current = sections[0][0]
+    for node in mistune.create_markdown(renderer="ast", plugins=["table"])(content):
+        if node["type"] == "heading":
+            heading = inline(node.get("children", []), markup=False)
+            if node.get("attrs", {}).get("level") == 1 and "计划" in heading:
+                continue
+            match = next((label for label, aliases, _ in sections if any(
+                name in heading for name in (label, *aliases))), None)
+            if match:
+                current = match
+                continue
+        grouped[current].append(node)
+
+    story = [Paragraph("AI Hiking 徒步计划书", h1),
+             Paragraph("活动安排草案 · 路线事实尚待核验", body), Spacer(1, 10)]
+    for number, (label, _, default) in enumerate(sections, 1):
+        story.append(Paragraph(f"{number:02d}  {label}", h2))
+        section_blocks = blocks(grouped[label])
+        story.extend(section_blocks or [Paragraph(default, body), Spacer(1, 4)])
+    return story
+
+
+def _render_pdf_bytes(content: str) -> bytes:
+    """Render text or a structured document into a valid PDF.
+
+    Structured route-comparison reports (JSON with ``kind=route_comparison_report``)
+    get a designed layout with real heading hierarchy, a comparison table and
+    source cards; any other content falls back to markdown-flavoured text.
     ReportLab keeps the development path deterministic and produces bytes that
     PDF readers and downstream artifact checks can actually parse.
     """
     try:
-        from reportlab.lib.enums import TA_LEFT
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import ParagraphStyle
         from reportlab.lib.units import mm
-        from reportlab.pdfbase import pdfmetrics
-        from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
-        from xml.sax.saxutils import escape
+        from reportlab.platypus import SimpleDocTemplate
     except ImportError as exc:
         raise ComputerError(
             "PDF generation requires reportlab; install ai-service/requirements.txt"
         ) from exc
 
-    font_name = "Helvetica"
-    try:
-        pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
-        font_name = "STSong-Light"
-    except Exception:
-        # Latin-only content still has a usable fallback when the CID font is
-        # unavailable in a minimal local environment.
-        logger.warning("STSong-Light is unavailable; using Helvetica for PDF text")
+    regular, bold = _register_pdf_font()
+    document_data: dict[str, Any] | None = None
+    if content.lstrip().startswith("{"):
+        try:
+            parsed = json.loads(content)
+            if isinstance(parsed, dict) and parsed.get("kind") == "route_comparison_report":
+                document_data = parsed
+        except ValueError:
+            document_data = None
 
     output = BytesIO()
-    document = SimpleDocTemplate(
+    doc = SimpleDocTemplate(
         output,
         pagesize=A4,
         rightMargin=18 * mm,
         leftMargin=18 * mm,
         topMargin=18 * mm,
-        bottomMargin=18 * mm,
-        title="AI Hiking artifact",
+        bottomMargin=22 * mm,
+        title=document_data.get("title", "AI Hiking 徒步计划书") if document_data else "AI Hiking 徒步计划书",
+        author=_PDF_BRAND,
     )
-    style = ParagraphStyle(
-        "ArtifactBody",
-        fontName=font_name,
-        fontSize=10,
-        leading=15,
-        alignment=TA_LEFT,
-    )
-    lines = content.splitlines() or [""]
-    story = []
-    for line in lines:
-        story.append(Paragraph(escape(line) or "&nbsp;", style))
-        story.append(Spacer(1, 3))
-    document.build(story)
+    doc._pdf_font_regular = regular
+    doc._pdf_font_bold = bold
+    doc._pdf_title = doc.title
+    if document_data is not None:
+        story = _report_story(doc, document_data)
+    else:
+        story = _text_story(doc, content)
+    doc.build(story, onFirstPage=_pdf_footer, onLaterPages=_pdf_footer)
     return output.getvalue()
 
 
@@ -531,16 +979,16 @@ class LocalNativeComputer(Computer):
         return usage
 
 
-# ---- RemoteE2B (production; stub until live E2B client lands) -------------
+# ---- RemoteE2B (production interface; development placeholder) -------------
 
 
 class RemoteE2BComputer(Computer):
-    """Production sandbox backed by E2B (stub implementation).
+    """E2B-shaped computer used until the live client is configured.
 
-    This stub mimics the E2B lifecycle (create → execute → destroy)
-    without making a network call. It uses a temp directory to stand in
-    for the remote filesystem so the artifact flow is end-to-end testable
-    before the real E2B client is integrated.
+    This development placeholder mimics the E2B lifecycle without making a
+    network call. It uses a temp directory, so it must not be described as a
+    production isolation boundary. The health endpoint reports this selected
+    implementation as unavailable until a live E2B adapter is wired in.
 
     Fail-closed contract (spec decision #19): any failure raises a
     :class:`ComputerError` subclass. The caller NEVER falls back to
@@ -561,16 +1009,16 @@ class RemoteE2BComputer(Computer):
             raise SandboxCreationError("E2B sandbox creation failed")
         if self._failure_mode == "quota":
             raise SandboxQuotaError("E2B quota exhausted")
-        # Stub: temp dir stands in for the remote E2B filesystem. Real
-        # integration calls e2b.Sandbox.create() and returns the sandbox
-        # handle; the workspace_path would be an opaque sandbox id.
+        # Placeholder: temp dir stands in for the remote E2B filesystem. A
+        # live integration must call e2b.Sandbox.create() and return an opaque
+        # sandbox handle instead of a host path.
         # Wrap OSError as SandboxCreationError to preserve fail-closed.
         try:
             workspace = tempfile.mkdtemp(prefix=f"v2-e2b-{run_id}-")
         except OSError as exc:
             raise SandboxCreationError(f"E2B workspace creation failed: {exc}") from exc
         self._created_at = time.monotonic()
-        logger.info("RemoteE2B sandbox created (stub): %s", workspace)
+        logger.warning("RemoteE2B placeholder sandbox created locally: %s", workspace)
         return workspace
 
     def generate_pdf(
@@ -645,8 +1093,7 @@ class RemoteE2BComputer(Computer):
         timeout_seconds: float = 30.0,
         max_output_bytes: int = 1_048_576,
     ) -> "BashResult":
-        """Run ``command`` inside the E2B sandbox (stub: same isolation
-        contract as :class:`LocalNativeComputer`).
+        """Run ``command`` inside the development placeholder workspace.
 
         Production E2B integration replaces this body with
         ``sandbox.commands.run(command, timeout=...)`` from the E2B SDK.
@@ -655,8 +1102,7 @@ class RemoteE2BComputer(Computer):
         """
         if self._failure_mode == "timeout":
             raise SandboxTimeoutError("E2B bash timeout")
-        # Stub stage: reuse the LocalNative implementation against the
-        # temp dir that stands in for the E2B filesystem. Real E2B
+        # Placeholder stage: execute against the temp dir. Real E2B
         # integration replaces this with sandbox.commands.run().
         import subprocess
 

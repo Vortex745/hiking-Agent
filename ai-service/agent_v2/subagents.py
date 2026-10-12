@@ -153,7 +153,7 @@ _RESEARCHER_DEFINITION = SubagentDefinition(
     system_duty=(
         "You are a researcher subagent for hiking-related complex research. "
         "You gather evidence from hiking knowledge, route research, web "
-        "search, web scraping, and memory. You do NOT execute shell, write "
+        "scraping, and memory. Route research owns candidate search. You do NOT execute shell, write "
         "files, edit files, or call MCP servers. You return structured "
         "findings to the root Agent; the root Agent owns the final "
         "user-facing answer."
@@ -161,7 +161,6 @@ _RESEARCHER_DEFINITION = SubagentDefinition(
     allowed_tools=(
         "hiking_knowledge_search",
         "route_research",
-        "web_search",
         "web_scraping",
         "memory_search",
     ),
@@ -175,8 +174,8 @@ _ROUTE_PLANNER_DEFINITION = SubagentDefinition(
     model_profile=_ROUTE_PLANNER_MODEL,
     system_duty=(
         "You are a route planner subagent. You produce evidence-grounded "
-        "route plans using hiking knowledge, route research, web search, "
-        "gear checklists, risk assessments, and memory. You may reach the "
+        "route plans using hiking knowledge, route research, gear checklists, "
+        "and memory. You may reach the "
         "two AMap MCP servers (weather + map) allowlisted below. You do "
         "NOT execute shell, write files, edit files, or create subagents. "
         "You return a structured plan to the root Agent; the root Agent "
@@ -185,9 +184,7 @@ _ROUTE_PLANNER_DEFINITION = SubagentDefinition(
     allowed_tools=(
         "hiking_knowledge_search",
         "route_research",
-        "web_search",
         "gear_checklist",
-        "risk_assessment",
         "memory_search",
     ),
     disallowed_tools=SUBAGENT_DISALLOWED_TOOLS,

@@ -144,11 +144,93 @@ const MARKDOWN_PATTERN = /(!\[[^\]]*\]\([^)]+\)|\[[^\]]*\]\([^)]+\)|\*\*(?=\S)[\
 const IMAGE_URL_PATTERN = /\.(jpg|jpeg|png|gif|webp|avif|bmp)(\?.*)?$/i;
 type PreviewImage = { src: string; alt: string };
 
+const wordSegmenter = typeof Intl.Segmenter === 'function'
+  ? new Intl.Segmenter('zh', { granularity: 'word' })
+  : null;
+
+function streamText(text: string, keyPrefix: string) {
+  const segments = wordSegmenter
+    ? Array.from(wordSegmenter.segment(text), ({ segment }) => segment)
+    : text.match(/\s+|[^\s]+/g) || [];
+  return segments.map((segment, index) =>
+    /^\s+$/.test(segment)
+      ? segment
+      : <span
+          key={`${keyPrefix}-${index}`}
+          className="t-stream-w"
+          data-stream-key={`${keyPrefix}-${index}`}
+        >
+          {segment}
+        </span>
+  );
+}
+
 const MarkdownText = (part: any) => {
   const [previewImage, setPreviewImage] = useState<PreviewImage | null>(null);
   const raw = part.text || part.part?.text || '';
+  const role = useMessage((state) => state.role);
+  const wasStreamed = useMessage((state) => (
+    (state.metadata as { streamed?: boolean } | undefined)?.streamed === true
+  ));
+  const streamRef = useRef<HTMLDivElement>(null);
+  const streamQueueRef = useRef<Array<{ key: string; element: HTMLElement }>>([]);
+  const queuedWordsRef = useRef(new Set<string>());
+  const revealedWordsRef = useRef(new Set<string>());
+  const streamTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Split on bold, images, and links patterns
   const segments = raw.split(MARKDOWN_PATTERN);
+
+  useLayoutEffect(() => {
+    const block = streamRef.current;
+    if (!block || role !== 'assistant') return;
+
+    const words = Array.from(block.querySelectorAll<HTMLElement>('.t-stream-w'));
+    if (!wasStreamed || prefersReducedMotion()) {
+      words.forEach((word) => {
+        word.classList.add('is-in');
+        if (word.dataset.streamKey) revealedWordsRef.current.add(word.dataset.streamKey);
+      });
+      streamQueueRef.current = [];
+      queuedWordsRef.current.clear();
+      if (streamTimerRef.current !== null) clearTimeout(streamTimerRef.current);
+      streamTimerRef.current = null;
+      return;
+    }
+
+    words.forEach((word) => {
+      const key = word.dataset.streamKey;
+      if (!key) return;
+      if (revealedWordsRef.current.has(key)) {
+        word.classList.add('is-in');
+      } else if (!queuedWordsRef.current.has(key)) {
+        streamQueueRef.current.push({ key, element: word });
+        queuedWordsRef.current.add(key);
+      }
+    });
+    if (streamTimerRef.current !== null || streamQueueRef.current.length === 0) return;
+
+    const gap = parseFloat(getComputedStyle(block).getPropertyValue('--stream-gap')) || 60;
+    const showNext = () => {
+      const word = streamQueueRef.current.shift();
+      if (word?.element.isConnected) {
+        word.element.classList.add('is-in');
+        revealedWordsRef.current.add(word.key);
+      }
+      if (word) queuedWordsRef.current.delete(word.key);
+      streamTimerRef.current = streamQueueRef.current.length > 0
+        ? setTimeout(showNext, gap)
+        : null;
+    };
+    streamTimerRef.current = setTimeout(showNext, 0);
+  }, [raw, role, wasStreamed]);
+
+  useEffect(() => () => {
+    if (streamTimerRef.current !== null) clearTimeout(streamTimerRef.current);
+    streamTimerRef.current = null;
+    streamQueueRef.current = [];
+    queuedWordsRef.current.clear();
+    revealedWordsRef.current.clear();
+  }, []);
 
   useEffect(() => {
     if (!previewImage) return;
@@ -162,7 +244,7 @@ const MarkdownText = (part: any) => {
   }, [previewImage]);
 
   return (
-    <div className="whitespace-pre-wrap leading-relaxed relative">
+    <div ref={streamRef} className={`whitespace-pre-wrap leading-relaxed relative${role === 'assistant' ? ' t-stream' : ''}`}>
       {segments.map((seg: string, i: number) => {
         if (!seg) return null;
         
@@ -221,16 +303,16 @@ const MarkdownText = (part: any) => {
               rel="noopener noreferrer"
               className="text-[#0b57d0] hover:underline dark:text-[#a8c7fa]"
             >
-              {linkText}
+              {role === 'assistant' ? streamText(linkText, `link-${i}`) : linkText}
             </a>
           );
         }
 
         if (seg.startsWith('**') && seg.endsWith('**')) {
-          return <strong key={i} className="font-bold">{seg.slice(2, -2)}</strong>;
+          return <strong key={i} className="font-bold">{role === 'assistant' ? streamText(seg.slice(2, -2), `bold-${i}`) : seg.slice(2, -2)}</strong>;
         }
         
-        return <span key={i}>{seg}</span>;
+        return <span key={i}>{role === 'assistant' ? streamText(seg, `text-${i}`) : seg}</span>;
       })}
       {previewImage && (
         <div

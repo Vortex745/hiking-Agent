@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS subjects (
 
 CREATE TABLE IF NOT EXISTS memory_settings (
     subject_id TEXT PRIMARY KEY,
-    enabled INTEGER NOT NULL DEFAULT 0,
+    enabled INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (subject_id) REFERENCES subjects(subject_id) ON DELETE CASCADE
 );
@@ -124,7 +124,7 @@ class MemoryStore:
             )
             self._conn.execute(
                 "INSERT INTO memory_settings(subject_id, enabled, updated_at) "
-                "VALUES (?, 0, ?)",
+                "VALUES (?, 1, ?)",
                 (subject_id, now),
             )
             self._conn.execute("COMMIT")
@@ -315,6 +315,9 @@ class MemoryStore:
             return None
         if row["status"] != "pending":
             if row["decision_request_id"] == decision_request_id:
+                expected_status = "approved" if decision == "approve" else "rejected"
+                if row["status"] != expected_status:
+                    raise ValueError("decision_request_conflict")
                 return self._candidate_result(row), True
             raise ValueError(f"candidate_{row['status']}")
 

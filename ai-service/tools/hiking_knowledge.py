@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 from typing import Any
 
@@ -19,6 +20,19 @@ from rag.retriever import VectorStoreRetriever
 from rag.text_processing import clean_display_text
 
 logger = logging.getLogger("ai-service.tools.hiking_knowledge")
+
+# Distance numbers only (gate v1). Extracted from FULL content — the
+# preview is truncated and must never be the source of gate evidence.
+_DISTANCE_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*(?:千米|公里|km)", re.IGNORECASE)
+
+
+def distance_values_in(text: str) -> list[float]:
+    values: list[float] = []
+    for match in _DISTANCE_PATTERN.finditer(text or ""):
+        value = float(match.group(1))
+        if value not in values:
+            values.append(value)
+    return values
 
 
 def _preview(text: str, limit: int = 220) -> str:
@@ -106,6 +120,7 @@ def _chunks_from_docs(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "source": source,
                 "score": _score_from_fields(doc),
                 "preview": _preview(doc.get("content", "")),
+                "distance_values": distance_values_in(doc.get("content", "")),
             }
         )
     return chunks

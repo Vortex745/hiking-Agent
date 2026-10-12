@@ -12,7 +12,7 @@ from pydantic import Field
 from agent_v2.kernel_tools import BoundedDomainTool
 from route_compare.data import collect_candidates
 from route_compare.fixtures import fixture_candidates
-from route_compare.models import CompareParams, ComparisonResult, Contract, RouteCandidate, RouteQuery
+from route_compare.models import CompareParams, ComparisonResult, Contract, PlanDetails, RouteCandidate, RouteQuery
 from route_compare.providers import ProviderConfig, select_provider
 from route_compare.service import compare_routes, render_report
 
@@ -87,6 +87,7 @@ def provider_config(settings: Any) -> ProviderConfig:
 
 class ReportParams(Contract):
     comparison_id: str = Field(min_length=1, max_length=150)
+    plan_details: PlanDetails | None = None
 
 
 class RouteSession:
@@ -133,10 +134,12 @@ class RouteSession:
                 return ComparisonResult.model_validate(raw)
         return None
 
-    async def prepare_report(self, comparison_id: str) -> dict:
+    async def prepare_report(self, comparison_id: str, plan_details: dict | None = None) -> dict:
         result = self.load_result(comparison_id)
         if result is None:
             return {"status": "blocked", "reason": "comparison_not_found"}
+        if plan_details is not None:
+            result.plan_details = PlanDetails.model_validate(plan_details)
         try:
             render_report(result)
         except ValueError:
@@ -162,7 +165,9 @@ class RouteCompareTool(BoundedDomainTool):
 
 class ReportExportTool(BoundedDomainTool):
     name = "report_export"
-    description = "按服务器签发的 comparison_id 请求带来源 PDF。仅通过证据/安全门的结果可进入现有 PDF 审批与 Artifact 生命周期。"
+    description = ("按服务器签发的 comparison_id 导出完整徒步计划书。plan_details 只填写用户明确提供的日期、"
+                   "集合、人数、交通住宿、行程、预算和应急安排；缺失项留空，禁止猜测或填入路线事实。"
+                   "仅通过证据/安全门的结果可进入现有 PDF 审批与 Artifact 生命周期。")
     args_schema = ReportParams
 
     async def execute(self, params):

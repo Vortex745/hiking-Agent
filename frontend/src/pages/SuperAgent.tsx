@@ -35,13 +35,13 @@ import {
 import { useExternalStoreRuntime, AssistantRuntimeProvider, ThreadMessage } from "@assistant-ui/react"
 import { GeminiThread } from '../components/assistant-ui/gemini/GeminiThread'
 import { GeminiSidebar } from '../components/assistant-ui/gemini/GeminiSidebar'
+import ApprovalCard, { DEFAULT_APPROVAL_QUESTIONS } from '../components/ApprovalCard'
 import X from 'reicon-react/icons/X'
 import Trash2 from 'reicon-react/icons/Trash2'
 import Clipboard from 'reicon-react/icons/Clipboard'
 import CheckCircle from 'reicon-react/icons/CheckCircle'
 import AlertTriangle from 'reicon-react/icons/AlertTriangle'
 import Map from 'reicon-react/icons/Map'
-import Database from 'reicon-react/icons/Database'
 import Download from 'reicon-react/icons/Download'
 import Pen from 'reicon-react/icons/Pen'
 
@@ -50,6 +50,8 @@ interface Message {
   content: string
   time?: string
   isStreaming?: boolean
+  /** Runtime-only marker so a fast SSE response still gets the word reveal. */
+  hasStreamed?: boolean
   traceEvents?: AgentTraceEvent[]
   artifacts?: AgentArtifact[]
 }
@@ -211,13 +213,25 @@ function sanitizeStoredValue(value: unknown): unknown {
 }
 
 function serializeMessages(messages: Message[]) {
-  return JSON.stringify(sanitizeStoredValue(messages))
+  return JSON.stringify(sanitizeStoredValue(messages.map(stripTransientMessageState)))
+}
+
+function stripTransientMessageState(message: Message): Message {
+  const { hasStreamed: _hasStreamed, ...stored } = message
+  return stored
+}
+
+function restoreStoredMessages(value: unknown): Message[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .filter((message): message is Message => Boolean(message && typeof message === 'object'))
+    .map(stripTransientMessageState)
 }
 
 function sanitizeSessionForStorage(session: ChatSession): ChatSession {
   return {
     ...session,
-    messages: sanitizeStoredValue(session.messages) as Message[],
+    messages: sanitizeStoredValue(session.messages.map(stripTransientMessageState)) as Message[],
   }
 }
 
@@ -240,7 +254,7 @@ function loadSessions(): ChatSession[] {
       chatId: session.chatId || createChatId(),
       title: session.title || '新对话',
       date: session.date || getTodayDate(),
-      messages: Array.isArray(session.messages) ? session.messages : [],
+      messages: restoreStoredMessages(session.messages),
     }))
   } catch { return [] }
 }
@@ -354,7 +368,7 @@ const convertMessage = (msg: Message, index: number): ThreadMessage => {
     content: content,
     status: (msg.isStreaming ? { type: "running" } : { type: "complete" }),
     createdAt: new Date(),
-    metadata: {},
+    metadata: { streamed: msg.hasStreamed === true },
   } as unknown as ThreadMessage;
 };
 
@@ -362,7 +376,7 @@ function SuperAgent() {
   const [messages, setMessages] = useState<Message[]>(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEY)
-      return saved ? JSON.parse(saved) : []
+      return saved ? restoreStoredMessages(JSON.parse(saved)) : []
     } catch { return [] }
   })
   const [sessions, setSessions] = useState<ChatSession[]>(loadSessions)
@@ -404,8 +418,6 @@ function SuperAgent() {
   // ``approval.required`` event. ``pendingApproval`` mirrors the
   // reducer's ``pendingApproval`` as React state so the approve/reject
   // prompt re-renders when a run pauses.
-  const [memoryEnabled, setMemoryEnabled] = useState(false)
-  const [memoryPending, setMemoryPending] = useState(false)
   const [memoryPanelOpen, setMemoryPanelOpen] = useState(false)
   const [memoryItems, setMemoryItems] = useState<V2Memory[]>([])
   const [memoryTotal, setMemoryTotal] = useState(0)
@@ -423,22 +435,17 @@ function SuperAgent() {
 
   useEffect(() => {
     let cancelled = false
-    void fetchV2MemorySettings()
-      .then(settings => { if (!cancelled) setMemoryEnabled(settings.enabled) })
-      .catch(() => { if (!cancelled) setMemoryEnabled(false) })
+    const ensureMemoryEnabled = async () => {
+      try {
+        const settings = await fetchV2MemorySettings()
+        if (!cancelled && !settings.enabled) await updateV2MemorySettings(true)
+      } catch {
+        // The memory service fails closed when unavailable; retry on the next mount.
+      }
+    }
+    void ensureMemoryEnabled()
     return () => { cancelled = true }
   }, [])
-
-  const handleMemoryToggle = useCallback(async () => {
-    if (memoryPending) return
-    setMemoryPending(true)
-    try {
-      const settings = await updateV2MemorySettings(!memoryEnabled)
-      setMemoryEnabled(settings.enabled)
-    } finally {
-      setMemoryPending(false)
-    }
-  }, [memoryEnabled, memoryPending])
 
   useEffect(() => {
     if (!memoryPanelOpen) return
@@ -540,8 +547,8 @@ function SuperAgent() {
   // Ticket 08: v2 event handlers (spec AC2). Map v2 wire events to stable
   // UI state. These are defined as useCallbacks before the recovery effect
   // so the effect can reference them without forward-reference issues.
-  // v2 text is written directly to the messages array (no typewriter queue)
-  // to keep v2 independent of v1's streaming polish (spec AC1).
+  // v2 text is written directly to the messages array. The presentation
+  // layer owns the word reveal; the reducer stays independent of animation.
   const handleV2Event = useCallback((event: V2EventEnvelope) => {
     const next = reduceV2Event(v2StateRef.current, event)
     v2StateRef.current = next
@@ -595,7 +602,7 @@ function SuperAgent() {
         const updated = [...prev]
         const last = updated[updated.length - 1]
         if (last && last.role === 'assistant') {
-          updated[updated.length - 1] = { ...last, content: last.content + delta, isStreaming: true }
+          updated[updated.length - 1] = { ...last, content: last.content + delta, isStreaming: true, hasStreamed: true }
         }
         return updated
       })
@@ -974,6 +981,9 @@ function SuperAgent() {
               // directly) — re-append so the replay preserves them.
               content: `${next.assistantText}${v2NoticeSuffix(next.reviewNotices)}`,
               isStreaming: !isV2Terminal(next),
+              // Recovered text already existed before this page loaded;
+              // only future live deltas may opt into the reveal.
+              hasStreamed: false,
               // A02: artifacts delivered before the refresh are part of
               // the replay state — reattach so download cards survive.
               artifacts: next.artifacts.length > 0 ? next.artifacts : undefined,
@@ -991,6 +1001,7 @@ function SuperAgent() {
             ...last,
             content: `${next.assistantText}${v2NoticeSuffix(next.reviewNotices)}`,
             isStreaming: !isV2Terminal(next),
+            hasStreamed: false,
             artifacts: next.artifacts.length > 0 ? next.artifacts : undefined,
           }
         }
@@ -1245,8 +1256,9 @@ function SuperAgent() {
     setActiveSessionId(target.id)
     chatIdRef.current = target.chatId
     localStorage.setItem(CHAT_ID_KEY, target.chatId)
-    setMessages(target.messages)
-    try { localStorage.setItem(STORAGE_KEY, serializeMessages(target.messages)) } catch { /* ignore */ }
+    const restoredMessages = restoreStoredMessages(target.messages)
+    setMessages(restoredMessages)
+    try { localStorage.setItem(STORAGE_KEY, serializeMessages(restoredMessages)) } catch { /* ignore */ }
   }, [activeSessionId, messages, teardownActiveStream])
 
   const selectSession = useCallback((sessionId: string) => {
@@ -1291,7 +1303,7 @@ function SuperAgent() {
       ? messages.slice(0, Math.max(0, replaceFromIndex))
       : messages
     const nextUserMessage: Message = { role: 'user', content: text, time: timeStr }
-    const nextAssistantMessage: Message = { role: 'assistant', content: '', isStreaming: true }
+    const nextAssistantMessage: Message = { role: 'assistant', content: '', isStreaming: true, hasStreamed: true }
 
     setMessages(prev => {
       const base = typeof replaceFromIndex === 'number'
@@ -1301,8 +1313,8 @@ function SuperAgent() {
     })
 
     // Ticket 08: v2 是唯一 chat 链路。Spec AC1 requires an independent v2
-    // client and v2 event reducer. v2 does NOT use a typewriter queue —
-    // text deltas are written directly to the messages array. The v2
+    // client and v2 event reducer. Text deltas are written directly to the
+    // messages array; the presentation layer handles word reveal. The v2
     // request body is strict: only message, request_id, conversation_id,
     // profile_id, and current_location are allowed (server rejects
     // everything else).
@@ -1457,6 +1469,21 @@ function SuperAgent() {
     }
   });
 
+  // 问答框（ApprovalCard）提交后，把所选选项拼成一句偏好描述，作为一条
+  // 用户消息发回对话流，让 agent 基于答案继续规划。
+  const handleClarificationSubmitted = useCallback((answers: Record<number, number[]>) => {
+    const parts: string[] = []
+    DEFAULT_APPROVAL_QUESTIONS.forEach((question, qi) => {
+      const picked = answers[qi] ?? []
+      if (picked.length > 0) {
+        parts.push(`${question.q}${picked.map(i => question.options[i]).join('、')}`)
+      }
+    })
+    if (parts.length > 0) {
+      void handleSend(`我的偏好：${parts.join('；')}`)
+    }
+  }, [handleSend])
+
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <div className="flex h-full w-full overflow-hidden relative">
@@ -1481,6 +1508,13 @@ function SuperAgent() {
               <div className="mt-2 break-words text-white/75">{v2StateRef.current.resumeErrorMessage}</div>
             </div>
           )}
+          {/* 问答框：agent 向用户收集偏好/确认，内嵌在主线程区右上角 */}
+          <div className="absolute right-4 top-16 z-40">
+            <ApprovalCard
+              questions={DEFAULT_APPROVAL_QUESTIONS}
+              onSubmitted={handleClarificationSubmitted}
+            />
+          </div>
           {pendingApproval && v2ApprovalState !== 'resolved' && (
             <div className="absolute left-4 right-4 top-16 z-50 ml-auto max-w-sm rounded-md border border-amber-400/30 bg-zinc-950 p-4 text-sm text-white shadow-xl">
               <div className="font-medium">
@@ -1507,27 +1541,6 @@ function SuperAgent() {
               </div>
             </div>
           )}
-          <div className="absolute top-4 right-4 z-40 flex h-9 items-center gap-3 rounded-md border border-white/10 bg-black/50 px-3 text-xs text-white/80 backdrop-blur-md">
-              <label className="flex cursor-pointer items-center gap-2">
-                <span>长期记忆</span>
-                <input
-                  type="checkbox"
-                  className="h-4 w-4 accent-emerald-500"
-                  checked={memoryEnabled}
-                  disabled={memoryPending}
-                  onChange={() => { void handleMemoryToggle() }}
-                />
-              </label>
-              <button
-                type="button"
-                className="flex h-7 w-7 items-center justify-center text-white/70 hover:text-white disabled:opacity-50"
-                title="管理长期记忆"
-                disabled={!memoryEnabled}
-                onClick={() => setMemoryPanelOpen(open => !open)}
-              >
-                <Database className="h-4 w-4" />
-              </button>
-            </div>
           {pendingMemoryConsent && (
             <div className="absolute left-4 right-4 top-16 z-50 ml-auto max-w-sm rounded-md border border-amber-400/30 bg-zinc-950 p-4 text-sm text-white shadow-xl">
               <div className="font-medium">确认保存 {pendingMemoryConsent.category}</div>

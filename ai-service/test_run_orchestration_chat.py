@@ -233,6 +233,68 @@ def test_chat_flow_preserves_answer_when_knowledge_evidence_exists(tmp_path: Pat
     assert text == expected
 
 
+def _knowledge_evidence(distance_values: list[float]) -> list[dict[str, Any]]:
+    return [{
+        "tool": "hiking_knowledge_search",
+        "phase": "result",
+        "ok": True,
+        "evidence": {
+            "has_chunks": True,
+            "sources": ["trail-guide.md"],
+            "chunks": [{
+                "title": "trail-guide",
+                "source": "trail-guide.md",
+                "preview": "全程里程……",
+                "distance_values": distance_values,
+            }],
+        },
+    }]
+
+
+def test_chat_flow_keeps_answer_when_distance_numbers_are_supported(tmp_path: Path):
+    kernel_calls: list[dict[str, Any]] = []
+    expected = "鳌太线全程约120公里，冬季水源很少。"
+    orch = _orchestrator(
+        tmp_path,
+        kernel_calls,
+        kernel_result=(expected, _knowledge_evidence([120.0])),
+    )
+
+    items = _stream(orch, _flow_req(message="鳌太线多长"))
+
+    text = next(event.payload["content"] for event in items if event.type == "text")
+    assert text == expected
+
+
+def test_chat_flow_replaces_answer_with_unsupported_distance_number(tmp_path: Path):
+    kernel_calls: list[dict[str, Any]] = []
+    orch = _orchestrator(
+        tmp_path,
+        kernel_calls,
+        kernel_result=("鳌太线全程约120公里，冬季水源很少。", _knowledge_evidence([55.0])),
+    )
+
+    items = _stream(orch, _flow_req(message="鳌太线多长"))
+
+    text = next(event.payload["content"] for event in items if event.type == "text")
+    assert "120公里" not in text
+    assert "资料不足" in text
+    # 语义区别于第一层「未检索到证据」：用户能看出是证据不支持，而非没去查。
+    assert "未检索到" not in text
+
+
+def test_chat_flow_keeps_distance_numbers_when_search_never_attempted(tmp_path: Path):
+    """窄门边界不变：从未检索的回合不做数字校验。"""
+    kernel_calls: list[dict[str, Any]] = []
+    expected = "这段路线全程约15公里。"
+    orch = _orchestrator(tmp_path, kernel_calls, kernel_result=(expected, []))
+
+    items = _stream(orch, _flow_req(message="这段路线多长"))
+
+    text = next(event.payload["content"] for event in items if event.type == "text")
+    assert text == expected
+
+
 def test_chat_flow_persists_events_and_marks_run_done(tmp_path: Path):
     repo = _repo(tmp_path)
     kernel_calls: list[dict[str, Any]] = []

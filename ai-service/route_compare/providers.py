@@ -4,10 +4,43 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import random
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 from .models import Confidence, DecisionRequest, DecisionResult
+
+# Bounded retry for transient failures only; final failure semantics are unchanged.
+MAX_DECIDE_ATTEMPTS = 3
+_RETRY_AFTER_CAP_SECONDS = 10.0
+_BACKOFF_SECONDS = (0.5, 1.5)
+_TRANSIENT_MARKERS = ("ratelimit", "rate limit", "429", "connection", "timeout", "timed out")
+
+
+def _is_transient(exc: Exception) -> bool:
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(marker in text for marker in _TRANSIENT_MARKERS)
+
+
+def _retry_after_seconds(exc: Exception) -> float | None:
+    headers = getattr(exc, "headers", None) or getattr(getattr(exc, "response", None), "headers", None)
+    get = getattr(headers, "get", None)
+    if get is None:
+        return None
+    raw = get("retry-after")
+    if raw is None:
+        return None
+    try:
+        return min(float(raw), _RETRY_AFTER_CAP_SECONDS)
+    except (TypeError, ValueError):
+        return None
+
+
+def _backoff_seconds(attempt: int, exc: Exception) -> float:
+    retry_after = _retry_after_seconds(exc)
+    if retry_after is not None:
+        return retry_after
+    return _BACKOFF_SECONDS[min(attempt, len(_BACKOFF_SECONDS) - 1)] * random.uniform(0.75, 1.25)
 
 
 @dataclass(frozen=True)
@@ -41,20 +74,24 @@ class Provider:
                               status=self.invalid_response_status if invalid else "unavailable", reason=reason)
 
     async def decide(self, request: DecisionRequest) -> DecisionResult:
-        try:
-            result = await asyncio.wait_for(self.evaluate(request), self.config.timeout_seconds)
-            if (result.status == "ok" and
-                (len(result.ranking) != len(set(result.ranking)) or
-                 set(result.ranking) != set(request.candidate_ids))):
-                return self.failure("invalid_ranking", invalid=True)
-            return result
-        except TimeoutError:
-            return self.failure("provider_timeout")
-        except (ValueError, KeyError, TypeError):
-            return self.failure("invalid_response", invalid=True)
-        except Exception:
-            # Provider exceptions may include credentials or request bodies.
-            return self.failure("provider_unavailable")
+        for attempt in range(MAX_DECIDE_ATTEMPTS):
+            try:
+                result = await asyncio.wait_for(self.evaluate(request), self.config.timeout_seconds)
+                if (result.status == "ok" and
+                    (len(result.ranking) != len(set(result.ranking)) or
+                     set(result.ranking) != set(request.candidate_ids))):
+                    return self.failure("invalid_ranking", invalid=True)
+                return result
+            except (ValueError, KeyError, TypeError):
+                return self.failure("invalid_response", invalid=True)
+            except Exception as exc:
+                # Provider exceptions may include credentials or request bodies.
+                if attempt + 1 >= MAX_DECIDE_ATTEMPTS or not _is_transient(exc):
+                    reason = "provider_timeout" if isinstance(exc, TimeoutError) else "provider_unavailable"
+                    return self.failure(reason)
+                delay = _backoff_seconds(attempt, exc)
+            await asyncio.sleep(delay)
+        return self.failure("provider_unavailable")
 
     async def evaluate(self, request: DecisionRequest) -> DecisionResult:
         raise NotImplementedError

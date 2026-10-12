@@ -88,7 +88,12 @@ def v2_health_status(app_state: Any, settings: Any) -> dict[str, Any]:
                 else "disabled"
             },
             "e2b": {
-                "status": "ready" if sandbox_type != "remote_e2b" else "selected"
+                "status": "ready" if sandbox_type != "remote_e2b" else "unavailable",
+                "detail": (
+                    "live E2B adapter is not configured; remote_e2b currently uses a development placeholder"
+                    if sandbox_type == "remote_e2b"
+                    else "local development sandbox"
+                ),
             },
             "checkpoint": {
                 "status": "ready"

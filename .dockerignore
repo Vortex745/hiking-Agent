@@ -39,3 +39,8 @@ workspace/
 !README.md
 .git/
 .gitignore
+# Keep the vendored fork's Git metadata so the runtime can verify the pinned
+# UniHarness commit after its editable install. The repository's own history
+# stays excluded from the image context.
+!third_party/uniharness/.git/
+!third_party/uniharness/.git/**
