@@ -120,6 +120,52 @@ class RouteSelectionOutcome:
         return self.status == "blocked"
 
 
+@dataclass(frozen=True, slots=True)
+class RouteResearchOutcome:
+    """Result of one route-research turn for a draft's free destination (04).
+
+    Same ``status``/``reason`` discipline as :class:`RouteSelectionOutcome`,
+    with one extra honest case: ``unavailable`` means research could not run
+    at all (no data source configured), which is NOT the same statement as
+    ``insufficient`` (it ran and nothing was verifiable). Only ``ok`` may be
+    labelled a route plan, and the label comes from the gate's own answer.
+
+    ``result`` is the stored :class:`route_compare.models.ComparisonResult`
+    itself — candidates, sources, gaps and all — so the caller persists and
+    renders the evidence rather than a paraphrase of it. It is present even for
+    ``insufficient``, because "here is what we found and why it does not
+    qualify" is the informative answer (spec AC2/AC3).
+    """
+
+    status: Literal["ok", "insufficient", "unavailable"]
+    result: ComparisonResult | None = None
+    reason: str | None = None
+    gaps: tuple[str, ...] = ()
+
+    @property
+    def insufficient(self) -> bool:
+        return self.status != "ok"
+
+
+def _research_query(destination_or_route: str) -> dict:
+    """Turn one free-text destination into a bounded research query.
+
+    ``RouteQuery``'s field caps are the transport's, not the user's: a
+    120-character 目的地 or a long route description is a legal draft field
+    (:data:`agent_v2.plan_workflow._DESTINATION_MAX`) and simply does not fit a
+    search term, so each slot carries the same clipped text. Nothing is
+    invented here — no city, no origin, no "nearby" route is guessed to make
+    the query look richer, and a clipped term is still the user's own words.
+    """
+    text = (destination_or_route or "").strip()
+    return {
+        "name": text[:100],
+        "city": text[:80],
+        "origin": text[:100],
+        "destination": text[:100],
+    }
+
+
 def _route_basis(result: ComparisonResult, assessment: CandidateAssessment,
                  role: Literal["recommended", "alternative"]) -> RouteBasis:
     """Project a re-assessed candidate onto the draft's fact section (AC2).
@@ -257,6 +303,46 @@ class RouteSession:
         role: Literal["recommended", "alternative"] = (
             "recommended" if candidate_id == result.recommended_id else "alternative")
         return RouteSelectionOutcome("ok", basis=_route_basis(result, checked, role))
+
+    async def research_destination(self, destination_or_route: str) -> RouteResearchOutcome:
+        """Try to research the draft's own free destination or route (ticket 04).
+
+        This is a *branch*, not a second gate: it hands one query to the same
+        :meth:`compare` the kernel tool uses — ``fixture_candidates`` offline,
+        :func:`route_compare.data.collect_candidates` live — and then reads the
+        verdict :func:`route_compare.service.compare_routes` already reached
+        through :func:`assess_candidate`. A candidate counts as evidence only
+        when its facts are source-backed, non-negative and its weather /
+        open-status / risk clear the freshness rules; that is the gate's
+        business and this leaf does not restate, weaken or override it.
+
+        So AC3 is the *status*, not a retry policy: anything other than
+        ``recommended`` (partial evidence, empty evidence, moderate risk, severe
+        weather, provider unavailable) is returned as ``insufficient`` together
+        with the gaps that produced the answer, and the caller must not write a
+        formal route plan from it. Nothing here fills a gap: no derived segment
+        time, no estimated price, no search snippet promoted to a fact
+        (:data:`route_compare.service.REQUIRED_FACTS` stays the only yardstick).
+        """
+        query = _research_query(destination_or_route)
+        if not query["name"]:
+            return RouteResearchOutcome("unavailable", reason=PlanBlockReason.RESEARCH_WITHOUT_DRAFT)
+
+        try:
+            raw = await self.compare([query])
+        except ValueError:
+            # ``unknown_data_mode``: no research source is configured at all.
+            # Saying "not enough material" here would be a false statement
+            # about the destination, so this comes back as ``unavailable``.
+            return RouteResearchOutcome("unavailable", reason=PlanBlockReason.RESEARCH_UNAVAILABLE)
+
+        result = ComparisonResult.model_validate(raw)
+        gaps = tuple(dict.fromkeys(
+            reason for assessment in result.candidates for reason in assessment.reasons))
+        if result.status == "recommended":
+            return RouteResearchOutcome("ok", result=result, gaps=gaps)
+        return RouteResearchOutcome("insufficient", result=result,
+                                    reason=result.status, gaps=gaps)
 
 
 class RouteCompareTool(BoundedDomainTool):

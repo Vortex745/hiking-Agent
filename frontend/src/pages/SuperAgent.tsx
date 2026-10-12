@@ -27,6 +27,7 @@ import {
   type V2PlanDraftState,
   type V2PlanDraftFields,
   type V2PlanRouteReference,
+  type V2PlanType,
 } from '../api/chatV2'
 import {
   reduceV2Event,
@@ -135,6 +136,20 @@ const PLAN_INTENT_LABELS: Record<V2PlanIntent, string> = {
   plan_cancel: '取消生成计划书',
   plan_regenerate: '重新生成草稿',
   plan_select_route: '选用该路线进入计划书草稿',
+  plan_research_route: '研究该目的地的路线资料',
+  plan_generic_draft: '继续生成通用草案',
+}
+
+/**
+ * Ticket 04 AC5: the draft's type, in the user's words. Keyed by the type union
+ * the same way the stage and intent maps are, so TS forces a label for any type
+ * a later ticket adds. The text is a *translation* of the server's marker — the
+ * server's own sentence lives in ``plan_workflow.draft_summary``, and the
+ * summary block below shows that verbatim.
+ */
+const PLAN_TYPE_LABELS: Record<V2PlanType, string> = {
+  route_plan: '正式路线计划草案（依据已核验路线事实）',
+  generic_draft: '通用草案（无已核验路线依据）',
 }
 
 /**
@@ -146,6 +161,7 @@ const PLAN_STAGE_LABELS: Record<V2PlanDraftStage, string> = {
   awaiting_confirmation: '等你确认是否生成计划书',
   awaiting_input: '等你填写基本信息',
   minimal_draft: '最小草稿已生成，可继续修改',
+  awaiting_generic_choice: '路线资料不足，等你选择通用草案或取消',
   cancelled: '已取消',
 }
 
@@ -1434,6 +1450,13 @@ function SuperAgent() {
        * client cannot supply one (spec AC3/AC4).
        */
       routeSelection?: V2PlanRouteReference
+      /**
+       * Ticket 04 AC4: the draft type the user chose when research found nothing
+       * verifiable. Only ever 'generic_draft' — declaring 'route_plan' is refused
+       * by the server, and this page never sends it (the label the user reads is
+       * derived from the basis the server re-read, not from here).
+       */
+      planType?: V2PlanType
     } = {},
   ) => {
     const text = typeof textOverride === 'string' ? textOverride.trim() : input.trim()
@@ -1509,6 +1532,7 @@ function SuperAgent() {
           v2Payload.intent = options.intent
           if (options.planInput) v2Payload.plan_input = options.planInput
           if (options.routeSelection) v2Payload.route_selection = options.routeSelection
+          if (options.planType) v2Payload.plan_type = options.planType
         }
         const needsRouteFollowupLocation = shouldRequestRouteFollowupLocation(text, contextMessages)
         // A plan send must not trigger a geolocation prompt: the draft flow
@@ -1694,8 +1718,27 @@ function SuperAgent() {
     })
   }, [handleSend])
 
-  const handlePlanDialogDismiss = useCallback(() => {
-    // AC2: closing the dialog parks the draft — nothing leaves the page, so
+  // Ticket 04 AC1: ask the server to research the destination this draft
+  // already holds. The send carries the intent ALONE — no search term, no
+  // distance, no weather claim — because the query is the stored 目的地或路线
+  // and every fact comes back from the server's own collection through the
+  // deterministic gate. It is a plain conversational turn like every other plan
+  // step, never the tool-approval pause (that machinery has a 300 s TTL and
+  // holds a sandbox lease; a user reading research results for six minutes
+  // would expire it).
+  const handleResearchRoute = useCallback(() => {
+    void handleSend('', { intent: 'plan_research_route' })
+  }, [handleSend])
+
+  // Ticket 04 AC4: the first of the two answers a parked research turn asks
+  // for. 「继续生成通用草案」is the only place this page ever names a draft
+  // type, and it names the generic one: whether a draft is a route plan is the
+  // server's derivation, so there is no affordance here that could claim it.
+  const handleContinueAsGenericDraft = useCallback(() => {
+    void handleSend('', { intent: 'plan_generic_draft', planType: 'generic_draft' })
+  }, [handleSend])
+
+  const handlePlanDialogDismiss = useCallback(() => {    // AC2: closing the dialog parks the draft — nothing leaves the page, so
     // the conversation keeps its stored stage and the 恢复草稿 panel takes
     // over. Cancelling has its own action below; conflating the two would
     // destroy the draft the moment the user stepped away.
@@ -1856,6 +1899,30 @@ function SuperAgent() {
               </div>
             </div>
           )}
+          {/* Ticket 04 AC3/AC4: research ran and the material did not pass the
+              gate, so NO formal route plan was produced — the draft is parked
+              here and the user picks. Both answers are ordinary conversational
+              turns with a whitelisted intent; 取消 is the same single
+              plan_cancel exit the confirmation prompt above uses, and closing
+              this prompt is not an action at all (ticket 02's park/cancel
+              split: only 取消 cancels). */}
+          {planDraft?.stage === 'awaiting_generic_choice' && (
+            <div className="absolute left-4 right-4 top-16 z-50 ml-auto max-w-sm rounded-md border border-border bg-white p-4 text-sm text-text-primary shadow-xl dark:border-white/10 dark:bg-[#1e1f20]">
+              <div className="font-medium">路线资料不足，无法形成正式路线计划</div>
+              <p className="mt-1 text-xs text-text-muted">
+                已针对「{planDraft.draft.destination_or_route || '未填写的目的地'}」发起路线研究，
+                但没有资料通过确定性核验。继续只会得到一份通用草案：未核验的路线事实仍为待核验。
+              </p>
+              <div className="mt-3 flex justify-end gap-2">
+                <Button variant="ghost" size="sm" disabled={isSending} onClick={handlePlanDecline}>
+                  取消
+                </Button>
+                <Button variant="accent" size="sm" disabled={isSending} onClick={handleContinueAsGenericDraft}>
+                  继续生成通用草案
+                </Button>
+              </div>
+            </div>
+          )}
           {/* Ticket 02 AC2: the restore affordance. A draft in an open stage
               survives a refresh or a conversation switch (conversation-keyed
               store), and this panel is how the user gets it back — reopening
@@ -1874,7 +1941,23 @@ function SuperAgent() {
                 {planDraft.draft.activity_date ? ` · ${planDraft.draft.activity_date}` : ''}
                 {planDraft.draft.participants != null ? ` · ${planDraft.draft.participants} 人` : ''}
               </p>
+              {/* Ticket 04 AC5: the draft's type, marked in the plan data and
+                  shown here. Translated from the server's own marker, which
+                  ``planDraft.summary`` above/below carries verbatim. */}
+              <p className="mt-1 text-xs text-text-muted">
+                草案类型：{PLAN_TYPE_LABELS[planDraft.plan_type]}
+              </p>
               <div className="mt-3 flex justify-end gap-2">
+                {/* Ticket 04 AC1: research only makes sense once the free
+                    destination exists, i.e. on a submitted draft with no route
+                    basis attached yet. A draft already backed by a selected,
+                    gate-passed route has nothing left to ask for. */}
+                {planDraft.stage === 'minimal_draft' && planDraft.draft.destination_or_route
+                  && !planDraft.route_selection && (
+                  <Button variant="ghost" size="sm" disabled={isSending} onClick={handleResearchRoute}>
+                    研究路线资料
+                  </Button>
+                )}
                 <Button variant="ghost" size="sm" disabled={isSending} onClick={handlePlanDialogCancel}>
                   取消草稿
                 </Button>

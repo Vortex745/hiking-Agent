@@ -31,6 +31,10 @@ The contract this module owns:
   of the same draft, in its own section and always with its source
   provenance. Facts the gate cannot certify stay absent, which renders as
   待核验: nothing is ever invented to fill a gap.
+* **Draft type** (:data:`PlanType`) — ``route_plan`` only when a gate-passed
+  route basis backs the draft, otherwise ``generic_draft``. The marker is
+  derived from that evidence and rendered by :func:`draft_summary`, so an
+  unverified draft is never presented as a formal route plan (spec 04 AC3/AC5).
 """
 
 from __future__ import annotations
@@ -51,6 +55,11 @@ PlanIntent = Literal[
     "plan_cancel",
     "plan_regenerate",
     "plan_select_route",
+    # Ticket 04: attempt route research for the draft's own free-text
+    # destination, and answer the "research found nothing verifiable"
+    # question the two ways the user is allowed to answer it.
+    "plan_research_route",
+    "plan_generic_draft",
 ]
 
 #: The only intents a client may send, derived from :data:`PlanIntent` so the
@@ -58,6 +67,26 @@ PlanIntent = Literal[
 #: ``api.chat_v2.ChatV2Request`` annotates ``intent`` with ``PlanIntent``:
 #: an unknown value is rejected by Pydantic (422) before any streaming.
 PLAN_INTENTS: frozenset[str] = frozenset(get_args(PlanIntent))
+
+
+# ---- Draft type (ticket 04) ------------------------------------------------
+
+PlanType = Literal["route_plan", "generic_draft"]
+
+#: What a draft is, in the user's terms and in the plan data. Derived by the
+#: flow from one question with a server-side answer: does the draft point at a
+#: route whose facts still pass the deterministic gate?
+#:
+#: * ``route_plan`` — a gate-passed route basis exists, so 距离/爬升/天气… can
+#:   be shown with provenance.
+#: * ``generic_draft`` — no verified route basis. Every unknown stays unknown
+#:   (待确认 for arrangements, 待核验 for facts) and the summary says outright
+#:   that this is not a route plan (spec AC3/AC5).
+#:
+#: A client may only ever *ask* for ``generic_draft``: claiming ``route_plan``
+#: is refused by :func:`evaluate_plan_intent`, because a plan type is a claim
+#: about evidence the client does not hold.
+PLAN_TYPES: frozenset[str] = frozenset(get_args(PlanType))
 
 
 # ---- Draft stages ----------------------------------------------------------
@@ -79,6 +108,13 @@ class PlanDraftStage(str, Enum):
     AWAITING_CONFIRMATION = "awaiting_confirmation"
     AWAITING_INPUT = "awaiting_input"
     MINIMAL_DRAFT = "minimal_draft"
+    #: Ticket 04 AC3/AC4: route research ran for the draft's free destination
+    #: and nothing passed the deterministic gate. The draft is parked HERE,
+    #: waiting for the user to choose between a generic draft and cancelling —
+    #: insufficient material never produces a plan on its own. Like
+    #: ``awaiting_confirmation`` this stage opens no dialog: it is answered by
+    #: a structured intent.
+    AWAITING_GENERIC_CHOICE = "awaiting_generic_choice"
     CANCELLED = "cancelled"
 
 
@@ -244,6 +280,14 @@ class PlanBlockReason:
     ROUTE_SELECTION_WITHOUT_DRAFT = "route_selection_without_draft"
     COMPARISON_NOT_FOUND = "comparison_not_found"
     ROUTE_NOT_SELECTABLE = "route_not_selectable"
+    # Ticket 04 — research and the generic-draft fallback are structured
+    # operations too: each refusal is a stable reason, and the fallback is
+    # only ever reachable from the stage that asks for it.
+    RESEARCH_WITHOUT_DRAFT = "route_research_without_draft"
+    RESEARCH_UNAVAILABLE = "route_research_unavailable"
+    PLAN_TYPE_NOT_ALLOWED = "plan_type_not_allowed"
+    INVALID_PLAN_TYPE = "invalid_plan_type"
+    GENERIC_DRAFT_WITHOUT_PENDING = "generic_draft_without_pending"
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,6 +297,12 @@ class PlanTransition:
     ``status`` is ``ok`` (with the resulting ``stage``) or ``blocked``
     (with the stable ``reason``). Nothing is mutated: the caller persists
     the returned stage, keeping this module free of storage.
+
+    ``fallback_stage`` is ticket 04's only concession to something outside
+    this layer: a research turn's outcome is a storage-and-gate question the
+    pure rules cannot see, so the rules name BOTH stages the turn may land on
+    and the flow picks between them with the leaf's own answer. The decision
+    stays here — the flow never invents a stage.
     """
 
     status: Literal["ok", "blocked"]
@@ -260,6 +310,8 @@ class PlanTransition:
     reason: str | None = None
     draft_input: PlanDraftInput | None = None
     route_selection: RouteSelectionInput | None = None
+    fallback_stage: PlanDraftStage | None = None
+    plan_type: str | None = None
 
     @property
     def blocked(self) -> bool:
@@ -271,6 +323,9 @@ _INTENTS_THAT_COLLECT_FIELDS: frozenset[str] = frozenset({"plan_create", "plan_r
 #: and the reference is only meaningful on a draft the user has already
 #: submitted — the stage that owns the arrangements the facts join.
 _INTENTS_THAT_SELECT_ROUTES: frozenset[str] = frozenset({"plan_select_route"})
+#: ``plan_generic_draft`` is the only intent that may declare a draft type,
+#: and it declares exactly one: the client cannot claim ``route_plan``.
+_INTENTS_THAT_DECLARE_PLAN_TYPE: frozenset[str] = frozenset({"plan_generic_draft"})
 
 #: User-facing text per stable rejection reason. The machine-readable
 #: ``reason`` is what clients branch on; this is only what the user reads.
@@ -297,6 +352,19 @@ BLOCK_MESSAGE: dict[str, str] = {
     PlanBlockReason.ROUTE_NOT_SELECTABLE: (
         "该路线不在可比选的推荐或备选范围内，或资料未通过核验。草稿保留，路线事实仍为待核验。"
     ),
+    PlanBlockReason.RESEARCH_WITHOUT_DRAFT: (
+        "还没有可研究的目的地或路线，请先填写并提交这三项安排。"
+    ),
+    PlanBlockReason.RESEARCH_UNAVAILABLE: (
+        "当前没有可用的路线资料来源，本次未能开展研究。草稿保持原状，路线事实仍为待核验。"
+    ),
+    PlanBlockReason.PLAN_TYPE_NOT_ALLOWED: "该计划书操作不接受草案类型标记。",
+    PlanBlockReason.INVALID_PLAN_TYPE: (
+        "只能显式选择「通用草案」：正式路线计划的类型由服务器依据已核验资料判定。"
+    ),
+    PlanBlockReason.GENERIC_DRAFT_WITHOUT_PENDING: (
+        "当前没有等待决定的资料不足情形，无法直接生成通用草案。"
+    ),
 }
 
 
@@ -307,6 +375,7 @@ def evaluate_plan_intent(
     plan_input: PlanDraftInput | dict | None,
     conversation_id: str | None,
     route_selection: RouteSelectionInput | dict | None = None,
+    plan_type: str | None = None,
 ) -> PlanTransition:
     """Decide what a structured intent may do, given the current stage.
 
@@ -331,6 +400,14 @@ def evaluate_plan_intent(
 
     if route_selection is not None and intent not in _INTENTS_THAT_SELECT_ROUTES:
         return PlanTransition("blocked", reason=PlanBlockReason.ROUTE_SELECTION_NOT_ALLOWED)
+
+    if plan_type is not None and intent not in _INTENTS_THAT_DECLARE_PLAN_TYPE:
+        return PlanTransition("blocked", reason=PlanBlockReason.PLAN_TYPE_NOT_ALLOWED)
+
+    if intent in _INTENTS_THAT_DECLARE_PLAN_TYPE and plan_type != "generic_draft":
+        # AC5 in its strictest form: a draft is never *declared* a route plan.
+        # Only the server, reading a gate-passed basis, can say that.
+        return PlanTransition("blocked", reason=PlanBlockReason.INVALID_PLAN_TYPE)
 
     validated: PlanDraftInput | None = None
     if plan_input is not None:
@@ -375,6 +452,29 @@ def evaluate_plan_intent(
         return PlanTransition(
             "ok", stage=PlanDraftStage.MINIMAL_DRAFT, route_selection=validated_selection
         )
+
+    if intent == "plan_research_route":
+        # AC1: research reads the draft's own free-text destination, so it only
+        # makes sense once the form was submitted — ``minimal_draft`` is the
+        # stage that guarantees a non-empty 目的地或路线. The turn does not move
+        # the stage by itself: ``stage`` is what a gate-passed research result
+        # leaves it at, ``fallback_stage`` where insufficient material parks it
+        # (AC3 — parked, never promoted). Whether the material was enough is
+        # the leaf's answer, not this layer's.
+        if current_stage is not PlanDraftStage.MINIMAL_DRAFT:
+            return PlanTransition("blocked", reason=PlanBlockReason.RESEARCH_WITHOUT_DRAFT)
+        return PlanTransition(
+            "ok",
+            stage=PlanDraftStage.MINIMAL_DRAFT,
+            fallback_stage=PlanDraftStage.AWAITING_GENERIC_CHOICE,
+        )
+
+    if intent == "plan_generic_draft":
+        # AC4: the way out of a parked research turn. Chosen by the user, on
+        # purpose — the server does not fall through to a draft on its own.
+        if current_stage is not PlanDraftStage.AWAITING_GENERIC_CHOICE:
+            return PlanTransition("blocked", reason=PlanBlockReason.GENERIC_DRAFT_WITHOUT_PENDING)
+        return PlanTransition("ok", stage=PlanDraftStage.MINIMAL_DRAFT, plan_type="generic_draft")
 
     if intent == "plan_create":
         # Re-entry from any stage is legal: the dialog is idempotent and a
@@ -424,6 +524,11 @@ STAGE_MESSAGE: dict[PlanDraftStage, str] = {
         "已打开计划书填写弹窗：请填写目的地或路线、活动日期和参与人数。"
     ),
     PlanDraftStage.CANCELLED: "已取消本次计划书草稿，需要时再点「生成行程」重新开始。",
+    PlanDraftStage.AWAITING_GENERIC_CHOICE: (
+        "已针对该目的地/路线发起路线研究，但没有资料通过确定性核验（资料不足、时效无法确认或存在风险），"
+        "因此不会据此生成正式路线计划。你可以继续生成「通用草案」，或取消本次计划书；"
+        "未通过核验的路线事实仍为待核验。"
+    ),
 }
 
 
@@ -450,6 +555,14 @@ def draft_summary(
     arrangements and the server's verified facts stay visibly separate (AC3),
     and it is ``None`` whenever no usable comparison exists — which is what
     keeps AC4 honest, because this function has no way to invent a number.
+
+    Ticket 04 reads that ``None`` as exactly one thing: a ``generic_draft``.
+    The "this is not a route plan" disclaimer therefore lives in this renderer
+    rather than in any component, so the streamed text, the ``plan.draft_state``
+    payload and a draft restored after a refresh cannot disagree about what
+    kind of draft the user is looking at (AC5) — and a draft with no basis
+    cannot be dressed up as a formal route plan even by a caller that asked for
+    that label, because the marker is derived from ``route``, never passed in.
 
     Nothing is invented: the summary is a pure function of the stored fields
     plus the caller's re-read basis, so editing a field and re-rendering is
@@ -490,6 +603,12 @@ def render_minimal_draft(
     "facts 待核验" line would otherwise contradict it. The arrangements stay
     待确认 and the closing disclaimer still says the draft is unreviewed —
     ``route_attached`` never promotes a 草案 to a 路书.
+
+    Ticket 04 AC5: that flag is also what the draft's *type* is marked from.
+    ``route_attached=False`` IS the ``generic_draft`` case — no verified route
+    basis — so the label is derived from the evidence the caller re-read, never
+    from a claim, and the same line appears in the streamed text, the payload's
+    summary and a restored draft because this is the only place it is written.
     """
     def arrangement(value: str) -> str:
         return value.strip() or UNCONFIRMED
@@ -507,7 +626,10 @@ def render_minimal_draft(
         else "以上只是用户填写的安排草案，不是已核验的路线计划。"
     )
     return "\n".join([
-        "**最小计划草稿（草案，未经路线核验）**",
+        ("**最小计划草稿（路线草案 · 依据已核验路线事实）**" if route_attached
+         else "**最小计划草稿（通用草案 · 无已核验路线依据）**"),
+        ("- 草案类型：route_plan（正式路线计划草案，仍需计划审核）" if route_attached
+         else "- 草案类型：generic_draft（通用草案，不是路线计划）"),
         f"- 目的地或路线：{arrangement(destination_or_route)}",
         f"- 活动日期：{arrangement(activity_date)}",
         f"- 参与人数：{people}",

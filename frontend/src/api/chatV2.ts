@@ -62,6 +62,30 @@ export type V2PlanIntent =
    * draft. Sent with a V2PlanRouteReference and never with facts — the server
    * re-reads and re-verifies them from the reference. */
   | 'plan_select_route'
+  /* Ticket 04 AC1: ask the server to research the draft's own free-text
+   * destination or route. There is nothing else in this payload: the query is
+   * what the draft already holds, so a click cannot smuggle a search term that
+   * is not the user's, and no fact can be supplied. */
+  | 'plan_research_route'
+  /* Ticket 04 AC4: after research found nothing verifiable, continue as a
+   * GENERIC DRAFT. The only intent allowed to name a draft type, and the only
+   * type it may name is generic_draft — a client can never declare route_plan. */
+  | 'plan_generic_draft'
+
+/**
+ * Ticket 04 AC5: what kind of draft the server is holding. Derived server-side
+ * from one question — does a route basis whose facts still pass the
+ * deterministic gate back this draft? — so `route_plan` is a report about the
+ * server's evidence and never a client claim. `generic_draft` means there is no
+ * verified route basis: every unknown stays 待确认 (arrangements) or 待核验
+ * (facts), and the summary says outright that this is not a route plan.
+ */
+export type V2PlanType = 'route_plan' | 'generic_draft'
+
+export const V2_PLAN_TYPES: ReadonlySet<V2PlanType> = new Set([
+  'route_plan',
+  'generic_draft',
+])
 
 /**
  * The reference a plan draft points at: two ids and nothing else. There is
@@ -86,6 +110,11 @@ export type V2PlanDraftStage =
   | 'awaiting_confirmation'
   | 'awaiting_input'
   | 'minimal_draft'
+  /* Ticket 04 AC3/AC4: route research ran and the material did not pass the
+   * deterministic gate, so the draft is parked waiting for the user to choose
+   * between a generic draft and cancelling. Like awaiting_confirmation this
+   * stage opens NO dialog — it is answered by a structured intent. */
+  | 'awaiting_generic_choice'
   | 'cancelled'
 
 /** The three fields the entry dialog collects. Absent values stay absent. */
@@ -111,6 +140,14 @@ export interface V2PlanDraftState {
    */
   summary: string
   /**
+   * Ticket 04 AC5: the draft's type, marked in the plan data as well as in the
+   * summary above. The server derives it from the route basis it re-read on this
+   * very turn, so this field and ``summary`` are one render and cannot
+   * contradict each other — and a draft with no basis is never ``route_plan``,
+   * which is AC3's refusal in data form.
+   */
+  plan_type: V2PlanType
+  /**
    * Ticket 03: the route this draft points at, or ``null`` when it points at
    * nothing. ``null`` is AC4's shape — no comparison, no reference, and the
    * draft's route facts stay 待核验; the summary above is what carries the
@@ -124,6 +161,7 @@ export const V2_PLAN_DRAFT_STAGES: ReadonlySet<V2PlanDraftStage> = new Set([
   'awaiting_confirmation',
   'awaiting_input',
   'minimal_draft',
+  'awaiting_generic_choice',
   'cancelled',
 ])
 

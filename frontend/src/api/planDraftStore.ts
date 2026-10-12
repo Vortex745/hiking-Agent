@@ -138,6 +138,11 @@ export function isSamePlanDraft(
     && a.draft_id === b.draft_id
     && a.conversation_id === b.conversation_id
     && a.summary === b.summary
+    // Ticket 04 AC5: the draft's type is compared like every other field. Skip
+    // it and a route_plan → generic_draft flip (or the reverse) looks like "no
+    // change", so the restore effect hands back the OLD object and the marker
+    // the user is supposed to see silently disappears after a refresh.
+    && a.plan_type === b.plan_type
     && isSameRouteSelection(a.route_selection, b.route_selection)
     && a.draft.destination_or_route === b.draft.destination_or_route
     && a.draft.activity_date === b.draft.activity_date

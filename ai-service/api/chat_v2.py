@@ -79,7 +79,12 @@ from agent_v2.observability import CapacityExceeded
 from agent_v2.permissions import (
     PermissionGate,
 )
-from agent_v2.plan_workflow import PlanDraftInput, PlanIntent, RouteSelectionInput
+from agent_v2.plan_workflow import (
+    PlanDraftInput,
+    PlanIntent,
+    PlanType,
+    RouteSelectionInput,
+)
 from agent_v2.run_orchestration import (
     ChatFlowRequest,
     RunOrchestrator,
@@ -198,6 +203,15 @@ class ChatV2Request(BaseModel):
             "Ticket 03: a reference (comparison_id + candidate_id) into an existing "
             "route-comparison result. Verified facts are re-read server-side from it; "
             "nothing else about a route can be sent."
+        ),
+    )
+    plan_type: Optional[PlanType] = Field(
+        default=None,
+        description=(
+            "Ticket 04: the draft type a user chooses when route research found nothing "
+            "verifiable. Only 'generic_draft' is ever accepted, and only on "
+            "plan_generic_draft — 'route_plan' is a claim about server-held evidence and "
+            "is rejected by the state machine, never by name lookup."
         ),
     )
 
@@ -392,6 +406,7 @@ async def chat_v2_sse(req: ChatV2Request, request: Request):
         intent=req.intent,
         plan_input=req.plan_input,
         route_selection=req.route_selection,
+        plan_type=req.plan_type,
     )
 
     async def guarded_stream() -> AsyncGenerator[str, None]:

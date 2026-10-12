@@ -114,11 +114,19 @@ def test_classifier_requires_an_explicit_plan_book_request():
 
 
 def test_draft_stage_values_are_the_shared_vocabulary():
-    """AC8: the stage enum is the vocabulary both sides speak."""
+    """AC8: the stage enum is the vocabulary both sides speak.
+
+    Ticket 04 added ``awaiting_generic_choice`` — the parked answer to a
+    research turn whose material did not pass the gate. Members are only ever
+    ADDED here, never renamed, and every added member has to show up in the
+    store, the wire union and the summary renderer at once (see
+    ``test_plan_draft_restore.py`` for the pinned cross-check).
+    """
     assert {stage.value for stage in PlanDraftStage} == {
         "awaiting_confirmation",
         "awaiting_input",
         "minimal_draft",
+        "awaiting_generic_choice",
         "cancelled",
     }
 

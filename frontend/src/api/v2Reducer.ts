@@ -36,8 +36,9 @@ import type {
   V2PlanDraftState,
   V2PlanDraftStage,
   V2PlanRouteReference,
+  V2PlanType,
 } from './chatV2'
-import { TERMINAL_V2_EVENT_TYPES, V2_PLAN_DRAFT_STAGES } from './chatV2'
+import { TERMINAL_V2_EVENT_TYPES, V2_PLAN_DRAFT_STAGES, V2_PLAN_TYPES } from './chatV2'
 
 export interface V2ToolTrace {
   type: 'tool_call' | 'tool_result' | 'artifact_progress'
@@ -476,6 +477,22 @@ function readRouteSelection(
   return { comparison_id: comparisonId, candidate_id: candidateId }
 }
 
+/**
+ * Ticket 04: read the draft's declared type. Only the two known values are
+ * ever honoured; anything else (a corrupted mirror, an older server, a value a
+ * client invented) falls back to what the draft demonstrably is — a route
+ * reference means a basis was re-read and passed the gate on the turn that
+ * wrote this payload, no reference means there is nothing to verify against.
+ * The fallback can never upgrade a draft to `route_plan` on its own, because a
+ * half-read reference already came out `null` above.
+ */
+function readPlanType(value: unknown, reference: V2PlanRouteReference | null): V2PlanType {
+  if (typeof value === 'string' && V2_PLAN_TYPES.has(value as V2PlanType)) {
+    return value as V2PlanType
+  }
+  return reference ? 'route_plan' : 'generic_draft'
+}
+
 export function readPlanDraftState(
   payload: Record<string, unknown>,
 ): V2PlanDraftState | null {
@@ -486,6 +503,7 @@ export function readPlanDraftState(
   const rawDraft = payload['draft']
   const draft = (rawDraft && typeof rawDraft === 'object' ? rawDraft : {}) as Record<string, unknown>
   const participants = draft['participants']
+  const routeSelection = readRouteSelection(payload['route_selection'])
   return {
     stage: stage as V2PlanDraftStage,
     draft_id: typeof payload['draft_id'] === 'string' ? payload['draft_id'] : '',
@@ -495,10 +513,15 @@ export function readPlanDraftState(
     // Ticket 02 AC3: the rendered draft summary. Absent on an older payload,
     // which is an empty summary — never a guess and never a dropped event.
     summary: typeof payload['summary'] === 'string' ? payload['summary'] : '',
+    // Ticket 04 AC5: the draft type. A payload that names one must name a known
+    // value; a payload from a server that predates the field is answered by the
+    // same rule the server uses — a draft pointing at nothing verified is a
+    // generic draft — so the reader never guesses a route plan into existence.
+    plan_type: readPlanType(payload['plan_type'], routeSelection),
     // Ticket 03: the route reference. Both ids must be non-empty strings or the
     // draft has no reference — a half-read pointer would render a route the
     // server never issued, which is the AC4 failure this reader exists to stop.
-    route_selection: readRouteSelection(payload['route_selection']),
+    route_selection: routeSelection,
     draft: {
       destination_or_route:
         typeof draft['destination_or_route'] === 'string' ? draft['destination_or_route'] : '',

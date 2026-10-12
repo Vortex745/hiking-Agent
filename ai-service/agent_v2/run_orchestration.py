@@ -137,6 +137,13 @@ class ChatFlowRequest:
     (``comparison_id`` + ``candidate_id``) into an existing comparison
     result. Forgetting it here is a silent bug, not a 422: the wire model
     would accept the field and the flow would never see it.
+
+    Ticket 04 adds the last plan input the same way: ``plan_type`` is the
+    adapter-validated draft-type *claim* a client may attach to
+    ``plan_generic_draft`` — the only value the state machine accepts there.
+    What a draft actually IS is never taken from this field: the flow derives it
+    from the route basis the comparison leaf re-read, so forgetting the field
+    here would only lose the user's choice, never fake a route plan.
     """
 
     message: str
@@ -147,6 +154,7 @@ class ChatFlowRequest:
     intent: str | None = None
     plan_input: Any | None = None
     route_selection: Any | None = None
+    plan_type: str | None = None
 
 
 # Kernel entry: ``agent_v2.kernel.run_chat_turn`` and test fakes with the
@@ -1176,12 +1184,15 @@ class RunOrchestrator:
         so server and frontend recognise the draft state from one
         vocabulary (spec AC8).
 
-        Deliberately NOT in scope here (later tickets): route-comparison
-        reuse (03), research (04), summaries and completeness rules (05-07),
-        PDF (08-09). Ticket 02 adds the two halves it owns: the draft summary
-        travels on ``plan.draft_state`` (AC3), and ``cancelled`` clears the
-        conversation's unfinished state (AC4) — restore itself reads the
-        stored row back through this same event vocabulary.
+        Deliberately NOT in scope here (later tickets): plan review summaries
+        and completeness rules (05-07), PDF (08-09). Ticket 02 adds the two
+        halves it owns: the draft summary travels on ``plan.draft_state`` (AC3),
+        and ``cancelled`` clears the conversation's unfinished state (AC4) —
+        restore itself reads the stored row back through this same event
+        vocabulary. Ticket 03 adds the route reference and its re-read. Ticket
+        04 adds the research branch (a ``tool_result`` carrying the server's own
+        comparison) and ``plan_type``, derived here from the basis the leaf
+        re-read so the payload and the summary can never disagree (AC5).
         """
         runs_repo = self._runs_repo
 
@@ -1213,6 +1224,7 @@ class RunOrchestrator:
                 plan_input=req.plan_input,
                 conversation_id=req.conversation_id,
                 route_selection=req.route_selection,
+                plan_type=req.plan_type,
             )
             if transition.blocked:
                 mark_terminal_safe(runs_repo, run_id, "error")
@@ -1228,6 +1240,58 @@ class RunOrchestrator:
             stage = transition.stage or PlanDraftStage.AWAITING_INPUT
             draft_input = transition.draft_input
             selection_input = transition.route_selection
+
+        # Uncollected arrangements stay absent — an upsert keeps whatever the
+        # user already submitted instead of blanking it or inventing a value.
+        fields = draft_input
+        destination = (
+            fields.destination_or_route if fields is not None
+            else (stored.destination_or_route if stored else "")
+        )
+        activity_date = (
+            fields.activity_date if fields is not None
+            else (stored.activity_date if stored else "")
+        )
+        participants = (
+            fields.participants if fields is not None
+            else (stored.participants if stored else None)
+        )
+
+        # Ticket 04 AC1/AC2/AC3: a research turn asks the leaf the one question
+        # the pure rules cannot answer — is there verifiable material behind this
+        # free destination? The answer picks between the two stages the
+        # transition named (``stage`` when material passed the gate, its
+        # ``fallback_stage`` when it did not), so the state machine still owns
+        # every move and "not enough evidence" is a fact reported by the gate,
+        # not a judgement made here. Research that could not run at all is a
+        # stable error that stores nothing: calling that 资料不足 would be a false
+        # statement about the destination.
+        if intent == "plan_research_route":
+            research = await self._research_route(req, run_id, destination)
+            if research.status == "unavailable":
+                mark_terminal_safe(runs_repo, run_id, "error")
+                yield emit("error", {
+                    "code": "route_research_unavailable",
+                    "status": "blocked",
+                    "reason": research.reason,
+                    "message": BLOCK_MESSAGE.get(
+                        research.reason or "", "路线研究未能开展，草稿保持原状。"
+                    ),
+                })
+                return
+            if research.result is not None:
+                # The comparison travels as the server's own evidence, through
+                # the event the thread already renders as candidates with their
+                # sources and gaps. It is also what makes the result loadable by
+                # ``comparison_id`` for ticket 03's selection leaf afterwards.
+                yield emit("tool_result", {
+                    "tool": "route_research",
+                    "status": research.status,
+                    "content": f"路线研究：{research.status}",
+                    "route_comparison": research.result.model_dump(),
+                })
+            if research.status != "ok" and transition.fallback_stage is not None:
+                stage = transition.fallback_stage
 
         # Ticket 03 AC1/AC4: resolve the route reference BEFORE anything is
         # written. A selection the comparison leaf cannot honour is a stable
@@ -1267,12 +1331,15 @@ class RunOrchestrator:
             route_reference = (selection_input.comparison_id, selection_input.candidate_id)
         elif (
             stored_selection is not None
-            and stage is PlanDraftStage.MINIMAL_DRAFT
+            and stage in (PlanDraftStage.MINIMAL_DRAFT, PlanDraftStage.AWAITING_GENERIC_CHOICE)
             and stored_selection.draft_id == (stored.draft_id if stored else None)
         ):
             # Reuse, not trust: the stored reference is only a pointer, so this
             # goes through the leaf again. A reference whose comparison has gone
-            # or whose facts no longer pass the gate renders as nothing.
+            # or whose facts no longer pass the gate renders as nothing. The
+            # parked research stage is included for the same reason as
+            # ``minimal_draft`` — a draft that does hold certified facts must
+            # not be drawn as though it holds none (ticket 04 AC5).
             route_basis = self._resolve_route_reference(
                 req,
                 run_id,
@@ -1281,21 +1348,13 @@ class RunOrchestrator:
             ).basis
             route_reference = (stored_selection.comparison_id, stored_selection.candidate_id)
 
-        # Uncollected arrangements stay absent — an upsert keeps whatever the
-        # user already submitted instead of blanking it or inventing a value.
-        fields = draft_input
-        destination = (
-            fields.destination_or_route if fields is not None
-            else (stored.destination_or_route if stored else "")
-        )
-        activity_date = (
-            fields.activity_date if fields is not None
-            else (stored.activity_date if stored else "")
-        )
-        participants = (
-            fields.participants if fields is not None
-            else (stored.participants if stored else None)
-        )
+        # Ticket 04 AC5: the draft's type is DERIVED, never declared. One basis
+        # test decides both the marker in the payload and the disclaimer in the
+        # summary, because :func:`draft_summary` reads the very same object — so
+        # the stream, the stored draft and a restored draft cannot disagree
+        # about whether this is a route plan, and no client claim of ``route_plan``
+        # can promote a draft the gate does not support.
+        plan_type = "route_plan" if route_basis is not None else "generic_draft"
 
         record = None
         if runs_repo is not None and req.conversation_id:
@@ -1360,6 +1419,10 @@ class RunOrchestrator:
             "source": entry.source,
             "intent": intent or "",
             "summary": summary,
+            # Ticket 04 AC5: the explicit marker, next to the same sentence in
+            # ``summary``. ``route_plan`` appears only when the leaf handed back
+            # a gate-passed basis for this very turn.
+            "plan_type": plan_type,
             # The reference only — two ids. No fact, no value, no
             # ``report_allowed`` flag travels to the client from here.
             "route_selection": (
@@ -1408,6 +1471,39 @@ class RunOrchestrator:
             conversation_id=req.conversation_id,
         )
         return session.select_candidate(comparison_id, candidate_id)
+
+    async def _research_route(
+        self,
+        req: ChatFlowRequest,
+        run_id: str | None,
+        destination_or_route: str,
+    ):
+        """Run one route-research turn through the comparison leaf (ticket 04).
+
+        A fresh :class:`agent_v2.route_tools.RouteSession` like
+        :meth:`_resolve_route_reference`: the leaf owns the data mode, the
+        collection and — crucially — the verdict, because
+        ``compare`` is the path that re-runs
+        :func:`route_compare.service.assess_candidate`. This method decides
+        nothing about the evidence and calls no model of its own; the ranking
+        provider behind ``compare_routes`` is the one the route tool already
+        uses, and it only ever ranks candidates that already passed the gate.
+
+        The comparison lands in this run's event log via the emitted
+        ``tool_result``, which is what lets the user select one of these
+        candidates afterwards: ``load_result`` finds it by ``comparison_id``
+        under this conversation and nothing is copied into the draft.
+        """
+        from agent_v2.route_tools import RouteSession
+
+        session = RouteSession(
+            settings=self._settings,
+            run_id=run_id,
+            audit_sink=None,
+            runs_repo=self._runs_repo,
+            conversation_id=req.conversation_id,
+        )
+        return await session.research_destination(destination_or_route)
 
     def _persist_plan_reply(
         self,

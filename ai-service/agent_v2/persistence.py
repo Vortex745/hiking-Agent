@@ -417,8 +417,20 @@ class ArtifactRecord:
 #: Stages a stored draft may hold. Mirrors
 #: :class:`agent_v2.plan_workflow.PlanDraftStage`; written as literals here
 #: so the persistence layer does not import the domain module.
+#: Ticket 04 adds ``awaiting_generic_choice`` — a research turn whose material
+#: did not pass the deterministic gate parks HERE for the user's choice, and
+#: needs no column: the draft keeps its arrangements, and the fact that it is
+#: not a route plan is derived from the absence of a route basis rather than
+#: stored as a claim (see ``plan_route_selections`` above for why a new column
+#: is not free on an existing database).
 _VALID_PLAN_DRAFT_STAGES: frozenset[str] = frozenset(
-    {"awaiting_confirmation", "awaiting_input", "minimal_draft", "cancelled"}
+    {
+        "awaiting_confirmation",
+        "awaiting_input",
+        "minimal_draft",
+        "awaiting_generic_choice",
+        "cancelled",
+    }
 )
 
 
