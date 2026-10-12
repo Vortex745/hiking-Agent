@@ -26,6 +26,7 @@ import {
   type V2PlanDraftStage,
   type V2PlanDraftState,
   type V2PlanDraftFields,
+  type V2PlanRouteReference,
 } from '../api/chatV2'
 import {
   reduceV2Event,
@@ -133,6 +134,7 @@ const PLAN_INTENT_LABELS: Record<V2PlanIntent, string> = {
   plan_confirm: '确认生成计划书',
   plan_cancel: '取消生成计划书',
   plan_regenerate: '重新生成草稿',
+  plan_select_route: '选用该路线进入计划书草稿',
 }
 
 /**
@@ -1425,6 +1427,13 @@ function SuperAgent() {
       intent?: V2PlanIntent
       /** The dialog's validated fields; only sent with plan_create/regenerate. */
       planInput?: V2PlanDraftFields
+      /**
+       * Ticket 03: the two-id route reference; only sent with plan_select_route.
+       * There is no place in this payload for a distance, an ascent or a weather
+       * claim — the server re-reads the verified facts from the reference, so the
+       * client cannot supply one (spec AC3/AC4).
+       */
+      routeSelection?: V2PlanRouteReference
     } = {},
   ) => {
     const text = typeof textOverride === 'string' ? textOverride.trim() : input.trim()
@@ -1499,6 +1508,7 @@ function SuperAgent() {
         if (options.intent) {
           v2Payload.intent = options.intent
           if (options.planInput) v2Payload.plan_input = options.planInput
+          if (options.routeSelection) v2Payload.route_selection = options.routeSelection
         }
         const needsRouteFollowupLocation = shouldRequestRouteFollowupLocation(text, contextMessages)
         // A plan send must not trigger a geolocation prompt: the draft flow
@@ -1668,6 +1678,20 @@ function SuperAgent() {
 
   const handlePlanDialogSubmit = useCallback((fields: V2PlanDraftFields) => {
     void handleSend('', { intent: 'plan_create', planInput: fields })
+  }, [handleSend])
+
+  // Ticket 03 AC1: pick the recommendation or an alternative from a comparison
+  // the thread already shows. The send carries the two-id reference and nothing
+  // else — the verified facts come back from the server, re-read through
+  // RouteSession, so a click cannot invent a distance or a weather claim (AC4).
+  // Profile ``route_plan`` is the widened entry: a plan intent on it joins the
+  // plan flow instead of being handed to the kernel.
+  const handleSelectRoute = useCallback((selection: V2PlanRouteReference) => {
+    void handleSend('', {
+      intent: 'plan_select_route',
+      routeSelection: selection,
+      profileId: 'route_plan',
+    })
   }, [handleSend])
 
   const handlePlanDialogDismiss = useCallback(() => {
@@ -1862,6 +1886,7 @@ function SuperAgent() {
           )}
           <GeminiThread
             onExportRoute={comparisonId => { void handleSend(`请导出带来源的路线比较 PDF，comparison_id=${comparisonId}`, { profileId: 'route_plan' }) }}
+            onSelectRoute={handleSelectRoute}
             onGeneratePlan={handleGeneratePlan}
             isSending={isSending}
             emptyTitle="告诉我你的徒步计划，我将为你规划路线、安排任务，并提供安全建议。"

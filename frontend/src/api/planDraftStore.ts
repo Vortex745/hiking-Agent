@@ -138,7 +138,24 @@ export function isSamePlanDraft(
     && a.draft_id === b.draft_id
     && a.conversation_id === b.conversation_id
     && a.summary === b.summary
+    && isSameRouteSelection(a.route_selection, b.route_selection)
     && a.draft.destination_or_route === b.draft.destination_or_route
     && a.draft.activity_date === b.draft.activity_date
     && a.draft.participants === b.draft.participants
+}
+
+/**
+ * Ticket 03: the route reference is compared field by field, like every other
+ * draft field. Skipping it here would make a selection look like "no change",
+ * so the restore effect would hand back the OLD object and the reference — and
+ * with it the route basis — would silently disappear after a refresh, which
+ * reads like a store bug rather than a wiring bug.
+ */
+function isSameRouteSelection(
+  a: V2PlanDraftState['route_selection'],
+  b: V2PlanDraftState['route_selection'],
+): boolean {
+  if (a === b) return true
+  if (!a || !b) return false
+  return a.comparison_id === b.comparison_id && a.candidate_id === b.candidate_id
 }

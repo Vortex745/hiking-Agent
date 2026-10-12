@@ -18,6 +18,7 @@ import Download from 'reicon-react/icons/Download';
 import { getConversationMemoryProgress } from '../../../api/conversationMemory';
 import { API } from '../../../api/config';
 import { RouteComparisonCard } from '../../RouteComparison';
+import type { RouteSelection } from '../../../api/routeComparison';
 import { useRef, useState, createContext, useContext, useCallback, useEffect, useLayoutEffect, type RefObject, type PointerEvent as ReactPointerEvent } from 'react';
 import gsap from 'gsap';
 import { useGSAP } from '@gsap/react';
@@ -26,6 +27,13 @@ gsap.registerPlugin(useGSAP);
 
 interface GeminiThreadProps {
   onExportRoute?: (comparisonId: string) => void;
+  /**
+   * Ticket 03 AC1: carry a recommended or alternative route from an existing
+   * comparison into the plan draft. The payload is the two-id reference only —
+   * the page sends it as the ``plan_select_route`` intent, so no route fact ever
+   * travels from the client.
+   */
+  onSelectRoute?: (selection: RouteSelection) => void;
   /**
    * Ticket 01: the 生成行程 quick action. It sends the structured
    * ``plan_create`` intent — never a sentence stuffed with a pseudo id,
@@ -45,6 +53,7 @@ interface GeminiThreadProps {
 /** Context to pass callbacks down to ChatMessage without prop drilling */
 const ThreadActionsContext = createContext<{
   onExportRoute?: (comparisonId: string) => void;
+  onSelectRoute?: (selection: RouteSelection) => void;
   onGeneratePlan?: () => void;
   isSending?: boolean;
   onRegenerate?: () => void;
@@ -52,8 +61,8 @@ const ThreadActionsContext = createContext<{
   realMessageCount: number;
 }>({ realMessageCount: 0 });
 
-export const GeminiThread = ({ emptyTitle, onRegenerate, onUploadClick, onConfirmTool, onExportRoute, onGeneratePlan, isSending, realMessageCount = 0 }: GeminiThreadProps) => (
-  <ThreadActionsContext.Provider value={{ onRegenerate, onConfirmTool, onExportRoute, onGeneratePlan, isSending, realMessageCount }}>
+export const GeminiThread = ({ emptyTitle, onRegenerate, onUploadClick, onConfirmTool, onExportRoute, onSelectRoute, onGeneratePlan, isSending, realMessageCount = 0 }: GeminiThreadProps) => (
+  <ThreadActionsContext.Provider value={{ onRegenerate, onConfirmTool, onExportRoute, onSelectRoute, onGeneratePlan, isSending, realMessageCount }}>
     <ThreadPrimitive.Root className="h-full bg-[#fdfcfc] dark:bg-[#131314] flex flex-col overflow-hidden w-full relative">
       <AuiIf condition={(s) => s.thread.isEmpty}>
         <EmptyState emptyTitle={emptyTitle} onUploadClick={onUploadClick} onGeneratePlan={onGeneratePlan} isSending={isSending} />
@@ -886,7 +895,7 @@ const ChatMessage = () => {
   const artifactArgs = getToolArgs(messageContent, "artifacts");
   const messageArtifacts = Array.isArray(artifactArgs) ? artifactArgs : [];
   const routeResults = messageContent.filter(part => part.type === 'tool-call' && part.toolName === 'routeComparison');
-  const { onExportRoute, isSending: routeExportBusy } = useContext(ThreadActionsContext);
+  const { onExportRoute, onSelectRoute, isSending: routeExportBusy } = useContext(ThreadActionsContext);
   const isMessageRunning = messageStatusType === 'running';
   const isAssistantThinking = messageRole === 'assistant'
     && isMessageRunning
@@ -1051,7 +1060,7 @@ const ChatMessage = () => {
             <div className="max-w-full text-[15px] text-[#1f1f1f] dark:text-[#e3e3e3] leading-relaxed break-words">
               <MessagePrimitive.Parts components={{ Text: MarkdownText, ToolCall: CustomToolCall } as any} />
               {messageArtifacts.length > 0 && <ArtifactList artifacts={messageArtifacts} />}
-              {routeResults.map(part => <RouteComparisonCard key={part.toolCallId} value={part.args} onExport={onExportRoute} busy={routeExportBusy} />)}
+              {routeResults.map(part => <RouteComparisonCard key={part.toolCallId} value={part.args} onExport={onExportRoute} onSelect={onSelectRoute} busy={routeExportBusy} />)}
               {isAssistantThinking && <AiThinking text={thinkingText} />}
             </div>
             

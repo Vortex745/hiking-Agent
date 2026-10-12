@@ -19,9 +19,18 @@ The contract this module owns:
   the current draft state with a stable machine-readable reason.
 * **Minimal draft validation** (:class:`PlanDraftInput`) — destination or
   route, activity date, participant count.
+* **Route selection reference** (:class:`RouteSelectionInput`) — a draft
+  points at an existing route-comparison result by ``comparison_id`` +
+  ``candidate_id`` and never stores a copy of its facts, so every render
+  re-reads them through the comparison leaf that re-runs the deterministic
+  gate (:mod:`agent_v2.route_tools`).
 * **Draft preview rendering** (:func:`render_minimal_draft`) — user
   arrangements only; anything the user has not given stays 待确认, and no
   route fact is ever produced here (docs/plan-pdf-format.md).
+* **Route basis rendering** (:func:`render_route_basis`) — the verified side
+  of the same draft, in its own section and always with its source
+  provenance. Facts the gate cannot certify stay absent, which renders as
+  待核验: nothing is ever invented to fill a gap.
 """
 
 from __future__ import annotations
@@ -36,7 +45,13 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # ---- Intent whitelist ------------------------------------------------------
 
-PlanIntent = Literal["plan_create", "plan_confirm", "plan_cancel", "plan_regenerate"]
+PlanIntent = Literal[
+    "plan_create",
+    "plan_confirm",
+    "plan_cancel",
+    "plan_regenerate",
+    "plan_select_route",
+]
 
 #: The only intents a client may send, derived from :data:`PlanIntent` so the
 #: wire contract and the domain contract cannot drift apart.
@@ -102,6 +117,48 @@ class PlanDraftInput(BaseModel):
         except ValueError as exc:  # pragma: no cover - fromisoformat guards above
             raise ValueError("activity_date is not a real calendar day") from exc
         return value
+
+
+# ---- Route selection reference (ticket 03) ---------------------------------
+
+#: The caps mirror the producing contracts — ``route_tools.ReportParams`` for
+#: ``comparison_id`` and ``route_compare.models.RouteCandidate`` for
+#: ``candidate_id`` — so a reference the draft can hold is exactly a reference
+#: a comparison result could have issued.
+_COMPARISON_ID_MAX = 150
+_CANDIDATE_ID_MAX = 80
+
+
+class RouteSelectionInput(BaseModel):
+    """A pointer into an existing route-comparison result (spec AC1).
+
+    This is the whole of what a selection contributes to a draft: two ids.
+    ``extra="forbid"`` is the invariant made executable — a client cannot
+    attach a distance, an ascent, a weather string or a
+    ``report_allowed`` flag alongside the reference, because verified facts
+    are only ever read back through
+    :meth:`agent_v2.route_tools.RouteSession.load_result`, which re-runs the
+    deterministic gate on every use.
+    """
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, allow_inf_nan=False)
+
+    comparison_id: str = Field(min_length=1, max_length=_COMPARISON_ID_MAX)
+    candidate_id: str = Field(min_length=1, max_length=_CANDIDATE_ID_MAX)
+
+
+@dataclass(frozen=True, slots=True)
+class PlanRouteReference:
+    """The stored half of a selection: the draft's pointer, nothing else.
+
+    ``draft_id`` ties the reference to the plan draft it belongs to, so a
+    draft that was replaced cannot be confused with the current one.
+    """
+
+    conversation_id: str
+    draft_id: str
+    comparison_id: str
+    candidate_id: str
 
 
 # ---- Deterministic natural-language classifier -----------------------------
@@ -178,6 +235,15 @@ class PlanBlockReason:
     CANCEL_WITHOUT_ACTIVE_DRAFT = "cancel_without_active_draft"
     PLAN_INPUT_NOT_ALLOWED = "plan_input_not_allowed"
     INVALID_DRAFT_FIELDS = "invalid_draft_fields"
+    # Ticket 03 — a route selection is its own structured input, with its own
+    # stable reasons. Following the ``prepare_report`` precedent, a selection
+    # the server cannot honour is a *reason*, never a best-effort draft that
+    # quietly carries a made-up route.
+    ROUTE_SELECTION_NOT_ALLOWED = "route_selection_not_allowed"
+    INVALID_ROUTE_SELECTION = "invalid_route_selection"
+    ROUTE_SELECTION_WITHOUT_DRAFT = "route_selection_without_draft"
+    COMPARISON_NOT_FOUND = "comparison_not_found"
+    ROUTE_NOT_SELECTABLE = "route_not_selectable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +259,7 @@ class PlanTransition:
     stage: PlanDraftStage | None = None
     reason: str | None = None
     draft_input: PlanDraftInput | None = None
+    route_selection: RouteSelectionInput | None = None
 
     @property
     def blocked(self) -> bool:
@@ -200,6 +267,10 @@ class PlanTransition:
 
 
 _INTENTS_THAT_COLLECT_FIELDS: frozenset[str] = frozenset({"plan_create", "plan_regenerate"})
+#: ``plan_select_route`` is the only intent that may carry a route reference,
+#: and the reference is only meaningful on a draft the user has already
+#: submitted — the stage that owns the arrangements the facts join.
+_INTENTS_THAT_SELECT_ROUTES: frozenset[str] = frozenset({"plan_select_route"})
 
 #: User-facing text per stable rejection reason. The machine-readable
 #: ``reason`` is what clients branch on; this is only what the user reads.
@@ -215,6 +286,17 @@ BLOCK_MESSAGE: dict[str, str] = {
     PlanBlockReason.INVALID_DRAFT_FIELDS: (
         "目的地或路线、活动日期、参与人数校验未通过，请修正后重新提交。"
     ),
+    PlanBlockReason.ROUTE_SELECTION_NOT_ALLOWED: "该计划书操作不接受路线选择。",
+    PlanBlockReason.INVALID_ROUTE_SELECTION: "路线选择参数无效，请从比较结果中重新选择。",
+    PlanBlockReason.ROUTE_SELECTION_WITHOUT_DRAFT: (
+        "还没有可带入路线事实的草稿，请先填写目的地或路线、活动日期和参与人数。"
+    ),
+    PlanBlockReason.COMPARISON_NOT_FOUND: (
+        "没有找到可复用的路线比较结果，请先完成一次路线比较。草稿保留，路线事实仍为待核验。"
+    ),
+    PlanBlockReason.ROUTE_NOT_SELECTABLE: (
+        "该路线不在可比选的推荐或备选范围内，或资料未通过核验。草稿保留，路线事实仍为待核验。"
+    ),
 }
 
 
@@ -224,6 +306,7 @@ def evaluate_plan_intent(
     current_stage: PlanDraftStage | None,
     plan_input: PlanDraftInput | dict | None,
     conversation_id: str | None,
+    route_selection: RouteSelectionInput | dict | None = None,
 ) -> PlanTransition:
     """Decide what a structured intent may do, given the current stage.
 
@@ -231,7 +314,9 @@ def evaluate_plan_intent(
     reason, so the flow can never guess. Three rejections are the point of
     the exercise (spec AC5): an intent outside the whitelist, an intent
     with no conversation to key the draft on, and an intent that does not
-    fit the stage the plan flow is in.
+    fit the stage the plan flow is in. Ticket 03 adds a fourth structured
+    input, validated the same way: a route selection is accepted only by the
+    intent that means it, and only on a draft that already holds arrangements.
     """
     if intent not in PLAN_INTENTS:
         return PlanTransition("blocked", reason=PlanBlockReason.UNKNOWN_INTENT)
@@ -244,6 +329,9 @@ def evaluate_plan_intent(
     if plan_input is not None and intent not in _INTENTS_THAT_COLLECT_FIELDS:
         return PlanTransition("blocked", reason=PlanBlockReason.PLAN_INPUT_NOT_ALLOWED)
 
+    if route_selection is not None and intent not in _INTENTS_THAT_SELECT_ROUTES:
+        return PlanTransition("blocked", reason=PlanBlockReason.ROUTE_SELECTION_NOT_ALLOWED)
+
     validated: PlanDraftInput | None = None
     if plan_input is not None:
         if isinstance(plan_input, dict):
@@ -255,6 +343,38 @@ def evaluate_plan_intent(
             validated = plan_input
         else:
             return PlanTransition("blocked", reason=PlanBlockReason.INVALID_DRAFT_FIELDS)
+
+    validated_selection: RouteSelectionInput | None = None
+    if route_selection is not None:
+        if isinstance(route_selection, dict):
+            try:
+                validated_selection = RouteSelectionInput.model_validate(route_selection)
+            except ValueError:
+                return PlanTransition("blocked", reason=PlanBlockReason.INVALID_ROUTE_SELECTION)
+        elif isinstance(route_selection, RouteSelectionInput):
+            validated_selection = route_selection
+        else:
+            return PlanTransition("blocked", reason=PlanBlockReason.INVALID_ROUTE_SELECTION)
+
+    if intent == "plan_select_route":
+        # AC1/AC3: verified route facts join a draft that already holds the
+        # user's arrangements. Selecting into ``awaiting_input`` (nothing
+        # submitted yet) or into a cancelled draft would put a route card in
+        # front of an empty form, so the stage gate refuses it with a stable
+        # reason and the flow stores nothing. Whether the referenced comparison
+        # exists, and whether the candidate still passes the deterministic
+        # gate, are storage-and-gate questions this pure layer cannot see: the
+        # flow resolves them through
+        # :meth:`agent_v2.route_tools.RouteSession.select_candidate`.
+        if validated_selection is None:
+            return PlanTransition("blocked", reason=PlanBlockReason.INVALID_ROUTE_SELECTION)
+        if current_stage is not PlanDraftStage.MINIMAL_DRAFT:
+            return PlanTransition("blocked", reason=PlanBlockReason.ROUTE_SELECTION_WITHOUT_DRAFT)
+        # A selection does not move the draft stage: the reference rides on the
+        # draft that ticket 05's summary confirmation reads (AC5).
+        return PlanTransition(
+            "ok", stage=PlanDraftStage.MINIMAL_DRAFT, route_selection=validated_selection
+        )
 
     if intent == "plan_create":
         # Re-entry from any stage is legal: the dialog is idempotent and a
@@ -313,6 +433,7 @@ def draft_summary(
     destination_or_route: str,
     activity_date: str,
     participants: int | None,
+    route: RouteBasis | None = None,
 ) -> str:
     """The draft summary for a stage and the fields stored with it (Ticket 02 AC3).
 
@@ -323,16 +444,29 @@ def draft_summary(
     miss (``MINIMAL_DRAFT`` is the one stage whose copy is the preview, which
     is why :data:`STAGE_MESSAGE` has no entry for it).
 
-    Nothing is invented: the summary is a pure function of the stored fields,
-    so editing a field and re-rendering is the same call.
+    ``route`` is ticket 03's addition: the verified route basis the draft
+    points at, re-read from the comparison result by the caller. It is
+    rendered as its own section under its own heading so the user's
+    arrangements and the server's verified facts stay visibly separate (AC3),
+    and it is ``None`` whenever no usable comparison exists — which is what
+    keeps AC4 honest, because this function has no way to invent a number.
+
+    Nothing is invented: the summary is a pure function of the stored fields
+    plus the caller's re-read basis, so editing a field and re-rendering is
+    the same call.
     """
     if stage is PlanDraftStage.MINIMAL_DRAFT:
-        return render_minimal_draft(
+        base = render_minimal_draft(
             destination_or_route=destination_or_route,
             activity_date=activity_date,
             participants=participants,
+            route_attached=route is not None,
         )
-    return STAGE_MESSAGE[stage]
+    else:
+        base = STAGE_MESSAGE[stage]
+    if route is None:
+        return base
+    return f"{base}\n\n{render_route_basis(route)}"
 
 
 def render_minimal_draft(
@@ -340,6 +474,7 @@ def render_minimal_draft(
     destination_or_route: str,
     activity_date: str,
     participants: int | None,
+    route_attached: bool = False,
 ) -> str:
     """Render the previewable minimal draft (spec AC1 "可预览的最小草稿").
 
@@ -348,11 +483,29 @@ def render_minimal_draft(
     is explicitly a 草案, never a verified route plan, and this function
     cannot produce a distance, an ascent, a weather claim or a price even
     if asked (docs/plan-pdf-format.md 内容边界).
+
+    ``route_attached`` is ticket 03's only exception, and it is a pointer
+    rather than a value: when the caller has re-read a certified route basis
+    it renders that basis as a separate section below, so the blanket
+    "facts 待核验" line would otherwise contradict it. The arrangements stay
+    待确认 and the closing disclaimer still says the draft is unreviewed —
+    ``route_attached`` never promotes a 草案 to a 路书.
     """
     def arrangement(value: str) -> str:
         return value.strip() or UNCONFIRMED
 
     people = f"{participants} 人" if participants else UNCONFIRMED
+    facts_line = (
+        f"- 距离 / 爬升 / 天气 / 路况 / 风险：见下方「路线核验事实」（未列出者仍为{UNVERIFIED}）"
+        if route_attached
+        else f"- 距离 / 爬升 / 天气 / 路况 / 风险：{UNVERIFIED}（需要服务器证据）"
+    )
+    closing = (
+        "以上用户安排仍为待确认；路线事实由服务器读取并保留来源，两者分开保存，"
+        "整份草稿尚未通过计划审核。"
+        if route_attached
+        else "以上只是用户填写的安排草案，不是已核验的路线计划。"
+    )
     return "\n".join([
         "**最小计划草稿（草案，未经路线核验）**",
         f"- 目的地或路线：{arrangement(destination_or_route)}",
@@ -361,7 +514,109 @@ def render_minimal_draft(
         f"- 集合时间 / 集合地点：{UNCONFIRMED}",
         f"- 领队 / 交通 / 住宿：{UNCONFIRMED}",
         f"- 费用预算 / 应急联络 / 撤退方案：{UNCONFIRMED}",
-        f"- 距离 / 爬升 / 天气 / 路况 / 风险：{UNVERIFIED}（需要服务器证据）",
-        "以上只是用户填写的安排草案，不是已核验的路线计划。",
+        facts_line,
+        closing,
     ])
+
+
+# ---- Verified route basis (ticket 03) --------------------------------------
+
+#: The dimensions a route fact may answer, in display order, with the labels
+#: the route-comparison card uses — one vocabulary for the card and the draft.
+FACT_DIMENSIONS: tuple[tuple[str, str, str], ...] = (
+    ("distance_km", "距离", "km"),
+    ("ascent_m", "爬升", "m"),
+    ("duration_hours", "耗时", "小时"),
+    ("weather", "天气", ""),
+    ("map", "地图", ""),
+    ("trail_status", "开放状态", ""),
+    ("risk", "风险资料", ""),
+)
+
+#: Same value wording the comparison card renders, so the draft and the card
+#: the user selected from say the same thing about the same fact.
+_FACT_VALUE_LABELS: dict[str, str] = {
+    "open": "开放", "closed": "封闭", "low": "低风险",
+    "moderate": "中等风险", "high": "高风险",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class RouteFactLine:
+    """One verified fact and the provenance that makes it verified (AC2).
+
+    ``source_id`` + ``source_field`` is the candidate's own claim about which
+    source backs it, and ``source_tool`` / ``observed_at`` are that source's
+    origin and timestamp. The line exists only for a fact the gate supported:
+    an unsupported fact is absent from ``RouteBasis.facts`` and renders
+    :data:`UNVERIFIED`, never a value with an empty provenance slot.
+    """
+
+    field: str
+    label: str
+    display_value: str
+    source_id: str
+    source_field: str
+    source_tool: str
+    observed_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class RouteBasis:
+    """What a draft's route reference resolved to, right now (AC1/AC5).
+
+    Built fresh from :class:`agent_v2.route_tools.RouteSession.load_result` on
+    every render, so it is a *view* and not a second copy of the comparison:
+    the stored draft keeps only the two ids.
+    """
+
+    comparison_id: str
+    candidate_id: str
+    candidate_name: str
+    role: Literal["recommended", "alternative"]
+    data_mode: str
+    facts: tuple[RouteFactLine, ...] = ()
+    missing_labels: tuple[str, ...] = ()
+
+
+def format_fact_value(field: str, value: str | float) -> str:
+    """Display a verified value without rounding, re-unitting or re-deriving it."""
+    if isinstance(value, bool):  # bool is an int subclass; never a route fact
+        return str(value)
+    if isinstance(value, (int, float)):
+        return f"{value:g}"
+    text = str(value).strip()
+    return _FACT_VALUE_LABELS.get(text.lower(), text)
+
+
+def render_route_basis(route: RouteBasis) -> str:
+    """Render the verified half of the draft, with provenance (AC2/AC3/AC4).
+
+    A separate section under its own heading: these lines are the server's
+    evidence, not the user's arrangements, and the two must never read as one
+    list. Facts the gate did not certify are listed as 待核验 — this function
+    has no parameter that accepts a value, so it cannot fabricate one.
+    """
+    lines = [
+        "**路线核验事实（来自已完成的路线比较，非用户填写）**",
+        f"- 已选路线：{route.candidate_name}（"
+        f"{'推荐路线' if route.role == 'recommended' else '备选路线'}）",
+        f"- 引用：comparison_id={route.comparison_id} · candidate_id={route.candidate_id}",
+    ]
+    if route.data_mode == "offline":
+        lines.append("- 资料模式：离线演示 · 合成数据，不可用于真实出行。")
+    by_field = {line.field: line for line in route.facts}
+    for field, label, unit in FACT_DIMENSIONS:
+        line = by_field.get(field)
+        if line is None:
+            lines.append(f"- {label}：{UNVERIFIED}（无服务器证据）")
+            continue
+        suffix = f" {unit}" if unit else ""
+        lines.append(
+            f"- {label}：{line.display_value}{suffix}"
+            f"（来源 [{line.source_id}] {line.source_tool} · "
+            f"字段 {line.source_field} · 观测 {line.observed_at}）"
+        )
+    lines.append("路线事实由服务器复核，用户安排仍为待确认，两者分开保存。")
+    return "\n".join(lines)
 

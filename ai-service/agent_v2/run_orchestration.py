@@ -130,6 +130,13 @@ class ChatFlowRequest:
     adapter-validated :class:`agent_v2.plan_workflow.PlanDraftInput`.
     Both must be mirrored here or the flow sees ``None`` for every
     request.
+
+    Ticket 03 adds the third plan input the same way: ``route_selection`` is
+    the adapter-validated
+    :class:`agent_v2.plan_workflow.RouteSelectionInput` — a reference
+    (``comparison_id`` + ``candidate_id``) into an existing comparison
+    result. Forgetting it here is a silent bug, not a 422: the wire model
+    would accept the field and the flow would never see it.
     """
 
     message: str
@@ -139,6 +146,7 @@ class ChatFlowRequest:
     current_location: Any | None = None
     intent: str | None = None
     plan_input: Any | None = None
+    route_selection: Any | None = None
 
 
 # Kernel entry: ``agent_v2.kernel.run_chat_turn`` and test fakes with the
@@ -197,18 +205,37 @@ class PlanEntry:
     intent: str | None = None
 
 
+#: Profiles a *structured* plan intent may enter the plan flow from. ``chat``
+#: is ticket 01's entry; ``route_plan`` is ticket 03's widening: the route
+#: comparison the user selects from is produced by a ``route_plan`` run, so a
+#: "select this route into my plan draft" click arrives with that profile.
+#: Without it the plan intent would fall through to the kernel, which is the
+#: one thing the plan path must never do (spec AC4/AC5).
+_PLAN_INTENT_PROFILES: frozenset[str] = frozenset({
+    ProfileId.CHAT.value,
+    ProfileId.ROUTE_PLAN.value,
+})
+
+
 def _resolve_plan_entry(req: ChatFlowRequest, profile: CapabilityProfile) -> PlanEntry | None:
     """Decide whether this request belongs to the plan flow — rules only.
 
-    Returns ``None`` for everything else, including every non-``chat``
-    profile: the plan entry must never hijack route_plan / rag / artifact
-    runs, and it must never be decided by a model.
+    Returns ``None`` for everything else. Natural-language entry stays
+    ``chat``-only: the plan entry must never hijack a route_plan / rag /
+    artifact / cowork run on the strength of a sentence, and it must never be
+    decided by a model.
+
+    A *whitelisted structured intent* is honoured on ``chat`` and ``route_plan``
+    only (ticket 03). The client cannot use this to skip the kernel for a
+    route question: :data:`_PLAN_INTENT_PROFILES` is server-side and the intent
+    set is the :data:`agent_v2.plan_workflow.PLAN_INTENTS` whitelist, so any
+    other profile_id keeps its normal flow.
     """
+    if req.intent and profile.profile_id.value in _PLAN_INTENT_PROFILES:
+        return PlanEntry("intent", "structured_intent", req.intent)
+
     if profile.profile_id != ProfileId.CHAT:
         return None
-
-    if req.intent:
-        return PlanEntry("intent", "structured_intent", req.intent)
 
     outcome = classify_plan_request(req.message).outcome
     if outcome == "clear_plan_intent":
@@ -1177,6 +1204,7 @@ class RunOrchestrator:
             stage = PlanDraftStage.AWAITING_CONFIRMATION
             intent: str | None = None
             draft_input = None
+            selection_input = None
         else:
             intent = entry.intent or "plan_create"
             transition = evaluate_plan_intent(
@@ -1184,6 +1212,7 @@ class RunOrchestrator:
                 current_stage=current_stage,
                 plan_input=req.plan_input,
                 conversation_id=req.conversation_id,
+                route_selection=req.route_selection,
             )
             if transition.blocked:
                 mark_terminal_safe(runs_repo, run_id, "error")
@@ -1198,6 +1227,59 @@ class RunOrchestrator:
                 return
             stage = transition.stage or PlanDraftStage.AWAITING_INPUT
             draft_input = transition.draft_input
+            selection_input = transition.route_selection
+
+        # Ticket 03 AC1/AC4: resolve the route reference BEFORE anything is
+        # written. A selection the comparison leaf cannot honour is a stable
+        # rejection that stores nothing and shows no facts — the draft keeps
+        # its previous state and its 待核验 route line, because a route the
+        # server cannot evidence is a route it must not describe. A reference
+        # already on the draft is re-read on every turn for the same reason:
+        # what renders is what the gate supports now, never what was copied
+        # when the user clicked.
+        stored_selection = (
+            runs_repo.get_route_selection(req.conversation_id)
+            if runs_repo is not None and req.conversation_id
+            else None
+        )
+        route_basis = None
+        route_reference: tuple[str, str] | None = None
+
+        if selection_input is not None:
+            outcome = self._resolve_route_reference(
+                req,
+                run_id,
+                selection_input.comparison_id,
+                selection_input.candidate_id,
+            )
+            if outcome.blocked:
+                mark_terminal_safe(runs_repo, run_id, "error")
+                yield emit("error", {
+                    "code": "route_selection_unavailable",
+                    "status": "blocked",
+                    "reason": outcome.reason,
+                    "message": BLOCK_MESSAGE.get(
+                        outcome.reason or "", "路线选择未能通过核验，草稿保持原状。"
+                    ),
+                })
+                return
+            route_basis = outcome.basis
+            route_reference = (selection_input.comparison_id, selection_input.candidate_id)
+        elif (
+            stored_selection is not None
+            and stage is PlanDraftStage.MINIMAL_DRAFT
+            and stored_selection.draft_id == (stored.draft_id if stored else None)
+        ):
+            # Reuse, not trust: the stored reference is only a pointer, so this
+            # goes through the leaf again. A reference whose comparison has gone
+            # or whose facts no longer pass the gate renders as nothing.
+            route_basis = self._resolve_route_reference(
+                req,
+                run_id,
+                stored_selection.comparison_id,
+                stored_selection.candidate_id,
+            ).basis
+            route_reference = (stored_selection.comparison_id, stored_selection.candidate_id)
 
         # Uncollected arrangements stay absent — an upsert keeps whatever the
         # user already submitted instead of blanking it or inventing a value.
@@ -1233,15 +1315,42 @@ class RunOrchestrator:
                     req.conversation_id,
                 )
 
+        # AC3 in storage form: the reference lives beside the draft, never in
+        # it. Written only after the draft row exists, because the reference is
+        # meaningless without the draft it points into; a cancel removes it with
+        # the rest of the unfinished plan state (ticket 02 AC4).
+        if runs_repo is not None and req.conversation_id:
+            try:
+                if stage is PlanDraftStage.CANCELLED:
+                    runs_repo.clear_route_selection(req.conversation_id)
+                elif route_reference is not None and record is not None:
+                    runs_repo.save_route_selection(
+                        conversation_id=req.conversation_id,
+                        draft_id=record.draft_id,
+                        comparison_id=route_reference[0],
+                        candidate_id=route_reference[1],
+                        selected_by_run_id=run_id or "",
+                    )
+            except Exception:
+                logger.exception(
+                    "chat_v2: plan route selection persistence failed for conversation=%s",
+                    req.conversation_id,
+                )
+
         # Ticket 02 AC3: the summary is rendered from the fields that were just
         # stored, and it travels INSIDE the draft state so a later restore can
         # re-read the same text the chat bubble showed. Rendering it here also
         # keeps one source of truth — the dialog and the thread cannot drift.
+        # Ticket 03: the verified route basis is rendered by the same call, in
+        # its own section, so a restored draft cannot show facts the live one
+        # did not (or the other way round) and the arrangements/facts split is
+        # the renderer's, not any component's.
         summary = draft_summary(
             stage=stage,
             destination_or_route=destination,
             activity_date=activity_date,
             participants=participants,
+            route=route_basis,
         )
 
         yield emit("plan.draft_state", {
@@ -1251,6 +1360,12 @@ class RunOrchestrator:
             "source": entry.source,
             "intent": intent or "",
             "summary": summary,
+            # The reference only — two ids. No fact, no value, no
+            # ``report_allowed`` flag travels to the client from here.
+            "route_selection": (
+                {"comparison_id": route_reference[0], "candidate_id": route_reference[1]}
+                if route_reference else None
+            ),
             "draft": {
                 "destination_or_route": destination,
                 "activity_date": activity_date,
@@ -1265,6 +1380,34 @@ class RunOrchestrator:
 
         mark_terminal_safe(runs_repo, run_id, "done")
         yield emit("done", {})
+
+    def _resolve_route_reference(
+        self,
+        req: ChatFlowRequest,
+        run_id: str | None,
+        comparison_id: str,
+        candidate_id: str,
+    ):
+        """Read one draft route reference back through the comparison leaf.
+
+        Deliberately not cached: a fresh :class:`agent_v2.route_tools.RouteSession`
+        per call, whose ``load_result`` hits storage and whose
+        ``select_candidate`` re-runs the deterministic gate. That is the whole
+        point of storing a reference instead of facts (ticket 03), and it is why
+        the plan path never needs a copy of a comparison — the kernel stays out
+        of this stream, and so does any assumption that a client's ids are
+        evidence.
+        """
+        from agent_v2.route_tools import RouteSession
+
+        session = RouteSession(
+            settings=self._settings,
+            run_id=run_id,
+            audit_sink=None,
+            runs_repo=self._runs_repo,
+            conversation_id=req.conversation_id,
+        )
+        return session.select_candidate(comparison_id, candidate_id)
 
     def _persist_plan_reply(
         self,

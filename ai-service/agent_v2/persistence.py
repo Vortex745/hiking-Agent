@@ -298,6 +298,28 @@ CREATE TABLE IF NOT EXISTS plan_drafts (
 );
 
 CREATE INDEX IF NOT EXISTS idx_plan_drafts_stage ON plan_drafts(stage);
+
+-- Ticket 03: the route reference a plan draft points at — its own table, on
+-- purpose. ``ControlStore.__init__`` only ever runs ``CREATE TABLE IF NOT
+-- EXISTS``, which creates a missing table on an existing database but never
+-- alters a present one: a ``comparison_id`` column added to ``plan_drafts``
+-- above would silently not exist on a developer's DB and surface later as
+-- ``sqlite3.OperationalError: no such column``. A new table needs no migration
+-- machinery. It is also AC3 in storage form: the user's arrangements stay on
+-- the draft row, a verified route is only ever *referenced* here — no fact
+-- column, so no copy of a fact can drift out of sync with its source.
+CREATE TABLE IF NOT EXISTS plan_route_selections (
+    conversation_id TEXT PRIMARY KEY,
+    draft_id TEXT NOT NULL,
+    comparison_id TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    selected_by_run_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_route_selections_draft
+ON plan_route_selections(draft_id);
 """
 
 
@@ -417,6 +439,26 @@ class PlanDraftRecord:
     activity_date: str
     participants: int | None
     updated_by_run_id: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class RouteSelectionRecord:
+    """Snapshot of a plan_route_selections row (Ticket 03 AC1/AC3).
+
+    Two ids and the draft they belong to. There is deliberately no field for
+    a distance, an ascent, a duration, a weather string or an open status:
+    verified facts are read back through
+    :meth:`agent_v2.route_tools.RouteSession.load_result`, which re-runs the
+    deterministic gate, so a stale copy cannot exist in the first place.
+    """
+
+    conversation_id: str
+    draft_id: str
+    comparison_id: str
+    candidate_id: str
+    selected_by_run_id: str
     created_at: str
     updated_at: str
 
@@ -1122,6 +1164,110 @@ class ControlStore:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
+
+    # -- route selections (Ticket 03) ----------------------------------
+
+    def upsert_route_selection(
+        self,
+        *,
+        conversation_id: str,
+        draft_id: str,
+        comparison_id: str,
+        candidate_id: str,
+        selected_by_run_id: str = "",
+    ) -> RouteSelectionRecord:
+        """Point the conversation's draft at one candidate of a comparison.
+
+        One row per conversation, replaced in place: choosing the alternative
+        instead of the recommendation is one draft's second thought, not a
+        second selection the user has to reconcile. ``draft_id`` travels with
+        it so a reference can only ever describe the draft it was made for.
+
+        Raises ``ValueError`` on an empty id — a reference that points at
+        nothing is exactly the fabricated route AC4 forbids, so it is refused
+        at the storage boundary too, never written as a row.
+        """
+        for name, value in (
+            ("draft_id", draft_id),
+            ("comparison_id", comparison_id),
+            ("candidate_id", candidate_id),
+        ):
+            if not (value or "").strip():
+                raise ValueError(f"invalid plan route selection {name}: {value!r}")
+
+        now = _now_iso()
+        existing = self.get_route_selection(conversation_id)
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute(
+                "INSERT INTO plan_route_selections "
+                "(conversation_id, draft_id, comparison_id, candidate_id, "
+                " selected_by_run_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(conversation_id) DO UPDATE SET "
+                " draft_id = excluded.draft_id, "
+                " comparison_id = excluded.comparison_id, "
+                " candidate_id = excluded.candidate_id, "
+                " selected_by_run_id = excluded.selected_by_run_id, "
+                " updated_at = excluded.updated_at",
+                (
+                    conversation_id,
+                    draft_id,
+                    comparison_id,
+                    candidate_id,
+                    selected_by_run_id,
+                    existing.created_at if existing else now,
+                    now,
+                ),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        record = self.get_route_selection(conversation_id)
+        assert record is not None  # just wrote it
+        return record
+
+    def get_route_selection(self, conversation_id: str) -> RouteSelectionRecord | None:
+        """The conversation's route reference, or ``None`` when it has none.
+
+        ``None`` is the honest AC4 state: no reference means no verified facts
+        may appear in the draft, and the render path treats it that way.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM plan_route_selections WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return RouteSelectionRecord(
+            conversation_id=row["conversation_id"],
+            draft_id=row["draft_id"],
+            comparison_id=row["comparison_id"],
+            candidate_id=row["candidate_id"],
+            selected_by_run_id=row["selected_by_run_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def clear_route_selection(self, conversation_id: str) -> int:
+        """Drop the conversation's route reference; return the removed count.
+
+        Used when a draft is cancelled (ticket 02 AC4: cancelling clears the
+        unfinished plan state) and when a draft is replaced by a fresh one, so
+        a reference cannot outlive the draft that earned it.
+        """
+        self._conn.execute("BEGIN")
+        try:
+            cursor = self._conn.execute(
+                "DELETE FROM plan_route_selections WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return cursor.rowcount
 
     # -- approvals (Ticket 11) -----------------------------------------
 

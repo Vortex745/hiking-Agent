@@ -58,6 +58,21 @@ export type V2PlanIntent =
   | 'plan_confirm'
   | 'plan_cancel'
   | 'plan_regenerate'
+  /* Ticket 03: put a route from an EXISTING comparison result into the plan
+   * draft. Sent with a V2PlanRouteReference and never with facts — the server
+   * re-reads and re-verifies them from the reference. */
+  | 'plan_select_route'
+
+/**
+ * The reference a plan draft points at: two ids and nothing else. There is
+ * deliberately no field for a distance, an ascent, a duration, a weather claim,
+ * an open status or ``report_allowed`` — verified route facts come back from
+ * the server, re-read through the comparison session on every use.
+ */
+export interface V2PlanRouteReference {
+  comparison_id: string
+  candidate_id: string
+}
 
 /**
  * Draft stages of ``plan.draft_state`` — the same vocabulary as
@@ -95,6 +110,13 @@ export interface V2PlanDraftState {
    * Empty only for a payload from a server that predates this field.
    */
   summary: string
+  /**
+   * Ticket 03: the route this draft points at, or ``null`` when it points at
+   * nothing. ``null`` is AC4's shape — no comparison, no reference, and the
+   * draft's route facts stay 待核验; the summary above is what carries the
+   * verified values, so a restored draft shows exactly what the stream showed.
+   */
+  route_selection: V2PlanRouteReference | null
   draft: V2PlanDraftFields
 }
 

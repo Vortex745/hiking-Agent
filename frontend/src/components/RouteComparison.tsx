@@ -1,4 +1,4 @@
-import { readRouteComparison, safeSourceUrl, type RouteFactKey } from '../api/routeComparison'
+import { readRouteComparison, safeSourceUrl, type RouteFactKey, type RouteSelection } from '../api/routeComparison'
 
 const dimensions: Array<[RouteFactKey, string, string]> = [
   ['distance_km', '距离', 'km'], ['ascent_m', '爬升', 'm'], ['duration_hours', '耗时', '小时'],
@@ -9,8 +9,16 @@ const risks = { clear: '风险资料齐全', caution: '谨慎 · 需要确认', 
 const evidence = { complete: '资料齐全', partial: '部分资料', empty: '无可核验资料' }
 const values: Record<string, string> = { open: '开放', closed: '封闭', low: '低风险', moderate: '中等风险', high: '高风险' }
 
-export function RouteComparisonCard({ value, onExport, busy = false }: {
+export function RouteComparisonCard({ value, onExport, onSelect, busy = false }: {
   value: unknown; onExport?: (comparisonId: string) => void; busy?: boolean
+  /**
+   * Ticket 03 AC1: send a route into the plan draft. The card is the only place
+   * a selection can be made — it shows the verified facts and their sources, so
+   * it is also the only place that can say which candidate the comparison
+   * actually offered. The action carries two ids: a draft that reuses a
+   * comparison stores a reference, never a copy of these facts.
+   */
+  onSelect?: (selection: RouteSelection) => void
 }) {
   const result = readRouteComparison(value)
   if (!result) return null
@@ -40,6 +48,11 @@ export function RouteComparisonCard({ value, onExport, busy = false }: {
           const candidate = assessment.candidate
           const recommended = validRecommendation && result.recommended_id === candidate.id && assessment.risk_status === 'clear' && assessment.evidence_status === 'complete'
           const alternate = validRecommendation && result.alternatives.includes(candidate.id)
+          // AC1/AC4: only what the comparison offered is selectable. A no-go, an
+          // insufficient-evidence or an off-ranking candidate gets no affordance,
+          // because choosing it could only ever produce an unverified draft.
+          const selectable = recommended || alternate
+          const selection: RouteSelection = { comparison_id: result.comparison_id, candidate_id: candidate.id }
           return <article key={candidate.id} className={`rounded-lg border p-3 ${recommended ? 'border-primary' : 'border-border'}`}>
             <h4 className="font-medium">{candidate.name}{recommended ? ' · 推荐' : alternate ? ' · 备选' : ''}</h4>
             <p className={`mt-1 text-xs ${assessment.risk_status === 'no_go' ? 'text-red-600 dark:text-red-400' : 'text-text-secondary'}`}>
@@ -64,11 +77,39 @@ export function RouteComparisonCard({ value, onExport, busy = false }: {
             </dl>
             {assessment.reasons.length > 0 && <ul className="mt-3 space-y-1 text-xs text-text-secondary">{assessment.reasons.map((reason, i) => <li key={i}>{reason}</li>)}</ul>}
             {assessment.required_action && <p className="mt-2 text-sm font-medium">{assessment.required_action}</p>}
+            {selectable && <button type="button" disabled={busy || !onSelect}
+              onClick={() => onSelect?.(selection)}
+              className="mt-3 rounded-lg border border-border px-3 py-2 text-sm hover:bg-bg-body disabled:opacity-50 dark:border-white/10">
+              {recommended ? '选用该路线（推荐）' : '选用该路线（备选）'}
+            </button>}
+            {!selectable && onSelect && <p className="mt-3 text-xs text-text-muted">该路线不在推荐或备选之列，无法带入计划书草稿。</p>}
           </article>
         })}
       </div>
-      <details className="mt-3 text-sm"><summary className="cursor-pointer">比较依据与资料缺口</summary>
+      {result.required_action && <p className="mt-3 rounded-lg bg-amber-500/10 p-2 text-sm">{result.required_action}</p>}
+      <details className="mt-3 text-sm"><summary className="cursor-pointer">比较依据、资料缺口与用户安排</summary>
         <ul className="mt-2 space-y-1 break-words text-text-secondary">{result.explanation.map((line, i) => <li key={i}>{line}</li>)}</ul>
+        {result.ranking.length > 0 && <p className="mt-2 break-words text-xs text-text-muted">
+          排序：{result.ranking.map(id => result.candidates.find(a => a.candidate.id === id)?.candidate.name || id).join(' → ')}
+        </p>}
+        {result.candidates.some(assessment => assessment.candidate.gaps.length > 0) && (
+          <div className="mt-2 space-y-2">
+            {result.candidates.map(assessment => assessment.candidate.gaps.length > 0 && (
+              <div key={assessment.candidate.id}>
+                <p className="text-xs text-text-muted">{assessment.candidate.name} · 资料缺口</p>
+                <ul className="space-y-1 break-words text-xs text-text-secondary">
+                  {assessment.candidate.gaps.map((gap, i) => <li key={i}>{gap}</li>)}
+                </ul>
+              </div>
+            ))}
+          </div>
+        )}
+        <p className="mt-2 text-xs text-text-muted">
+          用户安排（待确认，非核验事实）：活动日期 {result.plan_details.activity_date || '待确认'}
+          ，集合地点 {result.plan_details.meeting_point || '待确认'}
+          ，参与人数 {result.plan_details.participants ?? '待确认'}
+          ，交通 {result.plan_details.transport || '待确认'}
+        </p>
       </details>
     </section>
   )

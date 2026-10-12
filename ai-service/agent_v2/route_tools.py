@@ -1,20 +1,31 @@
-"""Run-scoped kernel leaves for route comparison and report preparation."""
+"""Run-scoped kernel leaves for route comparison, report preparation and the
+plan draft's route reference.
+"""
 from __future__ import annotations
 
 import asyncio
 import json
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import Field
 
 from agent_v2.kernel_tools import BoundedDomainTool
+from agent_v2.plan_workflow import (
+    FACT_DIMENSIONS,
+    PlanBlockReason,
+    RouteBasis,
+    RouteFactLine,
+    format_fact_value,
+)
 from route_compare.data import collect_candidates
 from route_compare.fixtures import fixture_candidates
-from route_compare.models import CompareParams, ComparisonResult, Contract, PlanDetails, RouteCandidate, RouteQuery
+from route_compare.models import (CompareParams, CandidateAssessment, ComparisonResult, Contract,
+                                  PlanDetails, RouteCandidate, RouteQuery)
 from route_compare.providers import ProviderConfig, select_provider
-from route_compare.service import compare_routes, render_report
+from route_compare.service import assess_candidate, compare_routes, render_report
 
 AMAP_OPERATIONS = {
     ("amap_map", "geocode"): "maps_geo",
@@ -90,6 +101,65 @@ class ReportParams(Contract):
     plan_details: PlanDetails | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class RouteSelectionOutcome:
+    """Result of resolving a draft's route reference (ticket 03).
+
+    Same ``status``/``reason`` shape :meth:`RouteSession.prepare_report`
+    returns, so a refusal is a stable machine-readable reason and never a
+    half-filled draft: blocked means the caller renders every route fact as
+    待核验, which is exactly spec AC4.
+    """
+
+    status: Literal["ok", "blocked"]
+    basis: RouteBasis | None = None
+    reason: str | None = None
+
+    @property
+    def blocked(self) -> bool:
+        return self.status == "blocked"
+
+
+def _route_basis(result: ComparisonResult, assessment: CandidateAssessment,
+                 role: Literal["recommended", "alternative"]) -> RouteBasis:
+    """Project a re-assessed candidate onto the draft's fact section (AC2).
+
+    Only facts the gate left standing appear, each with the source that backs
+    it: ``source_id`` + ``source_field`` come from the fact itself and
+    ``source_tool`` / ``observed_at`` from the candidate's own source list. A
+    fact whose source cannot be found is dropped rather than printed bare —
+    a number without provenance is not a verified fact.
+    """
+    candidate = assessment.candidate
+    sources = {source.id: source for source in candidate.sources}
+    lines: list[RouteFactLine] = []
+    missing: list[str] = []
+    for field, label, _unit in FACT_DIMENSIONS:
+        fact = candidate.facts.get(field)
+        source = sources.get(fact.source_id) if fact is not None else None
+        if fact is None or source is None:
+            missing.append(label)
+            continue
+        lines.append(RouteFactLine(
+            field=field,
+            label=label,
+            display_value=format_fact_value(field, fact.value),
+            source_id=fact.source_id,
+            source_field=fact.source_field,
+            source_tool=source.tool,
+            observed_at=source.observed_at,
+        ))
+    return RouteBasis(
+        comparison_id=result.comparison_id,
+        candidate_id=candidate.id,
+        candidate_name=candidate.name,
+        role=role,
+        data_mode=result.data_mode,
+        facts=tuple(lines),
+        missing_labels=tuple(missing),
+    )
+
+
 class RouteSession:
     def __init__(self, *, settings, run_id, audit_sink, runs_repo=None, conversation_id=None,
                  provider=None, tools=None):
@@ -146,6 +216,47 @@ class RouteSession:
             return {"status": "blocked", "reason": "evidence_or_safety_gate"}
         return {"status": "ready_for_approval", "comparison_id": comparison_id,
                 "route_report": result.model_dump()}
+
+    def select_candidate(self, comparison_id: str, candidate_id: str) -> RouteSelectionOutcome:
+        """Resolve a plan draft's route reference into verified facts (ticket 03).
+
+        This is the only way the plan path reaches a comparison, and it is
+        called on *every* use rather than once at selection time:
+        :meth:`load_result` re-reads and re-validates the stored result, and
+        :func:`route_compare.service.assess_candidate` — the same deterministic
+        gate :func:`render_report` re-runs before it trusts a stored result —
+        re-checks the candidate. So a draft can hold nothing but two ids and
+        still cannot carry a fact that its evidence no longer supports.
+
+        Selectable is the recommendation or a listed alternative of a gate
+        passed comparison (spec AC1), which is a rule over stored fields, not
+        a model call. Report eligibility is untouched here: this leaf makes no
+        ``report_allowed`` claim and never renders a report — that stays
+        :func:`render_report`'s authority.
+        """
+        result = self.load_result(comparison_id)
+        if result is None:
+            return RouteSelectionOutcome("blocked", reason=PlanBlockReason.COMPARISON_NOT_FOUND)
+
+        selectable = ([result.recommended_id] if result.recommended_id else []) + list(
+            result.alternatives)
+        if result.status != "recommended" or candidate_id not in selectable:
+            # No usable comparison, or a candidate the comparison did not offer
+            # (a no-go or insufficient-evidence route): AC4 forbids dressing it
+            # up as a basis for the plan.
+            return RouteSelectionOutcome("blocked", reason=PlanBlockReason.ROUTE_NOT_SELECTABLE)
+
+        stored = next((a for a in result.candidates if a.candidate.id == candidate_id), None)
+        if stored is None:
+            return RouteSelectionOutcome("blocked", reason=PlanBlockReason.ROUTE_NOT_SELECTABLE)
+
+        checked = assess_candidate(stored.candidate)
+        if checked.evidence_status != "complete" or checked.risk_status != "clear":
+            return RouteSelectionOutcome("blocked", reason=PlanBlockReason.ROUTE_NOT_SELECTABLE)
+
+        role: Literal["recommended", "alternative"] = (
+            "recommended" if candidate_id == result.recommended_id else "alternative")
+        return RouteSelectionOutcome("ok", basis=_route_basis(result, checked, role))
 
 
 class RouteCompareTool(BoundedDomainTool):

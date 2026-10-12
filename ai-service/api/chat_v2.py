@@ -79,7 +79,7 @@ from agent_v2.observability import CapacityExceeded
 from agent_v2.permissions import (
     PermissionGate,
 )
-from agent_v2.plan_workflow import PlanDraftInput, PlanIntent
+from agent_v2.plan_workflow import PlanDraftInput, PlanIntent, RouteSelectionInput
 from agent_v2.run_orchestration import (
     ChatFlowRequest,
     RunOrchestrator,
@@ -191,6 +191,14 @@ class ChatV2Request(BaseModel):
     plan_input: Optional[PlanDraftInput] = Field(
         default=None,
         description="Minimal plan draft fields collected by the entry dialog.",
+    )
+    route_selection: Optional[RouteSelectionInput] = Field(
+        default=None,
+        description=(
+            "Ticket 03: a reference (comparison_id + candidate_id) into an existing "
+            "route-comparison result. Verified facts are re-read server-side from it; "
+            "nothing else about a route can be sent."
+        ),
     )
 
 
@@ -383,6 +391,7 @@ async def chat_v2_sse(req: ChatV2Request, request: Request):
         current_location=req.current_location,
         intent=req.intent,
         plan_input=req.plan_input,
+        route_selection=req.route_selection,
     )
 
     async def guarded_stream() -> AsyncGenerator[str, None]:

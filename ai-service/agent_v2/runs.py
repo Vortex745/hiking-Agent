@@ -32,6 +32,7 @@ from agent_v2.persistence import (
     ControlStore,
     EffectRecord,
     PlanDraftRecord,
+    RouteSelectionRecord,
     RunAlreadyTerminal,
     RunNotFound,
     RunRecord,
@@ -294,6 +295,42 @@ class RunRepository:
         with a stable reason.
         """
         return self.control.get_plan_draft(conversation_id)
+
+    # -- route selections (Ticket 03) ---------------------------------
+
+    def save_route_selection(
+        self,
+        *,
+        conversation_id: str,
+        draft_id: str,
+        comparison_id: str,
+        candidate_id: str,
+        selected_by_run_id: str = "",
+    ) -> RouteSelectionRecord:
+        """Point the conversation's draft at one candidate of a comparison.
+
+        Ticket 03's facade over the reference row: flows go through here, never
+        through :class:`ControlStore` directly. The row holds two ids on
+        purpose — verified facts are re-read through
+        :class:`agent_v2.route_tools.RouteSession`, so the draft can never hold
+        a copy that outlives its evidence (spec AC3, and docs/plan-pdf-format.md
+        内容边界).
+        """
+        return self.control.upsert_route_selection(
+            conversation_id=conversation_id,
+            draft_id=draft_id,
+            comparison_id=comparison_id,
+            candidate_id=candidate_id,
+            selected_by_run_id=selected_by_run_id,
+        )
+
+    def get_route_selection(self, conversation_id: str) -> RouteSelectionRecord | None:
+        """The conversation's route reference, or ``None`` (no facts may show)."""
+        return self.control.get_route_selection(conversation_id)
+
+    def clear_route_selection(self, conversation_id: str) -> int:
+        """Drop the conversation's route reference (cancelled / replaced draft)."""
+        return self.control.clear_route_selection(conversation_id)
 
     def mark_run_done(self, run_id: str) -> None:
         """Transition a running run to ``done`` terminal.

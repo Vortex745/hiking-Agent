@@ -35,6 +35,7 @@ import type {
   V2Artifact,
   V2PlanDraftState,
   V2PlanDraftStage,
+  V2PlanRouteReference,
 } from './chatV2'
 import { TERMINAL_V2_EVENT_TYPES, V2_PLAN_DRAFT_STAGES } from './chatV2'
 
@@ -458,6 +459,23 @@ function readObject(
  * the shared vocabulary — an unknown stage must never open a dialog on a
  * guess.
  */
+/**
+ * Ticket 03: read a draft's route reference. ``null`` unless BOTH ids are
+ * non-empty strings — a partial pointer would let the UI name a route the
+ * server never issued, which is the thing spec AC4 forbids.
+ */
+function readRouteSelection(
+  value: unknown,
+): V2PlanRouteReference | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const raw = value as Record<string, unknown>
+  const comparisonId = raw['comparison_id']
+  const candidateId = raw['candidate_id']
+  if (typeof comparisonId !== 'string' || !comparisonId) return null
+  if (typeof candidateId !== 'string' || !candidateId) return null
+  return { comparison_id: comparisonId, candidate_id: candidateId }
+}
+
 export function readPlanDraftState(
   payload: Record<string, unknown>,
 ): V2PlanDraftState | null {
@@ -477,6 +495,10 @@ export function readPlanDraftState(
     // Ticket 02 AC3: the rendered draft summary. Absent on an older payload,
     // which is an empty summary — never a guess and never a dropped event.
     summary: typeof payload['summary'] === 'string' ? payload['summary'] : '',
+    // Ticket 03: the route reference. Both ids must be non-empty strings or the
+    // draft has no reference — a half-read pointer would render a route the
+    // server never issued, which is the AC4 failure this reader exists to stop.
+    route_selection: readRouteSelection(payload['route_selection']),
     draft: {
       destination_or_route:
         typeof draft['destination_or_route'] === 'string' ? draft['destination_or_route'] : '',
