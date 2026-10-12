@@ -374,22 +374,19 @@ def _export_payload(request_id: str) -> dict[str, Any]:
     }
 
 
-def _pause_plan_book(flow, monkeypatch, *, request_id: str, meeting_point: str,
-                     produced: list[str]) -> tuple[list[dict], list[dict]]:
-    """Open the plan book once: draft turn, then the approval-paused export run.
+def _pause_and_approve(flow, monkeypatch, *, request_id: str, meeting_point: str,
+                       produced: list[str], submit_draft: bool = True):
+    """Drive the plan book up to the pause, record the approval, do NOT resume.
 
-    Returns ``(paused_frames, resume_frames)`` with the approval already
-    recorded; the PDF is rendered only by the resume stream, and the plan rows
-    (draft + arrangements) are on record before it, so the version row the
-    export publishes carries a real ``draft_id``.
+    Returns ``(paused_frames, run_id, last_seq)`` — the state a client has when
+    the stream closed on ``run.paused``.
     """
-    # 1. the model-free draft turn that the book is built from.
-    draft_frames = _post_sse(flow.app, flow.subject, _submit(f"book-{request_id}"))
-    assert draft_frames[-1]["type"] == "done"
-    assert _drafts(draft_frames)[0]["payload"]["draft"]["arrangements"]["meeting_point"] \
-        == _ARRANGEMENTS["meeting_point"]
+    if submit_draft:
+        draft_frames = _post_sse(flow.app, flow.subject, _submit(f"book-{request_id}"))
+        assert draft_frames[-1]["type"] == "done"
+        assert _drafts(draft_frames)[0]["payload"]["draft"]["arrangements"]["meeting_point"] \
+            == _ARRANGEMENTS["meeting_point"]
 
-    # 2. the export run: kernel pair → pause → approve → resume renders.
     _install_route_plan_model(monkeypatch, flow, meeting_point=meeting_point)
     monkeypatch.setattr(chat_api, "_build_artifact_computer",
                         lambda *a, **k: _recording_computer(produced))
@@ -399,17 +396,264 @@ def _pause_plan_book(flow, monkeypatch, *, request_id: str, meeting_point: str,
             paused = _frames(await client.post(
                 "/api/v2/chat/sse", json=_export_payload(request_id)))
             assert paused[-1]["type"] == "run.paused", paused
-            approval = next(e["payload"] for e in paused if e["type"] == "approval.required")
+            approval_payload = next(
+                e["payload"] for e in paused if e["type"] == "approval.required")
             decided = await client.post(
-                f"/api/v2/approvals/{approval['approval_id']}/decision",
+                f"/api/v2/approvals/{approval_payload['approval_id']}/decision",
                 json={"decision": "approve", "decision_request_id": f"dec-{request_id}"})
             assert decided.status_code == 200
-            resumed = _frames(await client.post(
-                f"/api/v2/chat/resume/{paused[-1]['run_id']}",
-                params={"from_seq": paused[-1]["sequence"]}))
-            return paused, resumed
+            return paused, approval_payload
+
+    paused, approval_payload = asyncio.run(run())
+    return paused, paused[-1]["run_id"], paused[-1]["sequence"], approval_payload
+
+
+def _resume(app, subject, run_id: str, from_seq: int) -> list[dict[str, Any]]:
+    async def run():
+        async with _client(app, subject) as client:
+            return _frames(await client.post(
+                f"/api/v2/chat/resume/{run_id}", params={"from_seq": from_seq}))
 
     return asyncio.run(run())
+
+
+def _pause_plan_book(flow, monkeypatch, *, request_id: str, meeting_point: str,
+                     produced: list[str]) -> tuple[list[dict], list[dict]]:
+    """Open the plan book once and resume it: ``(paused_frames, resume_frames)``."""
+    paused, run_id, last_seq, _approval = _pause_and_approve(
+        flow, monkeypatch, request_id=request_id,
+        meeting_point=meeting_point, produced=produced)
+    return paused, _resume(flow.app, flow.subject, run_id, last_seq)
+
+
+# ---- AC4: cancel cleans the sandbox and the unfinished state ---------------
+
+def _artifact_pause(flow, monkeypatch, request_id: str, produced: list[str]):
+    """Open a plan-book PDF run on the ``artifact`` profile and stop at the pause.
+
+    The artifact profile is the site that holds a SANDBOX capacity slot
+    (:meth:`RunOrchestrator.acquire_leases` reserves one only for
+    ``artifact``/``cowork``), so it is the honest seam for AC4's "release both
+    the lease and the capacity key" claim.
+    """
+    monkeypatch.setattr(chat_api, "_build_artifact_computer",
+                        lambda *a, **k: _recording_computer(produced))
+
+    async def model(**kwargs):
+        flow.model_calls.append(kwargs["message"])
+        return "# 徒步计划\n集合时间上午八点", []
+
+    monkeypatch.setattr(kernel, "run_chat_turn", model)
+    payload = {"message": "生成计划书 PDF", "request_id": request_id,
+               "conversation_id": CONV, "profile_id": "artifact"}
+    frames = _post_sse(flow.app, flow.subject, payload)
+    assert frames[-1]["type"] == "run.paused", frames
+    assert produced == [], "the PDF was rendered before the approval"
+    return frames, payload
+
+
+def _cancel(app, subject, identifier: str, key: str):
+    async def run():
+        async with _client(app, subject) as client:
+            return await client.post(
+                f"/api/v2/chat/cancel/{identifier}", json={"idempotency_key": key})
+
+    return asyncio.run(run())
+
+
+def test_cancelling_a_paused_plan_book_releases_the_lease_and_the_capacity_slot(
+    flow, monkeypatch
+):
+    """AC4: cancel destroys the preserved sandbox AND frees its capacity key.
+
+    The pause deliberately keeps both (the next test pins that leak); cancel is
+    what ends it. Nothing was published, so the version history stays empty —
+    a cancelled run whose approval was never decided must not leave a row that
+    "which artifact is current" could point at.
+    """
+    produced: list[str] = []
+    request_id = "req-cancel-paused"
+    frames, _payload = _artifact_pause(flow, monkeypatch, request_id, produced)
+    run_id = frames[-1]["run_id"]
+    capacity = flow.app.state.agent_v2_runtime.capacity
+
+    # The deliberate leak, still in place while the run waits for a decision.
+    lease = flow.repo.get_sandbox_lease(run_id)
+    assert lease.status == "active"
+    import os
+    assert os.path.isdir(lease.workspace_path)
+    assert capacity.snapshot()["active_sandboxes"] == 1
+
+    cancelled = _cancel(flow.app, flow.subject, run_id, "cancel-1")
+    assert cancelled.status_code == 200
+    assert cancelled.json() == {"accepted": True, "reason": "cancelled", "run_id": run_id}
+
+    after = flow.repo.get_sandbox_lease(run_id)
+    assert after.status == "destroyed"
+    assert not os.path.isdir(after.workspace_path), (
+        "cancel only renamed the lease: the sandbox directory is still on disk"
+    )
+    assert capacity.snapshot()["active_sandboxes"] == 0, (
+        "cancel released the sandbox but kept the capacity slot reserved — a "
+        "paused run's slot is only freed by decision, cancel or the janitor"
+    )
+
+    # A duplicate cancel (same key) returns the recorded outcome; a fresh key on
+    # the terminal run learns the real terminal instead of a second cleanup.
+    repeated = _cancel(flow.app, flow.subject, run_id, "cancel-1")
+    fresh_key = _cancel(flow.app, flow.subject, request_id, "cancel-2")
+    assert repeated.json()["accepted"] is True
+    assert fresh_key.status_code == 409
+    assert fresh_key.json()["reason"] == "already_terminal:cancelled"
+
+    # Cancel resolves by request_id too (the early-cancel path), and publishes
+    # nothing: no artifact row, no version row, and the render never ran.
+    assert produced == []
+    assert flow.repo.list_artifacts_for_run(run_id) == []
+    assert flow.repo.list_plan_artifact_versions(CONV) == []
+    assert [e["payload"].get("approval_id") for e in frames
+            if e["type"] == "approval.required"]
+
+    # The cancelled run's stream is replayable and its terminal agrees.
+    tail = _get(flow.app, flow.subject, f"/api/v2/chat/events/{run_id}")
+    assert tail.json()["events"][-1]["type"] == "cancelled"
+    assert flow.repo.get_run(run_id).status == "cancelled"
+
+
+def test_a_pause_leaks_the_lease_on_purpose_and_the_janitor_reclaims_it(
+    flow, monkeypatch
+):
+    """AC4 must assert the DELIBERATE leak, not assume destroy-always.
+
+    ``preserve_sandbox`` keeps the lease active on pause (the approved resume
+    must reuse the SAME sandbox) and on an evidence-persistence failure; the 24 h
+    janitor is what reclaims it. A test that asserted cleanup on pause would be
+    asserting a contract this repo does not have.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from agent_v2.run_orchestration import sweep_expired_paused_runs
+
+    produced: list[str] = []
+    request_id = "req-leak-paused"
+    frames, _payload = _artifact_pause(flow, monkeypatch, request_id, produced)
+    run_id = frames[-1]["run_id"]
+    capacity = flow.app.state.agent_v2_runtime.capacity
+
+    lease = flow.repo.get_sandbox_lease(run_id)
+    assert lease.status == "active"
+    assert lease.workspace_path  # operators can still find the sandbox
+    assert capacity.snapshot()["active_sandboxes"] == 1
+    assert flow.repo.get_run(run_id).status == "paused"
+
+    # Within TTL the sweep leaves it alone: the user can still approve.
+    runtime = flow.app.state.agent_v2_runtime
+    assert sweep_expired_paused_runs(runtime) == 0
+
+    # Past the 24 h window the same run is reclaimed: lease failed, capacity
+    # freed, terminal reconciled to error — the leak has a bounded end.
+    backdated = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+    runtime.runs.control._conn.execute(
+        "UPDATE runs SET updated_at = ? WHERE run_id = ?", (backdated, run_id))
+    runtime.runs.control._conn.commit()
+
+    assert sweep_expired_paused_runs(runtime) == 1
+    assert flow.repo.get_sandbox_lease(run_id).status == "failed"
+    assert "expired" in (flow.repo.get_sandbox_lease(run_id).failure_reason or "")
+    assert capacity.snapshot()["active_sandboxes"] == 0
+    assert flow.repo.get_run(run_id).status == "error"
+    assert produced == []
+    # AC5: the sweep ends the run offline too, so the log is reconciled — a
+    # replay of an expired paused run cannot still answer ``run.paused``.
+    tail = _get(flow.app, flow.subject, f"/api/v2/chat/events/{run_id}")
+    assert tail.json()["events"][-1]["type"] == "error"
+
+
+def test_a_cancel_whose_sandbox_removal_fails_stays_honest_and_frees_the_slot(
+    flow, monkeypatch
+):
+    """AC4's failure arm: an unremovable sandbox is RECORDED, not reported clean.
+
+    The workspace removal raises (the real computer's injected cleanup failure);
+    cancel must still end the run, still free the capacity slot, and leave the
+    lease ``failed`` with the cleanup reason — the operator keeps a lead instead
+    of a ``destroyed`` row pointing at a directory that is still there.
+    """
+    produced: list[str] = []
+    request_id = "req-cancel-cleanupfail"
+    frames, _payload = _artifact_pause(flow, monkeypatch, request_id, produced)
+    run_id = frames[-1]["run_id"]
+    workspace = flow.repo.get_sandbox_lease(run_id).workspace_path
+    capacity = flow.app.state.agent_v2_runtime.capacity
+
+    # The pause stream's computer is gone; cancel builds one from the factory,
+    # so the injected cleanup failure has to come from there.
+    monkeypatch.setattr(chat_api, "_build_artifact_computer",
+                        lambda *a, **k: LocalNativeComputer(failure_mode="cleanup"))
+
+    cancelled = _cancel(flow.app, flow.subject, run_id, "cancel-cleanup")
+    assert cancelled.json()["accepted"] is True
+    after = flow.repo.get_sandbox_lease(run_id)
+    assert after.status == "failed"
+    assert "cleanup failed" in (after.failure_reason or "")
+    import os
+    assert os.path.isdir(workspace)  # honest: nothing pretends the dir is gone
+    assert capacity.snapshot()["active_sandboxes"] == 0
+    assert flow.repo.get_run(run_id).status == "cancelled"
+    assert flow.repo.list_plan_artifact_versions(CONV) == []
+
+
+def test_plan_cancel_clears_unfinished_rows_and_keeps_published_history(
+    flow, monkeypatch
+):
+    """AC4 + AC5's asymmetry: 取消 drops the unfinished state, not the evidence.
+
+    ``plan_cancel`` clears the draft's route selection, arrangements, rule
+    verdict and gate record — none of which may be inherited by the next plan.
+    The version history and the artifact rows are KEPT: they are evidence of
+    what was handed out, and the download rules stay theirs.
+    """
+    produced: list[str] = []
+    first = _pause_plan_book(flow, monkeypatch, request_id="req-cancel-keep",
+                             meeting_point="长坪沟北门", produced=produced)
+    artifact_id = _available(first[1])[0]["payload"]["artifact_id"]
+
+    # A research turn adds the gate record ticket 07 stores on the draft.
+    research = _post_sse(flow.app, flow.subject, {
+        "message": "研究路线资料", "request_id": "req-cancel-research",
+        "conversation_id": CONV, "profile_id": "chat",
+        "intent": "plan_research_route",
+    })
+    assert research[-1]["type"] == "done"
+    assert flow.repo.get_plan_safety(CONV) is not None
+
+    cancelled = _post_sse(flow.app, flow.subject, {
+        "message": "取消计划", "request_id": "req-cancel-go", "conversation_id": CONV,
+        "profile_id": "chat", "intent": "plan_cancel",
+    })
+    assert _drafts(cancelled)[0]["payload"]["stage"] == "cancelled"
+    assert cancelled[-1]["type"] == "done"
+
+    draft = flow.repo.get_plan_draft(CONV)
+    assert draft.stage == "cancelled"
+    assert flow.repo.get_plan_safety(CONV) is None
+    assert flow.repo.get_plan_arrangements(CONV) is None
+    assert flow.repo.get_completeness_check(CONV) is None
+    assert flow.repo.get_route_selection(CONV) is None
+
+    # …while the published book survives the cancel, still downloadable.
+    versions = flow.repo.list_plan_artifact_versions(CONV)
+    assert [v.revision for v in versions] == [1]
+    assert versions[0].artifact_id == artifact_id
+    assert flow.repo.get_current_plan_artifact_version(CONV).artifact_id == artifact_id
+
+    async def download():
+        async with _client(flow.app, flow.subject) as client:
+            return await client.get(f"/api/v2/artifacts/{artifact_id}")
+
+    got = asyncio.run(download())
+    assert got.status_code == 200 and got.content.startswith(b"%PDF-")
+    assert flow.model_calls == ["请导出带来源的计划书 PDF"]
 
 
 def _available(frames: list[dict]) -> list[dict]:
@@ -443,3 +687,98 @@ def test_replaying_a_published_plan_book_request_publishes_nothing_new(flow, mon
     versions = flow.repo.list_plan_artifact_versions(CONV)
     assert [v.revision for v in versions] == [1]
     assert versions[0].artifact_id == _available(resumed)[0]["payload"]["artifact_id"]
+
+
+# ---- AC3: resuming after approval must not execute the render again -------
+
+def test_a_second_resume_of_the_same_plan_generation_executes_the_pdf_once(
+    flow, monkeypatch
+):
+    """AC3 half 1: duplicate resumes of ONE generation render once.
+
+    The client that lost the resume stream re-opens ``/chat/resume``. The second
+    resume replays the stored continuation and stops at the run's terminal: the
+    sandbox render is NOT re-run, no second ``artifacts`` row and no second
+    version row appear, and the approval stays single-decision.
+    """
+    produced: list[str] = []
+    request_id = "req-book-resume"
+    _paused, run_id, last_seq, _approval = _pause_and_approve(
+        flow, monkeypatch, request_id=request_id,
+        meeting_point="长坪沟北门", produced=produced)
+    assert produced == []  # nothing executed before the resume
+
+    first = _resume(flow.app, flow.subject, run_id, last_seq)
+    second = _resume(flow.build(), flow.subject, run_id, last_seq)
+
+    assert first[-1]["type"] == "done" and second[-1]["type"] == "done"
+    assert len(produced) == 1, (
+        "the second resume re-rendered the plan book: the effect ledger or the "
+        "stored-event guard stopped deduplicating this generation"
+    )
+    assert len(_available(second)) == 1
+    assert [e["type"] for e in second if e["type"] in {"tool_result", "artifact.available"}] \
+        == ["tool_result", "artifact.available"]
+    assert len(flow.repo.list_artifacts_for_run(run_id)) == 1
+    assert [v.revision for v in flow.repo.list_plan_artifact_versions(CONV)] == [1]
+    # The approval was consumed exactly once: a second decision with the same
+    # key is idempotent, and a different decision is refused.
+    async def decide_again():
+        async with _client(flow.app, flow.subject) as client:
+            same = await client.post(
+                f"/api/v2/approvals/{_approval['approval_id']}/decision",
+                json={"decision": "approve", "decision_request_id": f"dec-{request_id}"})
+            other = await client.post(
+                f"/api/v2/approvals/{_approval['approval_id']}/decision",
+                json={"decision": "reject", "decision_request_id": "dec-other"})
+            return same, other
+
+    same, other = asyncio.run(decide_again())
+    assert same.status_code == 200 and same.json()["idempotent"] is True
+    assert other.status_code == 409
+    # The render came from the persisted report, not from a second model turn.
+    assert len(flow.model_calls) == 1
+
+
+def test_a_new_plan_revision_still_executes_after_the_previous_generation_committed(
+    flow, monkeypatch
+):
+    """AC3 half 2 (ticket 09's control): replay must not be fixed away globally.
+
+    Generation 2 of the same conversation is a NEW approval with
+    ``plan_revision = 2`` inside the canonical args, so its effect key differs
+    and the render really runs again — the old artifact and the old version row
+    stay exactly as they were.
+    """
+    produced: list[str] = []
+    first = _pause_plan_book(flow, monkeypatch, request_id="req-gen-1",
+                             meeting_point="长坪沟北门", produced=produced)
+    art1 = _available(first[1])[0]["payload"]
+    assert art1["plan_revision"] == 1 and art1["previous_artifact_id"] == ""
+
+    second = _pause_plan_book(flow, monkeypatch, request_id="req-gen-2",
+                              meeting_point="长坪沟南门", produced=produced)
+    art2 = _available(second[1])[0]["payload"]
+    assert art2["plan_revision"] == 2
+    assert art2["previous_artifact_id"] == art1["artifact_id"]
+    assert art2["artifact_id"] != art1["artifact_id"]
+    assert len(produced) == 2, (
+        "the new revision replayed generation 1's committed effect — the "
+        "discriminator is what makes a regeneration a regeneration"
+    )
+    versions = flow.repo.list_plan_artifact_versions(CONV)
+    assert [(v.revision, v.artifact_id) for v in versions] == [
+        (1, art1["artifact_id"]), (2, art2["artifact_id"])]
+    assert versions[1].draft_id == versions[0].draft_id == flow.repo.get_plan_draft(CONV).draft_id
+
+    # Generation 1 is untouched by generation 2: same row, same bytes on disk.
+    stored1 = flow.repo.get_artifact(art1["artifact_id"])
+    import os
+    assert stored1 is not None and os.path.isfile(stored1.storage_path)
+    assert stored1.sha256 != flow.repo.get_artifact(art2["artifact_id"]).sha256
+
+    # …and re-resuming generation 2's run still adds nothing.
+    again = _post_sse(flow.build(), flow.subject, _export_payload("req-gen-2"))
+    assert again == second[0] + second[1]
+    assert len(flow.repo.list_plan_artifact_versions(CONV)) == 2
+    assert len(produced) == 2

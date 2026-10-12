@@ -88,6 +88,7 @@ from agent_v2.plan_workflow import (
 from agent_v2.run_orchestration import (
     ChatFlowRequest,
     RunOrchestrator,
+    append_reconciled_terminal,
 )
 from agent_v2.runs import (
     RunRepository,
@@ -568,21 +569,50 @@ async def chat_v2_cancel(run_id: str, body: CancelRequest, request: Request):
     if outcome.accepted:
         sandbox = runs_repo.get_sandbox_lease(resolved_run_id)
         if sandbox is not None and sandbox.status == "active":
+            # Ticket 10 AC4: a run that PRESERVED its sandbox (the deliberate
+            # ``preserve_sandbox`` leak on pause / evidence-persistence failure)
+            # must have the sandbox actually destroyed on cancel, not only have
+            # its lease row flipped — otherwise the workspace bytes outlive the
+            # run nobody will ever resume. ``_cleanup_sandbox`` is this module's
+            # single cleanup implementation (same Computer + same lease
+            # recording as the flow's ``finally``), so a removal that raises is
+            # still recorded as ``failed`` for operators instead of being
+            # reported as clean.
+            computer = None
             try:
-                runs_repo.destroy_sandbox_lease(
-                    run_id=resolved_run_id,
-                    failure_reason="run cancelled",
-                )
+                computer = _build_artifact_computer(sandbox.sandbox_type)
             except Exception:
                 logger.exception(
-                    "chat_v2: sandbox cleanup failed for cancelled run_id=%s",
+                    "chat_v2: no computer available to clean the cancelled run's "
+                    "sandbox run_id=%s; lease marked failed instead",
                     resolved_run_id,
                 )
+            if computer is not None:
+                _cleanup_sandbox(
+                    computer, sandbox.workspace_path, runs_repo, resolved_run_id,
+                )
             else:
-                runtime = getattr(request.app.state, "agent_v2_runtime", None)
-                capacity = getattr(runtime, "capacity", None)
-                if capacity is not None:
-                    capacity.release_sandbox(run.request_id)
+                try:
+                    runs_repo.destroy_sandbox_lease(
+                        run_id=resolved_run_id,
+                        failure_reason="run cancelled",
+                    )
+                except Exception:
+                    logger.exception(
+                        "chat_v2: sandbox cleanup failed for cancelled run_id=%s",
+                        resolved_run_id,
+                    )
+            # The capacity slot is released whatever the removal did: the run is
+            # terminal, so nothing will ever reuse the sandbox again.
+            runtime = getattr(request.app.state, "agent_v2_runtime", None)
+            capacity = getattr(runtime, "capacity", None)
+            if capacity is not None:
+                capacity.release_sandbox(run.request_id)
+            # Ticket 10 AC5: a run that paused closed its stream on ``run.paused``
+            # long before this cancel, so no flow is left to emit the matching
+            # terminal. Reconcile the log with the run row — a replay must not
+            # answer ``run.paused`` for a run the client just cancelled.
+            append_reconciled_terminal(runs_repo, resolved_run_id)
     status_code = 200 if outcome.accepted else 409
     return JSONResponse(
         status_code=status_code,

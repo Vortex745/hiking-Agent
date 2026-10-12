@@ -351,6 +351,77 @@ def synthesize_terminal_type(snapshot: RunSnapshot | None) -> str | None:
     return None
 
 
+def append_reconciled_terminal(runs_repo: RunRepository | None, run_id: str | None) -> bool:
+    """Close a PAUSED run's event log when the run reached a terminal offline.
+
+    Ticket 10 AC5. A run that paused ended its stream on ``run.paused`` and
+    returned, so nobody is left to emit the matching terminal when the run is
+    later finished by ``POST /chat/cancel`` or by the expired-paused sweep: the
+    run row turns terminal while the log still reads ``run.paused`` as its last
+    frame. A client replaying ``GET /chat/events/{run_id}`` would then be told
+    the run is waiting for a decision it no longer has — the terminal event, the
+    run row and (for the plan book) the draft/artifact records have to agree
+    after every interruption, so the log gets the one frame the run's own status
+    says it ended with.
+
+    Narrow on purpose:
+    * a run still ``running`` keeps its live stream as the only author of its
+      terminal (appending here would collide with it on ``UNIQUE(run_id,
+      sequence)``);
+    * a log that already holds ``done``/``error``/``cancelled`` is untouched;
+    * the frame is written at a sequence strictly past the stored cursor and a
+      write failure is swallowed — a missing reconciliation must never make the
+      cancel or the sweep itself fail.
+
+    Returns True when a terminal frame was appended.
+    """
+    if runs_repo is None or not run_id:
+        return False
+    run = runs_repo.get_run(run_id)
+    if run is None or not run.is_terminal:
+        return False
+    stored = runs_repo.get_events_since(run_id=run_id, from_seq=0)
+    if any(evt["type"] in {"done", "error", "cancelled"} for evt in stored):
+        return False
+    if not any(evt["type"] == "run.paused" for evt in stored):
+        return False
+    terminal_type = synthesize_terminal_type(runs_repo.get_snapshot(run_id))
+    if terminal_type is None:
+        return False
+
+    stream = EventStream(
+        request_id=run.request_id,
+        conversation_id=run.conversation_id,
+        run_id=run_id,
+    )
+    stream.advance_to(max((evt["sequence"] for evt in stored), default=0))
+    reason = {
+        "cancelled": "运行已取消。",
+        "error": "运行已结束。",
+        "done": "运行已结束。",
+    }[terminal_type]
+    envelope = stream.build(terminal_type, {"code": terminal_type, "message": reason})
+    try:
+        runs_repo.persist_event(
+            run_id=run_id,
+            sequence=envelope.sequence,
+            event_type=envelope.type,
+            payload=envelope.payload,
+            request_id=run.request_id,
+            conversation_id=run.conversation_id,
+            event_id=envelope.event_id,
+            timestamp=envelope.timestamp,
+        )
+    except Exception:
+        logger.exception(
+            "run_orchestration: could not reconcile the terminal event for "
+            "run_id=%s; the run row is terminal but the log still ends at run.paused",
+            run_id,
+        )
+        return False
+    return True
+
+
 # ---- Unified effect CAS ledger (Ticket 39) ----------------------------------
 #
 # The SINGLE implementation of the side-effect ledger state machine:
@@ -4246,6 +4317,10 @@ def sweep_expired_paused_runs(runtime: Any) -> int:
                 run.run_id,
             )
             continue
+        # Ticket 10 AC5: the swept run has no live stream either, so its log
+        # would otherwise keep ending at ``run.paused`` while the row says
+        # ``error``. Same reconciliation cancel uses.
+        append_reconciled_terminal(runs_repo, run.run_id)
         if capacity is not None:
             capacity.release_sandbox(run.request_id)
         reclaimed += 1
