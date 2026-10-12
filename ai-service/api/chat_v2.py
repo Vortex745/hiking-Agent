@@ -79,7 +79,7 @@ from agent_v2.observability import CapacityExceeded
 from agent_v2.permissions import (
     PermissionGate,
 )
-from agent_v2.plan_workflow import PlanIntent
+from agent_v2.plan_workflow import PlanDraftInput, PlanIntent
 from agent_v2.run_orchestration import (
     ChatFlowRequest,
     RunOrchestrator,
@@ -161,6 +161,14 @@ class ChatV2Request(BaseModel):
     ``plan_regenerate`` fails validation with 422 **before** the stream
     starts (spec AC5: 服务端拒绝未知 intent). Routing on it is
     deterministic — the LLM never decides whether a plan book is created.
+
+    ``plan_input`` is the dialog's three collected fields, annotated with
+    :class:`agent_v2.plan_workflow.PlanDraftInput` (also ``extra="forbid"``
+    with strict bounds), so a malformed date, a non-integer headcount or a
+    smuggled fourth field is a 422 at the boundary rather than a draft row
+    (spec AC6). It is only meaningful with a field-collecting intent;
+    :func:`agent_v2.plan_workflow.evaluate_plan_intent` still rejects it on
+    any other intent, in depth.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -179,6 +187,10 @@ class ChatV2Request(BaseModel):
     intent: Optional[PlanIntent] = Field(
         default=None,
         description="Whitelisted structured intent. Unknown values are rejected.",
+    )
+    plan_input: Optional[PlanDraftInput] = Field(
+        default=None,
+        description="Minimal plan draft fields collected by the entry dialog.",
     )
 
 
@@ -370,6 +382,7 @@ async def chat_v2_sse(req: ChatV2Request, request: Request):
         conversation_id=req.conversation_id,
         current_location=req.current_location,
         intent=req.intent,
+        plan_input=req.plan_input,
     )
 
     async def guarded_stream() -> AsyncGenerator[str, None]:

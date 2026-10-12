@@ -38,6 +38,8 @@ import {
 } from '../api/v2Reducer'
 import { useExternalStoreRuntime, AssistantRuntimeProvider, ThreadMessage } from "@assistant-ui/react"
 import { GeminiThread } from '../components/assistant-ui/gemini/GeminiThread'
+import PlanDraftDialog from '../components/PlanDraftDialog'
+import Button from '../components/Button'
 import { GeminiSidebar } from '../components/assistant-ui/gemini/GeminiSidebar'
 import ApprovalCard, { DEFAULT_APPROVAL_QUESTIONS } from '../components/ApprovalCard'
 import X from 'reicon-react/icons/X'
@@ -169,10 +171,12 @@ interface V2PersistedRun {
   // Ticket 11: last-known run status so recovery knows whether to
   // re-attach a stream, re-show the approval prompt, or do nothing.
   v2_status?: 'running' | 'paused' | 'done' | 'error' | 'cancelled'
-  // Ticket 01: the last plan-draft stage this conversation reached. Stored
-  // so a later ticket can recognise "there is a draft" without re-asking
-  // the server; ticket 01 itself does not build the restore UX.
-  plan_stage?: V2PlanDraftState['stage']
+  // Ticket 01: the last plan-draft STATE this conversation reached, mirrored
+  // from ``plan.draft_state``. ``stage`` is what a later turn (or a refresh)
+  // reads to know a draft exists; ``draft`` is what the dialog re-seeds from.
+  // This is the localStorage mirror only — ticket 02 owns the restore/revise
+  // UX that consumes it.
+  plan_draft?: V2PlanDraftState
 }
 const V2_RUN_KEY = 'ai-hiking-agent-v2-active-run'
 function loadV2PersistedRun(): V2PersistedRun | null {
@@ -459,16 +463,30 @@ function SuperAgent() {
   // ``awaiting_input`` — an ``awaiting_confirmation`` stage renders the
   // confirm prompt instead, because an ambiguous request must be confirmed
   // before the flow opens (spec AC2).
-  const [planDraft, setPlanDraft] = useState<V2PlanDraftState | null>(null)
+  //
+  // Seeded from the persisted run so a refresh still knows a draft exists.
+  // Nothing here reopens the dialog on restore — that decision is ticket 02's
+  // restore UX, so this stays a read of "does a draft exist" only.
+  const [planDraft, setPlanDraft] = useState<V2PlanDraftState | null>(
+    () => v2RunRef.current?.plan_draft ?? null,
+  )
   const [planDialogOpen, setPlanDialogOpen] = useState(false)
 
   // StrictMode rule (see the messages-updater comment below): state
   // transitions stay in event handlers, durable writes happen here.
+  // Only while a run is persisted — a terminal has already cleared the run
+  // record, and resurrecting it would re-trigger stream recovery on reload.
   useEffect(() => {
     if (!planDraft) return
     const persisted = v2RunRef.current
     if (!persisted) return
-    v2RunRef.current = { ...persisted, plan_stage: planDraft.stage }
+    if (persisted.plan_draft?.stage === planDraft.stage
+      && persisted.plan_draft.draft.destination_or_route === planDraft.draft.destination_or_route
+      && persisted.plan_draft.draft.activity_date === planDraft.draft.activity_date
+      && persisted.plan_draft.draft.participants === planDraft.draft.participants) {
+      return
+    }
+    v2RunRef.current = { ...persisted, plan_draft: planDraft }
     saveV2PersistedRun(v2RunRef.current)
   }, [planDraft])
 
@@ -632,6 +650,16 @@ function SuperAgent() {
     }
     if (event.type === 'memory.consent_required') {
       setPendingMemoryConsent(next.pendingMemoryConsent)
+    }
+    // Ticket 01 AC8: the conversation's plan draft moved stage. Read it from
+    // the reducer's validated state, never off the raw payload — an unknown
+    // stage keeps the previous state instead of opening a dialog on a guess.
+    // ``awaiting_input`` is the ONLY stage that opens the dialog (spec AC1);
+    // ``awaiting_confirmation`` must leave it closed until the user confirms
+    // (spec AC2), and ``minimal_draft``/``cancelled`` close it.
+    if (event.type === 'plan.draft_state') {
+      setPlanDraft(next.planDraft)
+      setPlanDialogOpen(next.planDraft?.stage === 'awaiting_input')
     }
 
     if (event.type === 'text') {
@@ -1003,6 +1031,12 @@ function SuperAgent() {
       }))
       const next = reduceV2Events(v2StateRef.current, replayEnvelopes)
       v2StateRef.current = next
+      // Ticket 01 AC8: a refresh mid-run replays ``plan.draft_state`` through
+      // the pure reducer, which writes the reducer state only — the page's
+      // own mirror has to be re-seeded here or the dialog loses the draft it
+      // had already opened. Mirroring the stage is all this does: the dialog
+      // is NOT auto-reopened from a replay (ticket 02 owns restore UX).
+      if (next.planDraft) setPlanDraft(next.planDraft)
 
       setMessages(prev => {
         if (prev.length === 0) {
@@ -1353,11 +1387,14 @@ function SuperAgent() {
     const contextMessages = typeof replaceFromIndex === 'number'
       ? messages.slice(0, Math.max(0, replaceFromIndex))
       : messages
-    // An intent send may carry no typed text; the bubble then shows the
-    // intent's human label instead of an empty message.
+    // An intent send may carry no typed text. ``ChatV2Request.message`` is
+    // ``min_length=1``, so a bare intent would 422 at the wire boundary —
+    // the intent's human label travels instead. Routing never reads it:
+    // the server branches on ``intent`` before the classifier runs.
+    const requestText = text || (options.intent ? PLAN_INTENT_LABELS[options.intent] : '')
     const nextUserMessage: Message = {
       role: 'user',
-      content: text || (options.intent ? PLAN_INTENT_LABELS[options.intent] : ''),
+      content: requestText,
       time: timeStr,
     }
     const nextAssistantMessage: Message = { role: 'assistant', content: '', isStreaming: true, hasStreamed: true }
@@ -1386,13 +1423,13 @@ function SuperAgent() {
         request_id: requestId,
         conversation_id: conversationId,
         sequence_cursor: 0,
-        user_message: text,
+        user_message: requestText,
       }
       saveV2PersistedRun(v2RunRef.current)
 
       try {
         const v2Payload: Record<string, unknown> = {
-          message: text,
+          message: requestText,
           request_id: requestId,
           conversation_id: conversationId,
           profile_id: options.profileId || (selectedScenario === 'route_plan' ? 'route_plan' : 'chat'),
@@ -1552,6 +1589,46 @@ function SuperAgent() {
     }
   }, [handleSend])
 
+  // ---- Ticket 01: plan-book entry sends ------------------------------------
+  // Each one is an ordinary conversational turn that carries a whitelisted
+  // ``intent`` (seam-contract ruling), NOT the tool-approval pause machinery
+  // and NOT prose the server has to re-parse the way
+  // ``handleClarificationSubmitted`` above does.
+  //
+  // They are rebuilt with ``handleSend`` on purpose: ``handleSend`` closes
+  // over ``input``/``messages``/``isSending`` and is recreated whenever those
+  // change, so a dialog that stays open across several turns must submit
+  // through the current closure. Memoising these behind a stable identity (or
+  // stashing ``handleSend`` in a ref set once) would hand the long-lived
+  // dialog a stale ``isSending`` and silently no-op or double-send.
+  const handleGeneratePlan = useCallback(() => {
+    // The dialog is opened by the server's ``awaiting_input`` event, not
+    // optimistically: a blocked intent must leave it closed.
+    void handleSend('', { intent: 'plan_create' })
+  }, [handleSend])
+
+  const handlePlanDialogSubmit = useCallback((fields: V2PlanDraftFields) => {
+    void handleSend('', { intent: 'plan_create', planInput: fields })
+  }, [handleSend])
+
+  const handlePlanDialogDismiss = useCallback(() => {
+    setPlanDialogOpen(false)
+    // Only a stage the user actually reached can be cancelled — cancelling
+    // ``awaiting_confirmation`` (nothing open) or an already-cancelled draft
+    // would come back as ``cancel_without_active_draft``.
+    if (planDraft && (planDraft.stage === 'awaiting_input' || planDraft.stage === 'minimal_draft')) {
+      void handleSend('', { intent: 'plan_cancel' })
+    }
+  }, [handleSend, planDraft])
+
+  const handlePlanConfirm = useCallback(() => {
+    void handleSend('', { intent: 'plan_confirm' })
+  }, [handleSend])
+
+  const handlePlanDecline = useCallback(() => {
+    void handleSend('', { intent: 'plan_cancel' })
+  }, [handleSend])
+
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <div className="flex h-full w-full overflow-hidden relative">
@@ -1657,12 +1734,43 @@ function SuperAgent() {
               )}
             </div>
           )}
+          {/* Ticket 01 AC2: an ambiguous planning request parks the draft in
+              ``awaiting_confirmation`` and the dialog stays shut. This prompt
+              is the confirmation affordance; both answers travel as a
+              whitelisted intent, never as text the server re-parses. */}
+          {planDraft?.stage === 'awaiting_confirmation' && (
+            <div className="absolute left-4 right-4 top-16 z-50 ml-auto max-w-sm rounded-md border border-border bg-white p-4 text-sm text-text-primary shadow-xl dark:border-white/10 dark:bg-[#1e1f20]">
+              <div className="font-medium">是否生成计划书？</div>
+              <p className="mt-1 text-xs text-text-muted">
+                你的请求还不够明确。确认后才会打开填写弹窗，未确认前不会生成任何计划内容。
+              </p>
+              <div className="mt-3 flex justify-end gap-2">
+                <Button variant="ghost" size="sm" disabled={isSending} onClick={handlePlanDecline}>
+                  暂不生成
+                </Button>
+                <Button variant="accent" size="sm" disabled={isSending} onClick={handlePlanConfirm}>
+                  确认生成
+                </Button>
+              </div>
+            </div>
+          )}
           <GeminiThread
             onExportRoute={comparisonId => { void handleSend(`请导出带来源的路线比较 PDF，comparison_id=${comparisonId}`, { profileId: 'route_plan' }) }}
+            onGeneratePlan={handleGeneratePlan}
             isSending={isSending}
             emptyTitle="告诉我你的徒步计划，我将为你规划路线、安排任务，并提供安全建议。"
             onRegenerate={handleRegenerate}
             realMessageCount={messages.length}
+          />
+          {/* Ticket 01 AC1/AC6: the entry dialog. Opens only from the
+              server's ``awaiting_input`` stage, and re-seeds from the stored
+              draft so a second entry does not discard what the user typed. */}
+          <PlanDraftDialog
+            open={planDialogOpen}
+            busy={isSending}
+            initial={planDraft?.draft}
+            onDismiss={handlePlanDialogDismiss}
+            onSubmit={handlePlanDialogSubmit}
           />
         </div>
       </div>
