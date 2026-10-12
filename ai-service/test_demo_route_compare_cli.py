@@ -15,7 +15,10 @@ SCRIPT = Path(__file__).parent / "scripts" / "demo_route_compare.py"
 
 
 def run_cli(*args: str) -> subprocess.CompletedProcess:
-    env = {**os.environ, "PYTHONPATH": str(Path(__file__).parent)}
+    # The CLI reports errors in Chinese and the parent decodes UTF-8, so pin the
+    # child's stream encoding instead of letting Windows default it to cp936.
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).parent),
+           "PYTHONIOENCODING": "utf-8"}
     return subprocess.run([sys.executable, str(SCRIPT), *args],
                           capture_output=True, text=True, cwd=str(Path(__file__).parent),
                           env=env, encoding="utf-8")
