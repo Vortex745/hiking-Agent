@@ -77,6 +77,11 @@ _PDF_AMBER_BG = "#fffbeb"
 _PDF_AMBER_BORDER = "#f59e0b"
 _PDF_AMBER_TEXT = "#92400e"
 _PDF_LINK = "#1d4ed8"
+#: The risk block is the page the leader reads twice, so it is the one block that
+#: is not green: a red rule, a red head row and a red panel behind it.
+_PDF_RISK = "#b91c1c"
+_PDF_RISK_DARK = "#7f1d1d"
+_PDF_RISK_BG = "#fef2f2"
 
 
 def _register_pdf_font() -> tuple[str, str]:
@@ -155,13 +160,54 @@ def _pdf_footer(canvas: Any, doc: Any) -> None:
     canvas.restoreState()
 
 
+#: The plan book's numbered sections, in order: ``(number, label, aliases)``.
+#: ONE vocabulary for both stories on purpose — :func:`_text_story` matches a
+#: Markdown heading by substring against these aliases, so renaming a label here
+#: without keeping the old name as an alias silently files its content under the
+#: previous section instead of erroring. The old names stay below as aliases.
+PLAN_SECTIONS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("01", "计划摘要", ("计划摘要", "计划概要", "本计划概要")),
+    ("02", "计划信息", ("计划信息", "活动信息", "目的地", "基本信息")),
+    ("03", "路线摘要", ("路线摘要", "路线概况", "路线规划", "路线信息")),
+    ("04", "行程时间线", ("行程时间线", "行程安排", "日程", "行程", "时间安排")),
+    ("05", "交通住宿与联络", ("交通住宿与联络", "交通", "住宿", "后勤安排")),
+    ("06", "人员分工", ("人员分工", "队伍", "组织分工")),
+    ("07", "费用预算", ("费用预算", "预算", "费用")),
+    ("08", "装备与补给", ("装备与补给", "装备", "装备清单", "补给")),
+    ("09", "风险决策区", ("风险决策区", "风险与应急", "风险", "风险预案", "安全", "应急")),
+    ("10", "出发前检查", ("出发前检查", "检查清单", "注意事项", "建议")),
+    ("11", "候选路线对比", ("候选路线对比", "候选对比", "候选路线")),
+    ("12", "排序依据与说明", ("排序依据与说明", "排序说明", "排序依据")),
+    ("13", "来源与证据", ("来源与证据", "来源", "参考资料")),
+)
+
+#: The copy an ordinary artifact export falls back to when the Markdown draft has
+#: nothing under a heading (spec: 补齐缺失章节并标为草案, never invent).
+_TEXT_SECTION_DEFAULTS: dict[str, str] = {
+    "计划摘要": "待确认：路线、日期与人数摘要需由已确认安排与核验资料组成。",
+    "计划信息": "待确认：活动日期、集合时间与地点、人数、活动目标。",
+    "路线摘要": "待核验：起终点、里程、爬升、耗时、天气与开放状态。",
+    "行程时间线": "待确认：逐日安排、途经点、补给与最晚下撤时间。",
+    "交通住宿与联络": "待确认：往返交通、住宿、应急联络与撤退交通。",
+    "人员分工": "待确认：领队、导航、收队和急救联络负责人。",
+    "费用预算": "待确认：交通、住宿门票、餐食补给、保险与费用分摊。",
+    "装备与补给": "待确认：防滑鞋、雨具、保暖层、头灯、手机充电宝、急救包、饮水和食品。",
+    "风险决策区": "通用建议：恶劣天气或封闭路线取消出行；身体不适或迷路时停止前进，在安全位置联系领队或当地救援。",
+    "出发前检查": "待确认：最新天气与开放状态、离线地图、装备自检和对外联络；垃圾全部带离。",
+    "候选路线对比": "待核验：本草案没有经过服务器核验的候选路线对比表。",
+    "排序依据与说明": "待核验：草案中的排序不来自证据校验，不得视为已核验结论。",
+    "来源与证据": "待核验：本草案未完成路线证据校验；请补充可靠资料和查询时间。",
+}
+
+
 def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
     """Render the structured report as a complete, evidence-aware plan book."""
     from reportlab.lib import colors
     from reportlab.lib.colors import HexColor
     from reportlab.lib.enums import TA_LEFT, TA_CENTER
     from reportlab.lib.styles import ParagraphStyle
-    from reportlab.platypus import HRFlowable, KeepTogether, Paragraph, Spacer, Table, TableStyle
+    from reportlab.platypus import (HRFlowable, KeepTogether, PageBreak, Paragraph,
+                                    Spacer, Table, TableStyle)
     from xml.sax.saxutils import escape
 
     regular, bold = doc._pdf_font_regular, doc._pdf_font_bold
@@ -180,12 +226,24 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
     meta = style("PlanMeta", fontSize=8.2, leading=12, textColor=HexColor("#dcfce7"))
     section = style("PlanSection", fontName=bold, fontSize=12.5, leading=16,
                     textColor=HexColor(_PDF_PRIMARY_DARK), spaceBefore=12, spaceAfter=4, keepWithNext=True)
+    risk_section = style("PlanRiskSection", fontName=bold, fontSize=13.5, leading=17,
+                         textColor=HexColor(_PDF_RISK), spaceBefore=14, spaceAfter=4, keepWithNext=True)
     body = style("PlanBody", fontSize=9.5, leading=14, textColor=HexColor(_PDF_TEXT))
     small = style("PlanSmall", fontSize=8.2, leading=12, textColor=HexColor(_PDF_MUTED))
     table_head = style("PlanTableHead", fontName=bold, fontSize=8.4, leading=11, textColor=colors.white)
+    risk_head = style("PlanRiskHead", fontName=bold, fontSize=8.6, leading=11,
+                      textColor=HexColor(_PDF_RISK_DARK))
     table_cell = style("PlanTableCell", fontSize=8.4, leading=12, textColor=HexColor(_PDF_TEXT))
     table_cell_bold = style("PlanTableCellBold", fontName=bold, fontSize=8.6, leading=12, textColor=HexColor(_PDF_TEXT))
+    timeline_time = style("PlanTimelineTime", fontName=bold, fontSize=8.6, leading=12,
+                          textColor=HexColor(_PDF_PRIMARY_DARK))
     status = style("PlanStatus", fontName=bold, fontSize=15, leading=19, textColor=HexColor(_PDF_PRIMARY))
+    status_heading = style("PlanStatusHeading", fontName=bold, fontSize=12, leading=16,
+                           textColor=HexColor(_PDF_PRIMARY_DARK))
+    risk_title = style("PlanRiskTitle", fontName=bold, fontSize=10.5, leading=14,
+                       textColor=HexColor(_PDF_RISK_DARK))
+    risk_center = style("PlanRiskCenter", fontName=bold, fontSize=8.4, leading=11, alignment=TA_CENTER,
+                        textColor=HexColor(_PDF_RISK_DARK))
     callout = style("PlanCallout", fontName=bold, fontSize=9, leading=13, textColor=HexColor(_PDF_AMBER_TEXT))
     center_cell = style("PlanCenterCell", fontSize=8.2, leading=11, alignment=TA_CENTER, textColor=HexColor(_PDF_TEXT))
 
@@ -193,15 +251,19 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
         text = escape(str(value if value not in (None, "") else "待核验")).replace("\n", "<br/>")
         return Paragraph(text, style_obj)
 
-    def section_title(number: str, label: str) -> list[Any]:
-        rule = HRFlowable(width="100%", thickness=0.8, color=HexColor(_PDF_PRIMARY), spaceAfter=6)
+    def section_title(number: str, label: str, _aliases: tuple[str, ...] = (),
+                      *, tone: str = "default") -> list[Any]:
+        risk = tone == "risk"
+        rule = HRFlowable(width="100%", thickness=1.4 if risk else 0.8,
+                          color=HexColor(_PDF_RISK if risk else _PDF_PRIMARY), spaceAfter=6)
         rule.keepWithNext = True
-        return [Paragraph(f"{number}  {escape(label)}", section), rule]
+        return [Paragraph(f"{number}  {escape(label)}", risk_section if risk else section), rule]
 
     def styled_table(rows: list[list[Any]], widths: list[float], *, header: bool = True,
-                     highlight_rows: set[int] | None = None) -> Table:
+                     highlight_rows: set[int] | None = None, tone: str = "default") -> Table:
         table = Table(rows, colWidths=[width * mm for width in widths], repeatRows=1 if header else 0,
                       splitByRow=1, splitInRow=1, hAlign="LEFT")
+        risk = tone == "risk"
         commands: list[tuple[Any, ...]] = [
             ("VALIGN", (0, 0), (-1, -1), "TOP"),
             ("GRID", (0, 0), (-1, -1), 0.45, HexColor(_PDF_BORDER)),
@@ -210,60 +272,107 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
             ("TOPPADDING", (0, 0), (-1, -1), 5),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
         ]
+        if risk:
+            commands.append(("BOX", (0, 0), (-1, -1), 1.1, HexColor(_PDF_RISK)))
         if header:
-            commands.append(("BACKGROUND", (0, 0), (-1, 0), HexColor(_PDF_PRIMARY)))
+            commands.append(("BACKGROUND", (0, 0), (-1, 0),
+                             HexColor(_PDF_RISK_BG if risk else _PDF_PRIMARY)))
         for index in range(1 if header else 0, len(rows)):
             if highlight_rows and index in highlight_rows:
                 commands.append(("BACKGROUND", (0, index), (-1, index), HexColor(_PDF_PRIMARY_BG)))
+            elif risk:
+                commands.append(("BACKGROUND", (0, index), (-1, index), HexColor(_PDF_RISK_BG)))
             elif index % 2 == 0:
                 commands.append(("BACKGROUND", (0, index), (-1, index), HexColor(_PDF_ZEBRA)))
         table.setStyle(TableStyle(commands))
         return table
 
     story: list[Any] = []
+    cover = data.get("cover") or {}
+    status_lines = cover.get("status_lines") or [
+        {"label": "计划状态", "value": str(data.get("status_label") or "待核验")}]
     generated = "生成时间：" + str(data.get("generated_at", "待核验"))
     cid = str(data.get("comparison_id", ""))
     cid_text = cid[:44] + ("…" if len(cid) > 44 else "")
-    title_table = Table([[Paragraph(escape(data.get("title", "AI Hiking 徒步计划书")), title)],
-                         [Paragraph(escape(data.get("subtitle", "证据核验版徒步计划书")), subtitle)],
-                         [Paragraph(escape(generated + ("　·　计划编号：" + cid_text if cid_text else "")), meta)]],
-                        colWidths=[page_width])
-    title_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), HexColor(_PDF_PRIMARY_DARK)),
-        ("BACKGROUND", (0, 1), (-1, 2), HexColor(_PDF_PRIMARY)),
-        ("LEFTPADDING", (0, 0), (-1, -1), 14), ("RIGHTPADDING", (0, 0), (-1, -1), 14),
-        ("TOPPADDING", (0, 0), (-1, 0), 13), ("BOTTOMPADDING", (0, 0), (-1, 0), 5),
-        ("TOPPADDING", (0, 1), (-1, 1), 1), ("BOTTOMPADDING", (0, 1), (-1, 1), 2),
-        ("TOPPADDING", (0, 2), (-1, 2), 2), ("BOTTOMPADDING", (0, 2), (-1, 2), 10),
-    ]))
-    story.extend([title_table, Spacer(1, 9)])
 
-    summary_rows: list[list[Any]] = []
-    if data.get("offline_disclaimer"):
-        summary_rows.append([Paragraph("离线演示：合成数据，不可用于真实出行。", callout), ""])
-    recommendation = str(data.get("recommended") or "暂未形成可执行推荐")
-    summary_rows.append([
-        Paragraph(escape(str(data.get("status_label", "待核验"))), status),
-        p(f"推荐路线：{recommendation}\n活动安排需逐项确认；路线状态需在出发前重新核验。", body),
-    ])
-    if data.get("alternatives"):
-        summary_rows.append([Paragraph("备选路线", table_cell_bold), p("、".join(map(str, data["alternatives"])), body)])
-    summary = Table(summary_rows, colWidths=[48 * mm, 126 * mm], hAlign="LEFT")
-    summary_commands: list[tuple[Any, ...]] = [
-        ("BOX", (0, 0), (-1, -1), 0.75, HexColor(_PDF_BORDER)),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    # ---- Cover page (page 1, nothing else on it) -------------------------
+    cover_head = Table([[Paragraph(escape(str(cover.get("kicker", data.get("title", "徒步计划书")))), meta)],
+                        [Paragraph(escape(data.get("title", "AI Hiking 徒步计划书")), title)],
+                        [Paragraph(escape(data.get("subtitle", "证据核验版徒步计划书")), subtitle)]],
+                       colWidths=[page_width])
+    cover_head.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), HexColor(_PDF_PRIMARY_DARK)),
+        ("LEFTPADDING", (0, 0), (-1, -1), 14), ("RIGHTPADDING", (0, 0), (-1, -1), 14),
+        ("TOPPADDING", (0, 0), (-1, 0), 16), ("BOTTOMPADDING", (0, 0), (-1, 0), 2),
+        ("TOPPADDING", (0, 1), (-1, 1), 2), ("BOTTOMPADDING", (0, 1), (-1, 1), 4),
+        ("TOPPADDING", (0, 2), (-1, 2), 2), ("BOTTOMPADDING", (0, 2), (-1, 2), 16),
+    ]))
+    status_rows: list[list[Any]] = [[Paragraph(escape(str(cover.get("heading", "计划状态"))), status_heading)]]
+    status_rows += [[Paragraph(escape(str(line.get("label", "")) + "："), table_cell_bold),
+                     p(line.get("value", ""))] for line in status_lines]
+    status_panel = Table(status_rows, colWidths=[46 * mm, 128 * mm], hAlign="LEFT")
+    status_panel.setStyle(TableStyle([
+        ("SPAN", (0, 0), (1, 0)),
+        ("BOX", (0, 0), (-1, -1), 0.75, HexColor(_PDF_PRIMARY)),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.7, HexColor(_PDF_BORDER)),
+        ("BACKGROUND", (0, 0), (-1, 0), HexColor(_PDF_PRIMARY_BG)),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("LEFTPADDING", (0, 0), (-1, -1), 10), ("RIGHTPADDING", (0, 0), (-1, -1), 10),
         ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
-    ]
+    ]))
+    story.extend([Spacer(1, 26), cover_head, Spacer(1, 14), status_panel])
     if data.get("offline_disclaimer"):
-        summary_commands += [("SPAN", (0, 0), (-1, 0)), ("BACKGROUND", (0, 0), (-1, 0), HexColor(_PDF_AMBER_BG)),
-                             ("LINEBELOW", (0, 0), (-1, 0), 0.7, HexColor(_PDF_AMBER_BORDER))]
-    summary_commands += [("BACKGROUND", (0, -1), (-1, -1), HexColor(_PDF_PRIMARY_BG))]
-    summary.setStyle(TableStyle(summary_commands))
-    story.extend([summary, Spacer(1, 3)])
+        notice = Table([[Paragraph("离线演示：合成数据，不可用于真实出行。", callout)]], colWidths=[page_width])
+        notice.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), HexColor(_PDF_AMBER_BG)),
+                                    ("BOX", (0, 0), (-1, -1), 0.65, HexColor(_PDF_AMBER_BORDER)),
+                                    ("LEFTPADDING", (0, 0), (-1, -1), 10), ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+                                    ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 7)]))
+        story.extend([Spacer(1, 10), notice])
+    policy = data.get("content_policy") or {}
+    story.append(Spacer(1, 18))
+    for key in ("facts", "advice"):
+        if policy.get(key):
+            story.append(Paragraph("·　" + escape(str(policy[key])), small))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("签名确认：________________　　确认日期：________________", body))
+    story.append(PageBreak())
 
-    # 1. Plan metadata + route overview -----------------------------------
-    story.extend(section_title("01", "计划信息"))
+    # ---- 01 计划摘要 -----------------------------------------------------
+    story.extend(section_title(*PLAN_SECTIONS[0]))
+    summary_data = data.get("summary") or {}
+    headline = str(summary_data.get("headline") or "").strip()
+    if headline:
+        story.append(Paragraph(escape(headline), status))
+    summary_lines = summary_data.get("lines") or []
+    summary_pairs: list[list[Any]] = []
+    for index in range(0, len(summary_lines), 2):
+        left = summary_lines[index]
+        right = summary_lines[index + 1] if index + 1 < len(summary_lines) else {"label": "", "value": ""}
+        summary_pairs.append([p(left.get("label", ""), table_cell_bold), p(left.get("value", "")),
+                              p(right.get("label", ""), table_cell_bold), p(right.get("value", ""))])
+    if summary_pairs:
+        story.append(styled_table(summary_pairs, [28, 59, 28, 59], header=False))
+        story.append(Spacer(1, 6))
+    recommendation = str(data.get("recommended") or "暂未形成可执行推荐")
+    decision_rows: list[list[Any]] = [[
+        Paragraph(escape(str(data.get("status_label", "待核验"))), status),
+        p(f"推荐路线：{recommendation}\n活动安排需逐项确认；路线状态需在出发前重新核验。", body),
+    ]]
+    if data.get("alternatives"):
+        decision_rows.append([Paragraph("备选路线", table_cell_bold),
+                              p("、".join(map(str, data["alternatives"])), body)])
+    decision = Table(decision_rows, colWidths=[48 * mm, 126 * mm], hAlign="LEFT")
+    decision.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.75, HexColor(_PDF_BORDER)),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("BACKGROUND", (0, 0), (-1, -1), HexColor(_PDF_PRIMARY_BG)),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10), ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+    ]))
+    story.append(decision)
+
+    # ---- 02 计划信息 + 03 路线摘要 --------------------------------------
+    story.extend(section_title(*PLAN_SECTIONS[1]))
     metadata = data.get("plan_metadata", [])
     metadata_rows: list[list[Any]] = []
     for index in range(0, len(metadata), 2):
@@ -274,7 +383,7 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
     if metadata_rows:
         story.append(styled_table(metadata_rows, [28, 59, 28, 59], header=False))
     story.append(Spacer(1, 4))
-    story.extend(section_title("02", "路线摘要"))
+    story.extend(section_title(*PLAN_SECTIONS[2]))
     overview = data.get("route_overview", [])
     overview_rows: list[list[Any]] = []
     for index in range(0, len(overview), 2):
@@ -287,63 +396,90 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
     story.append(Spacer(1, 2))
     story.append(Paragraph("事实字段来自路线证据；显示“待核验”的字段不得在出发前视为已确认。", small))
 
-    # 2. Itinerary ---------------------------------------------------------
-    story.extend(section_title("03", "行程安排"))
-    itinerary_note = ("以下为用户提供的安排，执行前需确认。" if data.get("user_itinerary") else
-                      "以下为通用行程模板，日期、时间与途经点待确认；不代表已核验的分段行程。")
-    story.append(Paragraph(itinerary_note, small))
+    # ---- 04 行程时间线 ---------------------------------------------------
+    story.extend(section_title(*PLAN_SECTIONS[3]))
+    timeline_note = ("以下按用户提供的安排成时间线，执行前需确认。" if data.get("user_itinerary") else
+                     "以下为通用行程模板，日期、时间与途经点待确认；不代表已核验的分段行程。")
+    story.append(Paragraph(timeline_note, small))
     story[-1].keepWithNext = True
-    itinerary = [[p("阶段", table_head), p("时间参考", table_head), p("执行重点", table_head), p("完成检查", table_head)]]
-    itinerary += [[p(row.get("stage"), table_cell_bold), p(row.get("window")), p(row.get("focus")), p(row.get("checkpoint"))]
-                  for row in (data.get("user_itinerary") or data.get("itinerary", []))]
-    story.append(styled_table(itinerary, [27, 28, 65, 54]))
+    timeline = [[p("时间", table_head), p("阶段", table_head),
+                 p("执行重点", table_head), p("完成检查", table_head)]]
+    timeline += [[p(row.get("time"), timeline_time), p(row.get("stage"), table_cell_bold),
+                  p(row.get("focus")), p(row.get("checkpoint"))]
+                 for row in data.get("timeline", [])]
+    timeline_table = styled_table(timeline, [26, 40, 62, 46])
+    # The axis rule down the left of the stage column is what makes this read as
+    # a timeline rather than as another four-column grid.
+    timeline_table.setStyle(TableStyle([("LINEBEFORE", (1, 1), (1, -1), 1.4, HexColor(_PDF_PRIMARY))]))
+    story.append(timeline_table)
 
-    story.extend(section_title("04", "交通住宿与联络"))
+    story.extend(section_title(*PLAN_SECTIONS[4]))
     logistics = [[p(row.get("label"), table_cell_bold), p(row.get("value"))]
                  for row in data.get("logistics", [])]
     if logistics:
         story.append(styled_table(logistics, [35, 139], header=False))
-    story.extend(section_title("05", "人员分工"))
+    story.extend(section_title(*PLAN_SECTIONS[5]))
     roles = [[p("岗位", table_head), p("人员", table_head), p("职责建议", table_head)]]
     roles += [[p(row.get("role")), p(row.get("person")), p(row.get("duty"))] for row in data.get("roles", [])]
     story.append(styled_table(roles, [30, 40, 104]))
-    story.extend(section_title("06", "费用预算"))
+    story.extend(section_title(*PLAN_SECTIONS[6]))
     budget = [[p("费用项目", table_head), p("金额", table_head), p("依据", table_head)]]
     budget += [[p(row.get("item")), p(row.get("amount")), p(row.get("basis"))] for row in data.get("budget", [])]
+    note = str(data.get("budget_note") or "").strip()
+    if note and note != "待确认":
+        # The user's own wording, as text, beside an amount that stays 待确认 —
+        # free text is never parsed into a number here.
+        budget.append([p("用户预算说明"), p("待确认"), p("用户原文")])
     story.append(styled_table(budget, [75, 50, 49]))
     story.extend([Spacer(1, 4), p("已列预算合计：" + str(data.get("budget_total", "待确认")), body)])
+    if note and note != "待确认":
+        story.append(p("预算原文：" + note, small))
 
-    # 3. Equipment ---------------------------------------------------------
-    story.extend(section_title("07", "装备与补给"))
+    # ---- 08 装备与补给 ---------------------------------------------------
+    story.extend(section_title(*PLAN_SECTIONS[7]))
     gear = [[p("类别", table_head), p("物品", table_head), p("优先级", table_head), p("出发前状态", table_head)]]
     gear += [[p(row.get("category"), table_cell_bold), p(row.get("item")), p(row.get("priority"), center_cell),
               p(row.get("status"), center_cell)] for row in data.get("equipment", [])]
     story.append(styled_table(gear, [25, 77, 30, 42]))
 
-    # 4. Risk --------------------------------------------------------------
-    risk_rows = [[p("触发条件", table_head), p("处置动作", table_head), p("级别", table_head)]]
-    risk_rows += [[p(row.get("trigger")), p(row.get("action")), p(row.get("severity"), center_cell)]
-                  for row in data.get("risk_controls", [])]
-    story.append(KeepTogether(section_title("08", "风险与应急") + [styled_table(risk_rows, [53, 82, 39])]))
-    if data.get("required_action"):
-        action_table = Table([[Paragraph("出发前必须完成：" + escape(str(data["required_action"])), callout)]], colWidths=[page_width])
+    # ---- 09 风险决策区 ---------------------------------------------------
+    risk = data.get("risk") or {}
+    risk_rows = [[p("触发条件", risk_head), p("处置动作", risk_head), p("级别", risk_head)]]
+    risk_rows += [[p(row.get("trigger")), p(row.get("action")), p(row.get("severity"), risk_center)]
+                  for row in risk.get("rows", data.get("risk_controls", []))]
+    risk_table = styled_table(risk_rows, [53, 82, 39], header=True, tone="risk")
+    risk_block: list[Any] = [Paragraph(
+        "风险状态：" + escape(str(risk.get("status_label", data.get("status_label", "待核验")))), risk_title)]
+    if risk.get("note"):
+        risk_block.append(Paragraph(escape(str(risk["note"])), small))
+    risk_block.append(risk_table)
+    contacts = risk.get("contacts") or []
+    if contacts:
+        risk_block.append(Spacer(1, 3))
+        risk_block.append(styled_table(
+            [[p(str(row.get("label", "")), table_cell_bold), p(row.get("value", ""))] for row in contacts],
+            [35, 139], header=False))
+    story.append(KeepTogether(section_title(*PLAN_SECTIONS[8], tone="risk") + risk_block))
+    required = str(data.get("required_action") or "").strip()
+    if required and required != "待确认":
+        action_table = Table([[Paragraph("出发前必须完成：" + escape(required), callout)]], colWidths=[page_width])
         action_table.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), HexColor(_PDF_AMBER_BG)),
                                           ("BOX", (0, 0), (-1, -1), 0.65, HexColor(_PDF_AMBER_BORDER)),
                                           ("LEFTPADDING", (0, 0), (-1, -1), 8), ("RIGHTPADDING", (0, 0), (-1, -1), 8),
                                           ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 7)]))
         story.extend([Spacer(1, 6), action_table])
 
-    # 5. Checklist ---------------------------------------------------------
-    story.extend(section_title("09", "出发前检查"))
+    # ---- 10 出发前检查 ---------------------------------------------------
+    story.extend(section_title(*PLAN_SECTIONS[9]))
     checklist = [[p("检查项", table_head), p("负责人", table_head), p("状态", table_head)]]
     checklist += [[p(row.get("item")), p(row.get("owner"), center_cell), p(row.get("status"), center_cell)]
                   for row in data.get("checklist", [])]
     story.append(styled_table(checklist, [107, 31, 36]))
 
-    # 6. Comparison appendix ------------------------------------------------
+    # ---- 11 候选路线对比 -------------------------------------------------
     rows = data.get("rows", [])
     if rows:
-        story.extend(section_title("10", "候选路线对比"))
+        story.extend(section_title(*PLAN_SECTIONS[10]))
         # Use one route per row and short labels so nine columns remain legible.
         columns = ["路线"] + [str(c).strip() for c in data.get("columns", [])] + ["资料", "风险"]
         table_data: list[list[Any]] = [[p(c, table_head) for c in columns]]
@@ -356,19 +492,18 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
         story.append(styled_table(table_data, col_widths, highlight_rows={i for i, row in enumerate(rows, 1) if row.get("highlight")}))
 
     notes = [str(n) for n in data.get("notes", []) if n]
+    story.extend(section_title(*PLAN_SECTIONS[11]))
     if notes:
-        story.extend(section_title("11", "排序依据与说明"))
         for note in notes:
             story.append(Paragraph("•　" + escape(note), body))
             story.append(Spacer(1, 2))
     else:
-        story.extend(section_title("11", "排序依据与说明"))
         story.append(p("仅对证据齐全且通过安全校验的候选排序；具体偏好说明待确认。", body))
 
     # Sources are retained as an appendix and can split across pages.
     source_groups = data.get("sources", [])
     if source_groups:
-        story.extend(section_title("12", "来源与证据"))
+        story.extend(section_title(*PLAN_SECTIONS[12]))
         for group in source_groups:
             story.append(Paragraph(escape("来源 — " + str(group.get("candidate", "待核验"))), table_cell_bold))
             for entry in group.get("entries", []):
@@ -393,10 +528,11 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
 def _text_story(doc: Any, content: str) -> list[Any]:
     """Parse Markdown into print elements and retain missing sections as open items."""
     import mistune
+    from reportlab.lib import colors
     from reportlab.lib.colors import HexColor
     from reportlab.lib.enums import TA_LEFT
     from reportlab.lib.styles import ParagraphStyle
-    from reportlab.platypus import Paragraph, Spacer, Table, TableStyle
+    from reportlab.platypus import PageBreak, Paragraph, Spacer, Table, TableStyle
     from xml.sax.saxutils import escape
 
     regular, bold = doc._pdf_font_regular, doc._pdf_font_bold
@@ -404,11 +540,14 @@ def _text_story(doc: Any, content: str) -> list[Any]:
     def style(name: str, **kw: Any) -> ParagraphStyle:
         return ParagraphStyle(name, alignment=TA_LEFT, wordWrap="CJK", **kw)
 
-    h1 = style("H1", fontName=bold, fontSize=16, leading=22, textColor=HexColor(_PDF_PRIMARY_DARK), spaceBefore=6, spaceAfter=4)
+    h1 = style("H1", fontName=bold, fontSize=16, leading=22, textColor=colors.white, spaceBefore=6, spaceAfter=4)
     h2 = style("H2", fontName=bold, fontSize=13, leading=18, textColor=HexColor(_PDF_PRIMARY_DARK), spaceBefore=10, spaceAfter=5, keepWithNext=True)
     h3 = style("H3", fontName=bold, fontSize=11.5, leading=16, spaceBefore=6, spaceAfter=2, keepWithNext=True)
     body = style("Body", fontName=regular, fontSize=10, leading=16, textColor=HexColor(_PDF_TEXT))
     bullet = style("Bullet", fontName=regular, fontSize=10, leading=16, leftIndent=12, textColor=HexColor(_PDF_TEXT))
+    meta = style("DraftMeta", fontName=regular, fontSize=8.6, leading=12, textColor=HexColor("#dcfce7"))
+    table_cell_bold = style("DraftCellBold", fontName=bold, fontSize=9, leading=13,
+                            textColor=HexColor(_PDF_TEXT))
 
     def inline(nodes: list[dict[str, Any]], *, markup: bool = True) -> str:
         parts = []
@@ -466,36 +605,50 @@ def _text_story(doc: Any, content: str) -> list[Any]:
                 rendered.append(Spacer(1, 4))
         return rendered
 
-    sections = [
-        ("计划信息", ("活动信息", "目的地", "基本信息"), "待确认：活动日期、集合时间与地点、人数、活动目标。"),
-        ("路线摘要", ("路线概况", "路线规划", "路线信息"), "待核验：起终点、里程、爬升、耗时、天气与开放状态。"),
-        ("行程安排", ("日程", "行程", "时间安排"), "待确认：逐日安排、途经点、补给与最晚下撤时间。"),
-        ("交通住宿与联络", ("交通", "住宿", "后勤安排"), "待确认：往返交通、住宿、紧急联系人与撤退交通。"),
-        ("人员分工", ("队伍", "组织分工"), "待确认：领队、导航、收队和急救联络负责人。"),
-        ("费用预算", ("预算", "费用"), "待确认：交通、住宿门票、餐食补给、保险与费用分摊。"),
-        ("装备与补给", ("装备", "装备清单", "补给"), "待确认：防滑鞋、雨具、保暖层、头灯、手机充电宝、急救包、饮水和食品。"),
-        ("风险与应急", ("风险", "风险预案", "安全", "应急"), "通用建议：恶劣天气或封闭路线取消出行；身体不适或迷路时停止前进，在安全位置联系领队或当地救援。"),
-        ("出发前检查", ("检查清单", "注意事项", "建议"), "待确认：最新天气与开放状态、离线地图、装备自检和对外联络；垃圾全部带离。"),
-        ("来源与证据", ("来源", "参考资料"), "待核验：本草案未完成路线证据校验；请补充可靠资料和查询时间。"),
-    ]
-    grouped: dict[str, list[dict[str, Any]]] = {label: [] for label, _, _ in sections}
-    current = sections[0][0]
+    # One vocabulary for both stories: the numbered headings and the aliases a
+    # Markdown heading is matched against come from PLAN_SECTIONS, so a rename in
+    # the plan book cannot leave the text draft matching the OLD name only.
+    sections = [(number, label, aliases, _TEXT_SECTION_DEFAULTS[label])
+                for number, label, aliases in PLAN_SECTIONS]
+    grouped: dict[str, list[dict[str, Any]]] = {label: [] for _n, label, _, _ in sections}
+    current = sections[0][1]
     for node in mistune.create_markdown(renderer="ast", plugins=["table"])(content):
         if node["type"] == "heading":
             heading = inline(node.get("children", []), markup=False)
             if node.get("attrs", {}).get("level") == 1 and "计划" in heading:
                 continue
-            match = next((label for label, aliases, _ in sections if any(
+            match = next((label for _n, label, aliases, _d in sections if any(
                 name in heading for name in (label, *aliases))), None)
             if match:
                 current = match
                 continue
         grouped[current].append(node)
 
-    story = [Paragraph("AI Hiking 徒步计划书", h1),
-             Paragraph("活动安排草案 · 路线事实尚待核验", body), Spacer(1, 10)]
-    for number, (label, _, default) in enumerate(sections, 1):
-        story.append(Paragraph(f"{number:02d}  {label}", h2))
+    # Cover page: an ordinary artifact export has no route evidence behind it, so
+    # its status line says 草案 and 待核验 rather than claiming a verified plan.
+    cover_rows = [
+        ("草案类型", "通用草案 · 路线事实待核验"),
+        ("审阅结论", "待核验"),
+        ("安全门", "待核验"),
+    ]
+    cover_panel = Table([[Paragraph("徒步计划书 · Hiking Plan Book", meta)],
+                         [Paragraph("AI Hiking 徒步计划书", h1)],
+                         [Paragraph("活动安排草案 · 路线事实尚待核验", meta)]]
+                        + [[Paragraph(escape(label), table_cell_bold), Paragraph(value, body)]
+                           for label, value in cover_rows],
+                        colWidths=[46 * 2.83465, doc.width - 12 - 46 * 2.83465])
+    cover_panel.setStyle(TableStyle([
+        ("SPAN", (0, 0), (-1, 0)), ("SPAN", (0, 1), (-1, 1)), ("SPAN", (0, 2), (-1, 2)),
+        ("BACKGROUND", (0, 0), (-1, 2), HexColor(_PDF_PRIMARY_DARK)),
+        ("TEXTCOLOR", (0, 1), (-1, 2), colors.white),
+        ("BOX", (3, 3), (-1, -1), 0.75, HexColor(_PDF_PRIMARY)),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10), ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+    ]))
+    story = [Spacer(1, 26), cover_panel, PageBreak()]
+    for number, label, _aliases, default in sections:
+        story.append(Paragraph(f"{number}  {label}", h2))
         section_blocks = blocks(grouped[label])
         story.extend(section_blocks or [Paragraph(default, body), Spacer(1, 4)])
     return story

@@ -106,8 +106,9 @@ def test_pdf_plan_pages_have_readable_sections_and_no_orphan_headings() -> None:
     with fitz.open(stream=payload, filetype="pdf") as pdf:
         texts = [page.get_text() for page in pdf]
         combined = "\n".join(texts)
-        for label in ("计划信息", "路线摘要", "行程安排", "装备与补给", "风险与应急", "出发前检查",
-                      "候选路线对比", "排序依据与说明", "交通住宿与联络", "人员分工", "费用预算", "来源与证据"):
+        for label in ("计划摘要", "计划信息", "路线摘要", "行程时间线", "装备与补给", "风险决策区",
+                      "出发前检查", "候选路线对比", "排序依据与说明", "交通住宿与联络",
+                      "人员分工", "费用预算", "来源与证据"):
             assert label in combined, label
         assert "已列预算合计：200 元" in combined
         assert len(pdf) > 2
@@ -140,9 +141,13 @@ def test_markdown_plan_renders_tables_and_fills_missing_sections() -> None:
     content = "# 徒步计划\n## 行程安排\n| 时间 | 活动 |\n| --- | --- |\n| 08:00 | **集合** |\n\n## 装备\n- 雨具\n- literal <b>标签</b>\n"
     with fitz.open(stream=_render_pdf_bytes(content), filetype="pdf") as pdf:
         text = "\n".join(page.get_text() for page in pdf)
-    for label in ("费用预算", "风险与应急", "出发前检查", "人员分工", "来源与证据"):
+    for label in ("费用预算", "风险决策区", "出发前检查", "人员分工", "来源与证据"):
         assert label in text
     assert "08:00" in text and "集合" in text and "雨具" in text
     assert "| ---" not in text and "**集合**" not in text
     assert "<b>标签</b>" in text
     assert "活动安排草案" in text and "待核验" in text
+    # The OLD heading name still routes: 行程安排 is an alias of 行程时间线, so a
+    # draft written before the rename cannot have its table filed under 路线摘要.
+    timeline = text.split("行程时间线", 1)[1]
+    assert "08:00" in timeline.split("交通住宿与联络", 1)[0]

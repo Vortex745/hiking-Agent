@@ -29,18 +29,41 @@ def main() -> None:
         budget=[BudgetItem(item="演示交通预算（全队）", amount_yuan=200),
                 BudgetItem(item="演示餐食补给预算（全队）", amount_yuan=160)],
     )
+    # The plan side of the cover: what tickets 04/06/07 record, read as stored.
+    arrangements = {"destination_or_route": "演示山谷环线", "emergency_contact": "",
+                    "budget": "全队AA，交通与补给为主（用户原文）"}
+    document = build_report_document(
+        result, plan_type="route_plan", completeness="confirmation_required",
+        safety={"hard_stop": False, "codes": [], "formal_route_plan_allowed": True,
+                "message": "", "comparison_id": result.comparison_id,
+                "comparison_status": result.status, "gate_reasons": [], "required_action": ""},
+        arrangements=arrangements)
     output = Path(__file__).resolve().parents[2] / "gui-test-screenshots"
     output.mkdir(exist_ok=True)
-    path = output / "hiking-plan-book-preview.pdf"
-    path.write_bytes(_render_pdf_bytes(json.dumps(build_report_document(result), ensure_ascii=False)))
+    name = "hiking-plan-book-preview-long" if "long" in sys.argv else "hiking-plan-book-preview"
+    if name.endswith("long"):
+        # A sample long enough to force a table across a page boundary, so the
+        # repeated header row and the risk block placement are visible, not just
+        # asserted.
+        result.plan_details.itinerary = [
+            PlanStage(time=f"{hour:02d}:00", activity=f"第 {index} 段：结伴徒步、补给、体感与天气复核")
+            for index, hour in enumerate(range(6, 22), 1)]
+        document["timeline"] = document["timeline"] + [
+            {"time": f"{hour:02d}:30", "stage": f"第 {index} 段：结伴徒步与体感复核",
+             "focus": "保持可沟通距离，按体感补水", "checkpoint": "条件恶化即停止前进"}
+            for index, hour in enumerate(range(6, 22), 1)]
+    path = output / f"{name}.pdf"
+    path.write_bytes(_render_pdf_bytes(json.dumps(document, ensure_ascii=False)))
     print(path)
     import fitz
     with fitz.open(path) as pdf:
         print(f"pages={len(pdf)}")
         for index, page in enumerate(pdf, 1):
-            preview = output / f"hiking-plan-book-preview-page-{index}.png"
+            preview = output / f"{name}-page-{index}.png"
             page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2), alpha=False).save(preview)
-            print(preview)
+            print(preview, "|", " / ".join(
+                line.strip() for line in page.get_text().splitlines()
+                if line.strip()[:2].isdigit() and line.strip()[2:3] == " ")[:400])
 
 
 if __name__ == "__main__":
