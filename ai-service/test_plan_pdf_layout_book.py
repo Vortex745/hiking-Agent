@@ -207,6 +207,12 @@ def test_appendix_text_stays_inside_the_print_margins() -> None:
 # ---- AC5: 跨页表格重复表头，风险章节不从表格中间开始 ----------------------
 
 
+def _header_pages(pages: list[str], header: list[str]) -> list[str]:
+    """Pages carrying a whole header ROW, i.e. its cells as consecutive lines."""
+    wanted = "\n".join(header)
+    return [page for page in pages if wanted in page]
+
+
 def test_a_timeline_that_splits_across_pages_repeats_its_header_row() -> None:
     """The header must reappear on the continuation page, demonstrated by rendering."""
     document = build_report_document(
@@ -215,26 +221,35 @@ def test_a_timeline_that_splits_across_pages_repeats_its_header_row() -> None:
             for i in range(1, 26)])),
         plan_type="route_plan")
     pages = _pages(document)
+    header = ["时间", "阶段", "执行重点", "完成检查"]
     timeline_pages = [page for page in pages if "完成检查" in page]
 
     assert len(timeline_pages) >= 2, "the sample must actually cross a page boundary"
-    for page in timeline_pages:
-        assert "时间线" in page or "时间" in page
-        assert page.count("完成检查") >= 1
+    assert len(_header_pages(timeline_pages, header)) == len(timeline_pages), (
+        "every continuation page must open on the repeated header row")
 
 
 def test_a_candidate_table_that_splits_across_pages_repeats_its_header_row() -> None:
     from route_compare.models import CandidateAssessment
 
     result = _result()
-    result.candidates = [assessment.model_copy(deep=True) for assessment in result.candidates] * 8
-    for index, assessment in enumerate(result.candidates):
-        assessment.candidate.name = f"演示林间环线 {index}"
+    base = list(result.candidates)
+    clones: list[CandidateAssessment] = []
+    for block in range(12):
+        for offset, assessment in enumerate(base):
+            clone = assessment.model_copy(deep=True)
+            clone.candidate.id = f"demo-{block}-{offset}"
+            clone.candidate.name = f"演示林间环线 {block}-{offset}"
+            clones.append(clone)
+    result.candidates = clones
+    result.recommended_id = clones[0].candidate.id
+    result.alternatives = [clone.candidate.id for clone in clones[1:]]
     document = build_report_document(result, plan_type="route_plan")
     pages = _pages(document)
-    comparison_pages = [page for page in pages if "累计爬升" in page and "开放状态" in page]
-
-    assert len(comparison_pages) >= 2, "the sample must actually cross a page boundary"
+    header = ["路线"] + [str(c).strip() for c in document["columns"]] + ["资料", "风险"]
+    # The header sequence exists in exactly one table, so two pages carrying it
+    # whole is both the split and the repeat.
+    assert len(_header_pages(pages, header)) >= 2, "the candidate table must split AND repeat"
 
 
 #: A risk set with more rows than the template ships, expressed in the same public
