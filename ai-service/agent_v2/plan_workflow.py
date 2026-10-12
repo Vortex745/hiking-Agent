@@ -47,7 +47,7 @@ import re
 from dataclasses import dataclass
 from datetime import date
 from enum import Enum
-from typing import Literal, get_args
+from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -142,10 +142,52 @@ class PlanDraftStage(str, Enum):
 
 _DESTINATION_MAX = 120
 _ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_HH_MM_PATTERN = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
+_HEADCOUNT_PATTERN = re.compile(r"^\d{1,5} 人$")
+_PHONE_DIGITS_PATTERN = re.compile(r"\d{7,}")
+_AMOUNT_PATTERN = re.compile(r"\d")
+
+
+class PlanArrangementInput(BaseModel):
+    """The supplementary arrangements the dialog can collect (ticket 06 AC1).
+
+    Completeness rules are only worth writing over fields that can genuinely be
+    filled in, so the eight arrangements ticket 05 listed as permanently 待确认
+    now have real input and real storage. Every key here is a key of
+    :data:`ARRANGEMENT_FIELDS` (and, but for ``budget``, a field of
+    :class:`route_compare.models.PlanDetails` with the same length cap), so this
+    is the arrangement record and not a second vocabulary.
+
+    ``extra="forbid"`` is the AC6 boundary in the shape of the input: a distance,
+    an ascent, a weather claim, a ``report_allowed`` flag or a draft type cannot
+    travel inside the user's own arrangements, because those are the server's
+    evidence and never the user's claim. Every field defaults to the empty
+    string, so "not filled in" stays "not filled in" — nothing is prefilled and
+    nothing is derived (docs/plan-pdf-format.md: 未知安排留空，显示"待确认").
+
+    ``budget`` is the user's own free-text 费用预算 note. The itemised
+    ``PlanDetails.budget`` entries are ticket 08's PDF record; no total is ever
+    computed here.
+    """
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, allow_inf_nan=False)
+
+    meeting_time: str = Field(default="", max_length=100)
+    meeting_point: str = Field(default="", max_length=300)
+    leader: str = Field(default="", max_length=100)
+    transport: str = Field(default="", max_length=500)
+    accommodation: str = Field(default="", max_length=500)
+    budget: str = Field(default="", max_length=500)
+    emergency_contact: str = Field(default="", max_length=300)
+    retreat_plan: str = Field(default="", max_length=500)
+
+    def as_values(self) -> dict[str, str]:
+        """The record as the draft stores and renders it: key → text."""
+        return {key: getattr(self, key) for key in SUPPLEMENT_ARRANGEMENT_KEYS}
 
 
 class PlanDraftInput(BaseModel):
-    """The three fields the entry dialog collects (spec AC6).
+    """The fields the entry dialog collects (spec AC6, widened by ticket 06).
 
     Deliberately narrow: ``extra="forbid"`` means the form cannot smuggle
     a route fact, a price, or a model-config blob into the draft. Unknown
@@ -154,6 +196,10 @@ class PlanDraftInput(BaseModel):
 
     ``participants`` is strict so ``"12"``/``True`` are refused rather
     than silently coerced; the dialog sends a JSON number.
+
+    ``arrangements`` is ticket 06's addition and is optional, so a draft that
+    only holds the three minimal fields stays a valid submission: the rule
+    verdict is what changes, not what the form demands.
     """
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, allow_inf_nan=False)
@@ -161,6 +207,7 @@ class PlanDraftInput(BaseModel):
     destination_or_route: str = Field(min_length=1, max_length=_DESTINATION_MAX)
     activity_date: str = Field(min_length=1, max_length=10)
     participants: int = Field(ge=1, le=10000, strict=True)
+    arrangements: PlanArrangementInput = Field(default_factory=PlanArrangementInput)
 
     @field_validator("activity_date")
     @classmethod
@@ -340,6 +387,7 @@ class PlanTransition:
     route_selection: RouteSelectionInput | None = None
     fallback_stage: PlanDraftStage | None = None
     plan_type: str | None = None
+    completeness: "PlanCompleteness | None" = None
 
     @property
     def blocked(self) -> bool:
@@ -428,6 +476,7 @@ def evaluate_plan_intent(
     conversation_id: str | None,
     route_selection: RouteSelectionInput | dict | None = None,
     plan_type: str | None = None,
+    completeness: "PlanCompleteness | None" = None,
 ) -> PlanTransition:
     """Decide what a structured intent may do, given the current stage.
 
@@ -605,10 +654,11 @@ UNVERIFIED = "待核验"
 #: :func:`render_minimal_draft` draws and the 缺失字段清单
 #: :func:`missing_plan_fields` enumerates. A field added here appears in the
 #: draft and in the missing list in the same render, and a field removed
-#: disappears from both. Only the three fields ticket 01's
-#: :class:`PlanDraftInput` collects have storage today, so the rest render
-#: 待确认 — an absent arrangement is reported as absent and never filled
-#: (spec AC4).
+#: disappears from both. The three minimal fields are what
+#: :class:`PlanDraftInput` has always required; the other eight are collected by
+#: ticket 06's :class:`PlanArrangementInput` and stored in their own table. A
+#: field the user left empty still renders 待确认 — an absent arrangement is
+#: reported as absent and never filled (spec AC4).
 ARRANGEMENT_FIELDS: tuple[tuple[str, str], ...] = (
     ("destination_or_route", "目的地或路线"),
     ("activity_date", "活动日期"),
@@ -622,6 +672,414 @@ ARRANGEMENT_FIELDS: tuple[tuple[str, str], ...] = (
     ("emergency_contact", "应急联络"),
     ("retreat_plan", "撤退方案"),
 )
+
+#: The three arrangements the minimal entry form has always made mandatory
+#: (:class:`PlanDraftInput`'s own fields). Named here so the completeness rules
+#: and the renderer read one vocabulary instead of two lists that can drift.
+MINIMAL_ARRANGEMENT_KEYS: tuple[str, ...] = (
+    "destination_or_route", "activity_date", "participants",
+)
+#: The supplementary arrangements ticket 06 gave real input and real storage to.
+#: Together with :data:`MINIMAL_ARRANGEMENT_KEYS` these are exactly
+#: :data:`ARRANGEMENT_FIELDS` — pinned, so a field cannot be collected without
+#: joining the checklist, nor listed without being collectable.
+SUPPLEMENT_ARRANGEMENT_KEYS: tuple[str, ...] = (
+    "meeting_time", "meeting_point", "leader", "transport", "accommodation",
+    "budget", "emergency_contact", "retreat_plan",
+)
+
+#: The business rule behind ticket 06 AC3, stated once: the arrangements an
+#: outing cannot run without. 集合时间/集合地点 decide whether the group can
+#: meet at all, and 应急联络 is the contact the plan is unsafe without — so a
+#: missing one of those sends the draft back to the form (补充流程) instead of
+#: forward to a summary. 领队 / 交通 / 住宿 / 费用预算 / 撤退方案 are needed for a
+#: complete plan book but do not block a draft the user can still review, so a
+#: missing one joins the 待确认清单. Route-fact dimensions are always treated as
+#: core: the user cannot supply a certified fact by typing one (AC6).
+CORE_ARRANGEMENT_KEYS: frozenset[str] = frozenset({
+    *MINIMAL_ARRANGEMENT_KEYS, "meeting_time", "meeting_point", "emergency_contact",
+})
+#: Every other arrangement — the 待确认清单 half of ticket 06 AC3. Derived from
+#: the enumeration rather than written out, so the two halves cannot overlap and
+#: a new field defaults to non-core until someone argues for more.
+NON_CORE_ARRANGEMENT_KEYS: frozenset[str] = frozenset(
+    key for key, _label in ARRANGEMENT_FIELDS if key not in CORE_ARRANGEMENT_KEYS
+)
+
+#: Which route-fact dimensions an arrangement can be checked against, expressed
+#: as the two vocabularies that already exist (ticket 06 AC2). A fact the gate
+#: never certified cannot confirm an arrangement, and an arrangement with no
+#: mapped dimension is stated as such rather than silently matched: these lines
+#: are a *relationship* record, and they never carry a value of their own.
+ARRANGEMENT_EVIDENCE_FIELDS: dict[str, tuple[str, ...]] = {
+    "destination_or_route": ("map",),
+    "activity_date": ("weather", "trail_status"),
+    "participants": (),
+    "meeting_time": ("duration_hours",),
+    "meeting_point": ("map", "trail_status"),
+    "leader": (),
+    "transport": ("distance_km",),
+    "accommodation": (),
+    "budget": (),
+    "emergency_contact": (),
+    "retreat_plan": ("risk", "trail_status"),
+}
+
+#: Explicit per-field format rules (ticket 06 AC1's 格式校验). Field existence
+#: alone would call 「明天一早」 a filled 集合时间, which is the difference between
+#: a draft and a usable plan. Each entry is (pattern, what the user must change);
+#: the rules never rewrite, normalise or complete a value — an unfilled field is
+#: a presence question, never a format one.
+ARRANGEMENT_FORMATS: dict[str, tuple[re.Pattern[str], str]] = {
+    "destination_or_route": (re.compile(r"^.{1,120}$"), "目的地或路线需为 1–120 字"),
+    "activity_date": (_ISO_DATE_PATTERN, "活动日期需为 YYYY-MM-DD"),
+    "participants": (_HEADCOUNT_PATTERN, "参与人数需为「数字 + 人」"),
+    "meeting_time": (_HH_MM_PATTERN, "集合时间需为 HH:MM（24 小时制）"),
+    "emergency_contact": (_PHONE_DIGITS_PATTERN, "应急联络需包含至少 7 位可拨打的电话号码"),
+    "budget": (_AMOUNT_PATTERN, "费用预算需包含金额数字（系统不会替你估算）"),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class PlanFormatIssue:
+    """One field that is filled in a form the plan cannot use (AC1)."""
+
+    key: str
+    label: str
+    message: str
+
+
+def arrangement_format_issues(values: dict[str, str]) -> tuple[PlanFormatIssue, ...]:
+    """Run the explicit format rules over the arrangement record (AC1).
+
+    Deterministic, total, and reads only the record it is given: an empty value
+    is a missing field and therefore nobody's format problem, and a value with no
+    rule for its key (领队, 交通, 住宿, 集合地点, 撤退方案) is free text the user owns.
+    Nothing is corrected — the issue is reported with the copy the user needs to
+    fix it, and the value stays as written until they change it.
+    """
+    label_of = dict(ARRANGEMENT_FIELDS)
+    issues: list[PlanFormatIssue] = []
+    for key, (pattern, message) in ARRANGEMENT_FORMATS.items():
+        value = (values.get(key) or "").strip()
+        if not value:
+            continue
+        if not pattern.search(value):
+            issues.append(PlanFormatIssue(key=key, label=label_of[key], message=message))
+    return tuple(issues)
+
+
+# ---- Deterministic completeness verdict (ticket 06) ------------------------
+
+
+class PlanReviewReason:
+    """Why a human still has to confirm this draft (ticket 06 AC4).
+
+    Stable, machine-readable values, never reworded — only added — following the
+    :class:`PlanBlockReason` + :data:`BLOCK_MESSAGE` precedent. They are distinct
+    from the block reasons: ``arrangements_not_pending`` stays what ticket 05
+    made it (a stage guard: no summary is on screen to confirm) and is reused,
+    never re-named, while these describe the *content* a person must decide on.
+    """
+
+    CORE_ARRANGEMENTS_MISSING = "core_arrangements_missing"
+    ARRANGEMENT_FORMAT_INVALID = "arrangement_format_invalid"
+    NON_CORE_ARRANGEMENTS_MISSING = "non_core_arrangements_missing"
+    ROUTE_FACTS_UNVERIFIED = "route_facts_unverified"
+
+
+#: The readable copy beside each stable value. A client branches on the code and
+#: shows this text; neither is derived from the other at render time.
+REASON_MESSAGE: dict[str, str] = {
+    PlanReviewReason.CORE_ARRANGEMENTS_MISSING: (
+        "缺少核心安排（集合时间、集合地点、应急联络等），请先在表单里补齐再生成草案；"
+        "系统不会替你填这些值。"
+    ),
+    PlanReviewReason.ARRANGEMENT_FORMAT_INVALID: (
+        "已填写的安排里有格式不通过的字段，请按提示修正后再继续。"
+    ),
+    PlanReviewReason.NON_CORE_ARRANGEMENTS_MISSING: (
+        "部分非核心安排仍为待确认，会随草案一并列出，等你补充。"
+    ),
+    PlanReviewReason.ROUTE_FACTS_UNVERIFIED: (
+        "路线事实仍为待核验：没有服务器证据的事实不会因草案生成而变成已核验。"
+    ),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class PlanFieldVerdict:
+    """One field's answer: is it there, and is it in a usable form (AC1).
+
+    ``kind`` keeps the two vocabularies distinguishable in the record itself —
+    an ``arrangement`` is the user's claim, a ``route_fact`` is the gate's. That
+    is why ``value`` is always empty for a route fact: the verdict reports the
+    *status* of a dimension and never carries a number, a weather word or an
+    open status (AC6). ``core`` is the business rule that decides which list a
+    gap lands in (AC3).
+    """
+
+    key: str
+    label: str
+    kind: Literal["arrangement", "route_fact"]
+    core: bool
+    presence: Literal["filled", "absent"]
+    format_status: Literal["valid", "invalid", "not_applicable"]
+    value: str
+
+
+@dataclass(frozen=True, slots=True)
+class PlanEvidenceMatch:
+    """How one arrangement stands against the server's evidence (AC2).
+
+    Explicit fields and a source status, never a sentence: ``fact_fields`` are
+    the dimensions that could speak to this arrangement, ``status`` says whether
+    the arrangement exists and whether those dimensions were certified, and
+    ``source_ids`` names the sources that did. An uncertified dimension
+    contributes no source id, so a match can never imply evidence the gate did
+    not produce — and ``not_applicable`` is the honest answer for an arrangement
+    no route fact bears on (a leader's name, a budget note).
+    """
+
+    arrangement_key: str
+    arrangement_label: str
+    fact_fields: tuple[str, ...]
+    status: Literal[
+        "matched", "partly_matched", "unverified", "arrangement_absent", "not_applicable"
+    ]
+    source_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PlanCompleteness:
+    """The deterministic verdict on one draft (ticket 06 AC1/AC3/AC4).
+
+    ``verdict`` is the business rule's answer and only three things can produce
+    it: a core arrangement missing or a field in an unusable format
+    (``supplement_required`` — go back to the form), any remaining gap
+    (``confirmation_required`` — the 待确认清单 plus the reasons a human must
+    confirm), or nothing missing at all (``complete``). There is no score: a
+    weighted number would let a draft be 70% of a plan, which is not a decision
+    anyone can act on.
+    """
+
+    verdict: Literal["complete", "confirmation_required", "supplement_required"]
+    fields: tuple[PlanFieldVerdict, ...]
+    missing_core_keys: tuple[str, ...]
+    missing_non_core_keys: tuple[str, ...]
+    format_issues: tuple[PlanFormatIssue, ...]
+    matches: tuple[PlanEvidenceMatch, ...]
+    reasons: tuple[str, ...]
+
+    @property
+    def invalid_format_keys(self) -> tuple[str, ...]:
+        return tuple(issue.key for issue in self.format_issues)
+
+    @property
+    def supplement_required(self) -> bool:
+        return self.verdict == "supplement_required"
+
+    def to_payload(self) -> dict[str, Any]:
+        """The wire shape of the verdict (AC5): codes, keys and labels only.
+
+        Emitted verbatim from this record so the streamed text, the payload and
+        the stored row are one computation, and a client can show the reasons
+        after a refresh without re-deciding anything.
+        """
+        labels = {field.key: field.label for field in self.fields}
+        return {
+            "verdict": self.verdict,
+            "reasons": [
+                {"code": code, "message": REASON_MESSAGE[code]} for code in self.reasons
+            ],
+            "missing_core": [
+                {"key": key, "label": labels.get(key, key)} for key in self.missing_core_keys
+            ],
+            "missing_non_core": [
+                {"key": key, "label": labels.get(key, key)} for key in self.missing_non_core_keys
+            ],
+            "format_issues": [
+                {
+                    "key": issue.key,
+                    "label": issue.label,
+                    "message": issue.message,
+                }
+                for issue in self.format_issues
+            ],
+            "matches": [
+                {
+                    "arrangement_key": match.arrangement_key,
+                    "arrangement_label": match.arrangement_label,
+                    "fact_fields": list(match.fact_fields),
+                    "status": match.status,
+                    "source_ids": list(match.source_ids),
+                }
+                for match in self.matches
+            ],
+        }
+
+
+def evaluate_plan_completeness(
+    *,
+    destination_or_route: str,
+    activity_date: str,
+    participants: int | None,
+    arrangements: dict[str, str] | None = None,
+    route: RouteBasis | None = None,
+) -> PlanCompleteness:
+    """Decide how complete a draft is — field existence, format, business rules.
+
+    A separate pure function over the same two tuples ticket 05's
+    :func:`missing_plan_fields` enumerates (existence is already computed there
+    and travels as ``plan.draft_state.missing_fields``), so ticket 05's two
+    markers stay exactly two: this adds a *verdict* beside them, never a third
+    status, never a score, and never re-reads the summary text. No model is
+    involved — this module has no kernel, no provider and no HTTP client, and the
+    only external answer it consumes is the route basis the caller already
+    re-read through the comparison leaf.
+
+    Args: the stored arrangement fields, the supplementary arrangement record,
+    and the caller's re-read :class:`RouteBasis` (``None`` for a generic draft).
+    """
+    values = _arrangement_values(
+        destination_or_route=destination_or_route,
+        activity_date=activity_date,
+        participants=participants,
+        arrangements=arrangements,
+    )
+    issues = arrangement_format_issues(values)
+    invalid = tuple(issue.key for issue in issues)
+    labels = dict(ARRANGEMENT_FIELDS)
+
+    missing_core = tuple(
+        key for key, _label in ARRANGEMENT_FIELDS
+        if key in CORE_ARRANGEMENT_KEYS and not values[key]
+    )
+    missing_non_core = tuple(
+        key for key, _label in ARRANGEMENT_FIELDS
+        if key in NON_CORE_ARRANGEMENT_KEYS and not values[key]
+    )
+
+    certified = {line.field: line for line in route.facts} if route is not None else {}
+    fields = tuple(
+        PlanFieldVerdict(
+            key=key,
+            label=label,
+            kind="arrangement",
+            core=key in CORE_ARRANGEMENT_KEYS,
+            presence="filled" if values[key] else "absent",
+            format_status=(
+                "invalid" if key in invalid
+                else "valid" if (key in ARRANGEMENT_FORMATS and values[key])
+                else "not_applicable"
+            ),
+            value=values[key],
+        )
+        for key, label in ARRANGEMENT_FIELDS
+    ) + tuple(
+        PlanFieldVerdict(
+            key=field,
+            label=label,
+            kind="route_fact",
+            core=True,
+            presence="filled" if field in certified else "absent",
+            format_status="not_applicable",
+            # AC6: the verdict never carries a route value. Only ``missing_plan_
+            # fields`` and ``render_route_basis`` report a certified fact, and
+            # both read the caller's re-read basis rather than this record.
+            value="",
+        )
+        for field, label, _unit in FACT_DIMENSIONS
+    )
+
+    matches: list[PlanEvidenceMatch] = []
+    for key, label in ARRANGEMENT_FIELDS:
+        fact_fields = ARRANGEMENT_EVIDENCE_FIELDS.get(key, ())
+        if not fact_fields:
+            matches.append(PlanEvidenceMatch(key, label, (), "not_applicable", ()))
+            continue
+        if not values[key]:
+            matches.append(PlanEvidenceMatch(key, label, fact_fields, "arrangement_absent", ()))
+            continue
+        sources = tuple(
+            certified[field].source_id for field in fact_fields if field in certified
+        )
+        status = (
+            "matched" if len(sources) == len(fact_fields)
+            else "partly_matched" if sources
+            else "unverified"
+        )
+        matches.append(PlanEvidenceMatch(key, label, fact_fields, status, sources))
+
+    unverified_facts = tuple(
+        field for field, _label, _unit in FACT_DIMENSIONS if field not in certified
+    )
+
+    reasons: list[str] = []
+    if missing_core:
+        reasons.append(PlanReviewReason.CORE_ARRANGEMENTS_MISSING)
+    if invalid:
+        reasons.append(PlanReviewReason.ARRANGEMENT_FORMAT_INVALID)
+    if missing_non_core:
+        reasons.append(PlanReviewReason.NON_CORE_ARRANGEMENTS_MISSING)
+    if unverified_facts:
+        reasons.append(PlanReviewReason.ROUTE_FACTS_UNVERIFIED)
+
+    if missing_core or invalid:
+        verdict = "supplement_required"
+    elif missing_non_core or unverified_facts:
+        verdict = "confirmation_required"
+    else:
+        verdict = "complete"
+
+    return PlanCompleteness(
+        verdict=verdict,
+        fields=fields,
+        missing_core_keys=missing_core,
+        missing_non_core_keys=missing_non_core,
+        format_issues=issues,
+        matches=tuple(matches),
+        reasons=tuple(reasons),
+    )
+
+
+def completeness_lines(completeness: PlanCompleteness) -> str:
+    """The verdict as deterministic copy (ticket 06 AC3/AC4).
+
+    Rendered from the record, in one place, so the streamed text, the payload and
+    the stored row cannot describe different verdicts. It names the stable reason
+    codes beside their readable copy — a reviewer can grep the value out of the
+    conversation history — and it lists gaps, never values: the only text here is
+    a field label, a code, or the message that tells the user how to fix a field
+    they filled in themselves.
+    """
+    labels = {key: label for key, label in ARRANGEMENT_FIELDS}
+    lines = ["**完整度规则结论（字段存在性 + 格式校验 + 业务规则，未使用任何模型）**"]
+    lines.append(f"- 结论：{completeness.verdict}")
+    if completeness.missing_core_keys:
+        lines.append(
+            "- 待补充（核心安排）："
+            + "、".join(labels[key] for key in completeness.missing_core_keys)
+        )
+    if completeness.format_issues:
+        lines.append(
+            "- 格式未通过："
+            + "；".join(f"{issue.label}（{issue.message}）" for issue in completeness.format_issues)
+        )
+    if completeness.missing_non_core_keys:
+        lines.append(
+            "- 待确认（非核心安排）："
+            + "、".join(labels[key] for key in completeness.missing_non_core_keys)
+        )
+    if completeness.reasons:
+        lines.append(
+            "- 需人工确认原因："
+            + "、".join(f"{code}（{REASON_MESSAGE[code]}）" for code in completeness.reasons)
+        )
+    else:
+        lines.append("- 需人工确认原因：无")
+    return "\n".join(lines)
+
 
 #: What the flow says per stage. Deterministic strings, so the entry path
 #: contains no model-generated claims (ticket 06 keeps it that way).
@@ -649,6 +1107,8 @@ def draft_summary(
     activity_date: str,
     participants: int | None,
     route: RouteBasis | None = None,
+    arrangements: dict[str, str] | None = None,
+    completeness: PlanCompleteness | None = None,
 ) -> str:
     """The draft summary for a stage and the fields stored with it (Ticket 02 AC3).
 
@@ -694,6 +1154,7 @@ def draft_summary(
             activity_date=activity_date,
             participants=participants,
             route=route,
+            arrangements=arrangements,
         )
     elif stage in (PlanDraftStage.AWAITING_FIRST_REVIEW, PlanDraftStage.FIRST_REVIEWED):
         base = render_minimal_draft(
@@ -701,7 +1162,21 @@ def draft_summary(
             activity_date=activity_date,
             participants=participants,
             route=route,
+            arrangements=arrangements,
             review="confirmed" if stage is PlanDraftStage.FIRST_REVIEWED else "pending",
+        )
+        # Ticket 06 AC4: the summary the user confirms also carries the rule's
+        # answer beside it, so 待确认 (arrangement), 待核验 (fact) and "these are
+        # the reasons a person still has to decide" are one render rather than
+        # three vocabularies that can disagree.
+        if completeness is not None:
+            base = f"{base}\n\n{completeness_lines(completeness)}"
+    elif stage is PlanDraftStage.AWAITING_INPUT and completeness is not None:
+        # Ticket 06 AC3: 直接生成草案 over a draft missing a core arrangement
+        # lands HERE — on the supplement flow — and the copy has to say why, or
+        # the click looks like it did nothing.
+        base = (
+            f"{STAGE_MESSAGE[stage]}\n\n{completeness_lines(completeness)}"
         )
     else:
         base = STAGE_MESSAGE[stage]
@@ -715,18 +1190,27 @@ def _arrangement_values(
     destination_or_route: str,
     activity_date: str,
     participants: int | None,
+    arrangements: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """The draft's arrangement record as stored: a value, or empty.
 
-    Every key of :data:`ARRANGEMENT_FIELDS` is present, and only the three the
-    entry dialog collects can ever be non-empty. That is AC4 in code form: this
-    function has no parameter for a date, a cost, a phone number or a retreat
-    point, so there is no path by which one of them becomes a value here.
+    Every key of :data:`ARRANGEMENT_FIELDS` is present, and a value can only
+    come from one of two places: the three minimal fields the entry form has
+    always collected, or ``arrangements`` — the eight supplementary arrangements
+    the user actually submitted (ticket 06). ``arrangements`` is a mapping keyed
+    by those keys, and only keys :data:`ARRANGEMENT_FIELDS` enumerates are read
+    from it, so this function still has no path by which a route fact, a derived
+    segment time or a computed cost becomes a value here: a key the checklist
+    does not name is dropped, not drawn (AC4/AC6).
     """
     values = {key: "" for key, _label in ARRANGEMENT_FIELDS}
     values["destination_or_route"] = (destination_or_route or "").strip()
     values["activity_date"] = (activity_date or "").strip()
     values["participants"] = f"{participants} 人" if participants else ""
+    supplied = arrangements or {}
+    for key in SUPPLEMENT_ARRANGEMENT_KEYS:
+        value = supplied.get(key)
+        values[key] = value.strip() if isinstance(value, str) else ""
     return values
 
 
@@ -752,11 +1236,13 @@ def missing_plan_fields(
     activity_date: str,
     participants: int | None,
     route: RouteBasis | None = None,
+    arrangements: dict[str, str] | None = None,
 ) -> tuple[MissingPlanField, ...]:
     """The 缺失字段清单, derived from the two existing vocabularies (AC1).
 
     Nothing is counted, scored or weighted here — ticket 05 only reports what is
-    absent, and ticket 06 owns completeness. The list is built from
+    absent, and :func:`evaluate_plan_completeness` (ticket 06) turns that same
+    existence answer into a verdict. The list is built from
     :data:`ARRANGEMENT_FIELDS` (the user's own record) and
     :data:`FACT_DIMENSIONS` (the dimensions a route fact can answer), the same
     two tuples the renderers already draw from, so the list cannot drift away
@@ -771,6 +1257,7 @@ def missing_plan_fields(
         destination_or_route=destination_or_route,
         activity_date=activity_date,
         participants=participants,
+        arrangements=arrangements,
     )
     missing = [
         MissingPlanField(key, label, UNCONFIRMED)
@@ -793,6 +1280,7 @@ def render_minimal_draft(
     participants: int | None,
     route: RouteBasis | None = None,
     review: Literal["pending", "confirmed"] | None = None,
+    arrangements: dict[str, str] | None = None,
 ) -> str:
     """Render the previewable minimal draft (spec AC1 "可预览的最小草稿").
 
@@ -830,6 +1318,7 @@ def render_minimal_draft(
         destination_or_route=destination_or_route,
         activity_date=activity_date,
         participants=participants,
+        arrangements=arrangements,
     )
     route_attached = route is not None
     missing = missing_plan_fields(
@@ -837,6 +1326,7 @@ def render_minimal_draft(
         activity_date=activity_date,
         participants=participants,
         route=route,
+        arrangements=arrangements,
     )
     arrangement_lines = [
         f"- {label}：{values[key] or UNCONFIRMED}" for key, label in ARRANGEMENT_FIELDS
