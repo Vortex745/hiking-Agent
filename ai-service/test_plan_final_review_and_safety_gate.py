@@ -271,7 +271,6 @@ def _evaluate(intent, stage=None, **kwargs):
         route_selection=kwargs.get("route_selection"), plan_type=kwargs.get("plan_type"),
         completeness=kwargs.get("completeness"),
         recorded_completeness=kwargs.get("recorded_completeness"),
-        safety=kwargs.get("safety"),
     )
 
 

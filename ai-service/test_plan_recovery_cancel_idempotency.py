@@ -174,6 +174,39 @@ def _post_sse(app, subject, payload: dict[str, Any]) -> list[dict[str, Any]]:
     return asyncio.run(run())
 
 
+#: The one advancing click for each source stage, walking a submitted draft to
+#: ``final_reviewed`` — the stage ticket 07 AC4's PDF door now reads. Every turn
+#: is a model-free chat-profile intent (the seam contract's ruling), so no plan
+#: turn here reaches the kernel.
+_ADVANCE = {
+    "minimal_draft": "plan_first_review",
+    "awaiting_first_review": "plan_confirm_arrangements",
+    "first_reviewed": "plan_final_review",
+    "awaiting_final_review": "plan_confirm_final",
+}
+
+
+def _advance_to_final(app, subject, repo, *, tag: str) -> None:
+    """Drive the conversation's draft through the review intents to final_reviewed.
+
+    Idempotent: a draft already at final_reviewed does nothing. Used by
+    :func:`_pause_and_approve` so every plan-book publish here has genuinely
+    confirmed the final review, which the export turn's confirmation door
+    requires (ticket 07 AC4).
+    """
+    for step in range(5):
+        stage = repo.get_plan_draft(CONV).stage
+        if stage == "final_reviewed":
+            return
+        intent = _ADVANCE.get(stage)
+        assert intent is not None, f"cannot advance a plan at stage {stage!r}"
+        frames = _post_sse(app, subject, {
+            "message": "确认", "request_id": f"{tag}-advance-{step}",
+            "conversation_id": CONV, "profile_id": "chat", "intent": intent})
+        assert frames[-1]["type"] == "done", (intent, frames[-1])
+    raise AssertionError("plan did not reach final_reviewed")
+
+
 def _get(app, subject, path: str, params: dict[str, Any] | None = None):
     async def run():
         async with _client(app, subject) as client:
@@ -388,6 +421,9 @@ def _pause_and_approve(flow, monkeypatch, *, request_id: str, meeting_point: str
         assert draft_frames[-1]["type"] == "done"
         assert _drafts(draft_frames)[0]["payload"]["draft"]["arrangements"]["meeting_point"] \
             == _ARRANGEMENTS["meeting_point"]
+        # Ticket 07 AC4: the export that queues the PDF is now gated on the
+        # confirmed final review, so every publish journey confirms first.
+        _advance_to_final(flow.app, flow.subject, flow.repo, tag=f"book-{request_id}")
 
     _install_route_plan_model(monkeypatch, flow, meeting_point=meeting_point)
     monkeypatch.setattr(chat_api, "_build_artifact_computer",
@@ -621,6 +657,11 @@ def test_plan_cancel_clears_unfinished_rows_and_keeps_published_history(
     artifact_id = _available(first[1])[0]["payload"]["artifact_id"]
 
     # A research turn adds the gate record ticket 07 stores on the draft.
+    # ``plan_research_route`` acts on a ``minimal_draft`` only, so the form is
+    # re-opened first (the publish above confirmed through final_reviewed); the
+    # re-submit is a fresh draft, and the just-published book's version rows are
+    # conversation-scoped evidence that a new draft does not touch.
+    _post_sse(flow.app, flow.subject, _submit("req-cancel-refill"))
     research = _post_sse(flow.app, flow.subject, {
         "message": "研究路线资料", "request_id": "req-cancel-research",
         "conversation_id": CONV, "profile_id": "chat",
@@ -752,6 +793,7 @@ def test_the_plan_book_records_agree_after_a_rejected_approval(flow, monkeypatch
     monkeypatch.setattr(chat_api, "_build_artifact_computer",
                         lambda *a, **k: _recording_computer(produced))
     _post_sse(flow.app, flow.subject, _submit("req-reject"))
+    _advance_to_final(flow.app, flow.subject, flow.repo, tag="req-reject")
 
     async def run():
         async with _client(flow.app, flow.subject) as client:
@@ -777,8 +819,9 @@ def test_the_plan_book_records_agree_after_a_rejected_approval(flow, monkeypatch
     assert flow.repo.list_plan_artifact_versions(CONV) == []
     assert flow.repo.get_current_plan_artifact_version(CONV) is None
     # The draft is untouched by the refusal — still the stage the last plan turn
-    # wrote, and no safety/verdict row was cleared by a rejection.
-    assert flow.repo.get_plan_draft(CONV).stage == "minimal_draft"
+    # wrote (final_reviewed, the confirmation the PDF door read), and no
+    # safety/verdict row was cleared by a rejection.
+    assert flow.repo.get_plan_draft(CONV).stage == "final_reviewed"
     # A refusal ends the run for good, so the preserved sandbox has to go with
     # it: the lease is no longer active, the workspace is off the disk, and the
     # capacity slot the pause kept reserved comes back. Nothing else ever

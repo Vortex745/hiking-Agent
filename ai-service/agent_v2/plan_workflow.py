@@ -731,7 +731,6 @@ def evaluate_plan_intent(
     plan_type: str | None = None,
     completeness: "PlanCompleteness | None" = None,
     recorded_completeness: "RecordedCompleteness | None" = None,
-    safety: "PlanSafety | None" = None,
 ) -> PlanTransition:
     """Decide what a structured intent may do, given the current stage.
 

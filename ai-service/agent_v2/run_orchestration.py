@@ -91,6 +91,7 @@ from agent_v2.permissions import PermissionDecision, PermissionGate
 from agent_v2.plan_workflow import (
     BLOCK_MESSAGE,
     SUPPLEMENT_ARRANGEMENT_KEYS,
+    PlanBlockReason,
     PlanDraftStage,
     RecordedCompleteness,
     classify_plan_request,
@@ -98,6 +99,7 @@ from agent_v2.plan_workflow import (
     evaluate_plan_completeness,
     evaluate_plan_intent,
     missing_plan_fields,
+    pdf_approval_block_reason,
 )
 from agent_v2.profiles import (
     CapabilityProfile,
@@ -1951,6 +1953,51 @@ class RunOrchestrator:
             conversation_id=req.conversation_id,
         )
         return session.select_candidate(comparison_id, candidate_id)
+
+    def _plan_pdf_confirmation_block(self, req: ChatFlowRequest) -> str | None:
+        """Ticket 07 AC4: may this conversation's plan book enter PDF approval?
+
+        :func:`route_compare.service.render_report` is the eligibility authority
+        and has already run for the report the caller is about to publish; this is
+        the ADDITIONAL confirmation door the plan flow was missing. It decides
+        nothing itself — it reads the stored plan stage, the verdict ticket 06 put
+        on record, and hands them to :func:`pdf_approval_block_reason`, the same
+        pure question the review intents already answer through.
+
+        A conversation with NO plan draft is a plain route report, not a plan
+        book, so the confirmation door is not engaged for it (``None``). Once a
+        draft exists it must have reached ``final_reviewed`` — the stage the
+        explicit final confirmation writes — with a verdict on record, or the PDF
+        is refused before the tool-approval pause.
+        """
+        runs_repo = self._runs_repo
+        if runs_repo is None or not req.conversation_id:
+            return None
+        try:
+            draft = runs_repo.get_plan_draft(req.conversation_id)
+            if draft is None:
+                return None
+            stage = PlanDraftStage(draft.stage)
+            check = runs_repo.get_completeness_check(req.conversation_id)
+            recorded = (
+                RecordedCompleteness(
+                    draft_id=check.draft_id, verdict=check.verdict,
+                    reasons=check.reasons, checked_by_run_id=check.checked_by_run_id,
+                )
+                if check is not None and check.draft_id == draft.draft_id
+                else None
+            )
+        except Exception:
+            # Fail closed: plan state we cannot read cannot certify a confirmation.
+            logger.exception(
+                "chat_v2: plan confirmation state unread for the PDF door "
+                "(conversation=%s); refusing the export rather than trusting it",
+                req.conversation_id,
+            )
+            return PlanBlockReason.FINAL_REVIEW_NOT_PENDING
+        return pdf_approval_block_reason(
+            stage=stage, recorded_completeness=recorded, safety=None,
+        )
 
     async def _research_route(
         self,
@@ -4286,6 +4333,24 @@ class RunOrchestrator:
             from route_compare.service import render_report
             report_result = ComparisonResult.model_validate(reports[-1])
             report_content = render_report(report_result)
+            # Ticket 07 AC4: eligibility above is render_report's alone; this is
+            # the ADDITIONAL confirmation door. A conversation that has opened a
+            # plan book may only queue the PDF once its draft has reached
+            # ``final_reviewed`` with a verdict on record — the stage the explicit
+            # final confirmation writes. An unconfirmed draft is refused here,
+            # before any tool-approval pause, and nothing is published.
+            block = self._plan_pdf_confirmation_block(req)
+            if block is not None:
+                mark_terminal_safe(self._runs_repo, run_id, "error")
+                yield emit("error", {
+                    "code": "plan_pdf_approval_required",
+                    "status": "blocked",
+                    "reason": block,
+                    "message": BLOCK_MESSAGE.get(
+                        block, "请先确认最终摘要，再导出计划书 PDF。"
+                    ),
+                })
+                return
             async for envelope in self._stream_artifact_flow(req, resolve_profile("artifact"),
                 run_id=run_id, emit=emit, report_content=report_content,
                 pdf_document=build_report_document(

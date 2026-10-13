@@ -301,6 +301,37 @@ def _terminal(frames: list[dict[str, Any]]) -> str:
     return frames[-1]["type"]
 
 
+#: The single advancing click for each source stage, so a draft can be walked to
+#: the ``final_reviewed`` stage the PDF door reads (ticket 07 AC4). Every turn is
+#: a model-free plan-flow intent (the seam contract's ruling), so this never
+#: touches the kernel — the AC5 determinism journeys still see ``calls == []``.
+_ADVANCE = {
+    PlanDraftStage.MINIMAL_DRAFT.value: "plan_first_review",
+    PlanDraftStage.AWAITING_FIRST_REVIEW.value: "plan_confirm_arrangements",
+    PlanDraftStage.FIRST_REVIEWED.value: "plan_final_review",
+    PlanDraftStage.AWAITING_FINAL_REVIEW.value: "plan_confirm_final",
+}
+
+
+def _advance_to_final(flow, *, tag: str) -> None:
+    """Walk a submitted draft through the review intents to ``final_reviewed``.
+
+    Idempotent: a draft already past any of these stages only performs the steps
+    it has not, and a draft already at ``final_reviewed`` does nothing. Used by
+    the publish helpers so every journey that expects a PDF has genuinely
+    confirmed the final review — the confirmation the door now enforces.
+    """
+    for step in range(5):
+        stage = flow.repo.get_plan_draft(CONV).stage
+        if stage == PlanDraftStage.FINAL_REVIEWED.value:
+            return
+        intent = _ADVANCE.get(stage)
+        assert intent is not None, f"cannot advance a plan at stage {stage!r}"
+        frames = _send(flow, f"{tag}-advance-{step}", message="确认", intent=intent)
+        assert _terminal(frames) == "done", (intent, frames[-1])
+    raise AssertionError("plan did not reach final_reviewed")
+
+
 def _install_export_model(
     flow, monkeypatch, *, meeting_point: str = _CORE["meeting_point"],
     stages: list[dict[str, str]] | None = None, export: bool = True,
@@ -349,7 +380,14 @@ def _pause_book(flow, monkeypatch, request_id: str, *, produced: list[str],
     refusal instead of an approval. The wire sequence is identical — an
     ``_export_payload`` turn, ``approval.required``, the decision POST, no resume —
     and the same module's ``_resume`` / ``_recording_computer`` still do the work.
+
+    Ticket 07 AC4: publishing now requires a confirmed final review, so the helper
+    walks the conversation's draft to ``final_reviewed`` (model-free) before the
+    export turn — every lifecycle journey that expects a PDF gets one, and the
+    refusal journey is the deliberate exception that drives the export itself
+    without confirming.
     """
+    _advance_to_final(flow, tag=request_id)
     _install_export_model(flow, monkeypatch, meeting_point=meeting_point, stages=stages)
     monkeypatch.setattr(chat_api, "_build_artifact_computer",
                         lambda *a, **k: computer or book._recording_computer(produced))
@@ -522,6 +560,60 @@ def test_journey_structured_intent_entry_publishes_the_book(flow, monkeypatch):
     assert _terminal(resumed) == "done"
     assert flow.model_calls == ["请导出带来源的计划书 PDF"]
     assert _assert_terminal_ledger(flow) == {"done": resumed[-1]["run_id"]}
+
+
+def test_journey_an_unconfirmed_draft_cannot_reach_a_pdf(flow, monkeypatch):
+    """Ticket 07 AC4, the door itself: no final-review confirmation → no PDF.
+
+    A ``plan_create`` leaves the draft at ``minimal_draft``. The export turn's
+    ``report_export`` PASSES ``render_report`` (eligibility is intact — the route
+    is a real gate-passed comparison), yet the book must still not be queued: PDF
+    approval requires the draft to have reached ``final_reviewed`` and a verdict
+    on record, which is exactly what :func:`pdf_approval_block_reason` reads. The
+    turn refuses before the tool-approval pause, publishes nothing, and leaves no
+    version row — while a draft that HAS confirmed the final review publishes (the
+    journey above). render_report stays the eligibility authority; this is the
+    additional confirmation door AC4 asked for.
+    """
+    boom = _ExplodingKernel()
+    monkeypatch.setattr(kernel, "run_chat_turn", boom)
+    _send(flow, "e11-unconf-create", **_submit_fields(arrangements=_ALL_ARRANGEMENTS))
+    assert flow.repo.get_plan_draft(CONV).stage == PlanDraftStage.MINIMAL_DRAFT.value
+
+    produced: list[str] = []
+    _install_export_model(flow, monkeypatch)
+    monkeypatch.setattr(chat_api, "_build_artifact_computer",
+                        lambda *a, **k: book._recording_computer(produced))
+
+    export = book._post_sse(flow.app, flow.subject, book._export_payload("e11-unconf-book"))
+    # Refused before any approval is requested, and nothing rendered.
+    assert [f for f in export if f["type"] == "approval.required"] == []
+    assert book._available(export) == []
+    assert produced == [], "an unconfirmed draft published a PDF"
+    assert flow.repo.list_plan_artifact_versions(CONV) == []
+    assert flow.repo.get_current_plan_artifact_version(CONV) is None
+    # The refusal is the stable AC4 reason, not a crash and not eligibility.
+    refused = next(f for f in export if f["type"] == "error")
+    assert refused["payload"]["code"] == "plan_pdf_approval_required", refused["payload"]
+    assert refused["payload"]["reason"] == "final_review_not_pending", refused["payload"]
+    # The draft is untouched — the refusal stores nothing.
+    assert flow.repo.get_plan_draft(CONV).stage == PlanDraftStage.MINIMAL_DRAFT.value
+    _assert_terminal_ledger(flow)
+
+
+def test_a_confirmed_draft_clears_the_pdf_door_the_unconfirmed_one_could_not(flow, monkeypatch):
+    """The other arm of the same door: confirming the final review lets it publish.
+
+    Pairs with the refusal journey above so the gate is shown to be about the
+    stage the confirmation writes, not about eligibility or a fluke.
+    """
+    _send(flow, "e11-conf-create", **_submit_fields(arrangements=_ALL_ARRANGEMENTS))
+    _advance_to_final(flow, tag="e11-conf")
+    assert flow.repo.get_plan_draft(CONV).stage == PlanDraftStage.FINAL_REVIEWED.value
+    _paused, resumed, produced = _publish(flow, monkeypatch, "e11-conf-book")
+    assert _published(flow, resumed)["plan_revision"] == 1
+    assert len(produced) == 1
+    _assert_terminal_ledger(flow)
 
 
 # ---- AC2: the ambiguous-intent confirmation journey ------------------------
@@ -1019,11 +1111,17 @@ def test_journey_render_failure_publishes_nothing_and_the_retry_recovers(
     assert flow.repo.list_plan_artifact_versions(CONV) == []
     assert produced == []
     # Nothing half-published means the draft and the "which version is current"
-    # pointer are untouched.
-    assert flow.repo.get_plan_draft(CONV).stage == PlanDraftStage.MINIMAL_DRAFT.value
+    # pointer are untouched. The draft is at ``final_reviewed`` because the publish
+    # it was attempting required the confirmed final review (ticket 07 AC4); the
+    # failed render leaves that stage exactly as it found it.
+    assert flow.repo.get_plan_draft(CONV).stage == PlanDraftStage.FINAL_REVIEWED.value
     assert flow.repo.get_current_plan_artifact_version(CONV) is None
 
     # 重新生成草稿 is a plan intent, not a render request: still nothing published.
+    # A fresh submit re-opens the form at ``minimal_draft``, which is the only
+    # stage ``plan_regenerate`` acts on, so the recovery arm proves regenerate
+    # renders no PDF without touching the door's confirmation requirement.
+    _send(flow, "e11-refill", **_submit_fields(arrangements=_CORE_ONLY))
     regen = _send(flow, "e11-plan-regenerate", message="重新生成草稿", intent="plan_regenerate",
                   plan_input={"destination_or_route": _DEMO_ROUTE, "activity_date": _DATE,
                               "participants": _PEOPLE, "arrangements": _CORE_ONLY})
@@ -1152,6 +1250,10 @@ def test_journey_a_refused_approval_publishes_nothing_and_cleans_up(flow, monkey
     sweep would never look at it.
     """
     _send(flow, "e11-reject-submit", **_submit_fields(arrangements=_CORE_ONLY))
+    # The publish that reaches the approval pause requires the confirmed final
+    # review (ticket 07 AC4), so the refusal is a refusal of the APPROVAL, not of
+    # an unconfirmed draft (that arm has its own journey above).
+    _advance_to_final(flow, tag="e11-reject")
     produced: list[str] = []
     _install_export_model(flow, monkeypatch)
     monkeypatch.setattr(chat_api, "_build_artifact_computer",
@@ -1186,7 +1288,9 @@ def test_journey_a_refused_approval_publishes_nothing_and_cleans_up(flow, monkey
     assert not os.path.isdir(lease.workspace_path)
     assert flow.app.state.agent_v2_runtime.capacity.snapshot()["active_sandboxes"] == 0
     # The plan itself survives a refusal: it is the run that ended, not the draft.
-    assert flow.repo.get_plan_draft(CONV).stage == PlanDraftStage.MINIMAL_DRAFT.value
+    # The draft is at ``final_reviewed`` (the confirmation the door requires), and
+    # the refusal clears nothing about it — only the sandbox and the slot.
+    assert flow.repo.get_plan_draft(CONV).stage == PlanDraftStage.FINAL_REVIEWED.value
     _assert_terminal_ledger(flow)
 
 
@@ -1408,7 +1512,11 @@ CRITERIA: dict[str, dict[str, Any]] = {
         "seams": ("test_plan_route_selection.py", "test_plan_research_branch.py")},
     "AC5": {"criterion": "计划完整度和确认路径完全由确定性规则驱动。", "journeys": (
         "test_journey_the_whole_deterministic_path_never_consults_a_model",
-        "test_journey_completeness_and_confirmation_are_recomputed_not_trusted",),
+        "test_journey_completeness_and_confirmation_are_recomputed_not_trusted",
+        # Ticket 07 AC4: the confirmation door at the PDF edge is the same
+        # deterministic stage the review intents write — an unconfirmed draft is
+        # refused with a stable reason, no model and no invented eligibility.
+        "test_journey_an_unconfirmed_draft_cannot_reach_a_pdf",),
         "seams": ("test_plan_completeness_rules.py",)},
     "AC6": {"criterion": "no_go 阻止流程通过。", "journeys": (
         "test_journey_no_go_blocks_the_plan_from_entry_to_pdf",),
