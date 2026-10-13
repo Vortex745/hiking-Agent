@@ -24,8 +24,10 @@ this table is :data:`CRITERIA`, enforced by the four gate tests at the bottom):
   ``…free_destination…`` journeys
 * AC5 计划完整度和确认路径完全由确定性规则驱动 — ``test_journey_the_whole_deterministic_path_never_consults_a_model``
   and ``test_journey_completeness_and_confirmation_are_recomputed_not_trusted``:
-  every plan click runs against a kernel that RAISES, so "deterministic" is proven
-  by explosion, not by an absence-of-log bookkeeping claim
+  every plan click runs against a kernel that RAISES, and the route-decision seam is
+  guarded so a provider other than ``deterministic`` — or any live/MCP data call —
+  explodes. "Deterministic" is proven by explosion, not by an absence-of-log
+  bookkeeping claim
 * AC6 no_go 阻止流程通过 — ``test_journey_no_go_blocks_the_plan_from_entry_to_pdf``
 * AC7 PDF 失败、取消、恢复和重生成流程通过 — the ``…render_failure…``, ``…cancel…``,
   ``…duplicate_resume…``, ``…refused_approval…``, ``…disconnected…`` and ``…expires…``
@@ -153,6 +155,49 @@ class _ExplodingKernel:
     async def __call__(self, **kwargs):
         self.calls.append(str(kwargs.get("message")))
         raise AssertionError(f"the plan path consulted a model: {kwargs.get('message')!r}")
+
+
+class _DeterminismSentinel:
+    """The other half of AC5: not only no model — no decision provider either.
+
+    :class:`_ExplodingKernel` closes the kernel door. The route-decision seam is a
+    second, independent door: ``agent_v2.route_tools.RouteSession`` builds its
+    provider through ``select_provider(provider_config(settings))``, which can be
+    ``llm`` (a chat model) or ``external`` (the Typesafe/Jev adapter), and its
+    ``LiveTools.call`` is the network/MCP data door. A plan path that quietly asked
+    for either would still be "deterministic" as long as the config happened to be
+    right in this process — a config claim, not a behaviour claim.
+
+    So both doors are guarded at runtime: the sentinel records every provider the
+    path asks for and refuses anything but ``deterministic``, and it refuses any
+    live tool call outright. What a journey then asserts is that the whole
+    deterministic path passed WITH the guard installed.
+    """
+
+    def __init__(self) -> None:
+        self.providers: list[tuple[str, str]] = []
+        self.live_calls: list[str] = []
+
+    def install(self, monkeypatch) -> "_DeterminismSentinel":
+        import agent_v2.route_tools as route_tools
+
+        real_select = route_tools.select_provider
+
+        def select(config):
+            self.providers.append((config.provider, config.data_mode))
+            if config.provider != "deterministic":
+                raise AssertionError(
+                    f"the plan path asked for the {config.provider!r} decision provider")
+            return real_select(config)
+
+        async def live_call(self_tools, server, tool, args):
+            self.live_calls.append(f"{server}:{tool}")
+            raise AssertionError(
+                f"the plan path consulted a live data source: {server}:{tool}")
+
+        monkeypatch.setattr(route_tools, "select_provider", select)
+        monkeypatch.setattr(route_tools.LiveTools, "call", live_call)
+        return self
 
 
 @pytest.fixture
@@ -752,9 +797,16 @@ def test_journey_the_whole_deterministic_path_never_consults_a_model(flow, monke
     The deterministic contract is "same input, same transition", so the refusal
     arms are clicked twice and must answer with the same stable enum reason, and
     regeneration must publish nothing: the plan path has no side effect at all.
+
+    "No model" is only half of "fully deterministic", so the journey also installs
+    :class:`_DeterminismSentinel`: the route-decision provider the path asks for is
+    recorded and must be ``deterministic``, and any live/MCP data call explodes. A
+    passing journey therefore proves the transition was decided by rules at runtime,
+    not by a config value nobody re-reads.
     """
     boom = _ExplodingKernel()
     monkeypatch.setattr(kernel, "run_chat_turn", boom)
+    sentinel = _DeterminismSentinel().install(monkeypatch)
 
     _send(flow, "e11-det-open", message="周末想去爬山，还没定")  # natural language, no intent
     assert _stage(_send(flow, "e11-det-confirm", message="确认", intent="plan_confirm")) \
@@ -805,6 +857,14 @@ def test_journey_the_whole_deterministic_path_never_consults_a_model(flow, monke
     cancelled = _send(flow, "e11-det-cancel", message="取消计划", intent="plan_cancel")
     assert _stage(cancelled) == PlanDraftStage.CANCELLED.value
     assert flow.repo.get_plan_draft(CONV).stage == "cancelled"
+    # Every provider this journey's turns reached for was the rule engine over
+    # offline fixtures — and the guard really was live, because the research turn
+    # built a session and the sentinel saw it.
+    assert sentinel.providers, "the journey never reached the decision-provider seam"
+    assert set(sentinel.providers) == {("deterministic", "offline")}, sentinel.providers
+    assert sentinel.live_calls == []
+    assert flow.settings.route_decision_provider == "deterministic"
+    assert flow.settings.route_compare_data_mode == "offline"
     _assert_terminal_ledger(flow)
 
 
