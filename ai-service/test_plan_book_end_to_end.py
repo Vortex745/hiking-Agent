@@ -20,8 +20,10 @@ this table is :data:`CRITERIA`, enforced by the four gate tests at the bottom):
 * AC1 结构化 intent 的明确入口流程通过 — ``test_journey_structured_intent_entry_publishes_the_book``
 * AC2 模糊意图确认流程通过 — ``test_journey_ambiguous_intent_confirms_before_it_opens_the_form``
 * AC3 缺失字段草案流程通过 — ``test_journey_missing_fields_supplement_review_and_publish``
-* AC4 已有路线比较和自由目的地流程通过 — the ``…existing_route_comparison…`` and
-  ``…free_destination…`` journeys
+* AC4 已有路线比较和自由目的地流程通过 — the ``…existing_route_comparison…``,
+  ``…free_destination…`` and ``…research_success_surfaces_candidates_and_the_user_selects_one``
+  journeys (the last one is ticket 04 AC2's success arm: research passes the gate,
+  the user's own click attaches the route)
 * AC5 计划完整度和确认路径完全由确定性规则驱动 — ``test_journey_the_whole_deterministic_path_never_consults_a_model``
   and ``test_journey_completeness_and_confirmation_are_recomputed_not_trusted``:
   every plan click runs against a kernel that RAISES, and the route-decision seam is
@@ -880,6 +882,109 @@ def test_journey_free_destination_research_falls_back_to_a_generic_draft(flow, m
     _assert_terminal_ledger(flow)
 
 
+def test_journey_research_success_surfaces_candidates_and_the_user_selects_one(flow, monkeypatch):
+    """AC4's SUCCESS arm (ticket 04 AC2): research that clears the gate hands the
+    user selectable candidates, and the user's own click is what attaches one.
+
+    The reviewed gap was that this branch was never walked: a passing research turn
+    stores no route reference, so nothing proved the 04→03 handover. The decision
+    recorded here is that this is CORRECT and the missing thing was the proof:
+    ticket 03's 「用户可以选择推荐路线或备选路线」 makes selection an explicit user act,
+    and notes-09's no-auto-select precedent forbids the server choosing for the
+    user. So a research ``ok`` turn SURFACES (the comparison rides the event, and
+    its ``comparison_id`` is loadable for the selection leaf) while ``plan_type``
+    stays DERIVED from ``route_basis is not None`` — generic until the click,
+    ``route_plan`` only after the leaf re-reads a gate-passed candidate.
+
+    Honest scope: the offline fixtures can only ever recommend 演示林间环线
+    (notes-05 landmine 7), so that is the destination this journey researches —
+    the counterpart 资料不足 arm is the journey above.
+    """
+    boom = _ExplodingKernel()
+    monkeypatch.setattr(kernel, "run_chat_turn", boom)
+    sentinel = _DeterminismSentinel().install(monkeypatch)
+
+    _send(flow, "e11-ok-submit", **_submit_fields(arrangements=_CORE_ONLY))
+
+    # --- the success turn: evidence is shown, nothing is attached -------------
+    researched = _send(flow, "e11-ok-research", message="研究这条路线",
+                       intent="plan_research_route")
+    comparison = next(f for f in researched if f["type"] == "tool_result")["payload"][
+        "route_comparison"]
+    assert comparison["status"] == "recommended", comparison["status"]
+    payload = _payload(researched)
+    assert payload["stage"] == PlanDraftStage.MINIMAL_DRAFT.value, (
+        "a passing research result leaves the draft where the user submitted it")
+    # AC2's surface, not a shortcut: the candidates and their sources travel on the
+    # event, and no fact is copied into the draft (seam contract invariant 1).
+    offered = {entry["candidate"]["id"]: entry for entry in comparison["candidates"]}
+    selectable = [comparison["recommended_id"], *comparison["alternatives"]]
+    assert selectable and all(cid in offered for cid in selectable)
+    assert offered[comparison["recommended_id"]]["evidence_status"] == "complete"
+    assert offered[comparison["recommended_id"]]["candidate"]["sources"], (
+        "a candidate the user may pick carries its own sources")
+    # The no-auto-select pin: with no user act there is no basis, so the draft is
+    # still a generic draft and holds no route reference — in the payload, in the
+    # row, and in the summary the user is reading.
+    assert payload["plan_type"] == "generic_draft"
+    assert payload["route_selection"] is None
+    assert flow.repo.get_route_selection(CONV) is None
+    assert "路线核验事实" not in payload["summary"]
+
+    # Ticket 07's pass record is stored verbatim on the success arm, which is what
+    # the PDF cover's 安全门 line reads later instead of staying 待核验.
+    gate = flow.repo.get_plan_safety(CONV)
+    assert gate is not None and gate.hard_stop is False and gate.codes == ()
+
+    # --- the user's act: selecting is what makes this a route plan ------------
+    chosen = comparison["recommended_id"]
+    selected = _send(flow, "e11-ok-select", message="选用推荐路线", intent="plan_select_route",
+                     route_selection={"comparison_id": comparison["comparison_id"],
+                                      "candidate_id": chosen})
+    picked = _payload(selected)
+    assert picked["stage"] == PlanDraftStage.MINIMAL_DRAFT.value
+    assert picked["route_selection"] == {"comparison_id": comparison["comparison_id"],
+                                         "candidate_id": chosen}
+    assert picked["plan_type"] == "route_plan", (
+        "the DERIVED marker: a gate-passed basis the leaf re-read, never a claim")
+    assert flow.repo.get_route_selection(CONV).candidate_id == chosen
+    # Facts render WITH their provenance — the source id the comparison carried.
+    source_id = offered[chosen]["candidate"]["sources"][0]["id"]
+    assert f"来源 [{source_id}]" in picked["summary"], picked["summary"]
+    assert "演示林间环线" in picked["summary"]
+
+    # A first review over the same draft keeps the sourced facts: the summary the
+    # user confirms is the review-grade render of the very same re-read.
+    review = _send(flow, "e11-ok-review", message="直接生成草案", intent="plan_first_review")
+    assert _stage(review) == PlanDraftStage.AWAITING_FIRST_REVIEW.value
+    assert f"来源 [{source_id}]" in _payload(review)["summary"]
+
+    # --- and the book publishes as a formal route plan -----------------------
+    _paused, resumed, produced = _publish(flow, monkeypatch, "e11-ok-book")
+    assert _published(flow, resumed)["plan_revision"] == 1
+    document = json.loads(produced[0])
+    cover = "\n".join(f"{line['label']}：{line['value']}"
+                      for line in document["cover"]["status_lines"])
+    assert "正式路线计划" in cover
+    assert "待核验" not in document["cover"]["status_lines"][2]["value"], (
+        "the researched book's 安全门 reads the stored gate answer")
+    assert document["sources"], "the published book carries the source list"
+    assert any(source_id in {entry["id"] for entry in group["entries"]}
+               for group in document["sources"]), document["sources"]
+    certified = [fact for fact in document["route_overview"] if fact["value"] != "待核验"]
+    assert {fact["label"] for fact in certified} >= {"距离", "累计爬升", "预计耗时"}
+
+    # Every plan click in this journey ran against a kernel that RAISES, so no
+    # transition, research result or fact render was model-decided. The one model
+    # turn below is the export turn the harness itself installs — the book is
+    # queued by ``report_export``, never by a plan intent (landmine 5).
+    assert set(sentinel.providers) == {("deterministic", "offline")}, sentinel.providers
+    assert sentinel.live_calls == []
+    assert len(flow.model_calls) == 1, flow.model_calls
+    assert boom.calls == [], "a plan click consulted the model"
+    _assert_terminal_ledger(flow)
+
+
 # ---- AC5: the deterministic path, proven by explosion ----------------------
 
 def test_journey_the_whole_deterministic_path_never_consults_a_model(flow, monkeypatch):
@@ -1508,7 +1613,8 @@ CRITERIA: dict[str, dict[str, Any]] = {
                   "test_plan_completeness_rules.py")},
     "AC4": {"criterion": "已有路线比较和自由目的地流程通过。", "journeys": (
         "test_journey_existing_route_comparison_selects_a_route_and_publishes",
-        "test_journey_free_destination_research_falls_back_to_a_generic_draft",),
+        "test_journey_free_destination_research_falls_back_to_a_generic_draft",
+        "test_journey_research_success_surfaces_candidates_and_the_user_selects_one",),
         "seams": ("test_plan_route_selection.py", "test_plan_research_branch.py")},
     "AC5": {"criterion": "计划完整度和确认路径完全由确定性规则驱动。", "journeys": (
         "test_journey_the_whole_deterministic_path_never_consults_a_model",
