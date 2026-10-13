@@ -2,7 +2,105 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from agent_v2.computer import LocalNativeComputer
+
+
+def test_the_renderer_types_no_plan_status_marker_of_its_own() -> None:
+    """The 待确认 / 待核验 markers are ``plan_workflow``'s, never the renderer's.
+
+    ``agent_v2/computer.py`` both FILLS these markers as values and COMPARES against
+    them (:func:`_report_story`'s ``if note and note != UNCONFIRMED`` budget and
+    required-action guards). With a literal on one side and
+    :data:`agent_v2.plan_workflow.UNCONFIRMED` on the other, rewording the marker
+    silently strands the comparison — the blank note starts rendering as user copy —
+    and no runtime test can see a rename that has not happened yet. So the rule is
+    pinned at the source level, the same way this repo pins what a browser-only
+    claim cannot prove.
+
+    The import direction is part of the claim: ``computer.py`` sits in
+    ``agent_v2``, so reading the vocabulary from :mod:`agent_v2.plan_workflow` is the
+    correct way down (the reverse edge is what finding 9 removed from
+    :mod:`route_compare.report_pdf`).
+    """
+    import ast
+    import inspect
+
+    import agent_v2.computer as computer_module
+    from agent_v2 import plan_workflow
+
+    path = Path(inspect.getfile(computer_module))
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+
+    docstrings: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = getattr(node, "body", None)
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+                docstrings.add(id(body[0].value))
+
+    literals = [node.value for node in ast.walk(tree)
+                if isinstance(node, ast.Constant) and isinstance(node.value, str)
+                and id(node) not in docstrings]
+    typed = [text for text in literals if plan_workflow.UNCONFIRMED in text
+             or plan_workflow.UNVERIFIED in text]
+    assert typed == [], f"placeholders must come from plan_workflow, not as literals: {typed}"
+
+    # …and the shared constants really are imported here, so the check above cannot
+    # be satisfied by deleting the markers instead of routing them.
+    imports_plan_workflow = any(
+        isinstance(node, ast.ImportFrom)
+        and (node.module or "").endswith("plan_workflow")
+        and {"UNCONFIRMED", "UNVERIFIED"} <= {alias.name for alias in node.names}
+        for node in ast.walk(tree))
+    assert imports_plan_workflow, (
+        "computer.py must read UNCONFIRMED/UNVERIFIED from agent_v2.plan_workflow")
+
+
+def test_the_blank_budget_note_and_action_are_gated_on_the_shared_marker() -> None:
+    """Same rule, observed as behaviour: an absent arrangement is not user copy.
+
+    The document builder writes :data:`UNCONFIRMED` for a budget the user left
+    blank; the renderer must recognise THAT marker and not print a 用户预算说明 row
+    for it, while a real note still prints both the row and the quote. Asserted
+    through the constant rather than the word, so the two sides cannot drift apart
+    and stay green.
+    """
+    import asyncio
+    import json
+
+    import pytest
+    fitz = pytest.importorskip("fitz")
+
+    from agent_v2.computer import _render_pdf_bytes
+    from agent_v2.plan_workflow import UNCONFIRMED
+    from route_compare.fixtures import fixture_candidates
+    from route_compare.providers import DeterministicProvider, ProviderConfig
+    from route_compare.report_pdf import build_report_document
+    from route_compare.service import compare_routes
+
+    result = asyncio.run(compare_routes(
+        fixture_candidates("complete"),
+        DeterministicProvider(ProviderConfig(data_mode="offline")),
+        comparison_id="run:marker"))
+    document = build_report_document(result)
+    # The builder's own answer for a user who never stated a budget: the marker.
+    assert document["budget_note"] == UNCONFIRMED
+
+    def text_of(payload: bytes) -> str:
+        with fitz.open(stream=payload, filetype="pdf") as pdf:
+            return "\n".join(page.get_text() for page in pdf)
+
+    blank = text_of(_render_pdf_bytes(json.dumps(document, ensure_ascii=False)))
+    assert "用户预算说明" not in blank, "an absent budget is not user copy"
+    assert "出发前必须完成：" not in blank
+
+    stated = dict(document, budget_note="300 元/人，含保险",
+                  required_action="出发前重新查询天气与开放状态")
+    shown = text_of(_render_pdf_bytes(json.dumps(stated, ensure_ascii=False)))
+    assert "用户预算说明" in shown and "预算原文：300 元/人，含保险" in shown
+    assert "出发前必须完成：出发前重新查询天气与开放状态" in shown
 
 
 def test_local_pdf_is_a_real_pdf(tmp_path) -> None:

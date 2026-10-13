@@ -42,6 +42,13 @@ from pathlib import Path
 from typing import Any, Literal
 
 from agent_v2.artifacts import ArtifactManifest, compute_sha256
+# The two plan status markers belong to the plan vocabulary, not to this renderer:
+# :func:`_report_story` both FILLS them as values and COMPARES against them (the
+# budget-note and required-action guards), so a literal typed here would be a second
+# copy of a word another module owns. ``agent_v2.computer`` → ``agent_v2.plan_workflow``
+# is the correct direction (plan_workflow imports nothing), pinned by
+# ``test_the_renderer_types_no_plan_status_marker_of_its_own``.
+from agent_v2.plan_workflow import UNCONFIRMED, UNVERIFIED
 
 logger = logging.getLogger("ai-service.agent_v2.computer")
 
@@ -184,19 +191,19 @@ PLAN_SECTIONS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 #: The copy an ordinary artifact export falls back to when the Markdown draft has
 #: nothing under a heading (spec: 补齐缺失章节并标为草案, never invent).
 _TEXT_SECTION_DEFAULTS: dict[str, str] = {
-    "计划摘要": "待确认：路线、日期与人数摘要需由已确认安排与核验资料组成。",
-    "计划信息": "待确认：活动日期、集合时间与地点、人数、活动目标。",
-    "路线摘要": "待核验：起终点、里程、爬升、耗时、天气与开放状态。",
-    "行程时间线": "待确认：逐日安排、途经点、补给与最晚下撤时间。",
-    "交通住宿与联络": "待确认：往返交通、住宿、应急联络与撤退交通。",
-    "人员分工": "待确认：领队、导航、收队和急救联络负责人。",
-    "费用预算": "待确认：交通、住宿门票、餐食补给、保险与费用分摊。",
-    "装备与补给": "待确认：防滑鞋、雨具、保暖层、头灯、手机充电宝、急救包、饮水和食品。",
+    "计划摘要": f"{UNCONFIRMED}：路线、日期与人数摘要需由已确认安排与核验资料组成。",
+    "计划信息": f"{UNCONFIRMED}：活动日期、集合时间与地点、人数、活动目标。",
+    "路线摘要": f"{UNVERIFIED}：起终点、里程、爬升、耗时、天气与开放状态。",
+    "行程时间线": f"{UNCONFIRMED}：逐日安排、途经点、补给与最晚下撤时间。",
+    "交通住宿与联络": f"{UNCONFIRMED}：往返交通、住宿、应急联络与撤退交通。",
+    "人员分工": f"{UNCONFIRMED}：领队、导航、收队和急救联络负责人。",
+    "费用预算": f"{UNCONFIRMED}：交通、住宿门票、餐食补给、保险与费用分摊。",
+    "装备与补给": f"{UNCONFIRMED}：防滑鞋、雨具、保暖层、头灯、手机充电宝、急救包、饮水和食品。",
     "风险决策区": "通用建议：恶劣天气或封闭路线取消出行；身体不适或迷路时停止前进，在安全位置联系领队或当地救援。",
-    "出发前检查": "待确认：最新天气与开放状态、离线地图、装备自检和对外联络；垃圾全部带离。",
-    "候选路线对比": "待核验：本草案没有经过服务器核验的候选路线对比表。",
-    "排序依据与说明": "待核验：草案中的排序不来自证据校验，不得视为已核验结论。",
-    "来源与证据": "待核验：本草案未完成路线证据校验；请补充可靠资料和查询时间。",
+    "出发前检查": f"{UNCONFIRMED}：最新天气与开放状态、离线地图、装备自检和对外联络；垃圾全部带离。",
+    "候选路线对比": f"{UNVERIFIED}：本草案没有经过服务器核验的候选路线对比表。",
+    "排序依据与说明": f"{UNVERIFIED}：草案中的排序不来自证据校验，不得视为已核验结论。",
+    "来源与证据": f"{UNVERIFIED}：本草案未完成路线证据校验；请补充可靠资料和查询时间。",
 }
 
 
@@ -248,7 +255,7 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
     center_cell = style("PlanCenterCell", fontSize=8.2, leading=11, alignment=TA_CENTER, textColor=HexColor(_PDF_TEXT))
 
     def p(value: Any, style_obj: ParagraphStyle = table_cell) -> Paragraph:
-        text = escape(str(value if value not in (None, "") else "待核验")).replace("\n", "<br/>")
+        text = escape(str(value if value not in (None, "") else UNVERIFIED)).replace("\n", "<br/>")
         return Paragraph(text, style_obj)
 
     def section_title(number: str, label: str, _aliases: tuple[str, ...] = (),
@@ -290,8 +297,8 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
     story: list[Any] = []
     cover = data.get("cover") or {}
     status_lines = cover.get("status_lines") or [
-        {"label": "计划状态", "value": str(data.get("status_label") or "待核验")}]
-    generated = "生成时间：" + str(data.get("generated_at", "待核验"))
+        {"label": "计划状态", "value": str(data.get("status_label") or UNVERIFIED)}]
+    generated = "生成时间：" + str(data.get("generated_at", UNVERIFIED))
     cid = str(data.get("comparison_id", ""))
     cid_text = cid[:44] + ("…" if len(cid) > 44 else "")
 
@@ -355,7 +362,7 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
         story.append(Spacer(1, 6))
     recommendation = str(data.get("recommended") or "暂未形成可执行推荐")
     decision_rows: list[list[Any]] = [[
-        Paragraph(escape(str(data.get("status_label", "待核验"))), status),
+        Paragraph(escape(str(data.get("status_label", UNVERIFIED))), status),
         p(f"推荐路线：{recommendation}\n活动安排需逐项确认；路线状态需在出发前重新核验。", body),
     ]]
     if data.get("alternatives"):
@@ -394,12 +401,12 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
     if overview_rows:
         story.append(styled_table(overview_rows, [28, 59, 28, 59], header=False))
     story.append(Spacer(1, 2))
-    story.append(Paragraph("事实字段来自路线证据；显示“待核验”的字段不得在出发前视为已确认。", small))
+    story.append(Paragraph(f"事实字段来自路线证据；显示“{UNVERIFIED}”的字段不得在出发前视为已确认。", small))
 
     # ---- 04 行程时间线 ---------------------------------------------------
     story.extend(section_title(*PLAN_SECTIONS[3]))
     timeline_note = ("以下按用户提供的安排成时间线，执行前需确认。" if data.get("user_itinerary") else
-                     "以下为通用行程模板，日期、时间与途经点待确认；不代表已核验的分段行程。")
+                     f"以下为通用行程模板，日期、时间与途经点{UNCONFIRMED}；不代表已核验的分段行程。")
     story.append(Paragraph(timeline_note, small))
     story[-1].keepWithNext = True
     timeline = [[p("时间", table_head), p("阶段", table_head),
@@ -426,13 +433,17 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
     budget = [[p("费用项目", table_head), p("金额", table_head), p("依据", table_head)]]
     budget += [[p(row.get("item")), p(row.get("amount")), p(row.get("basis"))] for row in data.get("budget", [])]
     note = str(data.get("budget_note") or "").strip()
-    if note and note != "待确认":
-        # The user's own wording, as text, beside an amount that stays 待确认 —
-        # free text is never parsed into a number here.
-        budget.append([p("用户预算说明"), p("待确认"), p("用户原文")])
+    if note and note != UNCONFIRMED:
+        # The user's own wording, as text, beside an amount that stays
+        # :data:`UNCONFIRMED` — free text is never parsed into a number here. The
+        # guard compares against the SAME constant the document builder writes, so
+        # rewording the marker moves both sides together instead of turning a blank
+        # budget into a 用户预算说明 row.
+        budget.append([p("用户预算说明"), p(UNCONFIRMED), p("用户原文")])
     story.append(styled_table(budget, [75, 50, 49]))
-    story.extend([Spacer(1, 4), p("已列预算合计：" + str(data.get("budget_total", "待确认")), body)])
-    if note and note != "待确认":
+    story.extend([Spacer(1, 4),
+                  p("已列预算合计：" + str(data.get("budget_total", UNCONFIRMED)), body)])
+    if note and note != UNCONFIRMED:
         story.append(p("预算原文：" + note, small))
 
     # ---- 08 装备与补给 ---------------------------------------------------
@@ -449,7 +460,7 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
                   for row in risk.get("rows", data.get("risk_controls", []))]
     risk_table = styled_table(risk_rows, [53, 82, 39], header=True, tone="risk")
     risk_block: list[Any] = [Paragraph(
-        "风险状态：" + escape(str(risk.get("status_label", data.get("status_label", "待核验")))), risk_title)]
+        "风险状态：" + escape(str(risk.get("status_label", data.get("status_label", UNVERIFIED)))), risk_title)]
     if risk.get("note"):
         risk_block.append(Paragraph(escape(str(risk["note"])), small))
     risk_block.append(risk_table)
@@ -461,7 +472,7 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
             [35, 139], header=False))
     story.append(KeepTogether(section_title(*PLAN_SECTIONS[8], tone="risk") + risk_block))
     required = str(data.get("required_action") or "").strip()
-    if required and required != "待确认":
+    if required and required != UNCONFIRMED:
         action_table = Table([[Paragraph("出发前必须完成：" + escape(required), callout)]], colWidths=[page_width])
         action_table.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), HexColor(_PDF_AMBER_BG)),
                                           ("BOX", (0, 0), (-1, -1), 0.65, HexColor(_PDF_AMBER_BORDER)),
@@ -484,7 +495,7 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
         columns = ["路线"] + [str(c).strip() for c in data.get("columns", [])] + ["资料", "风险"]
         table_data: list[list[Any]] = [[p(c, table_head) for c in columns]]
         for row in rows:
-            name = str(row.get("name", "待核验")) + (" ★" if row.get("badge") == "推荐" else "")
+            name = str(row.get("name", UNVERIFIED)) + (" ★" if row.get("badge") == "推荐" else "")
             table_data.append([p(name, table_cell_bold)] + [p(cell) for cell in row.get("cells", [])] +
                               [p(row.get("evidence")), p(row.get("risk"))])
         remaining = 174 - 34
@@ -498,22 +509,22 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
             story.append(Paragraph("•　" + escape(note), body))
             story.append(Spacer(1, 2))
     else:
-        story.append(p("仅对证据齐全且通过安全校验的候选排序；具体偏好说明待确认。", body))
+        story.append(p(f"仅对证据齐全且通过安全校验的候选排序；具体偏好说明{UNCONFIRMED}。", body))
 
     # Sources are retained as an appendix and can split across pages.
     source_groups = data.get("sources", [])
     if source_groups:
         story.extend(section_title(*PLAN_SECTIONS[12]))
         for group in source_groups:
-            story.append(Paragraph(escape("来源 — " + str(group.get("candidate", "待核验"))), table_cell_bold))
+            story.append(Paragraph(escape("来源 — " + str(group.get("candidate", UNVERIFIED))), table_cell_bold))
             for entry in group.get("entries", []):
                 url = str(entry.get("url", ""))
                 header = f"[{escape(str(entry.get('id', '')))}] {escape(str(entry.get('tool', '')))}"
                 if url:
                     header += f'　<font color="{_PDF_LINK}">{escape(url)}</font>'
                 source_card = Table([[Paragraph(header, small)],
-                                     [Paragraph(escape(str(entry.get("excerpt", "待核验"))), small)],
-                                     [Paragraph("观测时间：" + escape(str(entry.get("observed_at", "待核验"))), small)]],
+                                     [Paragraph(escape(str(entry.get("excerpt", UNVERIFIED))), small)],
+                                     [Paragraph("观测时间：" + escape(str(entry.get("observed_at", UNVERIFIED))), small)]],
                                     colWidths=[page_width], splitInRow=1)
                 source_card.setStyle(TableStyle([("BOX", (0, 0), (-1, -1), 0.45, HexColor(_PDF_BORDER)),
                                                  ("LEFTPADDING", (0, 0), (-1, -1), 8), ("RIGHTPADDING", (0, 0), (-1, -1), 8),
@@ -625,15 +636,16 @@ def _text_story(doc: Any, content: str) -> list[Any]:
         grouped[current].append(node)
 
     # Cover page: an ordinary artifact export has no route evidence behind it, so
-    # its status line says 草案 and 待核验 rather than claiming a verified plan.
+    # its status line says 草案 and :data:`UNVERIFIED` rather than claiming a
+    # verified plan.
     cover_rows = [
-        ("草案类型", "通用草案 · 路线事实待核验"),
-        ("审阅结论", "待核验"),
-        ("安全门", "待核验"),
+        ("草案类型", f"通用草案 · 路线事实{UNVERIFIED}"),
+        ("审阅结论", UNVERIFIED),
+        ("安全门", UNVERIFIED),
     ]
     cover_panel = Table([[Paragraph("徒步计划书 · Hiking Plan Book", meta)],
                          [Paragraph("AI Hiking 徒步计划书", h1)],
-                         [Paragraph("活动安排草案 · 路线事实尚待核验", meta)]]
+                         [Paragraph(f"活动安排草案 · 路线事实尚{UNVERIFIED}", meta)]]
                         + [[Paragraph(escape(label), table_cell_bold), Paragraph(value, body)]
                            for label, value in cover_rows],
                         colWidths=[46 * 2.83465, doc.width - 12 - 46 * 2.83465])
