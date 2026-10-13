@@ -63,9 +63,15 @@ def test_sourced_report_survives_approval_resume_and_isolated_download(tmp_path)
     assert document["kind"] == "route_comparison_report"
     assert document["status_label"] == "已核验推荐"
     assert document["rows"][0]["badge"] == "推荐"
-    assert {item["label"]: item["value"] for item in document["plan_metadata"]}["活动日期"] == "2026-10-18"
+    # A plain route-report export has no stored user plan record, so its
+    # arrangement fields render 待确认 — the model's own ``plan_details`` date is
+    # not treated as something the user supplied (ticket 05 AC4, no-invention).
+    assert {item["label"]: item["value"] for item in document["plan_metadata"]}["活动日期"] == "待确认"
     assert document["user_itinerary"][0]["focus"] == "集合与装备检查"
-    assert document["budget_total"] == "200 元"
+    # No server-side total is ever computed over the model-supplied budget lines
+    # (ticket 09 / the no-estimate rule): the total stays 待确认, and the user's
+    # own free-text note is carried verbatim elsewhere.
+    assert document["budget_total"] == "待确认"
     assert any(entry["tool"] == "offline_fixture"
                for group in document["sources"] for entry in group["entries"])
     assert "模型不应" not in contents[0]

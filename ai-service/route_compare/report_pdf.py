@@ -109,24 +109,23 @@ def _user_value(text: Any) -> str:
 
 def arrangement_values(result: ComparisonResult,
                        arrangements: Mapping[str, str] | None) -> dict[str, str]:
-    """The user's own record: the draft row with the stored arrangement row over it.
+    """The user's own record, nothing else.
 
-    ``arrangements`` is :meth:`PlanArrangementsRecord.as_values` — the eight
-    supplementary fields as submitted — merged on top of ``result.plan_details``,
-    because a submit restates the same record and is therefore the newer copy of
-    it. ``budget`` is the one key that is free text here and
-    :class:`~route_compare.models.BudgetItem` in the table: the text is carried as
-    the user's own note and is never parsed into an amount, so no price and no
-    total is ever produced here (seam contract AC2). Keys outside
-    :data:`ARRANGEMENT_FIELDS` are dropped rather than drawn.
+    Every user-arrangement field is drawn ONLY from ``arrangements`` — the
+    stored record :meth:`agent_v2.runs.RunRepository.get_plan_arrangements`
+    merged over the draft row by the export path. A field the user left blank
+    stays blank and renders 待确认 (seam contract AC2, ticket 05 AC4).
+
+    This deliberately does NOT seed from ``result.plan_details``: that object is
+    what the kernel composed for ``report_export``, so a model string would
+    otherwise render as if the user had supplied it — the invention the no-invention
+    invariant forbids. ``budget`` stays free text here and is never parsed into an
+    amount, so no price and no total is ever produced (AC2). Keys outside
+    :data:`ARRANGEMENT_FIELDS` are dropped rather than drawn. ``result`` is kept
+    in the signature because callers pass the gate-checked object through, not
+    because anything is read from it here.
     """
-    details = result.plan_details
     values = {key: "" for key, _label in _ARRANGEMENT_KEYS}
-    values["activity_date"] = (details.activity_date or "").strip()
-    values["participants"] = f"{details.participants} 人" if details.participants else ""
-    for key in ("meeting_time", "meeting_point", "leader", "transport",
-                "accommodation", "emergency_contact", "retreat_plan"):
-        values[key] = (getattr(details, key) or "").strip()
     supplied = arrangements or {}
     for key in values:
         value = supplied.get(key)
@@ -207,7 +206,12 @@ def _plan_sections(result: ComparisonResult, route_id: str | None,
         # The user's own free-text budget note travels as text: it is never parsed
         # into an amount, so no price and no total is created here (AC2).
         "budget_note": _user_value(values.get("budget")),
-        "budget_total": f"{sum(b.amount_yuan for b in details.budget):g} 元" if details.budget else "待确认",
+        # No server-side total is ever computed. The itemised ``budget`` above is
+        # the model's own plan_details, not a user-confirmed figure, and the spec
+        # rule (ticket 09 / plan_workflow:192) is that prices are never estimated
+        # and a total is never summed out of them. The 合计 therefore stays 待确认
+        # — a number the server cannot stand behind is not printed as one it can.
+        "budget_total": "待确认",
         "equipment": [
             {"category": "安全", "item": "手机、充电宝、头灯、急救包", "priority": "必带", "status": _UNKNOWN},
             {"category": "补给", "item": "饮水与能量补给", "priority": "必带", "status": _UNKNOWN},

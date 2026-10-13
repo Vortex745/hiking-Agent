@@ -242,7 +242,6 @@ def _research_query(destination_or_route: str) -> dict:
     return {
         "name": text[:100],
         "city": text[:80],
-        "origin": text[:100],
         "destination": text[:100],
     }
 

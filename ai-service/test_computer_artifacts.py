@@ -110,7 +110,7 @@ def test_pdf_plan_pages_have_readable_sections_and_no_orphan_headings() -> None:
                       "出发前检查", "候选路线对比", "排序依据与说明", "交通住宿与联络",
                       "人员分工", "费用预算", "来源与证据"):
             assert label in combined, label
-        assert "已列预算合计：200 元" in combined
+        assert "已列预算合计：待确认" in combined
         assert len(pdf) > 2
         for page in pdf:
             body_lines = [line for line in page.get_text().splitlines()

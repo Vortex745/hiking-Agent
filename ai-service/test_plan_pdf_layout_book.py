@@ -27,7 +27,7 @@ from agent_v2.computer import _render_pdf_bytes
 from route_compare.fixtures import fixture_candidates
 from route_compare.models import BudgetItem, PlanDetails, PlanStage
 from route_compare.providers import DeterministicProvider, ProviderConfig
-from route_compare.report_pdf import build_report_document
+from route_compare.report_pdf import arrangement_values, build_report_document
 from route_compare.service import compare_routes
 
 fitz = pytest.importorskip("fitz")
@@ -115,10 +115,13 @@ def test_a_safety_refusal_is_on_the_cover_in_the_gate_own_words() -> None:
 
 
 def test_the_summary_page_names_the_route_date_and_party_size() -> None:
+    # The date / party size reach the summary through the USER's stored record,
+    # not through the model's ``plan_details`` (which the kernel composes). This
+    # is ticket 05 AC4: an arrangement renders only when the user supplied it.
     document = build_report_document(
-        _result(plan_details=PlanDetails(activity_date="2026-10-18", participants=4,
-                                         meeting_time="08:00", leader="领队甲")),
-        plan_type="route_plan")
+        _result(), plan_type="route_plan",
+        arrangements={"activity_date": "2026-10-18", "participants": "4 人",
+                      "meeting_time": "08:00", "leader": "领队甲"})
     body = "\n".join(_pages(document))
 
     assert "计划摘要" in body
@@ -134,6 +137,33 @@ def test_a_summary_line_the_user_never_filled_stays_待确认() -> None:
 
     assert "待确认" in summary
     assert all(token not in summary for token in ("预计出发", "估算"))
+
+
+def test_an_arrangement_the_user_left_blank_is_not_backfilled_from_the_model() -> None:
+    """Ticket 05 AC4 / no-invention: the model is not the user's record.
+
+    ``arrangement_values`` used to seed every field from ``result.plan_details``
+    — a string the kernel composed — and only then overlay the stored user
+    values. So a field the user left blank rendered the model's text as if the
+    user had supplied it. The user-arrangement fields must come from the stored
+    user record ALONE: a blank stays blank (and renders 待确认), whatever the
+    draft's own ``plan_details`` happen to say.
+    """
+    result = _result(plan_details=PlanDetails(
+        activity_date="2026-10-18", participants=4, meeting_time="08:00",
+        leader="模型编的领队", emergency_contact="10086"))
+
+    # The user's record fills 集合时间 only; every other arrangement stays blank.
+    values = arrangement_values(result, {
+        "meeting_time": "07:30", "leader": "", "emergency_contact": ""})
+
+    assert values["meeting_time"] == "07:30"          # the user's own value
+    assert values["leader"] == ""                     # blank, not "模型编的领队"
+    assert values["emergency_contact"] == ""          # blank, not "10086"
+    # And the three minimal fields are not drawn from plan_details either when
+    # the record does not carry them.
+    assert values["activity_date"] == ""
+    assert values["participants"] == ""
 
 
 # ---- AC3: 时间线、风险决策区、装备、出发前检查 ------------------------------

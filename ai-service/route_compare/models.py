@@ -63,7 +63,7 @@ class RouteCandidate(Contract):
 class RouteQuery(Contract):
     name: str = Field(min_length=1, max_length=100)
     city: str = Field(min_length=1, max_length=80)
-    origin: str = Field(min_length=1, max_length=100)
+    origin: str = Field(default="", max_length=100)
     destination: str = Field(min_length=1, max_length=100)
 
 

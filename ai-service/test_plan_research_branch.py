@@ -510,6 +510,27 @@ def test_research_and_generic_draft_are_whitelisted_intents():
     assert choice.plan_type == "generic_draft"
 
 
+def test_a_research_query_never_fabricates_an_origin():
+    """Ticket 04 AC1 / no-invention: a free destination is only a destination.
+
+    ``_research_query`` turns one user-supplied 目的地 into a search term. The
+    user gave no starting point, so the query must not carry one: an
+    ``origin`` filled with the destination is an invented fact that could
+    later render as if the user had stated it. The field stays absent (or
+    empty), and the query is still a well-formed ``RouteQuery``.
+    """
+    from agent_v2.route_tools import _research_query
+    from route_compare.models import RouteQuery
+
+    query = _research_query("雨崩上村")
+    assert query["destination"] == "雨崩上村"
+    # No origin key, or one that is empty — never the destination echoed back
+    # as a starting point the user never gave.
+    assert not query.get("origin"), query
+    # Still a legal query the comparison leaf can validate.
+    RouteQuery.model_validate(query)
+
+
 # ---- The HTTP boundary (landmine: flow tests cannot see this) --------------
 
 import api.chat_v2 as chat_api  # noqa: E402
