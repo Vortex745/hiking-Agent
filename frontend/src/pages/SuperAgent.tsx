@@ -165,6 +165,18 @@ const PLAN_TYPE_LABELS: Record<V2PlanType, string> = {
 }
 
 /**
+ * The one box class the four plan notice panels share — the 确认 prompt, the
+ * 通用草案 choice, the 危险封闭 hard stop, and the 恢复草稿 panel. They rendered
+ * a byte-identical 16-utility string, which is a drift trap: adjust the shadow
+ * or the dark surface on three and the fourth silently disagrees. Named here so
+ * the box has one home. Kept in this file (not a component) so the class tokens
+ * stay in the source Tailwind scans, and `dark:` companions are preserved for
+ * the hardcoded light `border-border` / `bg-white` (media-query dark mode).
+ */
+const PLAN_NOTICE_PANEL_CLASS =
+  'absolute left-4 right-4 top-16 z-50 ml-auto max-w-sm rounded-md border border-border bg-white p-4 text-sm text-text-primary shadow-xl dark:border-white/10 dark:bg-[#1e1f20]'
+
+/**
  * Ticket 02: what a restored draft is waiting for. Keyed by the stage union,
  * so TypeScript forces a label for every stage a future ticket adds — the
  * same trick ``PLAN_INTENT_LABELS`` uses to keep the vocabulary from drifting.
@@ -2041,7 +2053,7 @@ function SuperAgent() {
               is the confirmation affordance; both answers travel as a
               whitelisted intent, never as text the server re-parses. */}
           {planDraft?.stage === 'awaiting_confirmation' && (
-            <div className="absolute left-4 right-4 top-16 z-50 ml-auto max-w-sm rounded-md border border-border bg-white p-4 text-sm text-text-primary shadow-xl dark:border-white/10 dark:bg-[#1e1f20]">
+            <div className={PLAN_NOTICE_PANEL_CLASS}>
               <div className="font-medium">是否生成计划书？</div>
               <p className="mt-1 text-xs text-text-muted">
                 你的请求还不够明确。确认后才会打开填写弹窗，未确认前不会生成任何计划内容。
@@ -2064,7 +2076,7 @@ function SuperAgent() {
               this prompt is not an action at all (ticket 02's park/cancel
               split: only 取消 cancels). */}
           {planDraft?.stage === 'awaiting_generic_choice' && (
-            <div className="absolute left-4 right-4 top-16 z-50 ml-auto max-w-sm rounded-md border border-border bg-white p-4 text-sm text-text-primary shadow-xl dark:border-white/10 dark:bg-[#1e1f20]">
+            <div className={PLAN_NOTICE_PANEL_CLASS}>
               <div className="font-medium">路线资料不足，无法形成正式路线计划</div>
               <p className="mt-1 text-xs text-text-muted">
                 已针对「{planDraft.draft.destination_or_route || '未填写的目的地'}」发起路线研究，
@@ -2091,7 +2103,7 @@ function SuperAgent() {
               plan_cancel, 修改安排 reopens the form locally (inert, ticket 02) so
               a different destination can be judged again. */}
           {planDraft?.stage === 'blocked_safety' && (
-            <div className="absolute left-4 right-4 top-16 z-50 ml-auto max-w-sm rounded-md border border-border bg-white p-4 text-sm text-text-primary shadow-xl dark:border-white/10 dark:bg-[#1e1f20]">
+            <div className={PLAN_NOTICE_PANEL_CLASS}>
               <div className="font-medium">安全门已阻止正式路线计划</div>
               <p className="mt-1 text-xs text-text-muted">
                 {PLAN_STAGE_LABELS.blocked_safety}
@@ -2133,7 +2145,7 @@ function SuperAgent() {
               It stays hidden while the dialog itself is open, and
               ``awaiting_confirmation`` has its own prompt above instead. */}
           {planDraft && !planDialogOpen && isReopenablePlanDraftStage(planDraft.stage) && (
-            <div className="absolute left-4 right-4 top-16 z-50 ml-auto max-w-sm rounded-md border border-border bg-white p-4 text-sm text-text-primary shadow-xl dark:border-white/10 dark:bg-[#1e1f20]">
+            <div className={PLAN_NOTICE_PANEL_CLASS}>
               <div className="font-medium">本会话有未完成的行程草稿</div>
               <p className="mt-1 text-xs text-text-muted">
                 草稿 {planDraft.draft_id ? planDraft.draft_id.slice(0, 8) : '—'}：

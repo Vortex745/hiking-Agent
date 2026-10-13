@@ -1381,3 +1381,25 @@ def test_the_safety_panel_adds_no_new_tailwind_class():
                 "text-xs", "mt-1", "mt-3", "justify-end", "gap-2", "flex-wrap",
                 "font-medium", "dark:border-white/10", "dark:bg-[#1e1f20]"):
         assert cls in page, cls
+
+
+def test_the_four_plan_notice_panels_share_one_box_class_constant():
+    """Code-review finding 11(a): the four plan notice panels — 确认 (awaiting_con-
+    firmation), 通用草案选择 (awaiting_generic_choice), 危险封闭 (blocked_safety),
+    恢复草稿 (restore) — each inlined a byte-identical box class. That is a drift
+    trap (fix the shadow on three and the fourth disagrees), so the box now has
+    ONE home: a module constant every panel references.
+
+    Behaviour-preserving, and there is no frontend runner, so the dedup is pinned
+    by the source: the shared box's distinguishing dark-mode tail appears exactly
+    once (in the constant, still in the file the CSS-generating scan reads, so
+    ``test_the_safety_panel_adds_no_new_tailwind_class`` keeps passing unchanged),
+    and all four panels reference the constant rather than re-inlining it.
+    """
+    page = _ts("src/pages/SuperAgent.tsx")
+
+    assert page.count("dark:bg-[#1e1f20]") == 1, (
+        "the shared box class must live in exactly one place"
+    )
+    assert "const PLAN_NOTICE_PANEL_CLASS" in page
+    assert page.count("className={PLAN_NOTICE_PANEL_CLASS}") == 4

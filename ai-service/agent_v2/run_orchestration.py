@@ -289,6 +289,49 @@ async def _production_kernel_turn(**kwargs: Any) -> tuple[str, list[dict[str, An
     return await run_chat_turn(**kwargs)
 
 
+# ---- Plan-draft persistence helpers ----------------------------------------
+#
+# Every plan turn writes its draft state through the same two rules, which
+# tickets 01-10 each re-spelled inline (code-review finding 11(c)): a row can
+# only be read or written when there is a repository AND a conversation key to
+# store it against (drafts live on the conversation axis, not the run axis),
+# and a persistence failure must NEVER break the stream — the draft state has
+# already travelled on ``plan.draft_state``, so the row is a best-effort mirror.
+# The predicate names the first rule once; the wrapper names the second.
+
+
+def _plan_persistence_available(runs_repo: Any, conversation_id: str | None) -> bool:
+    """Whether plan rows can be read or written for this turn."""
+    return runs_repo is not None and bool(conversation_id)
+
+
+def _persist_plan_write(
+    runs_repo: Any,
+    conversation_id: str | None,
+    *,
+    label: str,
+    action: Callable[[], Any],
+) -> Any:
+    """Run one plan-state write behind the persistence guard, swallowing failure.
+
+    Returns ``action()`` when there is a repository and a conversation to write
+    against, and ``None`` when the guard is not met or the write raised. The
+    raised case is logged (with the caller's ``label`` so the log line names
+    which row failed) and never re-raised: losing the durable mirror must not
+    abort a stream that already emitted its ``plan.draft_state`` frame.
+    """
+    if not _plan_persistence_available(runs_repo, conversation_id):
+        return None
+    try:
+        return action()
+    except Exception:
+        logger.exception(
+            "chat_v2: plan %s persistence failed for conversation=%s",
+            label, conversation_id,
+        )
+        return None
+
+
 # ---- Terminal-status helpers -----------------------------------------------
 #
 # Shared with the adapter (artifact / cowork flows and the resume path
@@ -1430,7 +1473,7 @@ class RunOrchestrator:
 
         stored = (
             runs_repo.get_plan_draft(req.conversation_id)
-            if runs_repo is not None and req.conversation_id
+            if _plan_persistence_available(runs_repo, req.conversation_id)
             else None
         )
         current_stage = PlanDraftStage(stored.stage) if stored else None
@@ -1442,7 +1485,7 @@ class RunOrchestrator:
         # ever submitted, so every arrangement stays 待确认, never guessed.
         stored_arrangements = (
             runs_repo.get_plan_arrangements(req.conversation_id)
-            if runs_repo is not None and req.conversation_id
+            if _plan_persistence_available(runs_repo, req.conversation_id)
             else None
         )
         # Ticket 07 AC4: the SECOND summary (and, from ticket 09 on, PDF approval)
@@ -1454,7 +1497,7 @@ class RunOrchestrator:
         # lost 集合时间 since that run read as review-ready.
         stored_check = (
             runs_repo.get_completeness_check(req.conversation_id)
-            if runs_repo is not None and req.conversation_id
+            if _plan_persistence_available(runs_repo, req.conversation_id)
             else None
         )
         recorded_completeness = (
@@ -1607,7 +1650,7 @@ class RunOrchestrator:
         # when the user clicked.
         stored_selection = (
             runs_repo.get_route_selection(req.conversation_id)
-            if runs_repo is not None and req.conversation_id
+            if _plan_persistence_available(runs_repo, req.conversation_id)
             else None
         )
         route_basis = None
@@ -1676,23 +1719,19 @@ class RunOrchestrator:
         # can promote a draft the gate does not support.
         plan_type = "route_plan" if route_basis is not None else "generic_draft"
 
-        record = None
-        if runs_repo is not None and req.conversation_id:
-            try:
-                record = runs_repo.save_plan_draft(
-                    conversation_id=req.conversation_id,
-                    stage=stage.value,
-                    destination_or_route=destination,
-                    activity_date=activity_date,
-                    participants=participants,
-                    updated_by_run_id=run_id or "",
-                )
-            except Exception:
-                logger.exception(
-                    "chat_v2: plan draft persistence failed for conversation=%s; "
-                    "stream continues with the in-stream draft state",
-                    req.conversation_id,
-                )
+        record = _persist_plan_write(
+            runs_repo,
+            req.conversation_id,
+            label="draft",
+            action=lambda: runs_repo.save_plan_draft(
+                conversation_id=req.conversation_id,
+                stage=stage.value,
+                destination_or_route=destination,
+                activity_date=activity_date,
+                participants=participants,
+                updated_by_run_id=run_id or "",
+            ),
+        )
 
         # AC3 in storage form: the reference lives beside the draft, never in
         # it. Written only after the draft row exists, because the reference is
@@ -1702,47 +1741,48 @@ class RunOrchestrator:
         # collected arrangements and the saved verdict go with the draft, so a
         # cancelled plan cannot leave a verdict (or a filled 集合时间) behind for
         # the next draft to inherit.
-        if runs_repo is not None and req.conversation_id:
-            try:
-                if stage is PlanDraftStage.CANCELLED:
-                    runs_repo.clear_route_selection(req.conversation_id)
-                    runs_repo.clear_plan_arrangements(req.conversation_id)
-                    runs_repo.clear_completeness_check(req.conversation_id)
-                    # Ticket 09: the safety row is unfinished plan state too —
-                    # a cancelled plan must not leave its last gate answer for
-                    # the next draft to inherit (ticket 06 landmine 7's rule).
-                    # PUBLISHED artifact versions are deliberately KEPT: they
-                    # are evidence of what was handed out, and old artifacts
-                    # keep their own download/expiry rules (AC5).
-                    runs_repo.clear_plan_safety(req.conversation_id)
-                    # Tickets 05/06 AC5: the confirmation records go with the
-                    # draft too — a cancelled plan must not leave "the user
-                    # confirmed the first/final summary" for the next draft.
-                    runs_repo.clear_plan_confirmations(req.conversation_id)
-                else:
-                    if route_reference is not None and record is not None:
-                        runs_repo.save_route_selection(
-                            conversation_id=req.conversation_id,
-                            draft_id=record.draft_id,
-                            comparison_id=route_reference[0],
-                            candidate_id=route_reference[1],
-                            selected_by_run_id=run_id or "",
-                        )
-                    # A submit rewrites the whole supplementary record: the form
-                    # sends all eight fields every time, so an omitted one is
-                    # cleared back to absent rather than silently kept.
-                    if fields is not None and record is not None and arrangement_values:
-                        runs_repo.save_plan_arrangements(
-                            conversation_id=req.conversation_id,
-                            draft_id=record.draft_id,
-                            arrangements=arrangement_values,
-                            updated_by_run_id=run_id or "",
-                        )
-            except Exception:
-                logger.exception(
-                    "chat_v2: plan route selection persistence failed for conversation=%s",
-                    req.conversation_id,
-                )
+        def _clear_or_write_plan_rows() -> None:
+            if stage is PlanDraftStage.CANCELLED:
+                runs_repo.clear_route_selection(req.conversation_id)
+                runs_repo.clear_plan_arrangements(req.conversation_id)
+                runs_repo.clear_completeness_check(req.conversation_id)
+                # Ticket 09: the safety row is unfinished plan state too —
+                # a cancelled plan must not leave its last gate answer for
+                # the next draft to inherit (ticket 06 landmine 7's rule).
+                # PUBLISHED artifact versions are deliberately KEPT: they
+                # are evidence of what was handed out, and old artifacts
+                # keep their own download/expiry rules (AC5).
+                runs_repo.clear_plan_safety(req.conversation_id)
+                # Tickets 05/06 AC5: the confirmation records go with the
+                # draft too — a cancelled plan must not leave "the user
+                # confirmed the first/final summary" for the next draft.
+                runs_repo.clear_plan_confirmations(req.conversation_id)
+            else:
+                if route_reference is not None and record is not None:
+                    runs_repo.save_route_selection(
+                        conversation_id=req.conversation_id,
+                        draft_id=record.draft_id,
+                        comparison_id=route_reference[0],
+                        candidate_id=route_reference[1],
+                        selected_by_run_id=run_id or "",
+                    )
+                # A submit rewrites the whole supplementary record: the form
+                # sends all eight fields every time, so an omitted one is
+                # cleared back to absent rather than silently kept.
+                if fields is not None and record is not None and arrangement_values:
+                    runs_repo.save_plan_arrangements(
+                        conversation_id=req.conversation_id,
+                        draft_id=record.draft_id,
+                        arrangements=arrangement_values,
+                        updated_by_run_id=run_id or "",
+                    )
+
+        _persist_plan_write(
+            runs_repo,
+            req.conversation_id,
+            label="route selection",
+            action=_clear_or_write_plan_rows,
+        )
 
         # Ticket 06 AC1/AC5: one deterministic pass over the fields exactly as
         # they were just stored, with the route basis the leaf re-read above —
@@ -1761,24 +1801,21 @@ class RunOrchestrator:
                 route=route_basis,
             )
         if (
-            runs_repo is not None
-            and req.conversation_id
-            and completeness is not None
+            completeness is not None
             and record is not None
             and stage is not PlanDraftStage.CANCELLED
         ):
-            try:
-                runs_repo.save_completeness_check(
+            _persist_plan_write(
+                runs_repo,
+                req.conversation_id,
+                label="completeness check",
+                action=lambda: runs_repo.save_completeness_check(
                     conversation_id=req.conversation_id,
                     draft_id=record.draft_id,
                     verdict=completeness,
                     checked_by_run_id=run_id or "",
-                )
-            except Exception:
-                logger.exception(
-                    "chat_v2: completeness check persistence failed for conversation=%s",
-                    req.conversation_id,
-                )
+                ),
+            )
 
         # Ticket 05 AC5 / ticket 06 AC5, and the record ticket 07 AC4's door reads:
         # an explicit confirmation is stored as a ROW, not only as the stage the
@@ -1788,12 +1825,7 @@ class RunOrchestrator:
         # recoverable record for restore and audit. Written only when the
         # confirmation transition actually LANDED on its stage (a refused or
         # bounced click stores nothing), keyed on the draft it was given over.
-        if (
-            runs_repo is not None
-            and req.conversation_id
-            and record is not None
-            and stage is not PlanDraftStage.CANCELLED
-        ):
+        if record is not None and stage is not PlanDraftStage.CANCELLED:
             confirmation_kind = (
                 "first" if intent == "plan_confirm_arrangements"
                 else "final" if intent == "plan_confirm_final"
@@ -1804,18 +1836,17 @@ class RunOrchestrator:
                 or (confirmation_kind == "final" and stage is PlanDraftStage.FINAL_REVIEWED)
             )
             if confirmation_landed:
-                try:
-                    runs_repo.record_plan_confirmation(
+                _persist_plan_write(
+                    runs_repo,
+                    req.conversation_id,
+                    label="confirmation",
+                    action=lambda: runs_repo.record_plan_confirmation(
                         conversation_id=req.conversation_id,
                         draft_id=record.draft_id,
                         kind=confirmation_kind or "",
                         confirmed_by_run_id=run_id or "",
-                    )
-                except Exception:
-                    logger.exception(
-                        "chat_v2: plan confirmation persistence failed for conversation=%s",
-                        req.conversation_id,
-                    )
+                    ),
+                )
 
         # Ticket 09 (ticket 07's record, finally a row): the deterministic route
         # gate's answer for THIS research turn is stored so the PDF cover's
@@ -1829,9 +1860,7 @@ class RunOrchestrator:
         # row decides nothing about report eligibility — ``render_report`` stays
         # the sole authority.
         if (
-            runs_repo is not None
-            and req.conversation_id
-            and record is not None
+            record is not None
             and intent == "plan_research_route"
             and stage is not PlanDraftStage.CANCELLED
         ):
@@ -1850,18 +1879,17 @@ class RunOrchestrator:
                     "required_action": research.result.required_action or "",
                 }
             if gate_answer is not None:
-                try:
-                    runs_repo.save_plan_safety(
+                _persist_plan_write(
+                    runs_repo,
+                    req.conversation_id,
+                    label="safety",
+                    action=lambda: runs_repo.save_plan_safety(
                         conversation_id=req.conversation_id,
                         draft_id=record.draft_id,
                         payload=gate_answer,
                         recorded_by_run_id=run_id or "",
-                    )
-                except Exception:
-                    logger.exception(
-                        "chat_v2: plan safety persistence failed for conversation=%s",
-                        req.conversation_id,
-                    )
+                    ),
+                )
 
         # Ticket 02 AC3: the summary is rendered from the fields that were just
         # stored, and it travels INSIDE the draft state so a later restore can

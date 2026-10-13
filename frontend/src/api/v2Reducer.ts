@@ -457,16 +457,26 @@ function readString(payload: Record<string, unknown>, key: string): string {
   return typeof value === 'string' ? value : ''
 }
 
+/**
+ * The one shape test every wire reader shares: is this an object we can index,
+ * or nothing at all? ``null`` for a non-object, an array, ``null``/``undefined``
+ * or any other falsy — a plain (non-array) object comes back as a record. Every
+ * reader used to re-spell the same "falsy-or-not-an-object-or-is-an-array" check
+ * inline (code-review finding 11(b)); one helper means a new reader cannot drop
+ * the array check and start treating a hostile localStorage mirror's ``[]`` as a
+ * payload.
+ */
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  return value as Record<string, unknown>
+}
+
 /** Helper: read an object field, undefined → undefined. */
 function readObject(
   payload: Record<string, unknown>,
   key: string,
 ): Record<string, unknown> | undefined {
-  const value = payload[key]
-  if (value && typeof value === 'object' && !Array.isArray(value)) {
-    return value as Record<string, unknown>
-  }
-  return undefined
+  return asRecord(payload[key]) ?? undefined
 }
 
 /**
@@ -483,8 +493,8 @@ function readObject(
 function readRouteSelection(
   value: unknown,
 ): V2PlanRouteReference | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
-  const raw = value as Record<string, unknown>
+  const raw = asRecord(value)
+  if (!raw) return null
   const comparisonId = raw['comparison_id']
   const candidateId = raw['candidate_id']
   if (typeof comparisonId !== 'string' || !comparisonId) return null
@@ -520,8 +530,8 @@ function readMissingPlanFields(value: unknown): V2PlanMissingField[] {
   if (!Array.isArray(value)) return []
   const fields: V2PlanMissingField[] = []
   for (const raw of value) {
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
-    const entry = raw as Record<string, unknown>
+    const entry = asRecord(raw)
+    if (!entry) continue
     const key = entry['key']
     const label = entry['label']
     const status = entry['status']
@@ -541,9 +551,7 @@ function readMissingPlanFields(value: unknown): V2PlanMissingField[] {
  * enumeration (a smuggled distance or budget total) is dropped, not drawn.
  */
 function readPlanArrangements(value: unknown): V2PlanArrangementFields {
-  const record = value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : {}
+  const record = asRecord(value) ?? {}
   const arrangements = {} as V2PlanArrangementFields
   for (const key of V2_PLAN_ARRANGEMENT_KEYS) {
     const entry = record[key]
@@ -565,8 +573,8 @@ function readStringArray(value: unknown): string[] {
  * copy exists for.
  */
 function readPlanRules(value: unknown): V2PlanCompletenessRules | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
-  const rules = value as Record<string, unknown>
+  const rules = asRecord(value)
+  if (!rules) return null
   const verdict = rules['verdict']
   if (typeof verdict !== 'string' || !V2_PLAN_VERDICTS.has(verdict as V2PlanCompletenessRules['verdict'])) {
     return null
@@ -574,8 +582,8 @@ function readPlanRules(value: unknown): V2PlanCompletenessRules | null {
   const reasons: V2PlanReviewReason[] = []
   if (Array.isArray(rules['reasons'])) {
     for (const raw of rules['reasons']) {
-      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
-      const entry = raw as Record<string, unknown>
+      const entry = asRecord(raw)
+      if (!entry) continue
       if (typeof entry['code'] !== 'string' || !entry['code']) continue
       if (typeof entry['message'] !== 'string' || !entry['message']) continue
       reasons.push({ code: entry['code'], message: entry['message'] })
@@ -585,8 +593,8 @@ function readPlanRules(value: unknown): V2PlanCompletenessRules | null {
     const out: V2PlanRuleGap[] = []
     const rawList = Array.isArray(rules[key]) ? rules[key] as unknown[] : []
     for (const raw of rawList) {
-      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
-      const entry = raw as Record<string, unknown>
+      const entry = asRecord(raw)
+      if (!entry) continue
       if (typeof entry['key'] !== 'string' || !entry['key']) continue
       out.push({ key: entry['key'], label: typeof entry['label'] === 'string' ? entry['label'] : entry['key'] })
     }
@@ -595,8 +603,8 @@ function readPlanRules(value: unknown): V2PlanCompletenessRules | null {
   const formatIssues: V2PlanFormatIssue[] = []
   const rawIssues = Array.isArray(rules['format_issues']) ? rules['format_issues'] as unknown[] : []
   for (const raw of rawIssues) {
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
-    const entry = raw as Record<string, unknown>
+    const entry = asRecord(raw)
+    if (!entry) continue
     if (typeof entry['key'] !== 'string' || !entry['key']) continue
     if (typeof entry['message'] !== 'string' || !entry['message']) continue
     formatIssues.push({
@@ -608,8 +616,8 @@ function readPlanRules(value: unknown): V2PlanCompletenessRules | null {
   const matches: V2PlanEvidenceMatch[] = []
   const rawMatches = Array.isArray(rules['matches']) ? rules['matches'] as unknown[] : []
   for (const raw of rawMatches) {
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
-    const entry = raw as Record<string, unknown>
+    const entry = asRecord(raw)
+    if (!entry) continue
     if (typeof entry['arrangement_key'] !== 'string' || !entry['arrangement_key']) continue
     if (typeof entry['status'] !== 'string' || !entry['status']) continue
     matches.push({
@@ -639,8 +647,8 @@ function readPlanRules(value: unknown): V2PlanCompletenessRules | null {
  * string, and the gate's own reason lines are kept only as strings.
  */
 function readPlanSafety(value: unknown): V2PlanSafety | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
-  const safety = value as Record<string, unknown>
+  const safety = asRecord(value)
+  if (!safety) return null
   const rawCodes = Array.isArray(safety['codes']) ? safety['codes'] as unknown[] : []
   const codes = rawCodes.filter(
     (code): code is string => typeof code === 'string' && V2_PLAN_SAFETY_CODES.includes(code),

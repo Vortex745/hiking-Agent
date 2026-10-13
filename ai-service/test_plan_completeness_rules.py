@@ -952,6 +952,44 @@ def test_the_collected_arrangements_have_all_four_frontend_homes():
     assert "planDraft.rules" in rules
 
 
+def test_the_six_plan_wire_readers_share_one_object_guard():
+    """Code-review finding 11(b): the six wire readers (``readRouteSelection``,
+    ``readMissingPlanFields`` per-entry, ``readPlanRules`` top + four per-entry
+    loops, ``readPlanSafety``, ``readPlanArrangements``, ``readObject``) each
+    spelled the same `!value || typeof value !== 'object' || Array.isArray(value)`
+    shape check inline. That is a drift trap TypeScript cannot see: a reader
+    that drops the array check would accept a hostile localStorage mirror's
+    ``[]`` as a record, and a reader that inverts the null check would accept
+    ``null`` — both would then index a non-object as if it were a payload.
+
+    All six now delegate to one ``asRecord`` helper, so the predicate is
+    spelled once and every reader agrees on what counts as an object.
+
+    Pinned by the source, since there is no frontend runner: ``!== 'object'``
+    appears exactly once (inside the helper), and each of the six reader
+    bodies calls ``asRecord(``.
+    """
+    reducer = _ts("src/api/v2Reducer.ts")
+
+    assert "function asRecord(value: unknown)" in reducer, "the shared helper exists"
+    helper_start = reducer.index("function asRecord(value: unknown)")
+    helper_end = reducer.index("\n}", helper_start) + 2
+    helper = reducer[helper_start:helper_end]
+    assert "!== 'object'" in helper and "Array.isArray(value)" in helper
+
+    assert reducer.count("!== 'object'") == 1, (
+        "only asRecord re-spells the negative guard inline"
+    )
+    for reader in ("readRouteSelection", "readMissingPlanFields",
+                   "readPlanArrangements", "readPlanRules",
+                   "readPlanSafety", "readObject"):
+        start = reducer.index(f"function {reader}(")
+        # Slice to the next top-level function boundary.
+        nxt = re.search(r"\n(?:export )?function ", reducer[start + 1:])
+        end = start + 1 + (nxt.start() if nxt else len(reducer) - start - 1)
+        assert "asRecord(" in reducer[start:end], f"{reader} must delegate to asRecord"
+
+
 def test_the_dialog_still_parks_on_dismiss_and_keeps_its_props_contract():
     """The dialog is ticket 06's to extend, but not to restructure: the read-only
     ``summary`` slot and the park/cancel split stay exactly as tickets 01/02 left
