@@ -43,8 +43,12 @@ def test_the_renderer_types_no_plan_status_marker_of_its_own() -> None:
     literals = [node.value for node in ast.walk(tree)
                 if isinstance(node, ast.Constant) and isinstance(node.value, str)
                 and id(node) not in docstrings]
-    typed = [text for text in literals if plan_workflow.UNCONFIRMED in text
-             or plan_workflow.UNVERIFIED in text]
+    # Scan for the CURRENT constant values AND for the two words
+    # ``docs/plan-pdf-format.md`` documents (未知安排留空显示"待确认"，未知事实显示
+    # "待核验"): after a rename, a half-migrated renderer still holds the OLD word,
+    # and that is exactly the file this pin exists to catch.
+    needles = {plan_workflow.UNCONFIRMED, plan_workflow.UNVERIFIED, "待确认", "待核验"}
+    typed = [text for text in literals if any(word in text for word in needles)]
     assert typed == [], f"placeholders must come from plan_workflow, not as literals: {typed}"
 
     # …and the shared constants really are imported here, so the check above cannot
