@@ -1812,8 +1812,20 @@ function SuperAgent() {
   }, [handleSend])
 
   const handlePlanDialogSubmit = useCallback((fields: V2PlanDraftFields) => {
-    void handleSend('', { intent: 'plan_create', planInput: fields })
-  }, [handleSend])
+    // Ticket 01 whitelisted ``plan_regenerate`` for the one act this dialog can
+    // do twice: reopen the form on a draft that is already ``minimal_draft``
+    // (02's 「恢复草稿」 / 「修改安排」, which re-seeds from the stored fields) and
+    // re-submit edited arrangements. That is a re-render of the draft the user
+    // already has — the server's own guard allows ``plan_regenerate`` only from
+    // ``minimal_draft`` and rewrites the arrangement record just like a create,
+    // so no new wire field travels (``plan_input`` already does). A first
+    // submit — no draft yet, or the form-open stage — still creates. It fires
+    // only on this explicit click, never on reopen, so regeneration stays a
+    // USER act (there is no auto-regenerate anywhere on this path).
+    const intent: V2PlanIntent =
+      planDraft?.stage === 'minimal_draft' ? 'plan_regenerate' : 'plan_create'
+    void handleSend('', { intent, planInput: fields })
+  }, [handleSend, planDraft])
 
   // Ticket 03 AC1: pick the recommendation or an alternative from a comparison
   // the thread already shows. The send carries the two-id reference and nothing

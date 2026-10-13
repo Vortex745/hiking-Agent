@@ -483,3 +483,41 @@ def test_restore_wiring_is_present_and_conversation_keyed():
     # left, without restructuring it.
     assert "summary" in dialog
     assert "summary={planDraft?.summary}" in page
+
+
+def test_the_dialog_editing_an_existing_draft_sends_plan_regenerate():
+    """Code-review finding 8: ``plan_regenerate`` was whitelisted + labelled but no
+    client path ever sent it — a dead intent is a trap for the next reader.
+
+    It is wired to the one affordance its own contract already describes: the
+    reopen affordance (02's 「恢复草稿」 / 「修改安排」, ticket 02 AC2) re-seeds the
+    form from the stored draft, so submitting it again is "re-render the draft I
+    already have with edited arrangements" — which is exactly the server-side
+    ``plan_regenerate`` guard (``evaluate_plan_intent`` re-enters ``minimal_draft``
+    only from a draft that is already there, and refuses it everywhere else with
+    ``regenerate_without_draft``). A first submission (no draft, or the form-open
+    stage) still sends ``plan_create``.
+
+    Deliberately a source pin — there is no frontend runner — but it pins the
+    behaviour, not incidental copy: the branch is the existing ``minimal_draft``
+    stage, both exits collect-and-store the dialog's fields (``planInput``), and
+    reopening itself stays local so no regenerate can fire without a click.
+    """
+    page = (FRONTEND / "src/pages/SuperAgent.tsx").read_text(encoding="utf-8")
+    submit = _ts_callback(page, "handlePlanDialogSubmit")
+
+    # Editing a draft that already sits at minimal_draft regenerates; anything
+    # else (the fresh open, a review stage where the server refuses regenerate)
+    # creates — the same two intents ticket 01 whitelists for field collection.
+    assert "planDraft?.stage === 'minimal_draft'" in submit
+    assert "'plan_regenerate'" in submit
+    assert "'plan_create'" in submit
+    # Both travel the dialog's collected fields, so the rewrite happens on the
+    # stored record exactly like a create (no new wire field is introduced).
+    assert "planInput: fields" in submit
+
+    # Reaching that edit stays the local reopen (no request leaves the page on
+    # reopen itself), so a regenerate is only ever a user act, never automatic.
+    restore = _ts_callback(page, "handleRestorePlanDraft")
+    assert "handleRestorePlanDraft" in page
+    assert "plan_regenerate" not in restore and "handleSend" not in restore
