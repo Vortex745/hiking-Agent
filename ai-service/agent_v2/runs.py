@@ -472,6 +472,41 @@ class RunRepository:
         """Drop the conversation's safety row (cancelled plan)."""
         return self.control.clear_plan_safety_record(conversation_id)
 
+    # -- confirmations (ticket 05 AC5 / ticket 06 AC5; ticket 07's door) --
+
+    def record_plan_confirmation(
+        self,
+        *,
+        conversation_id: str,
+        draft_id: str,
+        kind: str,
+        confirmed_by_run_id: str = "",
+    ):
+        """Record that the user confirmed one summary of the draft.
+
+        ``kind`` is ``"first"`` (the arrangements summary) or ``"final"`` (the
+        whole-book summary). This is the durable answer to "did the user confirm
+        the FIRST summary", which ``plan_drafts.stage`` cannot give once the next
+        transition overwrites it. Decides nothing — :func:`evaluate_plan_intent`
+        stays the only transition decider and
+        :func:`agent_v2.plan_workflow.pdf_approval_block_reason` the only PDF
+        question; this only stores the fact that a confirmation click landed.
+        """
+        return self.control.upsert_plan_confirmation_record(
+            conversation_id=conversation_id,
+            draft_id=draft_id,
+            kind=kind,
+            confirmed_by_run_id=confirmed_by_run_id,
+        )
+
+    def get_plan_confirmation(self, conversation_id: str, kind: str):
+        """The conversation's confirmation row for ``kind``, or ``None``."""
+        return self.control.get_plan_confirmation_record(conversation_id, kind)
+
+    def clear_plan_confirmations(self, conversation_id: str) -> int:
+        """Drop the conversation's confirmation rows (cancelled plan)."""
+        return self.control.clear_plan_confirmation_records(conversation_id)
+
     def mark_run_done(self, run_id: str) -> None:
         """Transition a running run to ``done`` terminal.
 

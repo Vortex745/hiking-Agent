@@ -428,6 +428,31 @@ CREATE TABLE IF NOT EXISTS plan_safety_records (
 
 CREATE INDEX IF NOT EXISTS idx_plan_safety_records_draft
 ON plan_safety_records(draft_id);
+
+-- Ticket 05 AC5 / ticket 06 AC5, enforced by ticket 07: an explicit confirmation
+-- is a RECORD, not only a stage. ``plan_drafts.stage`` is overwritten by the next
+-- transition, so "the user confirmed the FIRST summary" and "the user confirmed
+-- the FINAL summary" are not recoverable from it — yet AC4's PDF door and the
+-- audit both need them back. One row per (conversation, kind), ``kind`` in
+-- {first, final}: the first summary and the second summary are two distinct
+-- confirmations that must survive one another and every later stage move. A NEW
+-- table (never a ``plan_drafts`` column — ``ControlStore.__init__`` only runs
+-- CREATE TABLE IF NOT EXISTS, so an added column silently never exists on an
+-- existing database). Deliberately NOT FK'd to ``run_id``: run-scoped tables
+-- cascade-delete with the run, and a confirmation must outlive the turn that
+-- recorded it; ``confirmed_by_run_id`` is a plain audit string for the same reason.
+CREATE TABLE IF NOT EXISTS plan_confirmations (
+    conversation_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('first', 'final')),
+    draft_id TEXT NOT NULL,
+    confirmed_by_run_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (conversation_id, kind)
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_confirmations_draft
+ON plan_confirmations(draft_id);
 """
 
 
@@ -720,6 +745,27 @@ class PlanSafetyRecord:
             "gate_reasons": list(self.gate_reasons),
             "required_action": self.required_action,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class PlanConfirmationRecord:
+    """Snapshot of a plan_confirmations row (ticket 05 AC5 / ticket 06 AC5).
+
+    One explicit confirmation the user gave — the FIRST summary (their own
+    arrangements) or the FINAL summary (the whole book) — as a durable record.
+    ``kind`` is ``"first"`` or ``"final"``; ``draft_id`` names the draft it was
+    given on and ``confirmed_by_run_id`` the turn that carried it. Nothing is
+    derived here: it stores only that a confirmation click landed, which is what
+    the ``plan_drafts.stage`` (overwritten by the next transition) cannot answer
+    after the fact.
+    """
+
+    conversation_id: str
+    kind: str
+    draft_id: str
+    confirmed_by_run_id: str
+    created_at: str
+    updated_at: str
 
 
 # ---- Approval statuses (Ticket 11) ---------------------------------------
@@ -1972,6 +2018,97 @@ class ControlStore:
         try:
             cursor = self._conn.execute(
                 "DELETE FROM plan_safety_records WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return cursor.rowcount
+
+    # -- confirmations (ticket 05 AC5 / ticket 06 AC5) --------------------
+
+    _CONFIRMATION_KINDS = ("first", "final")
+
+    def upsert_plan_confirmation_record(
+        self,
+        *,
+        conversation_id: str,
+        draft_id: str,
+        kind: str,
+        confirmed_by_run_id: str = "",
+    ) -> PlanConfirmationRecord:
+        """Record that the user confirmed one summary of the conversation's draft.
+
+        ``kind`` is ``"first"`` (the arrangements summary, ticket 05 AC5) or
+        ``"final"`` (the whole-book summary, ticket 07 AC4). One row per
+        ``(conversation, kind)``: confirming the first summary is not overwritten
+        by the later final confirmation, and neither is erased by a stage move —
+        that is the whole point of the table, since ``plan_drafts.stage`` cannot
+        hold both facts. The row is keyed on the draft it was given over, so a
+        re-submitted (new) draft's confirmations never describe the previous one.
+        """
+        if not (conversation_id or "").strip():
+            raise ValueError("invalid plan confirmation conversation_id")
+        if not (draft_id or "").strip():
+            raise ValueError("invalid plan confirmation draft_id")
+        if kind not in self._CONFIRMATION_KINDS:
+            raise ValueError(f"invalid plan confirmation kind: {kind!r}")
+        now = _now_iso()
+        existing = self.get_plan_confirmation_record(conversation_id, kind)
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute(
+                "INSERT INTO plan_confirmations "
+                "(conversation_id, kind, draft_id, confirmed_by_run_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(conversation_id, kind) DO UPDATE SET "
+                " draft_id = excluded.draft_id, "
+                " confirmed_by_run_id = excluded.confirmed_by_run_id, "
+                " updated_at = excluded.updated_at",
+                (conversation_id, kind, draft_id, confirmed_by_run_id or "", now,
+                 existing["created_at"] if existing else now),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        record = self.get_plan_confirmation_record(conversation_id, kind)
+        assert record is not None  # just wrote it
+        return record
+
+    def get_plan_confirmation_record(
+        self, conversation_id: str, kind: str,
+    ) -> PlanConfirmationRecord | None:
+        if kind not in self._CONFIRMATION_KINDS:
+            raise ValueError(f"invalid plan confirmation kind: {kind!r}")
+        row = self._conn.execute(
+            "SELECT * FROM plan_confirmations WHERE conversation_id = ? AND kind = ?",
+            (conversation_id, kind),
+        ).fetchone()
+        if row is None:
+            return None
+        return PlanConfirmationRecord(
+            conversation_id=row["conversation_id"],
+            kind=row["kind"],
+            draft_id=row["draft_id"],
+            confirmed_by_run_id=row["confirmed_by_run_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def clear_plan_confirmation_records(self, conversation_id: str) -> int:
+        """Drop the conversation's confirmation rows (cancelled plan).
+
+        Part of ticket 02 AC4's unfinished-state clearing: a cancelled plan must
+        not leave "the user confirmed the first / final summary" behind for the
+        next draft to inherit, exactly like the arrangements, verdict and safety
+        rows it is cleared beside.
+        """
+        self._conn.execute("BEGIN")
+        try:
+            cursor = self._conn.execute(
+                "DELETE FROM plan_confirmations WHERE conversation_id = ?",
                 (conversation_id,),
             )
             self._conn.execute("COMMIT")

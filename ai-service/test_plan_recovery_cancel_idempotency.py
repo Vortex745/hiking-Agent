@@ -703,6 +703,41 @@ def _available(frames: list[dict]) -> list[dict]:
     return [f for f in frames if f["type"] == "artifact.available"]
 
 
+def test_confirmations_are_recoverable_records_not_just_the_stage(flow):
+    """Tickets 05/06 AC5: an explicit confirmation survives the next transition.
+
+    ``plan_drafts.stage`` records the CURRENT stage only — the final confirmation
+    overwrites "the first summary was confirmed". The new ``plan_confirmations``
+    table keeps BOTH as rows, exposed only through the RunRepository facade, so
+    "the user confirmed the FIRST summary" is a recoverable, auditable fact and
+    not a stage the next click erased. A cancel clears them with the rest of the
+    unfinished plan state.
+    """
+    _post_sse(flow.app, flow.subject, _submit("req-conf"))
+    assert flow.repo.get_plan_confirmation(CONV, "first") is None
+    assert flow.repo.get_plan_confirmation(CONV, "final") is None
+
+    _advance_to_final(flow.app, flow.subject, flow.repo, tag="req-conf")
+    draft = flow.repo.get_plan_draft(CONV)
+
+    first = flow.repo.get_plan_confirmation(CONV, "first")
+    final = flow.repo.get_plan_confirmation(CONV, "final")
+    assert first is not None and first.kind == "first"
+    assert final is not None and final.kind == "final"
+    # Both point at the same draft the confirmations were given over.
+    assert first.draft_id == final.draft_id == draft.draft_id
+    # The stage now reads final_reviewed — yet the FIRST confirmation is still on
+    # record, which is exactly what the stage alone cannot tell you.
+    assert draft.stage == "final_reviewed"
+
+    cancelled = _post_sse(flow.app, flow.subject, {
+        "message": "取消计划", "request_id": "req-conf-cancel", "conversation_id": CONV,
+        "profile_id": "chat", "intent": "plan_cancel"})
+    assert cancelled[-1]["type"] == "done"
+    assert flow.repo.get_plan_confirmation(CONV, "first") is None
+    assert flow.repo.get_plan_confirmation(CONV, "final") is None
+
+
 # ---- AC5: the terminal, the draft rows and the artifact rows agree ---------
 
 def _drive_plan_turn_with_cancel(flow, request_id: str, stop_at: str) -> list[str]:

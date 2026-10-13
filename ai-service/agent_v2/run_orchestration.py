@@ -1705,6 +1705,10 @@ class RunOrchestrator:
                     # are evidence of what was handed out, and old artifacts
                     # keep their own download/expiry rules (AC5).
                     runs_repo.clear_plan_safety(req.conversation_id)
+                    # Tickets 05/06 AC5: the confirmation records go with the
+                    # draft too — a cancelled plan must not leave "the user
+                    # confirmed the first/final summary" for the next draft.
+                    runs_repo.clear_plan_confirmations(req.conversation_id)
                 else:
                     if route_reference is not None and record is not None:
                         runs_repo.save_route_selection(
@@ -1765,6 +1769,43 @@ class RunOrchestrator:
                     "chat_v2: completeness check persistence failed for conversation=%s",
                     req.conversation_id,
                 )
+
+        # Ticket 05 AC5 / ticket 06 AC5, and the record ticket 07 AC4's door reads:
+        # an explicit confirmation is stored as a ROW, not only as the stage the
+        # next transition overwrites. Confirming the first summary and confirming
+        # the final summary are two facts that must survive one another and every
+        # later stage move, so "the user confirmed the FIRST summary" is a
+        # recoverable record for restore and audit. Written only when the
+        # confirmation transition actually LANDED on its stage (a refused or
+        # bounced click stores nothing), keyed on the draft it was given over.
+        if (
+            runs_repo is not None
+            and req.conversation_id
+            and record is not None
+            and stage is not PlanDraftStage.CANCELLED
+        ):
+            confirmation_kind = (
+                "first" if intent == "plan_confirm_arrangements"
+                else "final" if intent == "plan_confirm_final"
+                else None
+            )
+            confirmation_landed = (
+                (confirmation_kind == "first" and stage is PlanDraftStage.FIRST_REVIEWED)
+                or (confirmation_kind == "final" and stage is PlanDraftStage.FINAL_REVIEWED)
+            )
+            if confirmation_landed:
+                try:
+                    runs_repo.record_plan_confirmation(
+                        conversation_id=req.conversation_id,
+                        draft_id=record.draft_id,
+                        kind=confirmation_kind or "",
+                        confirmed_by_run_id=run_id or "",
+                    )
+                except Exception:
+                    logger.exception(
+                        "chat_v2: plan confirmation persistence failed for conversation=%s",
+                        req.conversation_id,
+                    )
 
         # Ticket 09 (ticket 07's record, finally a row): the deterministic route
         # gate's answer for THIS research turn is stored so the PDF cover's
