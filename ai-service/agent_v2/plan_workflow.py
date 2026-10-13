@@ -302,8 +302,20 @@ _PLAN_VERBS: tuple[str, ...] = ("生成", "制作", "制定", "做", "写", "出
 #: "路线" is deliberately absent: asking about a route is a question, not
 #: a plan-book request, and must fall through to ordinary chat.
 _PLANNING_HINTS: tuple[str, ...] = ("行程", "规划", "安排", "计划")
+#: Asking about an existing plan is a question, not a request to make one, so it
+#: must fall through to ordinary chat rather than park for a confirmation.
+_QUESTION_MARKERS: tuple[str, ...] = ("？", "?", "吗", "呢", "会不会", "是不是")
+#: The request signal that turns a bare planning noun into a planning ask.
+_PLANNING_REQUEST_MARKERS: tuple[str, ...] = (
+    *_PLAN_VERBS, "帮我", "我想", "我要", "需要", "帮忙",
+)
 #: Aspiring-but-uncommitted phrasings ("想去…还没定").
 _ASPIRATION_HINTS: tuple[str, ...] = ("想去", "打算去", "还没定", "还没决定", "考虑去")
+
+
+def _looks_like_question(message: str) -> bool:
+    """A yes/no or wh- question about a plan, not a request to produce one."""
+    return any(marker in message for marker in _QUESTION_MARKERS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,8 +354,21 @@ def classify_plan_request(text: str) -> PlanIntentClassification:
 
     hints = tuple(term for term in _PLANNING_HINTS if term in message)
     aspirations = tuple(term for term in _ASPIRATION_HINTS if term in message)
-    if hints or aspirations:
+    if aspirations:
+        # An aspiration to go («想去…还没定») is exactly the undecided planning
+        # ticket 01 AC2 asks to park for a confirmation — nothing else needed.
         return PlanIntentClassification("ambiguous", hints + aspirations)
+
+    # A bare planning noun («安排 / 计划 / 行程 / 规划») is NOT by itself a planning
+    # intent: it is ordinary conversation («你有什么安排», «我的计划排满了»). Parking
+    # those wrote a draft row for a chat the user never meant as planning (ticket 01
+    # asked only for an ambiguous PLANNING intent). Ambiguous therefore requires the
+    # hint to sit inside a request — a planning verb or a first-person ask — and not
+    # inside a question about an existing plan.
+    if hints and not _looks_like_question(message):
+        request = tuple(term for term in _PLANNING_REQUEST_MARKERS if term in message)
+        if request:
+            return PlanIntentClassification("ambiguous", hints + request)
 
     return PlanIntentClassification("not_plan_intent")
 

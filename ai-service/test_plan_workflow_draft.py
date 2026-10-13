@@ -102,6 +102,29 @@ def test_classifier_does_not_hijack_ordinary_chat():
         assert classify_plan_request(text).outcome == "not_plan_intent", text
 
 
+def test_a_bare_planning_word_in_ordinary_chat_is_not_a_planning_intent():
+    """P2 scope-creep fix: ticket 01 asked for ambiguous PLANNING intent only.
+
+    ``行程 / 规划 / 安排 / 计划`` appear in ordinary conversation — a question or a
+    statement that has nothing to do with generating a plan book. Catching those
+    parked the message in ``awaiting_confirmation`` and wrote a draft row for a
+    chat the user never meant as planning. A bare planning noun, or one wrapped in
+    a non-planning request, is ordinary chat; only an aspiration to go / a planning
+    ask stays ambiguous.
+    """
+    for text in (
+        "你明天有什么安排吗",
+        "我的工作计划已经排满了",
+        "这个行程会不会太赶",
+    ):
+        assert classify_plan_request(text).outcome == "not_plan_intent", text
+
+    # An explicit planning ask still parks for confirmation (ticket 01 AC2), and so
+    # does an aspiration to go — those are the two the classifier is for.
+    assert classify_plan_request("帮我规划一下行程").outcome == "ambiguous"
+    assert classify_plan_request("周末想去爬山，还没定").outcome == "ambiguous"
+
+
 def test_classifier_requires_an_explicit_plan_book_request():
     """AC4: only an unambiguous plan-book ask opens the flow directly."""
     for text in (
