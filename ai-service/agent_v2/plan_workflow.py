@@ -51,6 +51,13 @@ from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+# The two status markers are defined at the bottom of the stack, in the layer whose
+# own distinctions they are (:mod:`route_compare.models`), so the PDF document builder
+# in ``route_compare`` can use them without reading up into ``agent_v2``. They are
+# re-exported here — this module is the plan vocabulary the rest of ``agent_v2`` and
+# the tests read — and they stay the ONLY definitions.
+from route_compare.models import UNCONFIRMED, UNVERIFIED
+
 # ---- Intent whitelist ------------------------------------------------------
 
 PlanIntent = Literal[
@@ -989,8 +996,11 @@ def evaluate_plan_intent(
 #: Unknown user arrangement — the field was never filled in. Unknown route
 #: fact — no verified evidence exists. The distinction is the content
 #: boundary in docs/plan-pdf-format.md; they are never interchangeable.
-UNCONFIRMED = "待确认"
-UNVERIFIED = "待核验"
+#:
+#: :data:`UNCONFIRMED` / :data:`UNVERIFIED` are imported above from
+#: :mod:`route_compare.models` and re-exported here: one definition, so the draft
+#: text, the checklist, the PDF document and the renderer cannot each hold their own
+#: spelling of the same two words (see ``test_the_plan_document_layers_type_no_status_marker_of_its_own``).
 
 #: The user-arrangement record, in display order and with the labels the plan
 #: document uses (docs/plan-pdf-format.md: 日期、集合、人数、领队、交通住宿、

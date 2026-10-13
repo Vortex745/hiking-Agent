@@ -10,6 +10,19 @@ class Contract(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
 
+#: The two status markers of an incomplete plan, defined at the bottom of the stack
+#: because both halves of the split are this layer's own distinctions: an
+#: *arrangement* is what the user states (:class:`PlanDetails`) and a *fact* is what
+#: the evidence gate certifies (:class:`Fact`), so "not yet supplied" and "not yet
+#: verified" are domain facts, not presentation choices
+#: (docs/plan-pdf-format.md: 未知安排留空显示"待确认"，未知事实显示"待核验").
+#: :mod:`agent_v2.plan_workflow` re-exports them as the plan vocabulary the dialogs,
+#: summaries and checklist use, which keeps ONE definition and keeps the import
+#: direction honest — ``route_compare`` never reads up into ``agent_v2``.
+UNCONFIRMED = "待确认"
+UNVERIFIED = "待核验"
+
+
 class Confidence(Contract):
     kind: Literal["heuristic", "calibrated", "unavailable"] = "unavailable"
     value: float | None = Field(default=None, ge=0, le=1)

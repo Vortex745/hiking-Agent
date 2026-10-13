@@ -12,24 +12,26 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
-from agent_v2.plan_workflow import ARRANGEMENT_FIELDS, UNCONFIRMED, UNVERIFIED
-from .models import ComparisonResult
+from .models import UNCONFIRMED, UNVERIFIED, ComparisonResult
 
 REPORT_KIND = "route_comparison_report"
 
-#: The arrangement labels are ``plan_workflow``'s — the record the checklist and
-#: the draft render from. Re-typing them here was the drift ticket 06 named, so
-#: a field can no longer exist in one place and be missing from the PDF.
-ARRANGEMENT_LABELS: dict[str, str] = dict(ARRANGEMENT_FIELDS)
-_ARRANGEMENT_KEYS: tuple[str, ...] = tuple(ARRANGEMENT_FIELDS)
+#: The arrangement labels arrive as an ARGUMENT (:func:`build_report_document`'s
+#: ``arrangement_labels``) rather than being read from a module: they are the plan
+#: vocabulary the draft collects and the 缺失字段清单 enumerates, and this layer sits
+#: BELOW ``agent_v2``, so reaching up for them was the inversion ticket 06's drift
+#: guard accidentally created. The caller passes the same record it renders the
+#: checklist from, so a field still cannot exist in one place and be missing from the
+#: PDF — the rule is now enforced by the data flow instead of by an import.
 
 #: The plan status the cover states, from the two vocabularies that already own
 #: these answers (ticket 04's ``plan_type``, ticket 06's verdict). An absent one
-#: is ``待核验`` — a cover never infers a status the flow did not record.
+#: is :data:`route_compare.models.UNVERIFIED` — a cover never infers a status the
+#: flow did not record.
 _PLAN_TYPE_LABELS = {"route_plan": "正式路线计划", "generic_draft": "通用草案 · 未经核验路线资料"}
 _VERDICT_LABELS = {
     "complete": "安排已齐全",
-    "confirmation_required": "有待确认安排",
+    "confirmation_required": f"有{UNCONFIRMED}安排",
     "supplement_required": "核心安排待补充",
 }
 _DATA_MODE_LABELS = {"offline": "离线合成演示数据 · 不可用于真实出行", "live": "服务器实时核验来源"}
@@ -73,8 +75,6 @@ _VALUE_LABELS = {
     "risk": {"low": "低", "moderate": "中等", "high": "高"},
 }
 
-_UNKNOWN = "待核验"
-
 
 def format_datetime(raw: str) -> str:
     """Use China local time for this Chinese document, retaining unknown timestamps."""
@@ -90,7 +90,7 @@ def format_datetime(raw: str) -> str:
 
 def _format_fact(field: str, value: Any) -> str:
     if value is None:
-        return _UNKNOWN
+        return UNVERIFIED
     labels = _VALUE_LABELS.get(field)
     if labels is not None:
         return labels.get(str(value), str(value))
@@ -99,7 +99,7 @@ def _format_fact(field: str, value: Any) -> str:
     else:
         text = str(value)
     unit = _FIELD_UNITS.get(field)
-    return f"{text} {unit}" if unit and text != _UNKNOWN else text
+    return f"{text} {unit}" if unit and text != UNVERIFIED else text
 
 
 def _user_value(text: Any) -> str:
@@ -108,24 +108,29 @@ def _user_value(text: Any) -> str:
 
 
 def arrangement_values(result: ComparisonResult,
-                       arrangements: Mapping[str, str] | None) -> dict[str, str]:
+                       arrangements: Mapping[str, str] | None,
+                       labels: Mapping[str, str]) -> dict[str, str]:
     """The user's own record, nothing else.
 
     Every user-arrangement field is drawn ONLY from ``arrangements`` — the
     stored record :meth:`agent_v2.runs.RunRepository.get_plan_arrangements`
     merged over the draft row by the export path. A field the user left blank
-    stays blank and renders 待确认 (seam contract AC2, ticket 05 AC4).
+    stays blank and renders :data:`route_compare.models.UNCONFIRMED` (seam contract
+    AC2, ticket 05 AC4).
+
+    ``labels`` is the caller's arrangement enumeration
+    (:data:`agent_v2.plan_workflow.ARRANGEMENT_FIELDS`): it decides WHICH keys exist,
+    in display order. Keys outside it are dropped rather than drawn.
 
     This deliberately does NOT seed from ``result.plan_details``: that object is
     what the kernel composed for ``report_export``, so a model string would
     otherwise render as if the user had supplied it — the invention the no-invention
     invariant forbids. ``budget`` stays free text here and is never parsed into an
-    amount, so no price and no total is ever produced (AC2). Keys outside
-    :data:`ARRANGEMENT_FIELDS` are dropped rather than drawn. ``result`` is kept
-    in the signature because callers pass the gate-checked object through, not
-    because anything is read from it here.
+    amount, so no price and no total is ever produced (AC2). ``result`` is kept in
+    the signature because callers pass the gate-checked object through, not because
+    anything is read from it here.
     """
-    values = {key: "" for key, _label in _ARRANGEMENT_KEYS}
+    values = {key: "" for key in labels}
     supplied = arrangements or {}
     for key in values:
         value = supplied.get(key)
@@ -135,7 +140,8 @@ def arrangement_values(result: ComparisonResult,
 
 
 def _plan_sections(result: ComparisonResult, route_id: str | None,
-                   values: dict[str, str]) -> dict[str, Any]:
+                   values: dict[str, str],
+                   labels: Mapping[str, str]) -> dict[str, Any]:
     """Create deterministic execution sections from verified facts and safe defaults."""
     assessment = next((a for a in result.candidates if a.candidate.id == route_id), None)
     facts = assessment.candidate.facts if assessment else {}
@@ -145,15 +151,15 @@ def _plan_sections(result: ComparisonResult, route_id: str | None,
     details = result.plan_details
     def user_value(text: Any) -> str:
         return _user_value(text)
-    risk_label = _RISK_LABELS.get(assessment.risk_status, _UNKNOWN) if assessment else _UNKNOWN
+    risk_label = _RISK_LABELS.get(assessment.risk_status, UNVERIFIED) if assessment else UNVERIFIED
     template = [
-        {"stage": "出发准备", "window": "待确认",
+        {"stage": "出发准备", "window": UNCONFIRMED,
          "focus": "签到、热身、确认天气与开放状态", "checkpoint": "确认人数与撤退方案"},
-        {"stage": "主体徒步", "window": "待确认",
+        {"stage": "主体徒步", "window": UNCONFIRMED,
          "focus": "结伴行进，保持可沟通距离", "checkpoint": "按体感与环境及时补水和休息"},
-        {"stage": "补给与评估", "window": "待确认",
+        {"stage": "补给与评估", "window": UNCONFIRMED,
          "focus": "检查体感、天气和剩余补给", "checkpoint": "安全条件恶化时停止前进"},
-        {"stage": "返程与收尾", "window": "待确认",
+        {"stage": "返程与收尾", "window": UNCONFIRMED,
          "focus": "留出下撤余量，离队前清点人员与装备", "checkpoint": "到达终点后报平安"},
     ]
     timeline = ([{"time": _user_value(stage.time), "stage": _user_value(stage.activity),
@@ -170,16 +176,16 @@ def _plan_sections(result: ComparisonResult, route_id: str | None,
     ]
     return {
         "plan_metadata": [{"label": label, "value": user_value(values.get(key, ""))}
-                          for key, label in _ARRANGEMENT_KEYS],
+                          for key, label in labels.items()],
         "route_overview": [
-            {"label": "计划路线", "value": assessment.candidate.name if assessment else _UNKNOWN},
+            {"label": "计划路线", "value": assessment.candidate.name if assessment else UNVERIFIED},
             {"label": "距离", "value": value("distance_km")},
             {"label": "累计爬升", "value": value("ascent_m")},
             {"label": "预计耗时", "value": value("duration_hours")},
             {"label": "天气", "value": value("weather")},
             {"label": "开放状态", "value": value("trail_status")},
             {"label": "风险状态", "value": risk_label},
-            {"label": "资料状态", "value": _EVIDENCE_LABELS.get(assessment.evidence_status, _UNKNOWN) if assessment else _UNKNOWN},
+            {"label": "资料状态", "value": _EVIDENCE_LABELS.get(assessment.evidence_status, UNVERIFIED) if assessment else UNVERIFIED},
         ],
         "itinerary": template,
         "timeline": timeline,
@@ -187,21 +193,21 @@ def _plan_sections(result: ComparisonResult, route_id: str | None,
                             "focus": s.activity, "checkpoint": "用户安排，执行前确认"}
                            for i, s in enumerate(details.itinerary, 1)],
         "logistics": [
-            {"label": ARRANGEMENT_LABELS["transport"], "value": user_value(values.get("transport"))},
-            {"label": ARRANGEMENT_LABELS["accommodation"], "value": user_value(values.get("accommodation"))},
+            {"label": labels["transport"], "value": user_value(values.get("transport"))},
+            {"label": labels["accommodation"], "value": user_value(values.get("accommodation"))},
             {"label": "路线地图", "value": value("map")},
-            {"label": ARRANGEMENT_LABELS["emergency_contact"],
+            {"label": labels["emergency_contact"],
              "value": user_value(values.get("emergency_contact"))},
-            {"label": ARRANGEMENT_LABELS["retreat_plan"], "value": user_value(values.get("retreat_plan"))},
+            {"label": labels["retreat_plan"], "value": user_value(values.get("retreat_plan"))},
         ],
         "roles": [
             {"role": "领队", "person": user_value(values.get("leader")),
              "duty": "确认路线与风险，决定折返或取消"},
-            {"role": "导航 / 收队", "person": "待确认", "duty": "核对地图、清点人数，避免落单"},
-            {"role": "急救 / 联络", "person": "待确认", "duty": "检查急救用品，维护对外联络"},
+            {"role": "导航 / 收队", "person": UNCONFIRMED, "duty": "核对地图、清点人数，避免落单"},
+            {"role": "急救 / 联络", "person": UNCONFIRMED, "duty": "检查急救用品，维护对外联络"},
         ],
         "budget": [{"item": b.item, "amount": f"{b.amount_yuan:g} 元", "basis": "用户提供"} for b in details.budget]
-                  or [{"item": category, "amount": "待确认", "basis": "待询价"}
+                  or [{"item": category, "amount": UNCONFIRMED, "basis": "待询价"}
                       for category in ("交通", "住宿 / 门票", "餐食 / 补给", "保险 / 其他")],
         # The user's own free-text budget note travels as text: it is never parsed
         # into an amount, so no price and no total is created here (AC2).
@@ -209,15 +215,16 @@ def _plan_sections(result: ComparisonResult, route_id: str | None,
         # No server-side total is ever computed. The itemised ``budget`` above is
         # the model's own plan_details, not a user-confirmed figure, and the spec
         # rule (ticket 09 / plan_workflow:192) is that prices are never estimated
-        # and a total is never summed out of them. The 合计 therefore stays 待确认
-        # — a number the server cannot stand behind is not printed as one it can.
-        "budget_total": "待确认",
+        # and a total is never summed out of them. The 合计 therefore stays
+        # :data:`UNCONFIRMED` — a number the server cannot stand behind is not
+        # printed as one it can.
+        "budget_total": UNCONFIRMED,
         "equipment": [
-            {"category": "安全", "item": "手机、充电宝、头灯、急救包", "priority": "必带", "status": _UNKNOWN},
-            {"category": "补给", "item": "饮水与能量补给", "priority": "必带", "status": _UNKNOWN},
-            {"category": "防护", "item": "防滑鞋、雨具、防晒与保暖层", "priority": "必带", "status": _UNKNOWN},
-            {"category": "导航", "item": "离线地图与纸质 / 截图备份", "priority": "建议", "status": _UNKNOWN},
-            {"category": "联络", "item": "紧急联系人、集合点和撤退交通", "priority": "必带", "status": _UNKNOWN},
+            {"category": "安全", "item": "手机、充电宝、头灯、急救包", "priority": "必带", "status": UNVERIFIED},
+            {"category": "补给", "item": "饮水与能量补给", "priority": "必带", "status": UNVERIFIED},
+            {"category": "防护", "item": "防滑鞋、雨具、防晒与保暖层", "priority": "必带", "status": UNVERIFIED},
+            {"category": "导航", "item": "离线地图与纸质 / 截图备份", "priority": "建议", "status": UNVERIFIED},
+            {"category": "联络", "item": "紧急联系人、集合点和撤退交通", "priority": "必带", "status": UNVERIFIED},
         ],
         "risk_controls": risk_rows,
         "risk": {
@@ -226,18 +233,18 @@ def _plan_sections(result: ComparisonResult, route_id: str | None,
             "decision": _user_value(result.required_action),
             "note": "以上为通用风险处置建议：触发条件一旦成立即按处置动作执行，出发前由领队确认。",
             "contacts": [
-                {"label": ARRANGEMENT_LABELS["emergency_contact"],
+                {"label": labels["emergency_contact"],
                  "value": _user_value(values.get("emergency_contact"))},
-                {"label": ARRANGEMENT_LABELS["retreat_plan"],
+                {"label": labels["retreat_plan"],
                  "value": _user_value(values.get("retreat_plan"))},
             ],
         },
         "checklist": [
-            {"item": "天气、官方开放状态和风险资料在出发前重新确认", "owner": "领队", "status": _UNKNOWN},
-            {"item": "路线地图已下载，集合点和撤退点已共享", "owner": "领队", "status": _UNKNOWN},
-            {"item": "每位成员完成装备、饮水和身体状态自检", "owner": "全员", "status": _UNKNOWN},
-            {"item": "紧急联系人知道路线、预计返程时间和报平安方式", "owner": "领队", "status": _UNKNOWN},
-            {"item": "垃圾全部带离，遵守当地开放与生态保护规定", "owner": "全员", "status": _UNKNOWN},
+            {"item": "天气、官方开放状态和风险资料在出发前重新确认", "owner": "领队", "status": UNVERIFIED},
+            {"item": "路线地图已下载，集合点和撤退点已共享", "owner": "领队", "status": UNVERIFIED},
+            {"item": "每位成员完成装备、饮水和身体状态自检", "owner": "全员", "status": UNVERIFIED},
+            {"item": "紧急联系人知道路线、预计返程时间和报平安方式", "owner": "领队", "status": UNVERIFIED},
+            {"item": "垃圾全部带离，遵守当地开放与生态保护规定", "owner": "全员", "status": UNVERIFIED},
         ],
     }
 
@@ -245,8 +252,8 @@ def _plan_sections(result: ComparisonResult, route_id: str | None,
 def _stated(mapping: Mapping[str, str], key: Any) -> str:
     """A recorded status word as its label, or 待核验 — never a guessed one."""
     if key is None or str(key).strip() == "":
-        return _UNKNOWN
-    return mapping.get(str(key).strip(), _UNKNOWN)
+        return UNVERIFIED
+    return mapping.get(str(key).strip(), UNVERIFIED)
 
 
 def _safety_status(safety: Mapping[str, Any] | None) -> str:
@@ -256,7 +263,7 @@ def _safety_status(safety: Mapping[str, Any] | None) -> str:
     wrote it, and an absent record stays 待核验 rather than becoming a pass.
     """
     if not isinstance(safety, Mapping):
-        return _UNKNOWN
+        return UNVERIFIED
     message = str(safety.get("message") or "").strip()
     if safety.get("hard_stop") or not safety.get("formal_route_plan_allowed", True):
         return message or "安全门已拦截本次正式路线计划"
@@ -280,40 +287,46 @@ def _cover(result: ComparisonResult, status_label: str, plan_type: str | None,
             {"label": "计划编号", "value": result.comparison_id},
         ],
         "content_policy": {
-            "facts": "仅使用已核验来源；缺失信息显示为待核验",
+            "facts": f"仅使用已核验来源；缺失信息显示为{UNVERIFIED}",
             "advice": "通用执行建议，出发前需由领队确认",
         },
     }
 
 
-def _summary(result: ComparisonResult, names: dict[str, str], values: dict[str, str]) -> dict[str, Any]:
+def _summary(result: ComparisonResult, names: dict[str, str], values: dict[str, str],
+             labels: Mapping[str, str]) -> dict[str, Any]:
     """The 路线 / 日期 / 人数 summary — the book's answer to 「which outing is this」."""
     route = names.get(result.recommended_id or "", "") or _user_value(values.get("destination_or_route"))
     return {
-        "headline": route if route != _UNKNOWN else _UNKNOWN,
+        "headline": route if route != UNVERIFIED else UNVERIFIED,
         "lines": [
-            {"label": "路线", "value": _user_value(route) if route else _UNKNOWN},
-            {"label": ARRANGEMENT_LABELS["activity_date"], "value": _user_value(values.get("activity_date"))},
-            {"label": ARRANGEMENT_LABELS["participants"], "value": _user_value(values.get("participants"))},
-            {"label": ARRANGEMENT_LABELS["meeting_time"], "value": _user_value(values.get("meeting_time"))},
-            {"label": ARRANGEMENT_LABELS["meeting_point"], "value": _user_value(values.get("meeting_point"))},
-            {"label": ARRANGEMENT_LABELS["leader"], "value": _user_value(values.get("leader"))},
+            {"label": "路线", "value": _user_value(route) if route else UNVERIFIED},
+            {"label": labels["activity_date"], "value": _user_value(values.get("activity_date"))},
+            {"label": labels["participants"], "value": _user_value(values.get("participants"))},
+            {"label": labels["meeting_time"], "value": _user_value(values.get("meeting_time"))},
+            {"label": labels["meeting_point"], "value": _user_value(values.get("meeting_point"))},
+            {"label": labels["leader"], "value": _user_value(values.get("leader"))},
         ],
     }
 
 
-def build_report_document(result: ComparisonResult, *, plan_type: str | None = None,
+def build_report_document(result: ComparisonResult, *,
+                          arrangement_labels: Mapping[str, str],
+                          plan_type: str | None = None,
                           completeness: str | None = None,
                           safety: Mapping[str, Any] | None = None,
                           arrangements: Mapping[str, str] | None = None) -> dict[str, Any]:
     """Derive the structured PDF document from a gate-passed comparison result.
 
-    The four keyword arguments are the plan side of the book, each one a record an
-    earlier ticket already produced and this function only reads: ``plan_type``
-    (ticket 04), ``completeness`` — the rule verdict (ticket 06), ``safety`` — the
-    gate's own refusal payload (ticket 07), and ``arrangements`` — the stored
-    arrangement record merged over the draft row. None of them is a claim about
-    report eligibility: ``render_report`` stays the only authority on that, so a
+    The five keyword arguments are the plan side of the book, each one a record an
+    earlier ticket already produced and this function only reads:
+    ``arrangement_labels`` — the caller's arrangement enumeration
+    (:data:`agent_v2.plan_workflow.ARRANGEMENT_FIELDS`), REQUIRED because this module
+    sits below ``agent_v2`` and must not read up for its own vocabulary;
+    ``plan_type`` (ticket 04), ``completeness`` — the rule verdict (ticket 06),
+    ``safety`` — the gate's own refusal payload (ticket 07), and ``arrangements`` —
+    the stored arrangement record merged over the draft row. None of them is a claim
+    about report eligibility: ``render_report`` stays the only authority on that, so a
     ``complete`` verdict renders as 安排已齐全 and nothing more.
     """
     names = {a.candidate.id: a.candidate.name for a in result.candidates}
@@ -355,9 +368,9 @@ def build_report_document(result: ComparisonResult, *, plan_type: str | None = N
     value_text = "—" if confidence.value is None else f"{confidence.value:.2f}"
 
     selected_id = result.recommended_id or (result.candidates[0].candidate.id if result.candidates else None)
-    values = arrangement_values(result, arrangements)
+    values = arrangement_values(result, arrangements, arrangement_labels)
     status_label = _STATUS_LABELS.get(result.status, result.status)
-    sections = _plan_sections(result, selected_id, values)
+    sections = _plan_sections(result, selected_id, values, arrangement_labels)
     is_route_plan = str(plan_type or "").strip() == "route_plan"
     return {
         "kind": REPORT_KIND,
@@ -366,14 +379,14 @@ def build_report_document(result: ComparisonResult, *, plan_type: str | None = N
         "title": "AI Hiking 徒步计划书",
         # The subtitle is a status claim, so it follows the derived type: a draft
         # without a verified route basis cannot describe itself as 已核验.
-        "subtitle": ("路线资料已核验 · 活动安排待确认" if is_route_plan
-                     else "通用草案 · 路线资料待核验"),
+        "subtitle": (f"路线资料已核验 · 活动安排{UNCONFIRMED}" if is_route_plan
+                     else f"通用草案 · 路线资料{UNVERIFIED}"),
         "plan_type": _stated(_PLAN_TYPE_LABELS, plan_type),
         "completeness_verdict": _stated(_VERDICT_LABELS, completeness),
         "cover": _cover(result, status_label, plan_type, completeness, safety),
-        "summary": _summary(result, names, values),
+        "summary": _summary(result, names, values, arrangement_labels),
         "content_policy": {
-            "facts": "仅使用已核验来源；缺失信息显示为待核验",
+            "facts": f"仅使用已核验来源；缺失信息显示为{UNVERIFIED}",
             "advice": "通用执行建议，出发前需由领队确认",
         },
         "generated_at": format_datetime(result.generated_at),

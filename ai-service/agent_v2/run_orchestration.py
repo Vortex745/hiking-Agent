@@ -89,6 +89,7 @@ from agent_v2.memory_tools import extract_sensitive_memory
 from agent_v2.observability import CapacityExceeded
 from agent_v2.permissions import PermissionDecision, PermissionGate
 from agent_v2.plan_workflow import (
+    ARRANGEMENT_FIELDS,
     BLOCK_MESSAGE,
     SUPPLEMENT_ARRANGEMENT_KEYS,
     PlanBlockReason,
@@ -543,9 +544,18 @@ def _pdf_plan_status_inputs(runs_repo: Any, conversation_id: str) -> dict[str, A
     Nothing here reads or implies ``report_allowed`` — eligibility stays
     :func:`route_compare.service.render_report`'s alone. The 安全门 line reads
     the stored safety row (ticket 07's payload, given a table by ticket 09);
-    no row — or a row from another draft — keeps the line at 待核验.
+    no row — or a row from another draft — keeps the line at ``UNVERIFIED``.
+
+    ``arrangement_labels`` is handed down rather than reached for: the document
+    builder lives in ``route_compare``, BELOW this layer, and reading
+    :data:`ARRANGEMENT_FIELDS` there would be an upward import (the inversion the
+    review named). One export helper means both PDF call sites pass the same record
+    the draft and the checklist render from, so the labels still cannot drift.
     """
-    inputs: dict[str, Any] = {"plan_type": "route_plan"}
+    inputs: dict[str, Any] = {
+        "plan_type": "route_plan",
+        "arrangement_labels": dict(ARRANGEMENT_FIELDS),
+    }
     if runs_repo is None or not conversation_id:
         return inputs
     merged: dict[str, str] = {}

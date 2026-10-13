@@ -20,10 +20,13 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from functools import partial
 
 import pytest
 
+import route_compare.report_pdf as report_pdf
 from agent_v2.computer import _render_pdf_bytes
+from agent_v2.plan_workflow import ARRANGEMENT_FIELDS
 from route_compare.fixtures import fixture_candidates
 from route_compare.models import BudgetItem, PlanDetails, PlanStage
 from route_compare.providers import DeterministicProvider, ProviderConfig
@@ -31,6 +34,15 @@ from route_compare.report_pdf import arrangement_values, build_report_document
 from route_compare.service import compare_routes
 
 fitz = pytest.importorskip("fitz")
+
+#: This module is a CALL SITE of the document builder, exactly like the export path
+#: in :mod:`agent_v2.run_orchestration`: the arrangement record is handed IN, because
+#: ``route_compare`` sits below ``agent_v2`` and must not read up for it
+#: (:func:`test_route_compare_reads_nothing_from_the_layer_above`). The two aliases
+#: thread the same record every test would otherwise repeat.
+_LABELS = dict(ARRANGEMENT_FIELDS)
+_document = partial(build_report_document, arrangement_labels=_LABELS)
+_values = partial(arrangement_values, labels=_LABELS)
 
 
 def _result(scenario: str = "complete", plan_details: PlanDetails | None = None):
@@ -50,12 +62,85 @@ def _pages(document: dict) -> list[str]:
         return [page.get_text() for page in pdf]
 
 
+# ---- the layer seam: this module is pure domain -----------------------------
+
+
+def test_route_compare_reads_nothing_from_the_layer_above() -> None:
+    """``route_compare`` sits BELOW ``agent_v2``, so nothing under it may import up.
+
+    The direction is a fact of the codebase, not a preference:
+    :mod:`agent_v2.route_tools` imports :mod:`route_compare.service` at module level
+    (``route_tools.py:30``). ``report_pdf`` used to read
+    ``ARRANGEMENT_FIELDS`` / ``UNCONFIRMED`` / ``UNVERIFIED`` out of
+    :mod:`agent_v2.plan_workflow`, and the cycle survived only because the plan flow
+    imported ``route_compare`` inside functions — two lazy edges holding up an upside-
+    down dependency. The fix is :mod:`route_compare.service`'s existing style (take
+    your inputs as arguments; see
+    :func:`test_the_document_builder_draws_its_arrangement_labels_from_its_caller`),
+    not more laziness, so the rule is pinned with an AST sweep of the package.
+    """
+    import ast
+    import sys
+    from pathlib import Path
+
+    import route_compare
+
+    root = Path(route_compare.__file__).resolve().parent
+    readers: list[str] = []
+    for path in sorted(root.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                if (node.module or "").split(".")[0] == "agent_v2":
+                    readers.append(f"{path.name}:{node.lineno}")
+            elif isinstance(node, ast.Import):
+                readers.extend(
+                    f"{path.name}:{node.lineno}" for alias in node.names
+                    if alias.name.split(".")[0] == "agent_v2")
+    assert readers == [], (
+        f"route_compare imports up into agent_v2 at {readers}; pass the data in as an "
+        "argument instead (the layering rule, not a style choice)")
+    # …and the sweep really looked at the package it claims to cover.
+    assert {p.name for p in root.glob("*.py")} >= {"models.py", "service.py",
+                                                   "report_pdf.py", "fixtures.py"}
+    assert "route_compare" in sys.modules
+
+
+def test_the_document_builder_draws_its_arrangement_labels_from_its_caller() -> None:
+    """The arrangement labels are the caller's record, handed in, never reached for.
+
+    :data:`agent_v2.plan_workflow.ARRANGEMENT_FIELDS` is the enumeration the draft
+    collects and the 缺失字段清单 enumerates (ticket 05/06), and the seam contract's
+    rule is that the PDF and the draft cannot drift apart. That is honoured by the
+    export path PASSING the record, not by ``report_pdf`` importing it: the document
+    renders exactly the labels it was given, and a caller that supplies none is
+    refused rather than silently borrowing another layer's vocabulary.
+    """
+    with pytest.raises(TypeError):
+        # Called through the module so the alias below cannot supply the argument:
+        # a caller that hands in no record is refused instead of borrowing one.
+        report_pdf.build_report_document(_result())
+
+    labels = dict(ARRANGEMENT_FIELDS) | {"meeting_point": "集合门口"}
+    document = build_report_document(_result(), plan_type="route_plan",
+                                     arrangement_labels=labels)
+
+    metadata_labels = [row["label"] for row in document["plan_metadata"]]
+    assert "集合门口" in metadata_labels, metadata_labels
+    assert "集合地点" not in metadata_labels, "the caller's label is the one rendered"
+    assert metadata_labels and set(metadata_labels) == set(labels.values())
+    # The same record still labels the logistics and contact rows.
+    assert {"交通", "住宿", "应急联络", "撤退方案"} <= {
+        row["label"] for row in document["logistics"]}
+    assert [row["label"] for row in document["risk"]["contacts"]] == ["应急联络", "撤退方案"]
+
+
 # ---- AC1: 封面与计划状态 ----------------------------------------------------
 
 
 def test_the_first_page_is_a_cover_naming_the_plan_status() -> None:
     """A confirmed plan opens on its own cover page carrying the plan status."""
-    document = build_report_document(
+    document = _document(
         _result(), plan_type="route_plan", completeness="confirmation_required")
     pages = _pages(document)
 
@@ -73,7 +158,7 @@ def test_the_first_page_is_a_cover_naming_the_plan_status() -> None:
 
 def test_a_generic_draft_cover_is_never_presented_as_a_route_plan() -> None:
     """``plan_type`` decides the cover claim; a thin draft cannot wear the badge."""
-    document = build_report_document(
+    document = _document(
         _result("partial"), plan_type="generic_draft", completeness="supplement_required")
     cover = _pages(document)[0]
 
@@ -84,7 +169,7 @@ def test_a_generic_draft_cover_is_never_presented_as_a_route_plan() -> None:
 
 def test_a_cover_without_a_recorded_status_says_so_instead_of_claiming_one() -> None:
     """Absent status stays absent — the cover never infers a verdict."""
-    cover = _pages(build_report_document(_result()))[0]
+    cover = _pages(_document(_result()))[0]
 
     assert "待核验" in cover
     assert "正式路线计划" not in cover
@@ -105,7 +190,7 @@ def test_a_safety_refusal_is_on_the_cover_in_the_gate_own_words() -> None:
         "gate_reasons": [],
         "required_action": "",
     }
-    cover = _pages(build_report_document(_result("severe_weather"), plan_type="generic_draft",
+    cover = _pages(_document(_result("severe_weather"), plan_type="generic_draft",
                                          safety=safety))[0]
 
     assert SAFETY_MESSAGE[PlanSafetyReason.SEVERE_WEATHER] in cover.replace("\n", "")
@@ -118,7 +203,7 @@ def test_the_summary_page_names_the_route_date_and_party_size() -> None:
     # The date / party size reach the summary through the USER's stored record,
     # not through the model's ``plan_details`` (which the kernel composes). This
     # is ticket 05 AC4: an arrangement renders only when the user supplied it.
-    document = build_report_document(
+    document = _document(
         _result(), plan_type="route_plan",
         arrangements={"activity_date": "2026-10-18", "participants": "4 人",
                       "meeting_time": "08:00", "leader": "领队甲"})
@@ -132,7 +217,7 @@ def test_the_summary_page_names_the_route_date_and_party_size() -> None:
 
 def test_a_summary_line_the_user_never_filled_stays_待确认() -> None:
     """The summary shows the gap rather than a derived value (seam contract AC2)."""
-    document = build_report_document(_result(), plan_type="route_plan")
+    document = _document(_result(), plan_type="route_plan")
     summary = _pages(document)[1]
 
     assert "待确认" in summary
@@ -154,7 +239,7 @@ def test_an_arrangement_the_user_left_blank_is_not_backfilled_from_the_model() -
         leader="模型编的领队", emergency_contact="10086"))
 
     # The user's record fills 集合时间 only; every other arrangement stays blank.
-    values = arrangement_values(result, {
+    values = _values(result, {
         "meeting_time": "07:30", "leader": "", "emergency_contact": ""})
 
     assert values["meeting_time"] == "07:30"          # the user's own value
@@ -170,14 +255,14 @@ def test_an_arrangement_the_user_left_blank_is_not_backfilled_from_the_model() -
 
 
 def test_the_body_has_a_timeline_a_risk_block_gear_and_a_predeparture_check() -> None:
-    body = "\n".join(_pages(build_report_document(_result(), plan_type="route_plan")))
+    body = "\n".join(_pages(_document(_result(), plan_type="route_plan")))
 
     for heading in ("行程时间线", "风险决策区", "装备与补给", "出发前检查"):
         assert heading in body, heading
 
 
 def test_the_user_stages_are_the_timeline_and_the_template_says_it_is_a_template() -> None:
-    with_stages = build_report_document(
+    with_stages = _document(
         _result(plan_details=PlanDetails(itinerary=[
             PlanStage(time="08:00", activity="集合、点名与装备检查"),
             PlanStage(time="16:00", activity="清点人员、带离垃圾并报平安")])),
@@ -185,7 +270,7 @@ def test_the_user_stages_are_the_timeline_and_the_template_says_it_is_a_template
     body = "\n".join(_pages(with_stages))
     assert "08:00" in body and "16:00" in body
 
-    without = _pages(build_report_document(_result(), plan_type="route_plan"))
+    without = _pages(_document(_result(), plan_type="route_plan"))
     assert "通用行程模板" in "\n".join(without)
     # No segment time is ever derived from the total duration (AC2 of the contract).
     assert not re.search(r"行程时间线[\s\S]{0,400}\d{1,2}:\d{2}", "".join(without))
@@ -193,7 +278,7 @@ def test_the_user_stages_are_the_timeline_and_the_template_says_it_is_a_template
 
 def test_the_risk_block_is_rendered_differently_from_an_ordinary_table() -> None:
     """风险重点 means visual emphasis, measured as colour, not as a heading."""
-    document = build_report_document(_result(), plan_type="route_plan")
+    document = _document(_result(), plan_type="route_plan")
     payload = _render_pdf_bytes(json.dumps(document, ensure_ascii=False))
     with fitz.open(stream=payload, filetype="pdf") as pdf:
         spans = [span for page in pdf for block in page.get_text("dict")["blocks"]
@@ -209,7 +294,7 @@ def test_the_risk_block_is_rendered_differently_from_an_ordinary_table() -> None
 
 def test_every_candidate_and_every_source_stays_readable() -> None:
     result = _result()
-    document = build_report_document(result, plan_type="route_plan")
+    document = _document(result, plan_type="route_plan")
     body = "\n".join(_pages(document))
 
     for assessment in result.candidates:
@@ -221,7 +306,7 @@ def test_every_candidate_and_every_source_stays_readable() -> None:
 
 
 def test_appendix_text_stays_inside_the_print_margins() -> None:
-    document = build_report_document(
+    document = _document(
         _result(plan_details=PlanDetails(itinerary=[
             PlanStage(time=f"第 {i} 天", activity="集合、装备检查与结伴徒步；" * 12)
             for i in range(1, 16)])),
@@ -245,7 +330,7 @@ def _header_pages(pages: list[str], header: list[str]) -> list[str]:
 
 def test_a_timeline_that_splits_across_pages_repeats_its_header_row() -> None:
     """The header must reappear on the continuation page, demonstrated by rendering."""
-    document = build_report_document(
+    document = _document(
         _result(plan_details=PlanDetails(itinerary=[
             PlanStage(time=f"{i:02d}:00", activity="结伴徒步、补给与体感检查的长安排段落" * 6)
             for i in range(1, 26)])),
@@ -274,7 +359,7 @@ def test_a_candidate_table_that_splits_across_pages_repeats_its_header_row() -> 
     result.candidates = clones
     result.recommended_id = clones[0].candidate.id
     result.alternatives = [clone.candidate.id for clone in clones[1:]]
-    document = build_report_document(result, plan_type="route_plan")
+    document = _document(result, plan_type="route_plan")
     pages = _pages(document)
     header = ["路线"] + [str(c).strip() for c in document["columns"]] + ["资料", "风险"]
     # The header sequence exists in exactly one table, so two pages carrying it
@@ -297,7 +382,7 @@ def test_the_risk_block_never_opens_on_a_table_it_cannot_finish(padding_stages: 
         itinerary=[PlanStage(time=f"{i:02d}:00", activity="结伴徒步、补给与体感检查")
                    for i in range(1, padding_stages + 1)],
         budget=[BudgetItem(item=f"演示条目 {i}", amount_yuan=10 * i) for i in range(1, 5)])
-    document = build_report_document(_result(plan_details=details), plan_type="route_plan")
+    document = _document(_result(plan_details=details), plan_type="route_plan")
     document["risk"]["rows"] = _EXTRA_RISK_ROWS
     pages = _pages(document)
     risk_pages = [page for page in pages if "风险决策区" in page]
@@ -315,7 +400,7 @@ def test_the_risk_sweep_actually_stressed_a_page_boundary() -> None:
     """Guard for the sweep above: at least one case starts 风险决策区 below the top."""
     started_mid_page = 0
     for padding in (5, 9, 13, 17):
-        document = build_report_document(
+        document = _document(
             _result(plan_details=PlanDetails(itinerary=[
                 PlanStage(time=f"{i:02d}:00", activity="结伴徒步、补给与体感检查")
                 for i in range(1, padding + 1)])), plan_type="route_plan")
@@ -445,7 +530,12 @@ def test_a_stale_verdict_row_does_not_become_the_cover_status(tmp_path) -> None:
     inputs = _pdf_plan_status_inputs(repo, "conv-stale")
     assert "completeness" not in inputs
     assert inputs["plan_type"] == "route_plan"
-    assert _pdf_plan_status_inputs(None, "") == {"plan_type": "route_plan"}
+    # With no repo and no conversation there is nothing to READ, but the caller's own
+    # arrangement record is still handed down — the builder has no other source for it
+    # now that route_compare no longer imports up (the early return is exact, so a key
+    # added here without an argument is caught).
+    assert _pdf_plan_status_inputs(None, "") == {"plan_type": "route_plan",
+                                                 "arrangement_labels": _LABELS}
 
 
 # ---- The rename coupling: one vocabulary for both stories ------------------
@@ -486,7 +576,7 @@ def _pages_text(content: str) -> list[str]:
 
 
 def test_the_book_carries_no_decorative_imagery() -> None:
-    payload = _render_pdf_bytes(json.dumps(build_report_document(_result(), plan_type="route_plan"),
+    payload = _render_pdf_bytes(json.dumps(_document(_result(), plan_type="route_plan"),
                                            ensure_ascii=False))
     with fitz.open(stream=payload, filetype="pdf") as pdf:
         assert sum(len(page.get_images(full=True)) for page in pdf) == 0
@@ -495,7 +585,7 @@ def test_the_book_carries_no_decorative_imagery() -> None:
 
 
 def test_an_unverified_map_stays_a_待核验_line_and_not_a_picture() -> None:
-    document = build_report_document(_result("partial"), plan_type="generic_draft")
+    document = _document(_result("partial"), plan_type="generic_draft")
     body = "\n".join(_pages(document))
 
     assert "路线地图" in body

@@ -2,36 +2,54 @@
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 
+import pytest
+
 from agent_v2.computer import LocalNativeComputer
+from agent_v2.plan_workflow import ARRANGEMENT_FIELDS
+
+#: These tests are CALL SITES of the document builder, like the export path: the
+#: arrangement record is handed in, because ``route_compare`` sits below ``agent_v2``
+#: and reading up for its vocabulary was the inversion the review named.
+_LABELS = dict(ARRANGEMENT_FIELDS)
 
 
-def test_the_renderer_types_no_plan_status_marker_of_its_own() -> None:
-    """The 待确认 / 待核验 markers are ``plan_workflow``'s, never the renderer's.
+@pytest.mark.parametrize("module,marker_home", [
+    ("agent_v2.computer", "plan_workflow"),
+    ("route_compare.report_pdf", "models"),
+])
 
-    ``agent_v2/computer.py`` both FILLS these markers as values and COMPARES against
-    them (:func:`_report_story`'s ``if note and note != UNCONFIRMED`` budget and
-    required-action guards). With a literal on one side and
-    :data:`agent_v2.plan_workflow.UNCONFIRMED` on the other, rewording the marker
-    silently strands the comparison — the blank note starts rendering as user copy —
-    and no runtime test can see a rename that has not happened yet. So the rule is
-    pinned at the source level, the same way this repo pins what a browser-only
-    claim cannot prove.
 
-    The import direction is part of the claim: ``computer.py`` sits in
-    ``agent_v2``, so reading the vocabulary from :mod:`agent_v2.plan_workflow` is the
-    correct way down (the reverse edge is what finding 9 removed from
-    :mod:`route_compare.report_pdf`).
+def test_the_plan_document_layers_type_no_status_marker_of_its_own(
+    module, marker_home
+) -> None:
+    """The two renderers fill the markers, they do not spell them.
+
+    Both modules below both FILL these markers as values and COMPARE against them
+    (``computer._report_story``'s ``if note and note != UNCONFIRMED`` budget and
+    required-action guards; ``report_pdf``'s blank-arrangement defaults, which are the
+    values that comparison reads). With a literal on one side and the shared constant
+    on the other, rewording the marker silently strands the comparison — a blank note
+    starts rendering as user copy — and no runtime test can see a rename that has not
+    happened yet. So the rule is pinned at the source level, the same way this repo
+    pins what a browser-only claim cannot prove.
+
+    The import direction is part of the claim, and the two sides differ on purpose:
+    ``agent_v2/computer.py`` reads the vocabulary from :mod:`agent_v2.plan_workflow`
+    (same layer, and plan_workflow imports nothing but the definitions below), while
+    :mod:`route_compare.report_pdf` reads it from :mod:`route_compare.models` because
+    ``route_compare`` sits BELOW ``agent_v2`` and must not import up — the edge
+    finding 9 removed.
     """
     import ast
-    import inspect
+    import importlib
 
-    import agent_v2.computer as computer_module
+    target = importlib.import_module(module)
     from agent_v2 import plan_workflow
 
-    path = Path(inspect.getfile(computer_module))
-    tree = ast.parse(path.read_text(encoding="utf-8"))
+    tree = ast.parse(Path(inspect.getfile(target)).read_text(encoding="utf-8"))
 
     docstrings: set[int] = set()
     for node in ast.walk(tree):
@@ -49,17 +67,17 @@ def test_the_renderer_types_no_plan_status_marker_of_its_own() -> None:
     # and that is exactly the file this pin exists to catch.
     needles = {plan_workflow.UNCONFIRMED, plan_workflow.UNVERIFIED, "待确认", "待核验"}
     typed = [text for text in literals if any(word in text for word in needles)]
-    assert typed == [], f"placeholders must come from plan_workflow, not as literals: {typed}"
+    assert typed == [], f"placeholders must be imported, not typed: {typed}"
 
     # …and the shared constants really are imported here, so the check above cannot
     # be satisfied by deleting the markers instead of routing them.
-    imports_plan_workflow = any(
+    imports_them = any(
         isinstance(node, ast.ImportFrom)
-        and (node.module or "").endswith("plan_workflow")
+        and (node.module or "").endswith(marker_home)
         and {"UNCONFIRMED", "UNVERIFIED"} <= {alias.name for alias in node.names}
         for node in ast.walk(tree))
-    assert imports_plan_workflow, (
-        "computer.py must read UNCONFIRMED/UNVERIFIED from agent_v2.plan_workflow")
+    assert imports_them, f"{module} must read UNCONFIRMED/UNVERIFIED from {marker_home}"
+
 
 
 def test_the_blank_budget_note_and_action_are_gated_on_the_shared_marker() -> None:
@@ -88,7 +106,7 @@ def test_the_blank_budget_note_and_action_are_gated_on_the_shared_marker() -> No
         fixture_candidates("complete"),
         DeterministicProvider(ProviderConfig(data_mode="offline")),
         comparison_id="run:marker"))
-    document = build_report_document(result)
+    document = build_report_document(result, arrangement_labels=_LABELS)
     # The builder's own answer for a user who never stated a budget: the marker.
     assert document["budget_note"] == UNCONFIRMED
 
@@ -140,7 +158,7 @@ def test_structured_report_pdf_is_a_real_pdf(tmp_path) -> None:
 
     result = asyncio.run(compare_routes(
         fixture_candidates("complete"), OrderProvider(), preferences="新手", comparison_id="run:pdf"))
-    content = json.dumps(build_report_document(result), ensure_ascii=False)
+    content = json.dumps(build_report_document(result, arrangement_labels=_LABELS), ensure_ascii=False)
 
     computer = LocalNativeComputer()
     workspace = computer.create_workspace("pdf-report")
@@ -172,7 +190,7 @@ def test_plan_document_has_complete_sections_and_explicit_unknowns() -> None:
 
     result = asyncio.run(compare_routes(
         fixture_candidates("partial"), OrderProvider(), comparison_id="run:sections"))
-    document = build_report_document(result)
+    document = build_report_document(result, arrangement_labels=_LABELS)
 
     assert document["document_type"] == "hiking_plan"
     assert document["schema_version"] == "2.0"
@@ -204,7 +222,7 @@ def test_pdf_plan_pages_have_readable_sections_and_no_orphan_headings() -> None:
     result.plan_details = PlanDetails(leader="领队甲", itinerary=[
         PlanStage(time=f"第 {i} 天", activity="集合、装备检查与结伴徒步；" * 12) for i in range(1, 16)],
         budget=[BudgetItem(item="交通", amount_yuan=200)])
-    payload = _render_pdf_bytes(json.dumps(build_report_document(result), ensure_ascii=False))
+    payload = _render_pdf_bytes(json.dumps(build_report_document(result, arrangement_labels=_LABELS), ensure_ascii=False))
     with fitz.open(stream=payload, filetype="pdf") as pdf:
         texts = [page.get_text() for page in pdf]
         combined = "\n".join(texts)

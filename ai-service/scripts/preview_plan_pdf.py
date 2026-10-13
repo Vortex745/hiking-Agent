@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent_v2.computer import _render_pdf_bytes
+from agent_v2.plan_workflow import ARRANGEMENT_FIELDS
 from route_compare.fixtures import fixture_candidates
 from route_compare.models import BudgetItem, PlanDetails, PlanStage
 from route_compare.providers import DeterministicProvider, ProviderConfig
@@ -33,7 +34,8 @@ def main() -> None:
     arrangements = {"destination_or_route": "演示山谷环线", "emergency_contact": "",
                     "budget": "全队AA，交通与补给为主（用户原文）"}
     document = build_report_document(
-        result, plan_type="route_plan", completeness="confirmation_required",
+        result, arrangement_labels=dict(ARRANGEMENT_FIELDS),
+        plan_type="route_plan", completeness="confirmation_required",
         safety={"hard_stop": False, "codes": [], "formal_route_plan_allowed": True,
                 "message": "", "comparison_id": result.comparison_id,
                 "comparison_status": result.status, "gate_reasons": [], "required_action": ""},
