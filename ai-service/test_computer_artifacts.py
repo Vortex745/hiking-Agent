@@ -79,6 +79,54 @@ def test_the_plan_document_layers_type_no_status_marker_of_its_own(
     assert imports_them, f"{module} must read UNCONFIRMED/UNVERIFIED from {marker_home}"
 
 
+def test_the_plan_book_numbers_its_sections_by_name_not_by_offset() -> None:
+    """``PLAN_SECTIONS`` is ONE vocabulary; unpacking it by magic offset is not.
+
+    The report story called ``section_title(*PLAN_SECTIONS[9])`` thirteen times, and
+    ``section_title`` kept an ``_aliases`` parameter it ignored only so that unpacking
+    would bind. Neither was wrong while the tuple stayed as it was: inserting a
+    section, or reordering two, silently shifts every later heading's NUMBER and the
+    aliases argument stops being a nuisance and starts being a lie. The section-number
+    lookup is therefore by label, and the throw-away parameter is gone — pinned at
+    the source level because the failure mode is a document that renders happily with
+    the wrong numbers.
+    """
+    import ast
+
+    import agent_v2.computer as computer_module
+
+    tree = ast.parse(Path(inspect.getfile(computer_module)).read_text(encoding="utf-8"))
+
+    offset_reads = [node.lineno for node in ast.walk(tree)
+                    if isinstance(node, ast.Subscript)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "PLAN_SECTIONS"]
+    assert offset_reads == [], (
+        f"PLAN_SECTIONS is indexed by position at line(s) {offset_reads}; "
+        "look the section up by label so an inserted section cannot renumber the book")
+
+    def_title = next((node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                      and node.name == "section_title"), None)
+    assert def_title is not None, "section_title is gone"
+    ignored = [arg.arg for arg in [*def_title.args.posonlyargs, *def_title.args.args]
+               if arg.arg.startswith("_")]
+    assert ignored == [], (
+        f"section_title still accepts parameter(s) {ignored} only so a tuple can be "
+        "unpacking into it — the call site should pass what the function takes")
+
+    # …and the by-name lookup is really there, so the check above is not satisfied by
+    # deleting the numbering instead of fixing it.
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+             and getattr(node.func, "id", "") == "section_title"]
+    assert calls, "no section titles are drawn"
+    unpacked = [arg for arg in calls[0].args if isinstance(arg, ast.Starred)]
+    assert unpacked and all(isinstance(arg.value, ast.Call) for arg in unpacked), (
+        "section_title should be handed the (number, label) pair a by-name lookup "
+        "returns, not two hand-copied strings")
+    names = {getattr(call.args[0].value.func, "id", "") for call in calls if call.args}
+    assert len(names) == 1 and "" not in names, (
+        f"every section title should come from one lookup helper, saw {names}")
+
 
 def test_the_blank_budget_note_and_action_are_gated_on_the_shared_marker() -> None:
     """Same rule, observed as behaviour: an absent arrangement is not user copy.

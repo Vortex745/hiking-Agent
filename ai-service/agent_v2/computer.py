@@ -47,7 +47,7 @@ from agent_v2.artifacts import ArtifactManifest, compute_sha256
 # budget-note and required-action guards), so a literal typed here would be a second
 # copy of a word another module owns. ``agent_v2.computer`` → ``agent_v2.plan_workflow``
 # is the correct direction (plan_workflow imports nothing), pinned by
-# ``test_the_renderer_types_no_plan_status_marker_of_its_own``.
+# ``test_the_plan_document_layers_type_no_status_marker_of_its_own``.
 from agent_v2.plan_workflow import UNCONFIRMED, UNVERIFIED
 
 logger = logging.getLogger("ai-service.agent_v2.computer")
@@ -188,6 +188,16 @@ PLAN_SECTIONS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("13", "来源与证据", ("来源与证据", "来源", "参考资料")),
 )
 
+#: The (number, label) pair of one section, looked up BY NAME. Call sites name the
+#: section they draw instead of indexing PLAN_SECTIONS, so inserting or reordering a
+#: section cannot silently renumber every later heading.
+def _plan_section(label: str) -> tuple[str, str]:
+    for number, section_label, _aliases in PLAN_SECTIONS:
+        if section_label == label:
+            return number, section_label
+    raise KeyError(label)
+
+
 #: The copy an ordinary artifact export falls back to when the Markdown draft has
 #: nothing under a heading (spec: 补齐缺失章节并标为草案, never invent).
 _TEXT_SECTION_DEFAULTS: dict[str, str] = {
@@ -258,8 +268,7 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
         text = escape(str(value if value not in (None, "") else UNVERIFIED)).replace("\n", "<br/>")
         return Paragraph(text, style_obj)
 
-    def section_title(number: str, label: str, _aliases: tuple[str, ...] = (),
-                      *, tone: str = "default") -> list[Any]:
+    def section_title(number: str, label: str, *, tone: str = "default") -> list[Any]:
         risk = tone == "risk"
         rule = HRFlowable(width="100%", thickness=1.4 if risk else 0.8,
                           color=HexColor(_PDF_RISK if risk else _PDF_PRIMARY), spaceAfter=6)
@@ -345,7 +354,7 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
     story.append(PageBreak())
 
     # ---- 01 计划摘要 -----------------------------------------------------
-    story.extend(section_title(*PLAN_SECTIONS[0]))
+    story.extend(section_title(*_plan_section("计划摘要")))
     summary_data = data.get("summary") or {}
     headline = str(summary_data.get("headline") or "").strip()
     if headline:
@@ -379,7 +388,7 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
     story.append(decision)
 
     # ---- 02 计划信息 + 03 路线摘要 --------------------------------------
-    story.extend(section_title(*PLAN_SECTIONS[1]))
+    story.extend(section_title(*_plan_section("计划信息")))
     metadata = data.get("plan_metadata", [])
     metadata_rows: list[list[Any]] = []
     for index in range(0, len(metadata), 2):
@@ -390,7 +399,7 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
     if metadata_rows:
         story.append(styled_table(metadata_rows, [28, 59, 28, 59], header=False))
     story.append(Spacer(1, 4))
-    story.extend(section_title(*PLAN_SECTIONS[2]))
+    story.extend(section_title(*_plan_section("路线摘要")))
     overview = data.get("route_overview", [])
     overview_rows: list[list[Any]] = []
     for index in range(0, len(overview), 2):
@@ -404,7 +413,7 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
     story.append(Paragraph(f"事实字段来自路线证据；显示“{UNVERIFIED}”的字段不得在出发前视为已确认。", small))
 
     # ---- 04 行程时间线 ---------------------------------------------------
-    story.extend(section_title(*PLAN_SECTIONS[3]))
+    story.extend(section_title(*_plan_section("行程时间线")))
     timeline_note = ("以下按用户提供的安排成时间线，执行前需确认。" if data.get("user_itinerary") else
                      f"以下为通用行程模板，日期、时间与途经点{UNCONFIRMED}；不代表已核验的分段行程。")
     story.append(Paragraph(timeline_note, small))
@@ -420,16 +429,16 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
     timeline_table.setStyle(TableStyle([("LINEBEFORE", (1, 1), (1, -1), 1.4, HexColor(_PDF_PRIMARY))]))
     story.append(timeline_table)
 
-    story.extend(section_title(*PLAN_SECTIONS[4]))
+    story.extend(section_title(*_plan_section("交通住宿与联络")))
     logistics = [[p(row.get("label"), table_cell_bold), p(row.get("value"))]
                  for row in data.get("logistics", [])]
     if logistics:
         story.append(styled_table(logistics, [35, 139], header=False))
-    story.extend(section_title(*PLAN_SECTIONS[5]))
+    story.extend(section_title(*_plan_section("人员分工")))
     roles = [[p("岗位", table_head), p("人员", table_head), p("职责建议", table_head)]]
     roles += [[p(row.get("role")), p(row.get("person")), p(row.get("duty"))] for row in data.get("roles", [])]
     story.append(styled_table(roles, [30, 40, 104]))
-    story.extend(section_title(*PLAN_SECTIONS[6]))
+    story.extend(section_title(*_plan_section("费用预算")))
     budget = [[p("费用项目", table_head), p("金额", table_head), p("依据", table_head)]]
     budget += [[p(row.get("item")), p(row.get("amount")), p(row.get("basis"))] for row in data.get("budget", [])]
     note = str(data.get("budget_note") or "").strip()
@@ -447,7 +456,7 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
         story.append(p("预算原文：" + note, small))
 
     # ---- 08 装备与补给 ---------------------------------------------------
-    story.extend(section_title(*PLAN_SECTIONS[7]))
+    story.extend(section_title(*_plan_section("装备与补给")))
     gear = [[p("类别", table_head), p("物品", table_head), p("优先级", table_head), p("出发前状态", table_head)]]
     gear += [[p(row.get("category"), table_cell_bold), p(row.get("item")), p(row.get("priority"), center_cell),
               p(row.get("status"), center_cell)] for row in data.get("equipment", [])]
@@ -470,7 +479,7 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
         risk_block.append(styled_table(
             [[p(str(row.get("label", "")), table_cell_bold), p(row.get("value", ""))] for row in contacts],
             [35, 139], header=False))
-    story.append(KeepTogether(section_title(*PLAN_SECTIONS[8], tone="risk") + risk_block))
+    story.append(KeepTogether(section_title(*_plan_section("风险决策区"), tone="risk") + risk_block))
     required = str(data.get("required_action") or "").strip()
     if required and required != UNCONFIRMED:
         action_table = Table([[Paragraph("出发前必须完成：" + escape(required), callout)]], colWidths=[page_width])
@@ -481,7 +490,7 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
         story.extend([Spacer(1, 6), action_table])
 
     # ---- 10 出发前检查 ---------------------------------------------------
-    story.extend(section_title(*PLAN_SECTIONS[9]))
+    story.extend(section_title(*_plan_section("出发前检查")))
     checklist = [[p("检查项", table_head), p("负责人", table_head), p("状态", table_head)]]
     checklist += [[p(row.get("item")), p(row.get("owner"), center_cell), p(row.get("status"), center_cell)]
                   for row in data.get("checklist", [])]
@@ -490,7 +499,7 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
     # ---- 11 候选路线对比 -------------------------------------------------
     rows = data.get("rows", [])
     if rows:
-        story.extend(section_title(*PLAN_SECTIONS[10]))
+        story.extend(section_title(*_plan_section("候选路线对比")))
         # Use one route per row and short labels so nine columns remain legible.
         columns = ["路线"] + [str(c).strip() for c in data.get("columns", [])] + ["资料", "风险"]
         table_data: list[list[Any]] = [[p(c, table_head) for c in columns]]
@@ -503,7 +512,7 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
         story.append(styled_table(table_data, col_widths, highlight_rows={i for i, row in enumerate(rows, 1) if row.get("highlight")}))
 
     notes = [str(n) for n in data.get("notes", []) if n]
-    story.extend(section_title(*PLAN_SECTIONS[11]))
+    story.extend(section_title(*_plan_section("排序依据与说明")))
     if notes:
         for note in notes:
             story.append(Paragraph("•　" + escape(note), body))
@@ -514,7 +523,7 @@ def _report_story(doc: Any, data: dict[str, Any]) -> list[Any]:
     # Sources are retained as an appendix and can split across pages.
     source_groups = data.get("sources", [])
     if source_groups:
-        story.extend(section_title(*PLAN_SECTIONS[12]))
+        story.extend(section_title(*_plan_section("来源与证据")))
         for group in source_groups:
             story.append(Paragraph(escape("来源 — " + str(group.get("candidate", UNVERIFIED))), table_cell_bold))
             for entry in group.get("entries", []):
