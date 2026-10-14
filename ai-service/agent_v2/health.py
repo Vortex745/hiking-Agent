@@ -76,6 +76,28 @@ def v2_health_status(app_state: Any, settings: Any) -> dict[str, Any]:
             lock_row = runtime.runs.control.get_writer_lock()
             payload["persistence"]["writer_lock_row"] = lock_row
         sandbox_type = getattr(settings, "agent_v2_sandbox_type", "remote_e2b")
+        # Ticket 01 (harness-p0-p1): report what the sandbox REALLY does.
+        # ``remote_e2b`` is a placeholder that refuses before any host
+        # access — it must never look "ready". ``local_native`` is a host
+        # temp dir that is only trustworthy because an operator explicitly
+        # configured it. ``wsl_localvm`` currently runs on the local host
+        # implementation and is NOT advertised as verified isolation.
+        if sandbox_type == "remote_e2b":
+            sandbox_status = "unavailable"
+            sandbox_detail = (
+                "远程沙箱（remote_e2b）尚未接入：artifact/cowork 执行在任何宿主访问前"
+                "被拒绝（sandbox_unavailable），基础聊天不受影响。"
+            )
+        elif sandbox_type == "local_native":
+            sandbox_status = "trusted_local"
+            sandbox_detail = (
+                "受信本地开发沙箱（宿主临时目录），仅限明确配置的开发环境使用。"
+            )
+        else:
+            sandbox_status = "trusted_local"
+            sandbox_detail = (
+                "wsl_localvm 当前由本地宿主实现承载，未验证为隔离环境。"
+            )
         payload["dependencies"] = {
             "model": {
                 "status": "ready"
@@ -87,8 +109,14 @@ def v2_health_status(app_state: Any, settings: Any) -> dict[str, Any]:
                 if bool(getattr(settings, "mcp_servers", {}))
                 else "disabled"
             },
-            "e2b": {
-                "status": "ready" if sandbox_type != "remote_e2b" else "selected"
+            "sandbox": {
+                "status": sandbox_status,
+                "type": sandbox_type,
+                # No current backend provides verified isolation: the
+                # remote placeholder refuses, and the local backends run
+                # on the host.
+                "verified_isolation": False,
+                "detail": sandbox_detail,
             },
             "checkpoint": {
                 "status": "ready"

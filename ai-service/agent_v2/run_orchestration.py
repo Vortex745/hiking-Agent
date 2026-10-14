@@ -70,6 +70,7 @@ from agent_v2.computer import (
     SandboxCreationError,
     SandboxQuotaError,
     SandboxTimeoutError,
+    SandboxUnavailableError,
 )
 from agent_v2.effects import (
     EffectStatus,
@@ -611,6 +612,26 @@ async def drive_effect(
             yield emit("error", {
                 "code": "sandbox_timeout",
                 "message": f"{copy.timeout_error_message_prefix}{exc}",
+            })
+            mark_terminal_safe(runs_repo, run_id, "error")
+            return
+        except SandboxUnavailableError as exc:
+            # Ticket 01: the placeholder remote sandbox refused BEFORE any
+            # host access. This is a deterministic refusal, not a crash:
+            # nothing executed, so the effect is ``failed`` (never
+            # ``outcome_unknown``, never committed) and a replay cannot
+            # double-execute. The public code is the stable
+            # ``sandbox_unavailable`` — no local fallback is attempted.
+            runs_repo.mark_effect_failed(effect_key, reason=str(exc))
+            outcome.status = "failed"
+            yield emit("tool_result", {
+                "tool": copy.tool_name,
+                "status": "error",
+                "content": f"{copy.tool_result_failure_prefix}{exc}",
+            })
+            yield emit("error", {
+                "code": "sandbox_unavailable",
+                "message": f"沙箱不可用：{exc}",
             })
             mark_terminal_safe(runs_repo, run_id, "error")
             return
@@ -1881,6 +1902,21 @@ class RunOrchestrator:
                 yield emit("error", {
                     "code": "sandbox_timeout",
                     "message": f"沙箱命令超时：{exc}",
+                })
+                mark_terminal_safe(runs_repo, run_id, "error")
+                return
+            except SandboxUnavailableError as exc:
+                # Ticket 01: placeholder remote sandbox refused before any
+                # host access — surface the stable public code and stop.
+                # No artifact is published and no local fallback runs.
+                yield emit("tool_result", {
+                    "tool": "generate_pdf",
+                    "status": "error",
+                    "content": f"PDF 生成失败：{exc}",
+                })
+                yield emit("error", {
+                    "code": "sandbox_unavailable",
+                    "message": f"沙箱不可用：{exc}",
                 })
                 mark_terminal_safe(runs_repo, run_id, "error")
                 return
