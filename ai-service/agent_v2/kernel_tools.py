@@ -168,12 +168,24 @@ class GearChecklistTool(BoundedDomainTool):
     args_schema = _GearChecklistParams
     delegate_name = "gear_checklist"
 
+    def _success_audit_fields(self, raw: Any) -> dict[str, Any]:
+        # Ticket 02: the turn evidence gate renders gear answers from
+        # CONTROLLED fields, so the audit trail must carry a validated,
+        # bounded copy of the structured result. An unusable result is
+        # recorded as invalid — it must never launder a fake success.
+        controlled = _controlled_gear_result(self.name, raw)
+        return {"controlled": controlled} if controlled is not None else {}
+
 
 class RiskAssessmentTool(BoundedDomainTool):
     name = "risk_assessment"
     description = "对目的地/天气/路线/经验进行保守的风险评估并给出建议。"
     args_schema = _RiskAssessmentParams
     delegate_name = "risk_assessment"
+
+    def _success_audit_fields(self, raw: Any) -> dict[str, Any]:
+        controlled = _controlled_risk_result(self.name, raw)
+        return {"controlled": controlled} if controlled is not None else {}
 
 
 class HikingKnowledgeSearchTool(BoundedDomainTool):
@@ -210,6 +222,83 @@ class HikingKnowledgeSearchTool(BoundedDomainTool):
                 "chunks": chunk_summaries,
             }
         }
+
+
+# ---- Ticket 02: controlled domain results ------------------------------------
+#
+# The turn evidence gate only lets deterministic tool results shape the
+# public answer. These builders validate + bound the raw delegate output
+# into a ``controlled`` payload; anything that fails validation is reported
+# as ``{"ok": False, "code": "invalid_controlled_result"}`` so the gate can
+# never render a pseudo success. Sizes are capped so the audit trail (which
+# also rides on public tool_result events) stays bounded.
+
+_CONTROLLED_MAX_ITEMS = 40
+_CONTROLLED_MAX_TEXT = 300
+
+
+def _bounded_text(value: Any, *, limit: int = _CONTROLLED_MAX_TEXT) -> str:
+    text = value if isinstance(value, str) else ""
+    return text[:limit]
+
+
+def _bounded_items(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [_bounded_text(item, limit=120) for item in value[:_CONTROLLED_MAX_ITEMS] if item]
+
+
+def _controlled_gear_result(tool_name: str, raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, Mapping) or raw.get("ok") is not True:
+        return _invalid_controlled(tool_name)
+    checklist_raw = raw.get("checklist")
+    if not isinstance(checklist_raw, Mapping) or not checklist_raw:
+        return _invalid_controlled(tool_name)
+    checklist: dict[str, list[str]] = {}
+    for category, items in checklist_raw.items():
+        bounded = _bounded_items(items)
+        if bounded:
+            checklist[_bounded_text(category, limit=40)] = bounded
+    if not checklist:
+        return _invalid_controlled(tool_name)
+    return {
+        "tool": tool_name,
+        "ok": True,
+        "days": raw.get("days") if isinstance(raw.get("days"), int) else None,
+        "season": _bounded_text(raw.get("season"), limit=40) or "未指定",
+        "experience": _bounded_text(raw.get("experience"), limit=40) or "未指定",
+        "camping": bool(raw.get("camping")),
+        "checklist": checklist,
+        "limitations": _bounded_text(raw.get("message")),
+    }
+
+
+_RISK_LEVELS = frozenset({"low", "medium", "high"})
+
+
+def _controlled_risk_result(tool_name: str, raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, Mapping) or raw.get("ok") is not True:
+        return _invalid_controlled(tool_name)
+    level = raw.get("risk_level")
+    if not isinstance(level, str) or level not in _RISK_LEVELS:
+        return _invalid_controlled(tool_name)
+    reasons = _bounded_items(raw.get("reasons"))
+    if not reasons:
+        return _invalid_controlled(tool_name)
+    return {
+        "tool": tool_name,
+        "ok": True,
+        "destination": _bounded_text(raw.get("destination"), limit=80) or "未指定",
+        "risk_level": level,
+        "reasons": reasons,
+        "cancel_conditions": _bounded_items(raw.get("cancel_conditions")),
+        "alternatives": _bounded_items(raw.get("alternatives")),
+        "recommendation": _bounded_text(raw.get("recommendation")),
+    }
+
+
+def _invalid_controlled(tool_name: str) -> dict[str, Any]:
+    return {"tool": tool_name, "ok": False, "code": "invalid_controlled_result"}
 
 
 # Profile-aware registry: implemented adapters only. Anything allowed but

@@ -133,8 +133,12 @@ def test_chat_flow_emits_expected_sequence_with_single_done_terminal(tmp_path: P
     assert terminals == ["done"]
 
     text_events = [e for e in items if e.type == "text"]
-    # 窄门语义：本回合未尝试知识检索（无 audit），文本不被 fail-closed 替换。
-    assert text_events[0].payload["content"] == "你好，徒步愉快！"
+    # Ticket 02: no this-turn evidence and no controlled domain result —
+    # the free model text is replaced by the controlled insufficiency
+    # template. The OLD contract asserted the ungrounded text passed.
+    assert text_events[0].payload["content"] == (
+        "资料不足：未检索到可核验的徒步知识，无法提供具体徒步事实。"
+    )
 
     # Exactly one kernel call, with the composed product system prompt.
     assert len(kernel_calls) == 1
@@ -168,12 +172,14 @@ def test_chat_flow_replaces_unsupported_factual_output_when_search_has_no_eviden
     assert "120公里" not in text
 
 
-def test_chat_flow_passes_text_when_model_skips_knowledge_search(tmp_path: Path):
-    """窄门边界：模型完全未尝试检索时不拦截。
+def test_chat_flow_blocks_factual_output_when_model_skips_knowledge_search(
+    tmp_path: Path,
+):
+    """Ticket 02 反例回归：旧契约曾断言未检索文本原样透传。
 
-    fail-closed 只覆盖"编造签名"（检索被尝试但无可用地片段）。
-    未尝试检索的回合由 system prompt 的先检索约束约束；
-    语义蕴含门是计划中的第二层（见项目 TODO）。
+    模型完全未尝试检索时，任何路线事实（"这段路线爬升约1800米。"）
+    都不得透传——替换为受控资料不足提示。旧行为见 git 历史中本测试的
+    前身（passed un-retrieved text through）。
     """
     kernel_calls: list[dict[str, Any]] = []
     orch = _orchestrator(
@@ -185,21 +191,39 @@ def test_chat_flow_passes_text_when_model_skips_knowledge_search(tmp_path: Path)
     items = _stream(orch, _flow_req(message="这段路线爬升多少"))
 
     text = next(event.payload["content"] for event in items if event.type == "text")
-    assert text == "这段路线爬升约1800米。"
+    assert text != "这段路线爬升约1800米。"
+    assert "1800" not in text
+    assert "资料不足" in text
 
 
-def test_chat_flow_passes_text_when_other_tool_grounded_output_exists(tmp_path: Path):
-    """窄门边界：非知识工具的成功产出（装备清单等）不被拦截。"""
+def test_chat_flow_renders_controlled_gear_result_without_model_embellishment(
+    tmp_path: Path,
+):
+    """Ticket 02: gear_checklist 成功后按受控字段构造结果。
+
+    模型附加的未经支持内容（路线里程）不得出现在答复里；答复注明依据
+    与局限。受控字段由适配器写入 audit（生产路径），此处按同一形状注入。
+    """
     kernel_calls: list[dict[str, Any]] = []
     orch = _orchestrator(
         tmp_path,
         kernel_calls,
         kernel_result=(
-            "装备清单如下：帐篷、睡袋、登山鞋。请按保守原则准备。",
+            "装备清单如下：帐篷、睡袋、登山鞋。另外这条路线全程约120公里。",
             [{
                 "tool": "gear_checklist",
                 "phase": "result",
                 "ok": True,
+                "controlled": {
+                    "tool": "gear_checklist",
+                    "ok": True,
+                    "days": 2,
+                    "season": "冬季",
+                    "experience": "新手",
+                    "camping": True,
+                    "checklist": {"露营": ["帐篷", "睡袋"], "基础": ["登山鞋"]},
+                    "limitations": "具体重量和型号需结合天气、海拔和路线强度调整。",
+                },
             }],
         ),
     )
@@ -207,7 +231,10 @@ def test_chat_flow_passes_text_when_other_tool_grounded_output_exists(tmp_path: 
     items = _stream(orch, _flow_req(message="带什么装备？"))
 
     text = next(event.payload["content"] for event in items if event.type == "text")
-    assert "帐篷" in text
+    assert "帐篷" in text and "登山鞋" in text
+    assert "gear_checklist" in text  # basis stated
+    assert "局限" in text  # limitations stated
+    assert "120公里" not in text  # model embellishment dropped
 
 
 def test_chat_flow_preserves_answer_when_knowledge_evidence_exists(tmp_path: Path):

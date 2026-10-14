@@ -142,6 +142,109 @@ def test_knowledge_search_audit_records_whether_traceable_evidence_exists():
 
 
 # ---------------------------------------------------------------------------
+# Ticket 02: validated controlled results on the audit trail
+# ---------------------------------------------------------------------------
+
+
+def test_gear_success_records_validated_controlled_fields():
+    async def _delegate(**kwargs: Any):
+        return {
+            "ok": True,
+            "days": 2,
+            "season": "冬季",
+            "experience": "新手",
+            "camping": True,
+            "checklist": {"基础": ["登山鞋"], "露营": ["帐篷"]},
+            "message": "装备清单按保守原则生成。",
+        }
+
+    sink: list[dict[str, Any]] = []
+    tool = GearChecklistTool(run_id="r-gear-ctrl", audit_sink=sink.append, delegate=_delegate)
+
+    result = asyncio.run(tool(days=2, season="冬季"))
+
+    assert result.output
+    controlled = sink[-1]["controlled"]
+    assert controlled["ok"] is True
+    assert controlled["checklist"] == {"基础": ["登山鞋"], "露营": ["帐篷"]}
+    assert controlled["season"] == "冬季" and controlled["camping"] is True
+    assert controlled["limitations"] == "装备清单按保守原则生成。"
+
+
+def test_gear_unusable_result_is_recorded_as_invalid_controlled():
+    async def _delegate(**kwargs: Any):
+        return {"ok": True, "checklist": {}, "message": "no items"}
+
+    sink: list[dict[str, Any]] = []
+    tool = GearChecklistTool(run_id="r-gear-bad", audit_sink=sink.append, delegate=_delegate)
+
+    asyncio.run(tool(days=1))
+
+    controlled = sink[-1]["controlled"]
+    assert controlled["ok"] is False
+    assert controlled["code"] == "invalid_controlled_result"
+
+
+def test_risk_success_records_validated_controlled_fields():
+    async def _delegate(**kwargs: Any):
+        return {
+            "ok": True,
+            "destination": "鳌太线",
+            "risk_level": "high",
+            "reasons": ["存在暴雨/雷暴等硬风险条件。"],
+            "cancel_conditions": ["暴雨橙色及以上预警"],
+            "alternatives": ["改期"],
+            "recommendation": "建议取消或改期。",
+        }
+
+    sink: list[dict[str, Any]] = []
+    tool = RiskAssessmentTool(run_id="r-risk-ctrl", audit_sink=sink.append, delegate=_delegate)
+
+    asyncio.run(tool(destination="鳌太线"))
+
+    controlled = sink[-1]["controlled"]
+    assert controlled["ok"] is True
+    assert controlled["risk_level"] == "high"
+    assert controlled["reasons"] == ["存在暴雨/雷暴等硬风险条件。"]
+
+
+def test_risk_unknown_level_is_recorded_as_invalid_controlled():
+    async def _delegate(**kwargs: Any):
+        return {"ok": True, "risk_level": "extreme", "reasons": ["x"]}
+
+    sink: list[dict[str, Any]] = []
+    tool = RiskAssessmentTool(run_id="r-risk-bad", audit_sink=sink.append, delegate=_delegate)
+
+    asyncio.run(tool(destination="x"))
+
+    controlled = sink[-1]["controlled"]
+    assert controlled["ok"] is False
+    assert controlled["code"] == "invalid_controlled_result"
+
+
+def test_controlled_payload_is_bounded():
+    """Oversized tool output must not bloat the audit trail / public event."""
+
+    async def _delegate(**kwargs: Any):
+        return {
+            "ok": True,
+            "days": 1,
+            "checklist": {f"类目{i}": [f"物品{j}" for j in range(200)] for i in range(50)},
+            "message": "x" * 10_000,
+        }
+
+    sink: list[dict[str, Any]] = []
+    tool = GearChecklistTool(run_id="r-gear-big", audit_sink=sink.append, delegate=_delegate)
+
+    asyncio.run(tool(days=1))
+
+    controlled = sink[-1]["controlled"]
+    assert len(controlled["checklist"]) <= 50
+    assert all(len(items) <= 40 for items in controlled["checklist"].values())
+    assert len(controlled["limitations"]) <= 300
+
+
+# ---------------------------------------------------------------------------
 # Profile surface fail-closed + the ONE product gate bridge
 # ---------------------------------------------------------------------------
 

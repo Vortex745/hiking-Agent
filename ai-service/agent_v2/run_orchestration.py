@@ -720,6 +720,24 @@ def compose_chat_system_prompt(req: ChatFlowRequest, profile: CapabilityProfile)
 
 _NO_KNOWLEDGE_EVIDENCE_RESPONSE = "资料不足：未检索到可核验的徒步知识，无法提供具体徒步事实。"
 
+# Ticket 02 controlled templates. Without this-turn knowledge evidence the
+# user never sees free model text: greetings, missing-parameter
+# clarifications, and insufficiency each have ONE deterministic wording.
+_CONTROLLED_GREETING_RESPONSE = (
+    "你好！我是徒步助手，可以帮你查询徒步知识、准备装备清单或评估路线风险。"
+    "请告诉我你想了解的内容。"
+)
+_CONTROLLED_CLARIFICATION_RESPONSE = (
+    "为了给出可靠的徒步建议，请补充：路线对象或当前位置、出行时间与天数、"
+    "经验与露营需求。信息齐全后我会先检索知识库再作答。"
+)
+
+_GREETING_TOKENS = (
+    "你好", "您好", "hi", "hello", "嗨", "在吗",
+    "早上好", "上午好", "下午好", "晚上好",
+)
+_CLARIFICATION_MARKERS = ("请问", "请补充", "请提供", "需要知道", "缺少")
+
 
 def compose_rag_system_prompt(req: ChatFlowRequest, profile: CapabilityProfile) -> str:
     """Knowledge-QA system prompt for the rag profile (spec #13 phase 2).
@@ -740,35 +758,165 @@ def compose_rag_system_prompt(req: ChatFlowRequest, profile: CapabilityProfile) 
     )
 
 
-def has_hiking_knowledge_evidence(audit_entries: list[dict[str, Any]]) -> bool:
-    """Allow factual chat output only after a successful non-empty RAG search."""
-    return any(
-        entry.get("tool") == "hiking_knowledge_search"
-        and entry.get("phase") == "result"
-        and entry.get("ok") is True
-        and isinstance(entry.get("evidence"), dict)
-        and entry["evidence"].get("has_chunks") is True
-        for entry in audit_entries
-    )
-
-
-def knowledge_search_attempted_without_evidence(
-    audit_entries: list[dict[str, Any]],
+def has_hiking_knowledge_evidence(
+    audit_entries: list[dict[str, Any]], *, run_id: str | None = None
 ) -> bool:
-    """Fabrication signature: the knowledge tool was attempted this turn
-    (called, denied, or errored) but produced no retrievable chunks.
+    """True only when THIS turn ran a successful, non-empty, traceable
+    knowledge retrieval.
 
-    Only this signature triggers the fail-closed replacement — outputs
-    grounded in other successful tool executions (gear checklist, risk
-    classification, weather) pass through, and so does a turn that never
-    attempted the search. The system prompt mandates search-first; a
-    semantic-entailment gate for the never-searched turn is the planned
-    second layer (see project TODO).
+    Run-scoped (Ticket 02 AC3): an entry explicitly bound to a different
+    run never grounds the current turn — evidence cannot be borrowed from
+    another run's audit trail. Entries without a ``run_id`` belong to the
+    per-turn sink by construction and still count.
     """
-    attempted = any(
-        entry.get("tool") == "hiking_knowledge_search" for entry in audit_entries
+    for entry in audit_entries:
+        if entry.get("tool") != "hiking_knowledge_search":
+            continue
+        entry_run = entry.get("run_id")
+        if run_id is not None and entry_run is not None and entry_run != run_id:
+            continue
+        if (
+            entry.get("phase") == "result"
+            and entry.get("ok") is True
+            and isinstance(entry.get("evidence"), dict)
+            and entry["evidence"].get("has_chunks") is True
+        ):
+            return True
+    return False
+
+
+def _successful_controlled_entries(
+    audit_entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Validated ``controlled`` payloads from successful domain tools."""
+    controlled_entries: list[dict[str, Any]] = []
+    for entry in audit_entries:
+        if entry.get("phase") != "result" or entry.get("ok") is not True:
+            continue
+        controlled = entry.get("controlled")
+        if isinstance(controlled, dict) and controlled.get("ok") is True:
+            controlled_entries.append(controlled)
+    return controlled_entries
+
+
+def _render_gear_controlled(controlled: dict[str, Any]) -> str:
+    lines = ["装备清单（依据 gear_checklist 工具的结构化结果生成，非模型自由发挥）："]
+    context: list[str] = []
+    if isinstance(controlled.get("days"), int):
+        context.append(f"天数 {controlled['days']}")
+    context.append(f"季节 {controlled.get('season') or '未指定'}")
+    context.append(f"经验 {controlled.get('experience') or '未指定'}")
+    context.append(f"露营 {'是' if controlled.get('camping') else '否'}")
+    lines.append("行程参数：" + "，".join(context) + "。")
+    checklist = controlled.get("checklist")
+    if isinstance(checklist, dict):
+        for category, items in checklist.items():
+            if items:
+                lines.append(f"- {category}：{'、'.join(str(i) for i in items)}")
+    limitations = controlled.get("limitations")
+    if isinstance(limitations, str) and limitations:
+        lines.append(f"局限：{limitations}")
+    return "\n".join(lines)
+
+
+def _render_risk_controlled(controlled: dict[str, Any]) -> str:
+    lines = ["风险评估（依据 risk_assessment 工具的结构化结果生成，非模型自由发挥）："]
+    lines.append(
+        f"对象：{controlled.get('destination') or '未指定'}；"
+        f"风险等级：{controlled.get('risk_level')}。"
     )
-    return attempted and not has_hiking_knowledge_evidence(audit_entries)
+    for reason in controlled.get("reasons") or []:
+        lines.append(f"- {reason}")
+    recommendation = controlled.get("recommendation")
+    if isinstance(recommendation, str) and recommendation:
+        lines.append(f"建议：{recommendation}")
+    cancel_conditions = controlled.get("cancel_conditions") or []
+    if cancel_conditions:
+        lines.append("取消条件：" + "、".join(str(c) for c in cancel_conditions) + "。")
+    alternatives = controlled.get("alternatives") or []
+    if alternatives:
+        lines.append("备选：" + "、".join(str(a) for a in alternatives) + "。")
+    return "\n".join(lines)
+
+
+def build_controlled_domain_reply(
+    audit_entries: list[dict[str, Any]],
+) -> str | None:
+    """Render the deterministic answer for successful domain tools.
+
+    Ticket 02 AC5/AC6: after gear_checklist / risk_assessment succeed, the
+    public answer is CONSTRUCTED from the tools' validated fields with
+    basis and limitations — the model's free text is dropped, so it cannot
+    attach unsupported route numbers, live weather, or other facts.
+    Returns ``None`` when no valid controlled result exists (failures and
+    invalid payloads never fake a success).
+    """
+    blocks: list[str] = []
+    for controlled in _successful_controlled_entries(audit_entries):
+        tool = controlled.get("tool")
+        if tool == "gear_checklist":
+            blocks.append(_render_gear_controlled(controlled))
+        elif tool == "risk_assessment":
+            blocks.append(_render_risk_controlled(controlled))
+    if not blocks:
+        return None
+    return "\n\n".join(blocks)
+
+
+def _is_greeting_message(message: str) -> bool:
+    text = (message or "").strip().strip("，。！？!?~～ \n\r\t")
+    if not text or len(text) > 16:
+        return False
+    lowered = text.lower()
+    return any(lowered.startswith(token) for token in _GREETING_TOKENS)
+
+
+def _is_clarification_request(model_text: str) -> bool:
+    """The model asked a clarifying question instead of answering.
+
+    Used only to SELECT a controlled template — the model's wording is
+    never shown to the user, so a claim smuggled into a "question" is
+    still dropped.
+    """
+    body = model_text or ""
+    return ("？" in body or "?" in body) and any(
+        marker in body for marker in _CLARIFICATION_MARKERS
+    )
+
+
+def apply_chat_turn_evidence_gate(
+    model_text: str,
+    audit_entries: list[dict[str, Any]],
+    *,
+    req: ChatFlowRequest,
+    run_id: str | None = None,
+) -> str:
+    """Decide the public chat/rag answer for one turn (Ticket 02).
+
+    Order (first match wins):
+
+    1. this-turn successful non-empty traceable retrieval → the model's
+       free reply passes (AC1/AC7);
+    2. a valid controlled domain result (gear/risk) → deterministic
+       rendering of the controlled fields (AC5/AC6);
+    3. a greeting user message → controlled greeting template (AC4);
+    4. a clarifying model question → controlled clarification template
+       whose fields are the canonical request items (AC4);
+    5. otherwise → the insufficiency template (AC1).
+
+    The result is what the stream emits, what the client finally sees, and
+    what gets persisted — one shared decision, no second path (AC2).
+    """
+    if has_hiking_knowledge_evidence(audit_entries, run_id=run_id):
+        return model_text
+    controlled = build_controlled_domain_reply(audit_entries)
+    if controlled is not None:
+        return controlled
+    if _is_greeting_message(req.message):
+        return _CONTROLLED_GREETING_RESPONSE
+    if _is_clarification_request(model_text):
+        return _CONTROLLED_CLARIFICATION_RESPONSE
+    return _NO_KNOWLEDGE_EVIDENCE_RESPONSE
 
 
 def _tool_result_summary(entry: dict[str, Any]) -> str:
@@ -3091,10 +3239,19 @@ class RunOrchestrator:
             mark_terminal_safe(self._runs_repo, run_id, "error")
             return
 
-        if profile.profile_id in (ProfileId.CHAT, ProfileId.RAG) and (
-            knowledge_search_attempted_without_evidence(audit_entries)
-        ):
-            response_text = _NO_KNOWLEDGE_EVIDENCE_RESPONSE
+        # Ticket 02 (spec T03/T04): the turn evidence gate. Free factual
+        # text requires THIS-turn successful non-empty traceable retrieval;
+        # controlled domain results render from validated fields; anything
+        # else falls back to a controlled template. The decision is made
+        # ONCE here — the text event, the final result, and the persisted
+        # history all carry this same content (AC2).
+        if profile.profile_id in (ProfileId.CHAT, ProfileId.RAG):
+            response_text = apply_chat_turn_evidence_gate(
+                response_text,
+                audit_entries,
+                req=req,
+                run_id=run_id,
+            )
 
         # Ticket 28/29 AC6: public evidence of degraded sources, executed
         # and denied tool calls — bound to the run identity, emitted
