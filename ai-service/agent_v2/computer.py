@@ -70,6 +70,11 @@ class SandboxUnavailableError(ComputerError):
     committed and no artifact is produced.
     """
 
+    # The ONE source of truth for the public error code: direct adapter
+    # calls, the kernel-facing Bridge (which re-raises it as a CLIError
+    # carrying this code) and the run orchestration all map to it.
+    code = "sandbox_unavailable"
+
 
 class SandboxQuotaError(ComputerError):
     """Quota exhausted — no new sandboxes can be provisioned."""

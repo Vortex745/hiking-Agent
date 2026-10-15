@@ -341,6 +341,8 @@ class ProductSandboxBridge:
     async def run(self, command: str, *, timeout: float | None = None):
         from uniharness.exceptions import CLIError
 
+        from agent_v2.computer import SandboxUnavailableError
+
         started = time.perf_counter()
         try:
             result = await asyncio.wait_for(
@@ -354,6 +356,13 @@ class ProductSandboxBridge:
             )
         except Exception as exc:
             duration_ms = int((time.perf_counter() - started) * 1000)
+            if isinstance(exc, SandboxUnavailableError):
+                # Ticket 01 AC1: the indirect (kernel tool) call keeps the
+                # SAME refusal identity as a direct adapter call. The kernel
+                # protocol still sees the CLIError it knows how to render,
+                # but the stable ``sandbox_unavailable`` code rides on its
+                # message and the original refusal stays as ``__cause__``.
+                raise CLIError(f"{SandboxUnavailableError.code}: {exc}") from exc
             msg = "sandbox command timed out" if isinstance(exc, TimeoutError) else "sandbox command failed"
             raise CLIError(msg) from exc
         return result

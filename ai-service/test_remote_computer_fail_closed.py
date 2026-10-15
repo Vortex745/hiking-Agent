@@ -217,17 +217,35 @@ def test_remote_computer_every_operation_refuses_before_host_access(
 def test_bridge_indirect_call_shares_refusal_semantics(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    """Ticket 01 AC1: the indirect (Bridge) call refuses with the SAME
+    identity as the direct adapter call.
+
+    The kernel-facing protocol still raises ``CLIError`` so the kernel
+    tool-error path stays coherent, but the refusal must stay
+    identifiable: the stable ``sandbox_unavailable`` code rides on the
+    message and the original :class:`SandboxUnavailableError` (the exact
+    refusal a direct adapter call raises) stays reachable as
+    ``__cause__``. No host command ran either way.
+    """
+    from uniharness.exceptions import CLIError
+
     sentinels = _HostAccessSentinels(monkeypatch)
 
-    bridge = ProductSandboxBridge(RemoteE2BComputer(), "/ws/run-01")
+    computer = RemoteE2BComputer()
+    bridge = ProductSandboxBridge(computer, "/ws/run-01")
 
-    async def scenario() -> None:
-        # The kernel-facing protocol surfaces CLIError; the important
-        # contract is that NO host command ran.
-        with pytest.raises(Exception):
+    async def scenario() -> tuple[str, Any, Any]:
+        with pytest.raises(CLIError) as excinfo:
             await bridge.run("echo kernel-planned")
+        # The direct adapter call: the kernel's OWN refusal semantics.
+        with pytest.raises(SandboxUnavailableError) as direct:
+            computer.run_bash("/ws/run-01", "echo kernel-planned")
+        return str(excinfo.value), excinfo.value.__cause__, str(direct.value)
 
-    asyncio.run(scenario())
+    message, cause, direct_message = asyncio.run(scenario())
+    assert "sandbox_unavailable" in message  # stable public code, on the wire
+    assert isinstance(cause, SandboxUnavailableError)  # identity preserved
+    assert str(cause) == direct_message  # same refusal text as the direct call
     sentinels.assert_no_host_access()
 
 

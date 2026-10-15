@@ -418,7 +418,7 @@ EFFECT_COPY_GENERATE_PDF = EffectCopy(
 # the public ``error`` from that recorded reason, so the refusal keeps
 # surfacing ``sandbox_unavailable`` — never the generic per-tool failure
 # code (``artifact_generation_failed`` / ``bash_execution_failed``).
-_SANDBOX_UNAVAILABLE_CODE = "sandbox_unavailable"
+_SANDBOX_UNAVAILABLE_CODE = SandboxUnavailableError.code
 _SANDBOX_UNAVAILABLE_REASON_PREFIX = f"{_SANDBOX_UNAVAILABLE_CODE}: "
 _SANDBOX_UNAVAILABLE_MESSAGE_PREFIX = "沙箱不可用："
 
