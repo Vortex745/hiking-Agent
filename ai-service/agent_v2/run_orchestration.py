@@ -411,6 +411,53 @@ EFFECT_COPY_GENERATE_PDF = EffectCopy(
 )
 
 
+# ---- Ticket 01/02 fix (D1): stable sandbox refusal code on replay --------
+#
+# A deterministic sandbox refusal is recorded as ``FAILED`` with its public
+# code embedded in ``failure_reason``. Every later resume/replay re-derives
+# the public ``error`` from that recorded reason, so the refusal keeps
+# surfacing ``sandbox_unavailable`` — never the generic per-tool failure
+# code (``artifact_generation_failed`` / ``bash_execution_failed``).
+_SANDBOX_UNAVAILABLE_CODE = "sandbox_unavailable"
+_SANDBOX_UNAVAILABLE_REASON_PREFIX = f"{_SANDBOX_UNAVAILABLE_CODE}: "
+_SANDBOX_UNAVAILABLE_MESSAGE_PREFIX = "沙箱不可用："
+
+
+def _record_sandbox_refusal(
+    runs_repo: RunRepository,
+    effect_key: str,
+    exc: BaseException,
+) -> None:
+    """Mark the effect FAILED, embedding the stable public refusal code."""
+    runs_repo.mark_effect_failed(
+        effect_key,
+        reason=f"{_SANDBOX_UNAVAILABLE_REASON_PREFIX}{exc}",
+    )
+
+
+def _failed_effect_reason_text(reason: str) -> str:
+    """The operator-facing failure reason without the internal marker."""
+    if reason.startswith(_SANDBOX_UNAVAILABLE_REASON_PREFIX):
+        return reason[len(_SANDBOX_UNAVAILABLE_REASON_PREFIX):]
+    return reason
+
+
+def _failed_effect_public_error(copy: EffectCopy, reason: str) -> tuple[str, str]:
+    """Map a recorded FAILED reason to the public ``error`` (code, message).
+
+    Sandbox refusals keep the stable ``sandbox_unavailable`` code (and the
+    original message) on every resume/replay; all other failures keep the
+    per-tool ``copy.failure_code`` mapping.
+    """
+    if reason.startswith(_SANDBOX_UNAVAILABLE_REASON_PREFIX):
+        detail = reason[len(_SANDBOX_UNAVAILABLE_REASON_PREFIX):]
+        return (
+            _SANDBOX_UNAVAILABLE_CODE,
+            f"{_SANDBOX_UNAVAILABLE_MESSAGE_PREFIX}{detail}",
+        )
+    return copy.failure_code, f"{copy.error_failure_prefix}{reason}"
+
+
 async def drive_effect(
     *,
     runs_repo: RunRepository,
@@ -481,7 +528,9 @@ async def drive_effect(
         mark_terminal_safe(runs_repo, run_id, "error")
         return
 
-    # Prior terminal failure — don't re-execute (spec AC3).
+    # Prior terminal failure — don't re-execute (spec AC3). The public
+    # error is derived from the RECORDED reason so a sandbox refusal stays
+    # ``sandbox_unavailable`` on every resume/replay (Ticket 01/02 D1).
     if existing_effect is not None and existing_effect.status == EffectStatus.FAILED.value:
         reason = existing_effect.failure_reason or "未知错误"
         outcome.status = "failed"
@@ -490,14 +539,15 @@ async def drive_effect(
                 "tool": copy.tool_name,
                 "args": tool_args,
             })
+        err_code, err_message = _failed_effect_public_error(copy, reason)
         yield emit("tool_result", {
             "tool": copy.tool_name,
             "status": "error",
-            "content": f"{copy.tool_result_failure_prefix}{reason}",
+            "content": f"{copy.tool_result_failure_prefix}{_failed_effect_reason_text(reason)}",
         })
         yield emit("error", {
-            "code": copy.failure_code,
-            "message": f"{copy.error_failure_prefix}{reason}",
+            "code": err_code,
+            "message": err_message,
         })
         mark_terminal_safe(runs_repo, run_id, "error")
         return
@@ -576,10 +626,11 @@ async def drive_effect(
                     yield emit("tool_result", {
                         "tool": copy.tool_name,
                         "status": "error",
-                        "content": f"{copy.tool_result_failure_prefix}{reason}",
+                        "content": f"{copy.tool_result_failure_prefix}{_failed_effect_reason_text(reason)}",
                     })
-                    err_code = copy.failure_code
-                    err_msg = f"{copy.error_failure_prefix}{reason}"
+                    # Same mapping as the direct FAILED branch — a recorded
+                    # sandbox refusal keeps ``sandbox_unavailable`` (D1).
+                    err_code, err_msg = _failed_effect_public_error(copy, reason)
                 yield emit("error", {"code": err_code, "message": err_msg})
                 mark_terminal_safe(runs_repo, run_id, "error")
             else:
@@ -622,7 +673,9 @@ async def drive_effect(
             # ``outcome_unknown``, never committed) and a replay cannot
             # double-execute. The public code is the stable
             # ``sandbox_unavailable`` — no local fallback is attempted.
-            runs_repo.mark_effect_failed(effect_key, reason=str(exc))
+            # Ticket 01/02 D1: the code is recorded WITH the failure reason
+            # so a later resume re-derives the same public error.
+            _record_sandbox_refusal(runs_repo, effect_key, exc)
             outcome.status = "failed"
             yield emit("tool_result", {
                 "tool": copy.tool_name,
@@ -630,8 +683,8 @@ async def drive_effect(
                 "content": f"{copy.tool_result_failure_prefix}{exc}",
             })
             yield emit("error", {
-                "code": "sandbox_unavailable",
-                "message": f"沙箱不可用：{exc}",
+                "code": _SANDBOX_UNAVAILABLE_CODE,
+                "message": f"{_SANDBOX_UNAVAILABLE_MESSAGE_PREFIX}{exc}",
             })
             mark_terminal_safe(runs_repo, run_id, "error")
             return
@@ -739,6 +792,12 @@ _GREETING_TOKENS = (
 )
 _CLARIFICATION_MARKERS = ("请问", "请补充", "请提供", "需要知道", "缺少")
 
+# Ticket 02 AC5 (D6): the risk rendering states its limitation like the
+# gear rendering does. Fixed product copy — never model output.
+_RISK_CONTROLLED_LIMITATION = (
+    "风险评估按保守原则生成；实时天气、路况与现场情况需行前核实。"
+)
+
 
 def compose_rag_system_prompt(req: ChatFlowRequest, profile: CapabilityProfile) -> str:
     """Knowledge-QA system prompt for the rag profile (spec #13 phase 2).
@@ -837,6 +896,8 @@ def _render_risk_controlled(controlled: dict[str, Any]) -> str:
     alternatives = controlled.get("alternatives") or []
     if alternatives:
         lines.append("备选：" + "、".join(str(a) for a in alternatives) + "。")
+    # AC5 (D6): 依据 AND 局限, same controlled-template style as gear.
+    lines.append(f"局限：{_RISK_CONTROLLED_LIMITATION}")
     return "\n".join(lines)
 
 

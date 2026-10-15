@@ -239,7 +239,7 @@ def test_invalid_sandbox_type_still_rejected():
 # ---- AC2/AC4: first-stream artifact + cowork fail closed ----------------------
 
 
-def _asgi_app(tmp_path: Path) -> Any:
+def _asgi_app(tmp_path: Path, *, capacity: Any | None = None) -> Any:
     from fastapi import FastAPI
 
     import api.chat_v2 as chat_v2_module
@@ -250,7 +250,7 @@ def _asgi_app(tmp_path: Path) -> Any:
         runs=_repo(tmp_path),
         memory=None,
         telemetry=None,
-        capacity=None,
+        capacity=capacity,
         kernel_checkpoints=None,
     )
     return app
@@ -485,6 +485,74 @@ def test_resume_replay_after_refusal_does_not_reexecute(
     sentinels.assert_no_host_access()
 
 
+def test_disconnect_window_after_refusal_keeps_sandbox_unavailable_on_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """D1 regression: disconnect in the window AFTER the refusal ``error``
+    frame is emitted but BEFORE the run is marked terminal (generator
+    close). The effect row is already ``FAILED`` with the sandbox refusal
+    reason; the next resume must still surface the stable
+    ``sandbox_unavailable`` code with identical replayed payloads — never
+    ``artifact_generation_failed``."""
+    sentinels = _HostAccessSentinels(monkeypatch)
+
+    repo = _repo(tmp_path)
+    run_id, _approval_id = _paused_artifact_run(repo, "req-01-window")
+
+    orch = RunOrchestrator(
+        settings=_settings(),
+        runs_repo=repo,
+        computer_factory=lambda *a, **k: create_computer("remote_e2b"),
+        sandbox_cleanup=lambda *a, **k: None,
+        gate_factory=None,
+        kernel_turn=_fake_kernel_turn,
+    )
+
+    async def interrupted_resume() -> list[Any]:
+        agen = orch.stream_resume(run_id=run_id)
+        items: list[Any] = []
+        async for item in agen:
+            items.append(item)
+            if item.type == "error":
+                # Stop consuming exactly in the disconnect window: the
+                # error frame is persisted, ``mark_terminal_safe`` has not
+                # run yet.
+                break
+        await agen.aclose()
+        return items
+
+    first = asyncio.run(interrupted_resume())
+    first_error = first[-1]
+    assert first_error.type == "error"
+    assert first_error.payload["code"] == "sandbox_unavailable"
+
+    # The window state: the refusal is recorded as FAILED, and the run did
+    # NOT reach its terminal status (the disconnect cut the flow short).
+    effects = repo.list_effects_for_run(run_id)
+    assert effects and effects[0].status == EffectStatus.FAILED.value
+    assert effects[0].failure_reason
+    run = repo.get_run(run_id)
+    assert run is not None and not run.is_terminal
+
+    # Reconnect where the client left off: the refusal must stay stable.
+    second = _stream_resume(orch, run_id, from_seq=first_error.sequence)
+    terminals = [e.type for e in second if e.type in TERMINALS]
+    assert terminals == ["error"], [e.type for e in second]
+    assert second[-1].payload["code"] == "sandbox_unavailable"
+    assert second[-1].payload == first_error.payload
+    first_tool_result = next(e for e in first if e.type == "tool_result")
+    resumed_tool_result = next(e for e in second if e.type == "tool_result")
+    assert resumed_tool_result.payload == first_tool_result.payload
+
+    # Full replay of the whole log: every recorded refusal terminal keeps
+    # the stable code (no artifact_generation_failed drift).
+    full = _stream_resume(orch, run_id, from_seq=0)
+    error_codes = [e.payload["code"] for e in full if e.type == "error"]
+    assert error_codes == ["sandbox_unavailable", "sandbox_unavailable"]
+
+    sentinels.assert_no_host_access()
+
+
 def test_concurrent_resume_remote_refusal_single_terminal_each(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -512,6 +580,14 @@ def test_concurrent_resume_remote_refusal_single_terminal_each(
     for items in streams:
         terminals = [e.type for e in items if e.type in TERMINALS]
         assert terminals == ["error"], [e.type for e in items]
+        error_codes = [e.payload["code"] for e in items if e.type == "error"]
+        # After the D1 fix a finalized refusal surfaces ``sandbox_unavailable``
+        # even to the CAS loser, and a live winner surfaces
+        # ``effect_in_flight`` — no generic per-tool failure code may appear.
+        assert error_codes and all(
+            code in ("sandbox_unavailable", "effect_in_flight")
+            for code in error_codes
+        ), error_codes
         assert items[-1].payload["code"] in ("sandbox_unavailable", "effect_in_flight")
     effects = repo.list_effects_for_run(run_id)
     assert all(e.status != EffectStatus.COMMITTED.value for e in effects)
@@ -546,20 +622,49 @@ def test_resume_with_destroyed_remote_lease_fails_closed(
     sentinels.assert_no_host_access()
 
 
-def test_capacity_slot_released_after_refusal(tmp_path: Path):
-    """The sandbox capacity lease is returned — a refusal must not leak a slot."""
+def test_capacity_slot_released_after_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """D2: a REAL refusal through the HTTP flow returns the capacity slot.
+
+    Exercised path: the artifact first-stream POST acquires a sandbox slot
+    (``acquire_leases``), the placeholder refuses (terminal
+    ``sandbox_unavailable``), and the stream's ``finally``
+    (``leases.release()``, api/chat_v2.py) releases the slot once no
+    ``active`` sandbox lease row remains. A refusal must not leak a slot.
+    """
+    import api.chat_v2 as chat_v2_module
     from agent_v2.observability import CapacityGuard
 
-    async def scenario() -> None:
-        guard = CapacityGuard(max_runs=2, max_sandboxes=1)
-        first = await guard.acquire_sandbox("req-01-cap-a")
-        first.release()
-        # If the refusal leaked the slot, this second acquire would hang or
-        # raise CapacityExceeded.
-        second = await guard.acquire_sandbox("req-01-cap-b")
-        second.release()
+    sentinels = _HostAccessSentinels(monkeypatch)
 
-    asyncio.run(scenario())
+    monkeypatch.setattr(chat_v2_module.settings, "agent_v2_enabled", True)
+    monkeypatch.setattr(chat_v2_module.settings, "agent_v2_sandbox_type", "remote_e2b")
+    monkeypatch.setattr(chat_v2_module.settings, "openai_api_key", "sk-test")
+
+    async def scenario() -> tuple[dict[str, int], dict[str, int], list[dict[str, Any]]]:
+        guard = CapacityGuard(max_runs=2, max_sandboxes=1, queue_timeout_seconds=0.2)
+        app = _asgi_app(tmp_path, capacity=guard)
+        started = dict(guard.snapshot())
+        events = await _post_events(app, {
+            "message": "规划杭州两日徒步并出 PDF 计划",
+            "request_id": "req-01-cap-real",
+            "profile_id": "artifact",
+        })
+        released = dict(guard.snapshot())
+        # A fresh acquisition must succeed immediately — if the refusal had
+        # leaked the only sandbox slot this would queue and then raise
+        # CapacityExceeded (short queue timeout).
+        lease = await guard.acquire_sandbox("req-01-cap-recheck")
+        lease.release()
+        return started, released, events
+
+    started, released, events = asyncio.run(scenario())
+    _assert_single_sandbox_unavailable_terminal(events)
+    assert started == {"active_runs": 0, "active_sandboxes": 0}
+    assert released == started, "refusal leaked a capacity slot"
+
+    sentinels.assert_no_host_access()
 
 
 def test_no_local_fallback_bypasses_the_refusal(
