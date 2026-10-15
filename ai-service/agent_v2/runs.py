@@ -592,10 +592,47 @@ class RunRepository:
                 return False
             return not (current_run_id is not None and message.run_id == current_run_id)
 
+        def _select(
+            turns: list[list[Any]],
+            *,
+            last_resolved: bool,
+        ) -> tuple[list[list[Any]], bool]:
+            """Newest turns that fit; ``final`` = no older turn can change it.
+
+            Stop at the FIRST turn that would overflow: an unresolved
+            (page-boundary) turn can only grow, so it can never fit later
+            either; and once a turn is dropped, every OLDER turn is
+            dropped with it — stale constraints must never outrank the
+            newest ones.
+            """
+            selected: list[list[Any]] = []
+            used_messages = 0
+            used_chars = 0
+            for turn in turns:
+                if not _wanted(turn[0]):
+                    # Excluded by run status — skipped whole, independent
+                    # of the window.
+                    continue
+                turn_chars = sum(len(message.content) for message in turn)
+                if (
+                    used_messages + len(turn) > max_messages
+                    or used_chars + turn_chars > max_chars
+                ):
+                    return selected, True
+                selected.append(turn)
+                used_messages += len(turn)
+                used_chars += turn_chars
+            # Keep reading only while the oldest turn may still grow.
+            return selected, not turns or last_resolved
+
         # Newest-first scan. Contiguous messages of one run form one
-        # complete turn; a run boundary closes the previous turn.
+        # complete turn; a run boundary closes the previous turn. The scan
+        # stops as soon as the next older turn cannot fit the window, so
+        # reading cost stays bounded with the window.
         turns: list[list[Any]] = []
+        selected: list[list[Any]] = []
         offset = 0
+        exhausted = False
         while True:
             page = self.checkpoints.get_messages_newest_first(
                 conversation_id=conversation_id,
@@ -603,6 +640,7 @@ class RunRepository:
                 offset=offset,
             )
             if not page:
+                exhausted = True
                 break
             offset += len(page)
             for message in page:
@@ -610,24 +648,12 @@ class RunRepository:
                     turns[-1].append(message)
                 else:
                     turns.append([message])
-
-        # Keep the newest turns that fit, dropping from the oldest end by
-        # whole turns (stop at the first turn that would overflow).
-        selected: list[list[Any]] = []
-        used_messages = 0
-        used_chars = 0
-        for turn in turns:
-            if not _wanted(turn[0]):
-                continue
-            turn_chars = sum(len(message.content) for message in turn)
-            if (
-                used_messages + len(turn) > max_messages
-                or used_chars + turn_chars > max_chars
-            ):
+            selected, final = _select(turns, last_resolved=False)
+            if final:
                 break
-            selected.append(turn)
-            used_messages += len(turn)
-            used_chars += turn_chars
+        if exhausted:
+            # The oldest fetched turn is complete — every message exists.
+            selected, _ = _select(turns, last_resolved=True)
 
         ordered: list[Any] = []
         for turn in reversed(selected):
