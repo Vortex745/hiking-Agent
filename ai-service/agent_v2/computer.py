@@ -545,7 +545,10 @@ class RemoteE2BComputer(Computer):
     sandbox_type: SandboxType = "remote_e2b"
 
     def __init__(self, failure_mode: str | None = None) -> None:
-        self._failure_mode = failure_mode
+        # ``failure_mode`` is accepted for factory-signature compatibility
+        # and intentionally NOT stored: every operation refuses regardless,
+        # so there is no injectable failure behavior to read back.
+        _ = failure_mode
 
     def create_workspace(self, run_id: str) -> str:
         raise SandboxUnavailableError(_REFUSAL_MESSAGE)
