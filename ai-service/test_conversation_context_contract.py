@@ -360,6 +360,65 @@ def test_oversized_newest_turn_is_omitted_whole_never_truncated(tmp_path: Path):
     assert history == []
 
 
+def test_interleaved_completed_runs_never_leave_half_a_turn_in_the_window(
+    tmp_path: Path,
+):
+    """AC3 under interleaving: two COMPLETED runs of one conversation whose
+    messages interleave in insertion order are TWO whole turns — never
+    pseudo-turns split by run contiguity — so the window can never keep
+    half a pair (an assistant answer without its user question)."""
+    repo = _repo(tmp_path)
+    run_a, _ = repo.create_run_idempotent(
+        request_id="req-ilt-a",
+        conversation_id=CONVERSATION,
+        profile_id="chat",
+        user_message="约束A",
+    )
+    run_b, _ = repo.create_run_idempotent(
+        request_id="req-ilt-b",
+        conversation_id=CONVERSATION,
+        profile_id="chat",
+        user_message="约束B",
+    )
+    # True insertion order interleaves the two runs:
+    # A-user, B-user, A-assistant, B-assistant.
+    repo.checkpoints.append_message(
+        conversation_id=CONVERSATION,
+        run_id=run_a,
+        role="assistant",
+        content="回答A",
+        sequence=2,
+    )
+    repo.checkpoints.append_message(
+        conversation_id=CONVERSATION,
+        run_id=run_b,
+        role="assistant",
+        content="回答B",
+        sequence=2,
+    )
+    repo.mark_run_done(run_a)
+    repo.mark_run_done(run_b)
+
+    # The window fits the newest turn's pair but not both pairs: the older
+    # run is dropped WHOLE (its answer may never appear without its
+    # question).
+    trimmed = repo.get_recent_completed_history(
+        conversation_id=CONVERSATION, max_messages=3
+    )
+    assert [entry["content"] for entry in trimmed] == ["约束B", "回答B"]
+
+    # A wider window keeps BOTH turns whole, latest-starting turn last.
+    wider = repo.get_recent_completed_history(
+        conversation_id=CONVERSATION, max_messages=4
+    )
+    assert [entry["content"] for entry in wider] == [
+        "约束A",
+        "回答A",
+        "约束B",
+        "回答B",
+    ]
+
+
 # ---- AC4: snapshot semantics preserved, no history = fresh -------------------
 
 

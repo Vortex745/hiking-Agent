@@ -565,7 +565,11 @@ class RunRepository:
         ``user`` / ``assistant`` messages of naturally completed
         (``done``) runs qualify; running, failed, cancelled, paused and
         internal (tool/approval) turns never enter history. Messages are
-        returned oldest-first in stable true insertion order (``rowid``).
+        returned oldest-first in stable true insertion order (``rowid``);
+        a turn is ONE whole run, ordered by the run's first inserted
+        message, so runs whose messages interleave in storage (two
+        concurrent completed runs of one conversation) still never split
+        into pseudo-turns.
 
         The window keeps at most ``max_messages`` messages AND at most
         ``max_chars`` body characters, trimmed from the OLDEST end by
@@ -625,11 +629,18 @@ class RunRepository:
             # Keep reading only while the oldest turn may still grow.
             return selected, not turns or last_resolved
 
-        # Newest-first scan. Contiguous messages of one run form one
-        # complete turn; a run boundary closes the previous turn. The scan
-        # stops as soon as the next older turn cannot fit the window, so
-        # reading cost stays bounded with the window.
-        turns: list[list[Any]] = []
+        # Newest-first scan. EVERY message of one run belongs to ONE block
+        # keyed by ``run_id`` — a run's messages are never split by other
+        # runs interleaved between them, or trimming would keep half a
+        # pair (an assistant answer without its user question). Blocks are
+        # ordered (newest first) by the run's FIRST inserted message — the
+        # run's start — so a later-starting turn stays last and is
+        # trimmed first; a run whose OLDER message just arrived moves
+        # back with it. The scan stops as soon as the next older block
+        # cannot fit the window, so reading cost stays bounded with the
+        # window.
+        blocks: dict[str, list[Any]] = {}
+        block_order: list[str] = []
         selected: list[list[Any]] = []
         offset = 0
         exhausted = False
@@ -644,16 +655,30 @@ class RunRepository:
                 break
             offset += len(page)
             for message in page:
-                if turns and turns[-1][0].run_id == message.run_id:
-                    turns[-1].append(message)
+                block = blocks.get(message.run_id)
+                if block is None:
+                    blocks[message.run_id] = [message]
+                    block_order.append(message.run_id)
                 else:
-                    turns.append([message])
-            selected, final = _select(turns, last_resolved=False)
+                    block.append(message)
+                    # The scan walks newest → oldest, so this message sits
+                    # before every message already seen for the run: the
+                    # run started earlier than the scan thought, and its
+                    # block belongs after the newer-starting ones.
+                    block_order.remove(message.run_id)
+                    block_order.append(message.run_id)
+            selected, final = _select(
+                [blocks[run_id] for run_id in block_order],
+                last_resolved=False,
+            )
             if final:
                 break
         if exhausted:
             # The oldest fetched turn is complete — every message exists.
-            selected, _ = _select(turns, last_resolved=True)
+            selected, _ = _select(
+                [blocks[run_id] for run_id in block_order],
+                last_resolved=True,
+            )
 
         ordered: list[Any] = []
         for turn in reversed(selected):
