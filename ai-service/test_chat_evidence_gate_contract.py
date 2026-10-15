@@ -369,6 +369,9 @@ def test_risk_success_renders_controlled_fields_with_limitations(tmp_path: Path)
     assert "risk_assessment" in text
     assert "high" in text or "高" in text
     assert "取消或改期" in text
+    # AC5: basis AND limitations are stated, mirroring the gear rendering.
+    assert "局限" in text
+    assert "风险评估按保守原则生成" in text
     # Unsupported live weather never rides along (AC6).
     assert "25 度" not in text
     assert "明天晴" not in text

@@ -791,6 +791,12 @@ _GREETING_TOKENS = (
 )
 _CLARIFICATION_MARKERS = ("请问", "请补充", "请提供", "需要知道", "缺少")
 
+# Ticket 02 AC5 (D6): the risk rendering states its limitation like the
+# gear rendering does. Fixed product copy — never model output.
+_RISK_CONTROLLED_LIMITATION = (
+    "风险评估按保守原则生成；实时天气、路况与现场情况需行前核实。"
+)
+
 
 def compose_rag_system_prompt(req: ChatFlowRequest, profile: CapabilityProfile) -> str:
     """Knowledge-QA system prompt for the rag profile (spec #13 phase 2).
@@ -889,6 +895,8 @@ def _render_risk_controlled(controlled: dict[str, Any]) -> str:
     alternatives = controlled.get("alternatives") or []
     if alternatives:
         lines.append("备选：" + "、".join(str(a) for a in alternatives) + "。")
+    # AC5 (D6): 依据 AND 局限, same controlled-template style as gear.
+    lines.append(f"局限：{_RISK_CONTROLLED_LIMITATION}")
     return "\n".join(lines)
 
 
