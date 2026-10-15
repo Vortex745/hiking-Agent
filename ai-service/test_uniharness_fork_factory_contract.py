@@ -13,6 +13,7 @@ stays green; the skip is recorded, never silently converted to a pass.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -250,22 +251,47 @@ def test_factory_wires_checkpointer_and_compaction_profile():
     _run(scenario())
 
 
-def test_factory_mcp_connect_failure_fails_fast():
+def test_factory_mcp_connect_failure_is_skipped_not_fatal(
+    caplog: pytest.LogCaptureFixture,
+):
+    """Pinned fork semantics: an unreachable MCP server is retried with
+    backoff, then SKIPPED — the agent still builds and the product surfaces
+    the source as ``mcp_unavailable`` evidence at chat time. A bare
+    "fails fast" expectation here only ever passed on machines where the
+    ``mcp`` SDK's own import chain is broken (see the recorded skip below).
+    """
+    try:
+        import mcp  # noqa: F401
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        pytest.skip(
+            f"mcp client stack is not importable in this interpreter "
+            f"(recorded, not a pass): {exc}"
+        )
+
+    caplog.set_level(logging.WARNING)
+
     async def scenario():
-        with pytest.raises(Exception):
-            await asyncio.wait_for(
-                create_agent(
-                    _build_chat_model(),
-                    _EnvProbeComputer(),
-                    skill_paths=(),
-                    mcp_servers={
-                        "ghost": {"type": "http", "url": "http://127.0.0.1:9/mcp"},
-                    },
-                ),
-                timeout=30,
-            )
+        agent = await asyncio.wait_for(
+            create_agent(
+                _build_chat_model(),
+                _EnvProbeComputer(),
+                skill_paths=(),
+                mcp_servers={
+                    "ghost": {"type": "http", "url": "http://127.0.0.1:9/mcp"},
+                },
+            ),
+            timeout=30,
+        )
+        try:
+            assert agent.graph is not None
+        finally:
+            await agent.aclose()
 
     _run(scenario())
+    assert any(
+        "Failed to connect to MCP server 'ghost'" in record.getMessage()
+        for record in caplog.records
+    ), "the dead server must be recorded as skipped, not silently dropped"
 
 
 def test_bounded_subagent_definitions_validated_by_factory():
