@@ -219,10 +219,42 @@ ai-hiking/
 
 ## 测试
 
+CI 的验证 job 定义在 `.github/workflows/deploy.yml`（推送到 `main` 或 PR 时运行）。本地按同样顺序执行：
+
+1. 恢复受控 UniHarness fork（离线 bundle，无网络协议）：
+
+```bash
+python scripts/restore-uniharness-fork.py
+python scripts/restore-uniharness-fork.py --check
+```
+
+2. 安装运行、测试与评估依赖（Python 3.12），并校验依赖一致性：
+
+```bash
+python -m pip install -r ai-service/requirements.txt -r ai-service/requirements-test.txt
+python -m pip install -e third_party/uniharness/libs/uniharness
+python -m pip install -r evals/deepeval/requirements.txt
+python -m pip check
+```
+
+3. AI Service 离线后端回归（服务目录内，包含 kernel 身份测试与失败注入自检）：
+
+```bash
+cd ai-service
+python -m pytest -q -rs
+```
+
+4. 评估契约（仓库根目录，纯离线，不调用外部模型或 Judge）：
+
+```bash
+python -m pytest -q evals/test_evaluation_contract.py
+```
+
 Frontend：
 
 ```bash
 cd frontend
+npm ci
 npm run build
 ```
 
@@ -233,13 +265,13 @@ cd gateway
 go test ./...
 ```
 
-AI Service：
+### 评分状态与结论范围
 
-```bash
-cd ai-service
-python -m compileall -q .
-python -m pytest tests -q
-```
+- 评估结果只有 `passed` / `failed` / `not_evaluated` 三种状态；未执行或无法判定的评估记为 `not_evaluated`，绝不按通过处理（语义见 `evals/deepeval/README.md`）。
+- 默认验证 job 完全离线：不请求外部模型，不需要 OPENAI / Jev 凭证；无凭证的在线契约以 recorded skip 呈现，不会被计为通过。
+- 在线模型契约与在线质量评估保留显式 opt-in：后端在线契约需 `KERNEL_LIVE_E2E=1` 加真实 `OPENAI_*` 凭证；在线质量评估需 `HIKING_EVAL_LIVE=1` 加 Jev 凭证（见 `evals/deepeval/README.md`）。
+- 离线契约通过只证明离线行为契约（远程副作用拒绝、事实门禁、真实 PDF 与非法下载拒绝、有界多轮历史、依赖可复现、评估状态如实上报），不代表线上模型质量已达标。
+- 本仓库不沿用其他工作树的历史通过计数；未实际执行远程 GitHub Actions 或在线质量评估时，不得宣称已完成对应验证。
 
 ## 部署
 
