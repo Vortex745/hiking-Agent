@@ -569,6 +569,19 @@ class ControlStore:
         ).fetchall()
         return [self._row_to_record(row) for row in rows]
 
+    def list_completed_run_ids(self, conversation_id: str) -> set[str]:
+        """Ticket 05 (T07): run_ids of ``done`` runs in a conversation.
+
+        Only naturally completed runs count as conversation history —
+        running, failed (``error``), cancelled and paused runs are
+        unfinished turns and never enter the bounded recent history.
+        """
+        rows = self._conn.execute(
+            "SELECT run_id FROM runs WHERE conversation_id = ? AND status = 'done'",
+            (conversation_id,),
+        ).fetchall()
+        return {row["run_id"] for row in rows}
+
     def update_run_status(
         self,
         *,
@@ -1741,6 +1754,41 @@ class CheckpointsStore:
             "SELECT * FROM messages WHERE conversation_id = ? "
             "ORDER BY rowid ASC LIMIT ?",
             (conversation_id, limit),
+        ).fetchall()
+        return [
+            MessageRecord(
+                message_id=r["message_id"],
+                conversation_id=r["conversation_id"],
+                run_id=r["run_id"],
+                role=r["role"],
+                content=r["content"],
+                sequence=r["sequence"],
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
+
+    def get_messages_newest_first(
+        self,
+        *,
+        conversation_id: str,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[MessageRecord]:
+        """Ticket 05 (T07): newest-first page of model-visible messages.
+
+        This is the read seam behind the bounded recent-history query. It
+        deliberately differs from :meth:`get_messages` (which keeps its
+        OLDEST-first snapshot semantics for the UI): pages are ordered by
+        ``rowid DESC`` — the stable true insertion order — and only
+        ``user`` / ``assistant`` roles are returned, so internal tool /
+        approval rows can never enter a model turn.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM messages WHERE conversation_id = ? "
+            "AND role IN ('user', 'assistant') "
+            "ORDER BY rowid DESC LIMIT ? OFFSET ?",
+            (conversation_id, limit, offset),
         ).fetchall()
         return [
             MessageRecord(

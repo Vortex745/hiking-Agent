@@ -39,6 +39,17 @@ from agent_v2.persistence import (
 
 logger = logging.getLogger("ai-service.agent_v2.runs")
 
+# Ticket 05 (T07): the bounded window for the model-visible conversation
+# history. The limits apply to the HISTORY only — the current user message
+# is appended by the kernel afterwards and never counts against them.
+HISTORY_MAX_MESSAGES = 20
+HISTORY_MAX_CHARS = 8000
+
+# Newest-first page size for the history scan. The scan stops as soon as
+# the next older completed turn cannot fit the window, so a window-sized
+# conversation is read with one or two pages.
+_HISTORY_PAGE_SIZE = 50
+
 
 @dataclass(frozen=True, slots=True)
 class RunSnapshot:
@@ -535,6 +546,94 @@ class RunRepository:
                 "payload": json.loads(s.payload_json),
             }
             for s in stored
+        ]
+
+    # -- bounded conversation history for the model (Ticket 05 / T07) ---
+
+    def get_recent_completed_history(
+        self,
+        *,
+        conversation_id: str,
+        current_run_id: str | None = None,
+        max_messages: int = HISTORY_MAX_MESSAGES,
+        max_chars: int = HISTORY_MAX_CHARS,
+    ) -> list[dict[str, str]]:
+        """Recent completed conversation turns for the NEXT model turn.
+
+        Server-side read: the caller passes the CURRENT run's
+        conversation_id (and the run itself so it is excluded). Only
+        ``user`` / ``assistant`` messages of naturally completed
+        (``done``) runs qualify; running, failed, cancelled, paused and
+        internal (tool/approval) turns never enter history. Messages are
+        returned oldest-first in stable true insertion order (``rowid``).
+
+        The window keeps at most ``max_messages`` messages AND at most
+        ``max_chars`` body characters, trimmed from the OLDEST end by
+        COMPLETE turns: a turn is either fully present or fully absent —
+        never half a fact. When a newer turn does not fit, older turns
+        are omitted with it, so stale constraints can never outrank the
+        newest ones. No completed history at all returns ``[]`` (fresh
+        conversation semantics).
+
+        Storage failures propagate to the caller, which maps them to the
+        explicit ``context_unavailable`` terminal — a broken store must
+        never be silently treated as a fresh conversation.
+        """
+        if not conversation_id:
+            return []
+        completed_run_ids = self.control.list_completed_run_ids(conversation_id)
+        if not completed_run_ids:
+            return []
+
+        def _wanted(message: Any) -> bool:
+            if message.role not in ("user", "assistant"):
+                return False
+            if message.run_id not in completed_run_ids:
+                return False
+            return not (current_run_id is not None and message.run_id == current_run_id)
+
+        # Newest-first scan. Contiguous messages of one run form one
+        # complete turn; a run boundary closes the previous turn.
+        turns: list[list[Any]] = []
+        offset = 0
+        while True:
+            page = self.checkpoints.get_messages_newest_first(
+                conversation_id=conversation_id,
+                limit=_HISTORY_PAGE_SIZE,
+                offset=offset,
+            )
+            if not page:
+                break
+            offset += len(page)
+            for message in page:
+                if turns and turns[-1][0].run_id == message.run_id:
+                    turns[-1].append(message)
+                else:
+                    turns.append([message])
+
+        # Keep the newest turns that fit, dropping from the oldest end by
+        # whole turns (stop at the first turn that would overflow).
+        selected: list[list[Any]] = []
+        used_messages = 0
+        used_chars = 0
+        for turn in turns:
+            if not _wanted(turn[0]):
+                continue
+            turn_chars = sum(len(message.content) for message in turn)
+            if (
+                used_messages + len(turn) > max_messages
+                or used_chars + turn_chars > max_chars
+            ):
+                break
+            selected.append(turn)
+            used_messages += len(turn)
+            used_chars += turn_chars
+
+        ordered: list[Any] = []
+        for turn in reversed(selected):
+            ordered.extend(reversed(turn))
+        return [
+            {"role": message.role, "content": message.content} for message in ordered
         ]
 
     # -- snapshot -------------------------------------------------------
