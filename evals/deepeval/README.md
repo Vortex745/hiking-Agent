@@ -24,20 +24,22 @@ Promptfoo provider — there is no scratch fallback.
 
 ## Offline default vs live opt-in
 
-The default offline entry is `evals/test_evaluation_contract.py` (from the
-repo root; no external model or judge calls):
+The default offline entry is `evals/test_evaluation_contract.py` (run from
+the repo root; no external model or judge calls). This is the entry the
+validation job (`.github/workflows/deploy.yml`) runs on every PR, with the
+suite dependencies from `evals/deepeval/requirements.txt`:
 
-```powershell
-E:/miniconda3/python.exe -B -m pytest -q evals/test_evaluation_contract.py
+```bash
+python -m pytest -q evals/test_evaluation_contract.py
 ```
 
-This suite is live and therefore opt-in. Run it from the repository root
-with a working model provider AND a Jev credential:
+This suite below is live and therefore opt-in. Run it from the repository
+root with a working model provider AND a Jev credential:
 
 ```powershell
 $env:HIKING_EVAL_LIVE = "1"
 $env:TYPESAFE_API_KEY = "..."
-E:/miniconda3/Scripts/deepeval.exe test run evals/deepeval/test_hiking_agent.py --identifier "hiking-agent-jev-round-1"
+deepeval test run evals/deepeval/test_hiking_agent.py --identifier "hiking-agent-jev-round-1"
 ```
 
 Without `HIKING_EVAL_LIVE=1` the tests are skipped (they are never reported
