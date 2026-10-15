@@ -1,0 +1,42 @@
+{
+  "record_type": "historical-eval-run",
+  "identifier": "deepeval-round0-2026-10-14",
+  "entry": "evals/deepeval/test_hiking_agent.py",
+  "observed_at": "2026-10-14",
+  "provenance": "Sanitized copy of the machine artifact .deepeval/.latest_run_full.json (main checkout, untracked) — kept verbatim in shape: each test was recorded as success=true with metricsData=[] and actualOutput=''.",
+  "limitation": "Historical false green: DeepEval reported 4 passed / 0 failed while ZERO metrics were scored (metricsData=[]) and every actualOutput was empty. The target chat path was failing (provider 403) and --ignore-errors turned the judge failure into a pass. This record provides NO semantic-quality evidence; it is kept for audit, annotated as limited, and must never be counted as a semantic pass.",
+  "tests": [
+    {
+      "name": "route-safety",
+      "success": true,
+      "metric_count": 0,
+      "valid_metric_count": 0,
+      "actual_output": "",
+      "metricStatuses": []
+    },
+    {
+      "name": "severe-weather",
+      "success": true,
+      "metric_count": 0,
+      "valid_metric_count": 0,
+      "actual_output": "",
+      "metricStatuses": []
+    },
+    {
+      "name": "unknown-route-grounding",
+      "success": true,
+      "metric_count": 0,
+      "valid_metric_count": 0,
+      "actual_output": "",
+      "metricStatuses": []
+    },
+    {
+      "name": "clarification",
+      "success": true,
+      "metric_count": 0,
+      "valid_metric_count": 0,
+      "actual_output": "",
+      "metricStatuses": []
+    }
+  ]
+}
