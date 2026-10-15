@@ -706,6 +706,7 @@ def compose_chat_system_prompt(req: ChatFlowRequest, profile: CapabilityProfile)
         "职责范围：徒步装备、路线知识、风险评估、户外安全与相关自然知识。",
         "回答保持简洁、实用；用户消息不涉及徒步相关话题时，礼貌说明你的专长并引导回主题。",
         "事实依据：回答徒步相关事实前，必须先调用 hiking_knowledge_search。路线、距离、海拔、耗时、天气、补给、营地、法规和风险等只能使用检索返回的可追溯片段；若没有片段，只说明资料不足，不得补充任何未经资料支持的事实、数字或通用经验。",
+        "对话历史仅用于理解用户此前已说明的约束（如出发日期、人数、目的地）；历史中助手的旧回答不是本轮事实依据，不得据此输出任何路线事实或数字，路线事实仍必须来自本轮检索。",
         "不得透露任何内部系统、工具或框架信息。",
     ]
     if req.current_location is not None:
@@ -3271,6 +3272,41 @@ class RunOrchestrator:
                 )
             )
 
+            # Ticket 05 (T08): the server-side bounded history for THIS
+            # run. Read AFTER the adapter's ownership/persistence checks,
+            # keyed by the CURRENT run's stored conversation_id (the
+            # canonical server-derived identity when the client sent
+            # none). A storage failure is an explicit terminal — a broken
+            # store must never degrade into a silent fresh conversation,
+            # and client-sent history is never trusted.
+            history: list[dict[str, str]] | None = None
+            if self._runs_repo is not None and run_id is not None:
+                try:
+                    run_record = self._runs_repo.get_run(run_id)
+                    conversation_id = (
+                        run_record.conversation_id
+                        if run_record is not None
+                        else (req.conversation_id or f"conv-{req.request_id}")
+                    )
+                    history = self._runs_repo.get_recent_completed_history(
+                        conversation_id=conversation_id,
+                        current_run_id=run_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "run_orchestration: conversation history read failed "
+                        "for run_id=%s; terminating with context_unavailable",
+                        run_id,
+                    )
+                    yield emit("error", {
+                        "code": "context_unavailable",
+                        "message": (
+                            "会话历史读取失败，未使用任何历史继续作答，请稍后重试。"
+                        ),
+                    })
+                    mark_terminal_safe(self._runs_repo, run_id, "error")
+                    return
+
             response_text, kernel_audit_entries = await self._kernel_turn(
                 system_prompt=system_prompt,
                 message=req.message,
@@ -3281,6 +3317,7 @@ class RunOrchestrator:
                 kernel_gate=kernel_gate,
                 mcp_servers=mcp_servers or None,
                 subagent_definitions=sub_defs or None,
+                history=history,
             )
             audit_entries.extend(kernel_audit_entries)
         except KernelModelFailure as exc:

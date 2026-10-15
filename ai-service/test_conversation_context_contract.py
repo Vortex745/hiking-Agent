@@ -554,3 +554,373 @@ def test_kernel_thread_id_stays_run_scoped_with_history(monkeypatch):
 
     assert agent.config is not None
     assert agent.config["configurable"]["thread_id"] == "v2:chat:run-thread-a"
+
+
+# ---- AC1/AC4/AC5/AC6: orchestrator reads the history server-side -------------
+
+_EVIDENCE_OK = {
+    "tool": "hiking_knowledge_search",
+    "phase": "result",
+    "ok": True,
+    "evidence": {"has_chunks": True, "sources": ["鳌太线攻略.md"]},
+}
+
+
+class _FakeMemory:
+    def __init__(self, *, forbidden: set[str] | None = None) -> None:
+        self.forbidden = forbidden or set()
+
+    def memory_enabled(self, subject_id: str) -> bool:
+        return True
+
+    def claim_conversation(self, subject_id: str, conversation_id: str) -> bool:
+        return conversation_id not in self.forbidden
+
+    def owns_conversation(self, subject_id: str, conversation_id: str) -> bool:
+        return conversation_id not in self.forbidden
+
+    def create_candidate(self, subject_id: str, **kwargs: Any) -> Any:
+        return kwargs
+
+
+class _SpyHistoryRepo(RunRepository):
+    """Real repository plus a reader counter (history-read observability)."""
+
+    def __init__(self, control: ControlStore, checkpoints: CheckpointsStore) -> None:
+        super().__init__(control=control, checkpoints=checkpoints)
+        self.history_calls = 0
+
+    def get_recent_completed_history(self, **kwargs: Any) -> list[dict[str, str]]:
+        self.history_calls += 1
+        return super().get_recent_completed_history(**kwargs)
+
+
+class _BrokenHistoryRepo(RunRepository):
+    """Real repository whose history read fails like a storage fault."""
+
+    def get_recent_completed_history(self, **kwargs: Any) -> list[dict[str, str]]:
+        raise sqlite3.OperationalError("disk I/O error")
+
+
+def _settings(**overrides: Any) -> SimpleNamespace:
+    base = {
+        "agent_v2_enabled": True,
+        "openai_api_key": "sk-test",
+        "openai_model": "test-model",
+        "agent_v2_cowork_policy": "disabled",
+    }
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def _orchestrator(
+    repo: RunRepository,
+    kernel_calls: list[dict[str, Any]],
+    *,
+    memory: Any | None = None,
+    kernel_result: tuple[str, list[dict[str, Any]]] | None = None,
+) -> RunOrchestrator:
+    async def fake_kernel(**kwargs: Any) -> tuple[str, list[dict[str, Any]]]:
+        kernel_calls.append(kwargs)
+        return kernel_result or ("你好，徒步愉快！", [])
+
+    return RunOrchestrator(
+        settings=_settings(),
+        runs_repo=repo,
+        memory=memory or _FakeMemory(),
+        kernel_turn=fake_kernel,
+    )
+
+
+def _req(
+    message: str, request_id: str, conversation_id: str = CONVERSATION
+) -> ChatFlowRequest:
+    return ChatFlowRequest(
+        message=message, request_id=request_id, conversation_id=conversation_id
+    )
+
+
+def _stream(orch: RunOrchestrator, req: ChatFlowRequest) -> list[Any]:
+    async def run() -> list[Any]:
+        return [item async for item in orch.stream_chat(req, subject_id="sub-ctx")]
+
+    return asyncio.run(run())
+
+
+def _types(items: list[Any]) -> list[str]:
+    return [item.type for item in items]
+
+
+def _text_of(items: list[Any]) -> str:
+    return next(e.payload["content"] for e in items if e.type == "text")
+
+
+def test_first_turn_kernel_receives_an_empty_history(tmp_path: Path):
+    repo = _repo(tmp_path)
+    calls: list[dict[str, Any]] = []
+
+    items = _stream(_orchestrator(repo, calls), _req("你好", "req-first"))
+
+    assert _types(items)[-1] == "done"
+    assert calls[0]["history"] == []  # fresh conversation semantics
+    assert calls[0]["message"] == "你好"
+
+
+def test_second_turn_kernel_receives_the_prior_completed_turn_in_order(tmp_path: Path):
+    repo = _repo(tmp_path)
+    first = _stream(
+        _orchestrator(
+            repo,
+            [],
+            kernel_result=("好的，已记录10月20日出发、两人同行。", [_EVIDENCE_OK]),
+        ),
+        _req("10月20日出发，两个人", "req-turn-1"),
+    )
+    assert _types(first)[-1] == "done"
+
+    second_calls: list[dict[str, Any]] = []
+    second = _stream(
+        _orchestrator(repo, second_calls, kernel_result=("已按新日期更新。", [_EVIDENCE_OK])),
+        _req("改成下周", "req-turn-2"),
+    )
+
+    assert _types(second)[-1] == "done"
+    assert second_calls[0]["history"] == [
+        {"role": "user", "content": "10月20日出发，两个人"},
+        {"role": "assistant", "content": "好的，已记录10月20日出发、两人同行。"},
+    ]
+    assert second_calls[0]["message"] == "改成下周"
+
+
+def test_three_turn_continuation_keeps_the_latest_condition_last(tmp_path: Path):
+    repo = _repo(tmp_path)
+    orch = _orchestrator(repo, [], kernel_result=("收到，已记录。", [_EVIDENCE_OK]))
+    assert _types(_stream(orch, _req("出发日期10月20日", "req-c1")))[-1] == "done"
+    assert _types(_stream(orch, _req("改成10月27日", "req-c2")))[-1] == "done"
+
+    calls: list[dict[str, Any]] = []
+    third = _stream(
+        _orchestrator(repo, calls, kernel_result=("好的。", [_EVIDENCE_OK])),
+        _req("再加一个人", "req-c3"),
+    )
+
+    assert _types(third)[-1] == "done"
+    assert [entry["content"] for entry in calls[0]["history"]] == [
+        "出发日期10月20日",
+        "收到，已记录。",
+        "改成10月27日",
+        "收到，已记录。",
+    ]
+    assert calls[0]["message"] == "再加一个人"
+    # The current user message is NOT duplicated into the history window.
+    assert all(entry["content"] != "再加一个人" for entry in calls[0]["history"])
+
+
+def test_controlled_double_behavior_changes_with_history(tmp_path: Path):
+    """Deterministic double: with history it continues the constraint; on a
+    fresh conversation the same request cannot be answered from context."""
+
+    def _make_kernel(calls: list[dict[str, Any]]):
+        async def fake_kernel(**kwargs: Any) -> tuple[str, list[dict[str, Any]]]:
+            calls.append(kwargs)
+            history_text = "".join(
+                entry["content"] for entry in kwargs.get("history") or []
+            )
+            if "10月20日" in history_text:
+                return "沿用此前记录的10月20日出发，仅调整日程。", [_EVIDENCE_OK]
+            return "缺少出发日期，无法沿用任何约束。", []
+
+        return fake_kernel
+
+    repo = _repo(tmp_path)
+    _stream(
+        _orchestrator(repo, [], kernel_result=("已记录10月20日出发。", [_EVIDENCE_OK])),
+        _req("10月20日出发", "req-d1"),
+    )
+
+    follow_calls: list[dict[str, Any]] = []
+    follow = _stream(
+        RunOrchestrator(
+            settings=_settings(),
+            runs_repo=repo,
+            memory=_FakeMemory(),
+            kernel_turn=_make_kernel(follow_calls),
+        ),
+        _req("改成下周", "req-d2"),
+    )
+    assert "沿用此前记录的10月20日" in _text_of(follow)
+
+    fresh_calls: list[dict[str, Any]] = []
+    fresh = _stream(
+        RunOrchestrator(
+            settings=_settings(),
+            runs_repo=_repo(tmp_path, "-fresh"),
+            memory=_FakeMemory(),
+            kernel_turn=_make_kernel(fresh_calls),
+        ),
+        _req("改成下周", "req-d3", conversation_id="conv-fresh"),
+    )
+    assert fresh_calls[0]["history"] == []
+    assert "沿用" not in _text_of(fresh)
+    assert "资料不足" in _text_of(fresh)
+
+
+def test_old_ungrounded_assistant_fact_in_history_cannot_bypass_evidence_gate(
+    tmp_path: Path,
+):
+    """AC7: history is context, not this-turn evidence."""
+    repo = _repo(tmp_path)
+    # A completed turn whose stored answer carries an un-grounded route
+    # fact (written before Ticket 02's gate existed).
+    _completed_turn(
+        repo,
+        request_id="req-legacy",
+        user_msg="这段路线爬升多少",
+        assistant_msg="这段路线爬升约1800米。",
+    )
+    calls: list[dict[str, Any]] = []
+    items = _stream(
+        _orchestrator(
+            repo,
+            calls,
+            kernel_result=("根据上一轮记录，这段路线爬升约1800米。", []),
+        ),
+        _req("那爬升呢", "req-follow"),
+    )
+
+    # The double DID receive the un-grounded old fact…
+    assert calls[0]["history"][-1]["content"] == "这段路线爬升约1800米。"
+    # …but it grants no factual authority for THIS turn.
+    text = _text_of(items)
+    assert "1800" not in text
+    assert "资料不足" in text
+
+
+def test_oversized_prior_turn_stays_out_of_the_next_kernel_history(tmp_path: Path):
+    repo = _repo(tmp_path)
+    _completed_turn(
+        repo,
+        request_id="req-huge",
+        user_msg="超长约束",
+        assistant_msg="超长" * 4500,  # 9000 chars > 8000 window
+    )
+    calls: list[dict[str, Any]] = []
+    items = _stream(
+        _orchestrator(repo, calls, kernel_result=("好的。", [_EVIDENCE_OK])),
+        _req("改成下周", "req-after-huge"),
+    )
+
+    assert _types(items)[-1] == "done"
+    assert calls[0]["history"] == []  # omitted whole — ask, don't guess
+
+
+def test_concurrent_unfinished_turn_is_excluded_from_the_next_kernel_history(
+    tmp_path: Path,
+):
+    repo = _repo(tmp_path)
+    _completed_turn(
+        repo,
+        request_id="req-done-before",
+        user_msg="10月20日出发",
+        assistant_msg="已记录。",
+    )
+    # Another run of the SAME conversation is still running right now.
+    repo.create_run_idempotent(
+        request_id="req-concurrent",
+        conversation_id=CONVERSATION,
+        profile_id="chat",
+        user_message="正在进行的回合",
+    )
+
+    calls: list[dict[str, Any]] = []
+    items = _stream(
+        _orchestrator(repo, calls, kernel_result=("好的。", [_EVIDENCE_OK])),
+        _req("改成下周", "req-next"),
+    )
+
+    assert _types(items)[-1] == "done"
+    contents = [entry["content"] for entry in calls[0]["history"]]
+    assert contents == ["10月20日出发", "已记录。"]
+    assert "正在进行的回合" not in contents
+    assert "改成下周" not in contents
+
+
+def test_duplicate_request_id_does_not_repeat_the_model_call(tmp_path: Path):
+    repo = _repo(tmp_path)
+    calls: list[dict[str, Any]] = []
+    orch = _orchestrator(repo, calls, kernel_result=("已记录。", [_EVIDENCE_OK]))
+
+    first = _stream(orch, _req("10月20日出发", "req-dup-ctx"))
+    second = _stream(orch, _req("10月20日出发", "req-dup-ctx"))
+
+    assert len(calls) == 1  # idempotent replay — no second model call
+    assert _types(second) == _types(first)
+
+
+def test_context_unavailable_terminal_when_history_storage_fails(tmp_path: Path):
+    normal = _repo(tmp_path)
+    _completed_turn(
+        normal, request_id="req-pre", user_msg="约束", assistant_msg="答复"
+    )
+    broken = _BrokenHistoryRepo(
+        control=ControlStore(str(tmp_path / "control.sqlite")),
+        checkpoints=CheckpointsStore(str(tmp_path / "ckpt.sqlite")),
+    )
+    calls: list[dict[str, Any]] = []
+
+    items = _stream(_orchestrator(broken, calls), _req("改成下周", "req-broken"))
+
+    types = _types(items)
+    assert types[-1] == "error"
+    assert items[-1].payload["code"] == "context_unavailable"
+    assert [t for t in types if t in TERMINALS] == ["error"]
+    assert calls == []  # no model call without trustworthy history
+    run = broken.control.get_run_by_request("req-broken")
+    assert run is not None and run.status == "error"
+
+
+def test_foreign_subject_same_conversation_is_rejected_without_history_read(
+    tmp_path: Path,
+):
+    repo = _SpyHistoryRepo(
+        control=ControlStore(str(tmp_path / "control.sqlite")),
+        checkpoints=CheckpointsStore(str(tmp_path / "ckpt.sqlite")),
+    )
+    _completed_turn(
+        repo, request_id="req-owned", user_msg="本主体的约束", assistant_msg="答复"
+    )
+    calls: list[dict[str, Any]] = []
+
+    items = _stream(
+        _orchestrator(repo, calls, memory=_FakeMemory(forbidden={CONVERSATION})),
+        _req("改成下周", "req-foreign"),
+    )
+
+    assert [item.type for item in items] == ["error"]
+    assert items[0].payload["code"] == "conversation_forbidden"
+    assert calls == []
+    assert repo.history_calls == 0  # ownership check precedes any history read
+    assert repo.control.get_run_by_request("req-foreign") is None
+
+
+def test_history_is_available_after_service_restart_end_to_end(tmp_path: Path):
+    repo = _repo(tmp_path)
+    first = _stream(
+        _orchestrator(repo, [], kernel_result=("已记录。", [_EVIDENCE_OK])),
+        _req("10月20日出发", "req-r1"),
+    )
+    assert _types(first)[-1] == "done"
+    repo.close()  # process exit
+
+    reopened = _repo(tmp_path)  # new process, same files
+    calls: list[dict[str, Any]] = []
+    second = _stream(
+        _orchestrator(reopened, calls, kernel_result=("已更新。", [_EVIDENCE_OK])),
+        _req("改成下周", "req-r2"),
+    )
+
+    assert _types(second)[-1] == "done"
+    assert calls[0]["history"] == [
+        {"role": "user", "content": "10月20日出发"},
+        {"role": "assistant", "content": "已记录。"},
+    ]
