@@ -982,3 +982,93 @@ def test_client_sent_history_field_is_rejected(tmp_path: Path):
 
     response = asyncio.run(post())
     assert response.status_code == 422
+
+
+def test_two_turn_http_sse_followup_receives_server_side_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Real Chat v2 HTTP/SSE boundary: turn 2's kernel input carries turn 1."""
+    import json
+
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    import api.chat_v2 as chat_v2_module
+    from agent_v2 import kernel as kernel_module
+
+    repo = _repo(tmp_path)
+    seen: list[dict[str, Any]] = []
+
+    async def fake_kernel(**kwargs: Any) -> tuple[str, list[dict[str, Any]]]:
+        seen.append(kwargs)
+        if len(seen) == 1:
+            return ("好的，已记录10月20日出发、两人同行。", [_EVIDENCE_OK])
+        return ("已按新日期更新。", [_EVIDENCE_OK])
+
+    monkeypatch.setattr(kernel_module, "run_chat_turn", fake_kernel)
+    monkeypatch.setattr(chat_v2_module.settings, "agent_v2_enabled", True)
+    monkeypatch.setattr(chat_v2_module.settings, "openai_api_key", "sk-fake")
+    monkeypatch.setattr(chat_v2_module.settings, "openai_model", "fake-model")
+    monkeypatch.setattr(chat_v2_module.settings, "agent_v2_cowork_policy", "disabled")
+
+    def _fake_subject(request: Any) -> Any:
+        request.state.subject_id = "sub-ctx"
+        return _FakeMemory(), SimpleNamespace(
+            issued=False, token="tok", subject_id="sub-ctx"
+        )
+
+    monkeypatch.setattr(chat_v2_module, "resolve_request_subject", _fake_subject)
+
+    app = FastAPI()
+    app.include_router(chat_v2_module.chat_v2_router, prefix="/api/v2")
+    app.state.agent_v2_runtime = SimpleNamespace(
+        runs=repo,
+        telemetry=None,
+        kernel_checkpoints=None,
+        memory=_FakeMemory(),
+        capacity=None,
+    )
+
+    async def collect(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            async with client.stream(
+                "POST", "/api/v2/chat/sse", json=payload
+            ) as response:
+                assert response.status_code == 200
+                buffer = ""
+                async for chunk in response.aiter_text():
+                    buffer += chunk
+                    while "\n\n" in buffer:
+                        frame, buffer = buffer.split("\n\n", 1)
+                        for line in frame.splitlines():
+                            if line.startswith("data: "):
+                                events.append(json.loads(line[len("data: "):]))
+        return events
+
+    first = asyncio.run(
+        collect({
+            "message": "10月20日出发，两个人",
+            "request_id": "req-http-1",
+            "conversation_id": CONVERSATION,
+        })
+    )
+    assert first[-1]["type"] == "done"
+    assert seen[0]["history"] == []  # fresh conversation on turn 1
+
+    second = asyncio.run(
+        collect({
+            "message": "改成下周",
+            "request_id": "req-http-2",
+            "conversation_id": CONVERSATION,
+        })
+    )
+    assert second[-1]["type"] == "done"
+    assert seen[1]["history"] == [
+        {"role": "user", "content": "10月20日出发，两个人"},
+        {"role": "assistant", "content": "好的，已记录10月20日出发、两人同行。"},
+    ]
+    assert seen[1]["message"] == "改成下周"
+    # Exactly one current-message copy across the whole input contract.
+    assert [e for e in seen[1]["history"] if e["content"] == "改成下周"] == []
