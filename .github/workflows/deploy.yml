@@ -18,6 +18,14 @@ jobs:
   validate:
     name: Validate services
     runs-on: ubuntu-latest
+    env:
+      # Default validation is fully offline: no external model calls and no
+      # Jev/OPENAI credentials are needed. Cred-gated live contracts skip
+      # with a recorded reason; opt in deliberately with KERNEL_LIVE_E2E=1
+      # (backend live contracts) or HIKING_EVAL_LIVE=1 (online quality
+      # evals, which stay not_evaluated otherwise).
+      PYTHONUTF8: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -50,6 +58,38 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Validate AI service syntax
+      # The vendored UniHarness fork is restored from the tracked offline
+      # bundle (no network protocol; git metadata validated against the
+      # recorded pin/ancestor). `scripts/restore-uniharness-fork.py` is the
+      # single source of truth for restore + validation.
+      - name: Restore vendored UniHarness fork (offline bundle)
+        run: python scripts/restore-uniharness-fork.py
+
+      - name: Verify restored fork pin and ancestry (read-only)
+        run: python scripts/restore-uniharness-fork.py --check
+
+      - name: Install AI service, test and eval dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r ai-service/requirements.txt -r ai-service/requirements-test.txt
+          python -m pip install -e third_party/uniharness/libs/uniharness
+          python -m pip install -r evals/deepeval/requirements.txt
+
+      - name: Check installed dependency consistency
+        run: python -m pip check
+
+      # Full offline backend regression. Includes the kernel identity tests
+      # (third_party/uniharness was restored with real git metadata above)
+      # and the Ticket 07 failure-injection self-check
+      # (test_regression_injection_contract.py): a known old defect injected
+      # through safe sentinels must fail the key regressions. Syntax
+      # compilation is NOT a substitute for these behavior tests.
+      - name: Offline backend regression
         working-directory: ai-service
-        run: python -m compileall -q .
+        run: python -m pytest -q -rs
+
+      # Stable offline evaluation entry: contract results are recorded as
+      # passed/failed with semantic quality explicitly not_evaluated (no
+      # external model or judge call happens in this job).
+      - name: Evaluation contract (offline)
+        run: python -m pytest -q evals/test_evaluation_contract.py
