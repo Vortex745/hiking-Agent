@@ -485,6 +485,74 @@ def test_resume_replay_after_refusal_does_not_reexecute(
     sentinels.assert_no_host_access()
 
 
+def test_disconnect_window_after_refusal_keeps_sandbox_unavailable_on_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """D1 regression: disconnect in the window AFTER the refusal ``error``
+    frame is emitted but BEFORE the run is marked terminal (generator
+    close). The effect row is already ``FAILED`` with the sandbox refusal
+    reason; the next resume must still surface the stable
+    ``sandbox_unavailable`` code with identical replayed payloads — never
+    ``artifact_generation_failed``."""
+    sentinels = _HostAccessSentinels(monkeypatch)
+
+    repo = _repo(tmp_path)
+    run_id, _approval_id = _paused_artifact_run(repo, "req-01-window")
+
+    orch = RunOrchestrator(
+        settings=_settings(),
+        runs_repo=repo,
+        computer_factory=lambda *a, **k: create_computer("remote_e2b"),
+        sandbox_cleanup=lambda *a, **k: None,
+        gate_factory=None,
+        kernel_turn=_fake_kernel_turn,
+    )
+
+    async def interrupted_resume() -> list[Any]:
+        agen = orch.stream_resume(run_id=run_id)
+        items: list[Any] = []
+        async for item in agen:
+            items.append(item)
+            if item.type == "error":
+                # Stop consuming exactly in the disconnect window: the
+                # error frame is persisted, ``mark_terminal_safe`` has not
+                # run yet.
+                break
+        await agen.aclose()
+        return items
+
+    first = asyncio.run(interrupted_resume())
+    first_error = first[-1]
+    assert first_error.type == "error"
+    assert first_error.payload["code"] == "sandbox_unavailable"
+
+    # The window state: the refusal is recorded as FAILED, and the run did
+    # NOT reach its terminal status (the disconnect cut the flow short).
+    effects = repo.list_effects_for_run(run_id)
+    assert effects and effects[0].status == EffectStatus.FAILED.value
+    assert effects[0].failure_reason
+    run = repo.get_run(run_id)
+    assert run is not None and not run.is_terminal
+
+    # Reconnect where the client left off: the refusal must stay stable.
+    second = _stream_resume(orch, run_id, from_seq=first_error.sequence)
+    terminals = [e.type for e in second if e.type in TERMINALS]
+    assert terminals == ["error"], [e.type for e in second]
+    assert second[-1].payload["code"] == "sandbox_unavailable"
+    assert second[-1].payload == first_error.payload
+    first_tool_result = next(e for e in first if e.type == "tool_result")
+    resumed_tool_result = next(e for e in second if e.type == "tool_result")
+    assert resumed_tool_result.payload == first_tool_result.payload
+
+    # Full replay of the whole log: every recorded refusal terminal keeps
+    # the stable code (no artifact_generation_failed drift).
+    full = _stream_resume(orch, run_id, from_seq=0)
+    error_codes = [e.payload["code"] for e in full if e.type == "error"]
+    assert error_codes == ["sandbox_unavailable", "sandbox_unavailable"]
+
+    sentinels.assert_no_host_access()
+
+
 def test_concurrent_resume_remote_refusal_single_terminal_each(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -512,6 +580,14 @@ def test_concurrent_resume_remote_refusal_single_terminal_each(
     for items in streams:
         terminals = [e.type for e in items if e.type in TERMINALS]
         assert terminals == ["error"], [e.type for e in items]
+        error_codes = [e.payload["code"] for e in items if e.type == "error"]
+        # After the D1 fix a finalized refusal surfaces ``sandbox_unavailable``
+        # even to the CAS loser, and a live winner surfaces
+        # ``effect_in_flight`` — no generic per-tool failure code may appear.
+        assert error_codes and all(
+            code in ("sandbox_unavailable", "effect_in_flight")
+            for code in error_codes
+        ), error_codes
         assert items[-1].payload["code"] in ("sandbox_unavailable", "effect_in_flight")
     effects = repo.list_effects_for_run(run_id)
     assert all(e.status != EffectStatus.COMMITTED.value for e in effects)
