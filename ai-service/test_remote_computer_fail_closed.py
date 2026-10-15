@@ -239,7 +239,7 @@ def test_invalid_sandbox_type_still_rejected():
 # ---- AC2/AC4: first-stream artifact + cowork fail closed ----------------------
 
 
-def _asgi_app(tmp_path: Path) -> Any:
+def _asgi_app(tmp_path: Path, *, capacity: Any | None = None) -> Any:
     from fastapi import FastAPI
 
     import api.chat_v2 as chat_v2_module
@@ -250,7 +250,7 @@ def _asgi_app(tmp_path: Path) -> Any:
         runs=_repo(tmp_path),
         memory=None,
         telemetry=None,
-        capacity=None,
+        capacity=capacity,
         kernel_checkpoints=None,
     )
     return app
@@ -622,20 +622,49 @@ def test_resume_with_destroyed_remote_lease_fails_closed(
     sentinels.assert_no_host_access()
 
 
-def test_capacity_slot_released_after_refusal(tmp_path: Path):
-    """The sandbox capacity lease is returned — a refusal must not leak a slot."""
+def test_capacity_slot_released_after_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """D2: a REAL refusal through the HTTP flow returns the capacity slot.
+
+    Exercised path: the artifact first-stream POST acquires a sandbox slot
+    (``acquire_leases``), the placeholder refuses (terminal
+    ``sandbox_unavailable``), and the stream's ``finally``
+    (``leases.release()``, api/chat_v2.py) releases the slot once no
+    ``active`` sandbox lease row remains. A refusal must not leak a slot.
+    """
+    import api.chat_v2 as chat_v2_module
     from agent_v2.observability import CapacityGuard
 
-    async def scenario() -> None:
-        guard = CapacityGuard(max_runs=2, max_sandboxes=1)
-        first = await guard.acquire_sandbox("req-01-cap-a")
-        first.release()
-        # If the refusal leaked the slot, this second acquire would hang or
-        # raise CapacityExceeded.
-        second = await guard.acquire_sandbox("req-01-cap-b")
-        second.release()
+    sentinels = _HostAccessSentinels(monkeypatch)
 
-    asyncio.run(scenario())
+    monkeypatch.setattr(chat_v2_module.settings, "agent_v2_enabled", True)
+    monkeypatch.setattr(chat_v2_module.settings, "agent_v2_sandbox_type", "remote_e2b")
+    monkeypatch.setattr(chat_v2_module.settings, "openai_api_key", "sk-test")
+
+    async def scenario() -> tuple[dict[str, int], dict[str, int], list[dict[str, Any]]]:
+        guard = CapacityGuard(max_runs=2, max_sandboxes=1, queue_timeout_seconds=0.2)
+        app = _asgi_app(tmp_path, capacity=guard)
+        started = dict(guard.snapshot())
+        events = await _post_events(app, {
+            "message": "规划杭州两日徒步并出 PDF 计划",
+            "request_id": "req-01-cap-real",
+            "profile_id": "artifact",
+        })
+        released = dict(guard.snapshot())
+        # A fresh acquisition must succeed immediately — if the refusal had
+        # leaked the only sandbox slot this would queue and then raise
+        # CapacityExceeded (short queue timeout).
+        lease = await guard.acquire_sandbox("req-01-cap-recheck")
+        lease.release()
+        return started, released, events
+
+    started, released, events = asyncio.run(scenario())
+    _assert_single_sandbox_unavailable_terminal(events)
+    assert started == {"active_runs": 0, "active_sandboxes": 0}
+    assert released == started, "refusal leaked a capacity slot"
+
+    sentinels.assert_no_host_access()
 
 
 def test_no_local_fallback_bypasses_the_refusal(
