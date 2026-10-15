@@ -3392,6 +3392,18 @@ class RunOrchestrator:
             mark_terminal_safe(self._runs_repo, run_id, "error")
             return
 
+        # Ticket 02 AC7 (mid-turn): a cancel observed while THIS kernel
+        # turn was in flight must not leak the late answer. The single
+        # ``cancelled`` terminal is emitted here — before any tool_result
+        # / text event and before the assistant reply is persisted — so
+        # the stream keeps exactly one terminal and zero late text.
+        if is_cancelled(self._runs_repo, run_id):
+            yield emit("cancelled", {
+                "code": "cancelled",
+                "message": "运行已被取消。",
+            })
+            return
+
         # Ticket 02 (spec T03/T04): the turn evidence gate. Free factual
         # text requires THIS-turn successful non-empty traceable retrieval;
         # controlled domain results render from validated fields; anything

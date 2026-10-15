@@ -462,3 +462,51 @@ def test_cancelled_turn_has_single_terminal_and_no_late_text(tmp_path: Path):
     assert types[-1] == "cancelled"
     assert [t for t in types if t in TERMINALS] == ["cancelled"]
     assert "text" not in types  # no late ungrounded text after cancel
+
+
+def test_cancel_while_kernel_turn_is_in_flight_keeps_single_terminal(
+    tmp_path: Path,
+):
+    """AC7 (mid-turn): cancelling WHILE the kernel turn is in flight must
+    still end with exactly ONE terminal ``cancelled``, zero ``text``
+    events (no late answer after the cancel) and nothing after the
+    terminal — the pre-cancel test above only covers the pre-flight path.
+    """
+    repo = _repo(tmp_path)
+
+    async def scenario() -> list[Any]:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocking_kernel(**kwargs: Any) -> tuple[str, list[dict[str, Any]]]:
+            entered.set()
+            await release.wait()
+            # A late model answer produced AFTER the cancel: it must never
+            # reach the client as a `text` event.
+            return ("这段路线爬升约1800米。", [])
+
+        orch = RunOrchestrator(
+            settings=_settings(),
+            runs_repo=repo,
+            memory=_FakeMemory(),
+            kernel_turn=blocking_kernel,
+        )
+        req = _req("这段路线爬升多少", "req-gate-mid-cancel")
+
+        async def drain() -> list[Any]:
+            return [item async for item in orch.stream_chat(req, subject_id="sub-gate")]
+
+        task = asyncio.create_task(drain())
+        await entered.wait()  # kernel turn is now in flight
+        run_id = repo.resolve_run_id(req.request_id)
+        assert run_id is not None
+        outcome = repo.request_cancel(run_id=run_id, idempotency_key="k-gate-mid")
+        assert outcome.accepted
+        release.set()
+        return await task
+
+    items = asyncio.run(scenario())
+    types = [e.type for e in items]
+    assert types[-1] == "cancelled"
+    assert [t for t in types if t in TERMINALS] == ["cancelled"]
+    assert "text" not in types  # no late text after a mid-turn cancel
