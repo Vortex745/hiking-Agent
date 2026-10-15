@@ -1675,8 +1675,8 @@ class RunOrchestrator:
             return
         except ComputerError as exc:
             yield emit("error", {
-                "code": "sandbox_unavailable",
-                "message": f"沙箱不可用：{exc}",
+                "code": _SANDBOX_UNAVAILABLE_CODE,
+                "message": f"{_SANDBOX_UNAVAILABLE_MESSAGE_PREFIX}{exc}",
             })
             mark_terminal_safe(runs_repo, run_id, "error")
             return
@@ -1922,8 +1922,8 @@ class RunOrchestrator:
             return
         except ComputerError as exc:
             yield emit("error", {
-                "code": "sandbox_unavailable",
-                "message": f"沙箱不可用：{exc}",
+                "code": _SANDBOX_UNAVAILABLE_CODE,
+                "message": f"{_SANDBOX_UNAVAILABLE_MESSAGE_PREFIX}{exc}",
             })
             mark_terminal_safe(runs_repo, run_id, "error")
             return
@@ -2125,8 +2125,8 @@ class RunOrchestrator:
                     "content": f"PDF 生成失败：{exc}",
                 })
                 yield emit("error", {
-                    "code": "sandbox_unavailable",
-                    "message": f"沙箱不可用：{exc}",
+                    "code": _SANDBOX_UNAVAILABLE_CODE,
+                    "message": f"{_SANDBOX_UNAVAILABLE_MESSAGE_PREFIX}{exc}",
                 })
                 mark_terminal_safe(runs_repo, run_id, "error")
                 return
