@@ -420,3 +420,137 @@ def test_completed_history_reads_the_same_after_service_restart(tmp_path: Path):
         )
     finally:
         reopened.close()
+
+
+# ---- AC5/AC7: actual kernel input order (deterministic agent double) ---------
+
+HISTORY_FIXTURE = [
+    {"role": "user", "content": "10月20日出发，两个人"},
+    {"role": "assistant", "content": "好的，已记录10月20日出发、两人同行。"},
+]
+
+
+class _CapturingAgent:
+    """Deterministic agent double: records exactly what the kernel sends."""
+
+    def __init__(self) -> None:
+        self.inputs: Any = None
+        self.config: Any = None
+
+    async def ainvoke(self, inputs: Any, config: Any = None, **kwargs: Any) -> dict[str, Any]:
+        self.inputs = inputs
+        self.config = config
+        from langchain_core.messages import AIMessage
+
+        return {"messages": [AIMessage(content="ok")]}
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _run_through_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    message: str,
+    history: Any,
+    entry: str = "run_chat_turn",
+    run_id: str | None = "run-ctx-1",
+    checkpoint_store: Any | None = None,
+) -> _CapturingAgent:
+    import agent_v2.kernel as kernel_module
+    from agent_v2.kernel import run_chat_turn, run_toolless_chat
+
+    agent = _CapturingAgent()
+
+    async def _fake_assemble(config: Any, settings: Any) -> _CapturingAgent:
+        return agent
+
+    monkeypatch.setattr(kernel_module, "assemble_kernel_agent", _fake_assemble)
+    monkeypatch.setattr(kernel_module, "get_langchain_callbacks", lambda: [])
+
+    kwargs = dict(
+        system_prompt="sp",
+        message=message,
+        settings=SimpleNamespace(),
+        run_id=run_id,
+        history=history,
+    )
+    if checkpoint_store is not None:
+        kwargs["checkpoint_store"] = checkpoint_store
+    if entry == "run_chat_turn":
+        asyncio.run(run_chat_turn(**kwargs))
+    else:
+        asyncio.run(run_toolless_chat(**kwargs))
+    return agent
+
+
+def _inputs_of(agent: _CapturingAgent) -> list[tuple[str, str]]:
+    assert agent.inputs is not None
+    return list(agent.inputs["messages"])
+
+
+def test_kernel_input_is_history_then_the_single_current_message(monkeypatch):
+    agent = _run_through_kernel(
+        monkeypatch, message="改成下周", history=HISTORY_FIXTURE
+    )
+
+    assert _inputs_of(agent) == [
+        ("user", "10月20日出发，两个人"),
+        ("assistant", "好的，已记录10月20日出发、两人同行。"),
+        ("user", "改成下周"),
+    ]
+    # The current user message appears exactly once.
+    assert [m for m in _inputs_of(agent) if m == ("user", "改成下周")] == [
+        ("user", "改成下周")
+    ]
+
+
+def test_both_kernel_entry_constructions_receive_the_same_history(monkeypatch):
+    """Ticket 26 wrapper and the T28 entry share ONE input construction."""
+    direct = _run_through_kernel(
+        monkeypatch, message="改成下周", history=HISTORY_FIXTURE
+    )
+    wrapper = _run_through_kernel(
+        monkeypatch, message="改成下周", history=HISTORY_FIXTURE, entry="run_toolless_chat"
+    )
+
+    assert _inputs_of(direct) == _inputs_of(wrapper)
+
+
+def test_kernel_without_history_appends_only_the_current_message(monkeypatch):
+    agent = _run_through_kernel(monkeypatch, message="你好", history=None)
+    assert _inputs_of(agent) == [("user", "你好")]
+
+
+def test_kernel_history_never_carries_internal_roles(monkeypatch):
+    """Defense in depth: a mis-shaped caller cannot smuggle tool rows in."""
+    agent = _run_through_kernel(
+        monkeypatch,
+        message="改成下周",
+        history=[
+            {"role": "tool", "content": "sandbox_bash 内部记录"},
+            {"role": "approval", "content": "待批准 Bash"},
+            {"role": "user", "content": "10月20日出发，两个人"},
+        ],
+    )
+    assert _inputs_of(agent) == [
+        ("user", "10月20日出发，两个人"),
+        ("user", "改成下周"),
+    ]
+
+
+def test_kernel_thread_id_stays_run_scoped_with_history(monkeypatch):
+    class _Store:
+        async def get(self) -> object:
+            return object()
+
+    agent = _run_through_kernel(
+        monkeypatch,
+        message="改成下周",
+        history=HISTORY_FIXTURE,
+        run_id="run-thread-a",
+        checkpoint_store=_Store(),
+    )
+
+    assert agent.config is not None
+    assert agent.config["configurable"]["thread_id"] == "v2:chat:run-thread-a"

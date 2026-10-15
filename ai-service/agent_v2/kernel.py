@@ -276,6 +276,39 @@ def extract_final_text(agent_result: dict[str, Any]) -> str | None:
     return text or None
 
 
+def build_kernel_messages(
+    *,
+    message: str,
+    history: list[dict[str, str]] | None = None,
+) -> list[tuple[str, str]]:
+    """Ticket 05 (T08): single construction of the model input messages.
+
+    The bounded server-side history (T07) is prepended in its given order,
+    then the CURRENT user message is appended exactly once. Every kernel
+    invocation style (``ainvoke`` for the final result today; an
+    ``astream`` loop if the harness ever streams tokens) derives its input
+    from this one function, so both paths observe the same history order
+    and the same single current message.
+
+    Defensive filter: only ``user`` / ``assistant`` entries with string
+    content are forwarded — an internal tool/approval record can never
+    leak into the model input even if a caller passes a mis-shaped list.
+    History rows help the model understand the user's constraints; they
+    grant no factual authority for the current turn (the evidence gate
+    audits only THIS turn's tool results).
+    """
+    messages: list[tuple[str, str]] = []
+    for entry in history or ():
+        if not isinstance(entry, dict):
+            continue
+        role = entry.get("role")
+        content = entry.get("content")
+        if role in ("user", "assistant") and isinstance(content, str) and content:
+            messages.append((role, content))
+    messages.append(("user", message))
+    return messages
+
+
 async def run_chat_turn(
     *,
     system_prompt: str,
@@ -289,6 +322,7 @@ async def run_chat_turn(
     computer: Any | None = None,
     approval_callback: Any | None = None,
     subagent_definitions: dict[str, Any] | None = None,
+    history: list[dict[str, str]] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Run ONE chat turn through the real UniHarness model loop (T28 entry).
 
@@ -296,6 +330,12 @@ async def run_chat_turn(
     execution and every permission denial to the public run identity so the
     stream layer can emit evidence events; adapters and the gate share one
     in-memory sink for the turn.
+
+    ``history`` is the server-read bounded recent history (Ticket 05 /
+    T07): it is prepended verbatim before the current user message, which
+    is appended exactly once (:func:`build_kernel_messages`). The run's
+    checkpoint thread stays ``v2:chat:{run_id}`` — history never changes
+    the checkpoint identity.
 
     Failure semantics identical to Ticket 26: stable :class:`KernelModelFailure`
     codes, no fallback of any kind.
@@ -353,10 +393,13 @@ async def run_chat_turn(
         invoke_config = dict(invoke_config) if invoke_config else {}
         invoke_config["callbacks"] = _lf_callbacks
         invoke_config.update(langchain_run_config())
+    # Ticket 05 (T08): ONE input construction for every kernel invocation —
+    # bounded history first, the current user message appended exactly once.
+    input_messages = build_kernel_messages(message=message, history=history)
     try:
         try:
             result = await asyncio.wait_for(
-                agent.ainvoke({"messages": [("user", message)]}, config=invoke_config),
+                agent.ainvoke({"messages": input_messages}, config=invoke_config),
                 timeout=240,
             )
         except TimeoutError as exc:
@@ -385,13 +428,20 @@ async def run_toolless_chat(
     settings: Any,
     run_id: str | None = None,
     checkpoint_store: Any | None = None,
+    history: list[dict[str, str]] | None = None,
 ) -> str:
-    """Ticket-26-compatible wrapper: text-only result, no tools, no gate."""
+    """Ticket-26-compatible wrapper: text-only result, no tools, no gate.
+
+    Ticket 05: accepts the same ``history`` input and forwards it to the
+    single :func:`run_chat_turn` construction, so both kernel entry points
+    observe the identical history order and single current message.
+    """
     text, _audit = await run_chat_turn(
         system_prompt=system_prompt,
         message=message,
         settings=settings,
         run_id=run_id,
         checkpoint_store=checkpoint_store,
+        history=history,
     )
     return text
