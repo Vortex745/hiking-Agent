@@ -223,13 +223,20 @@ def test_risk_unknown_level_is_recorded_as_invalid_controlled():
 
 
 def test_controlled_payload_is_bounded():
-    """Oversized tool output must not bloat the audit trail / public event."""
+    """Oversized tool output must not bloat the audit trail / public event.
+
+    The delegate returns MORE than every cap, so each trim is exercised
+    for real (a delegate returning exactly the cap proves nothing):
+    categories are capped at 50 (``_CONTROLLED_MAX_CATEGORIES``), each
+    category's items at 40 (``_CONTROLLED_MAX_ITEMS``) and the free-text
+    limitation at 300 chars (``_CONTROLLED_MAX_TEXT``).
+    """
 
     async def _delegate(**kwargs: Any):
         return {
             "ok": True,
             "days": 1,
-            "checklist": {f"类目{i}": [f"物品{j}" for j in range(200)] for i in range(50)},
+            "checklist": {f"类目{i}": [f"物品{j}" for j in range(200)] for i in range(60)},
             "message": "x" * 10_000,
         }
 
@@ -239,9 +246,10 @@ def test_controlled_payload_is_bounded():
     asyncio.run(tool(days=1))
 
     controlled = sink[-1]["controlled"]
-    assert len(controlled["checklist"]) <= 50
-    assert all(len(items) <= 40 for items in controlled["checklist"].values())
-    assert len(controlled["limitations"]) <= 300
+    # Trimmed to the category cap, order preserved (the first 50 survive).
+    assert list(controlled["checklist"]) == [f"类目{i}" for i in range(50)]
+    assert all(len(items) == 40 for items in controlled["checklist"].values())
+    assert len(controlled["limitations"]) == 300
 
 
 # ---------------------------------------------------------------------------

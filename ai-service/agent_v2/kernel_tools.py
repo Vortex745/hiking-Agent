@@ -233,6 +233,7 @@ class HikingKnowledgeSearchTool(BoundedDomainTool):
 # never render a pseudo success. Sizes are capped so the audit trail (which
 # also rides on public tool_result events) stays bounded.
 
+_CONTROLLED_MAX_CATEGORIES = 50
 _CONTROLLED_MAX_ITEMS = 40
 _CONTROLLED_MAX_TEXT = 300
 
@@ -243,6 +244,8 @@ def _bounded_text(value: Any, *, limit: int = _CONTROLLED_MAX_TEXT) -> str:
 
 
 def _bounded_items(value: Any) -> list[str]:
+    """Non-empty strings of one list, capped at ``_CONTROLLED_MAX_ITEMS``
+    (each entry capped at 120 chars). Non-list input yields ``[]``."""
     if not isinstance(value, list):
         return []
     return [_bounded_text(item, limit=120) for item in value[:_CONTROLLED_MAX_ITEMS] if item]
@@ -255,7 +258,7 @@ def _controlled_gear_result(tool_name: str, raw: Any) -> dict[str, Any]:
     if not isinstance(checklist_raw, Mapping) or not checklist_raw:
         return _invalid_controlled(tool_name)
     checklist: dict[str, list[str]] = {}
-    for category, items in checklist_raw.items():
+    for category, items in list(checklist_raw.items())[:_CONTROLLED_MAX_CATEGORIES]:
         bounded = _bounded_items(items)
         if bounded:
             checklist[_bounded_text(category, limit=40)] = bounded
