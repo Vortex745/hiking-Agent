@@ -29,6 +29,7 @@ import hashlib
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -218,3 +219,148 @@ def test_restored_tree_is_installable_source_and_imports(tmp_path: Path):
     # module must expose the fork's delta surface (approval_callback).
     source = (package_dir / "langchain" / "agent.py").read_text(encoding="utf-8")
     assert "approval_callback" in source
+
+
+# ---- Ticket 07 — the restore script is the CI source of truth ------------------
+#
+# The validation job (`.github/workflows/deploy.yml`, ticket 07) does not
+# hand-roll git commands inline: it runs `scripts/restore-uniharness-fork.py`
+# (restore mode) and then the SAME script with `--check` (read-only verify).
+# These tests pin the script's contract on temp targets so the job's wiring
+# cannot silently rot: fail closed on a tampered bundle, a provenance digest
+# disagreement, a foreign pin, and a missing git history — and never clobber
+# a target that is not provably the pinned fork.
+
+SCRIPT_PATH = REPO_ROOT / "scripts" / "restore-uniharness-fork.py"
+VENDOR_TREE = REPO_ROOT / "third_party" / "uniharness"
+
+
+def _run_restore_script(*args: str) -> subprocess.CompletedProcess[str]:
+    assert SCRIPT_PATH.is_file(), f"restore script missing: {SCRIPT_PATH}"
+    return subprocess.run(
+        [sys.executable, "-B", str(SCRIPT_PATH), *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=600,
+    )
+
+
+def _plain_checkout_tree(tmp_path: Path) -> Path:
+    """The exact clean-checkout shape of the vendor tree.
+
+    A tracked checkout carries no nested ``.git`` AND omits the doc/asset
+    files the OUTER repo's ``.gitignore`` excludes (``*.md`` / ``*.png``),
+    so it is NOT the complete pinned fork — restoring must materialize the
+    full pinned tree, not only graft git metadata.
+    """
+    target = tmp_path / "uniharness"
+    shutil.copytree(
+        VENDOR_TREE, target, ignore=shutil.ignore_patterns(".git")
+    )
+    assert not (target / ".git").exists()
+    return target
+
+
+def _combined_output(proc: subprocess.CompletedProcess[str]) -> str:
+    return proc.stdout + proc.stderr
+
+
+def test_restore_script_check_passes_on_the_restored_repository_tree():
+    """CI runs this AFTER the restore step; it re-verifies in place."""
+    proc = _run_restore_script("--check")
+    assert proc.returncode == 0, _combined_output(proc)
+
+
+def test_restore_script_check_fails_closed_without_git_history(tmp_path: Path):
+    target = _plain_checkout_tree(tmp_path)
+    proc = _run_restore_script("--check", "--target", str(target))
+    assert proc.returncode != 0
+    assert "restore" in _combined_output(proc).lower()
+    # Read-only: the failed check did not restore anything.
+    assert not (target / ".git").exists()
+
+
+def test_restore_script_restores_plain_checkout_to_the_pinned_tree(tmp_path: Path):
+    target = _plain_checkout_tree(tmp_path)
+    proc = _run_restore_script("--target", str(target))
+    assert proc.returncode == 0, _combined_output(proc)
+
+    head = _git("rev-parse", "HEAD", cwd=target).stdout.strip()
+    assert head == PIN
+    ancestor = _git(
+        "merge-base", "--is-ancestor", UPSTREAM_BASE, "HEAD", cwd=target, check=False
+    )
+    assert ancestor.returncode == 0, "upstream base is not an ancestor after restore"
+    # The complete pinned checkout is materialized — the ignored doc/asset
+    # files the plain checkout lacked are present now.
+    assert (target / "CONTRIBUTING.md").is_file()
+    assert (
+        target / "libs" / "uniharness" / "uniharness" / "prompts" / "fragments"
+        / "tool_instruction_bash.md"
+    ).is_file()
+    # And the read-only check agrees on the restored tree.
+    assert _run_restore_script("--check", "--target", str(target)).returncode == 0
+
+
+def test_restore_script_is_idempotent(tmp_path: Path):
+    target = _plain_checkout_tree(tmp_path)
+    assert _run_restore_script("--target", str(target)).returncode == 0
+    second = _run_restore_script("--target", str(target))
+    assert second.returncode == 0, _combined_output(second)
+    assert _git("rev-parse", "HEAD", cwd=target).stdout.strip() == PIN
+
+
+def test_restore_script_restores_into_a_missing_target(tmp_path: Path):
+    target = tmp_path / "fresh" / "uniharness"
+    proc = _run_restore_script("--target", str(target))
+    assert proc.returncode == 0, _combined_output(proc)
+    assert _git("rev-parse", "HEAD", cwd=target).stdout.strip() == PIN
+    status = _git("status", "--porcelain", cwd=target).stdout.strip()
+    assert status == "", status
+
+
+def test_restore_script_fails_closed_on_tampered_bundle(tmp_path: Path):
+    data = bytearray(BUNDLE_PATH.read_bytes())
+    tampered = tmp_path / "tampered.bundle"
+    tampered.write_bytes(bytes(data[:-101]))
+    target = tmp_path / "target"
+
+    proc = _run_restore_script("--bundle", str(tampered), "--target", str(target))
+    assert proc.returncode != 0
+    assert "sha" in _combined_output(proc).lower() or "checksum" in _combined_output(proc).lower()
+    # Temp-safe fail-closed: no half-restored target left behind.
+    assert not target.exists()
+
+
+def test_restore_script_fails_closed_when_provenance_digest_disagrees(tmp_path: Path):
+    doc = tmp_path / "uniharness-provenance.md"
+    text = PROVENANCE_PATH.read_text(encoding="utf-8")
+    doc.write_text(re.sub(r"[0-9a-f]{64}", "0" * 64, text, count=1), encoding="utf-8")
+    target = tmp_path / "target"
+
+    proc = _run_restore_script(
+        "--provenance", str(doc), "--target", str(target)
+    )
+    assert proc.returncode != 0
+    assert "provenance" in _combined_output(proc).lower()
+    assert not target.exists()
+
+
+def test_restore_script_refuses_to_clobber_a_foreign_pin_checkout(tmp_path: Path):
+    """A target that IS a repo but at the wrong revision must not be
+    silently replaced, and `--check` must reject it."""
+    target = _restore_bundle(tmp_path / "foreign")
+    _git("checkout", "--detach", UPSTREAM_BASE, cwd=target)
+    assert _git("rev-parse", "HEAD", cwd=target).stdout.strip() == UPSTREAM_BASE
+
+    check = _run_restore_script("--check", "--target", str(target))
+    assert check.returncode != 0
+    assert PIN[:12] in _combined_output(check)
+
+    restore = _run_restore_script("--target", str(target))
+    assert restore.returncode != 0
+    assert "refus" in _combined_output(restore).lower()
+    # Unchanged: the foreign checkout was not destroyed by the refusal.
+    assert _git("rev-parse", "HEAD", cwd=target).stdout.strip() == UPSTREAM_BASE
