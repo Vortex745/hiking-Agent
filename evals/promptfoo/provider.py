@@ -1,4 +1,15 @@
-"""Promptfoo provider for the real Chat v2 ASGI/SSE path."""
+"""Promptfoo provider for the real Chat v2 ASGI/SSE path.
+
+Uses the TRACKED stable evaluation package (``evals/hiking_evals``); there
+is no scratch fallback. The provider is a live entry: it drives the real
+Chat v2 app, so a runnable model provider is required (offline contract
+checks live in ``evals/test_evaluation_contract.py``).
+
+Honest output contract: the SSE outcome is extracted with the shared
+``extract_chat_outcome``. Error terminals and empty answers yield an EMPTY
+output (Promptfoo assertions fail — never a false green); the failure
+detail stays in ``metadata``.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-EVALS_ROOT = REPO_ROOT / ".scratch" / "hiking-ai-evals"
+EVALS_ROOT = REPO_ROOT / "evals"
 AI_SERVICE = REPO_ROOT / "ai-service"
 for candidate in (str(EVALS_ROOT), str(AI_SERVICE)):
     if candidate not in sys.path:
@@ -19,7 +30,7 @@ for candidate in (str(EVALS_ROOT), str(AI_SERVICE)):
 
 from hiking_evals.fixtures import FixtureEnv
 from hiking_evals.models import ActionSpec
-from hiking_evals.target import ASGITarget
+from hiking_evals.target import ASGITarget, extract_chat_outcome
 
 
 async def evaluate(prompt: str, variables: dict[str, Any]) -> dict[str, Any]:
@@ -42,21 +53,19 @@ async def evaluate(prompt: str, variables: dict[str, Any]) -> dict[str, Any]:
                     sse=True,
                 )
             )
-            event_types = [str(event.get("type")) for event in record.events]
-            text = "\n".join(
-                str((event.get("payload") or {}).get("content") or "")
-                for event in record.events
-                if event.get("type") == "text"
-            ).strip()
-            terminal = record.events[-1] if record.events else {}
+            outcome = extract_chat_outcome(record)
             return {
-                "output": text or record.body_text or record.error,
+                "output": outcome.answer,
                 "metadata": {
-                    "http_status": record.status,
-                    "event_types": event_types,
-                    "terminal_type": terminal.get("type"),
-                    "terminal_code": (terminal.get("payload") or {}).get("code"),
-                    "transport_error": record.error or None,
+                    "http_status": outcome.http_status,
+                    "event_types": [
+                        str(event.get("type")) for event in record.events
+                    ],
+                    "terminal_type": outcome.terminal_type,
+                    "terminal_code": outcome.terminal_code or None,
+                    "gradable": outcome.gradable,
+                    "run_id": outcome.run_id,
+                    "transport_error": outcome.transport_error or None,
                 },
             }
         finally:
