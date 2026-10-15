@@ -396,6 +396,16 @@ def _paused_artifact_run(repo: RunRepository, request_id: str) -> tuple[str, str
     return run_id, approval_id
 
 
+async def _fake_kernel_turn(**kwargs: Any) -> tuple[str, list[Any]]:
+    """Kernel seam for the refusal tests.
+
+    Ticket 04 made the approved resume render the PLAN through the kernel
+    seam before the tool executes, so these tests stub the model loop —
+    their subject is the sandbox refusal, not content generation.
+    """
+    return ("# 徒步计划\n占位计划正文。", [])
+
+
 def test_resume_after_approval_with_legacy_remote_lease_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -414,6 +424,7 @@ def test_resume_after_approval_with_legacy_remote_lease_refuses(
         # refuses cleanup too) and still release the lease bookkeeping.
         sandbox_cleanup=_cleanup_sandbox,
         gate_factory=None,
+        kernel_turn=_fake_kernel_turn,
     )
 
     items = _stream_resume(orch, run_id)
@@ -456,6 +467,7 @@ def test_resume_replay_after_refusal_does_not_reexecute(
         computer_factory=lambda *a, **k: create_computer("remote_e2b"),
         sandbox_cleanup=lambda *a, **k: None,
         gate_factory=None,
+        kernel_turn=_fake_kernel_turn,
     )
 
     first = _stream_resume(orch, run_id)
@@ -487,6 +499,7 @@ def test_concurrent_resume_remote_refusal_single_terminal_each(
         computer_factory=lambda *a, **k: create_computer("remote_e2b"),
         sandbox_cleanup=lambda *a, **k: None,
         gate_factory=None,
+        kernel_turn=_fake_kernel_turn,
     )
 
     async def scenario() -> list[list[Any]]:
@@ -572,6 +585,7 @@ def test_no_local_fallback_bypasses_the_refusal(
         computer_factory=lambda *a, **k: create_computer(a[0] if a else "remote_e2b"),
         sandbox_cleanup=lambda *a, **k: None,
         gate_factory=None,
+        kernel_turn=_fake_kernel_turn,
     )
     items = _stream_resume(orch, run_id)
     assert items[-1].payload["code"] == "sandbox_unavailable"

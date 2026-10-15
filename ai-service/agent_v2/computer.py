@@ -79,6 +79,15 @@ class SandboxTimeoutError(ComputerError):
     """A command inside the sandbox timed out."""
 
 
+class SandboxGenerationError(ComputerError):
+    """Artifact generation inside the sandbox failed (Ticket 04).
+
+    Raised when the trusted-local sandbox cannot produce a real artifact
+    (e.g. blank body, missing rendering dependency). The caller maps it to
+    a terminal failure — no pseudo artifact is ever published.
+    """
+
+
 class SandboxFileNotFoundError(ComputerError):
     """A sandbox file was expected but is missing (e.g. manifest build
     or read_artifact_bytes on a non-existent path). Distinct from
@@ -334,13 +343,23 @@ class LocalNativeComputer(Computer):
     ) -> str:
         if self._failure_mode == "timeout":
             raise SandboxTimeoutError("injected command timeout")
-        # Stub PDF: write the content as a text file with a .pdf suffix.
-        # Real E2B integration runs a headless PDF generator in the sandbox.
+        # Ticket 04: real PDF bytes via the shared generic renderer. A
+        # blank body or a missing rendering dependency raises
+        # PDFRenderingError → mapped by the caller to a terminal failure;
+        # a text file with a .pdf suffix is never produced again.
+        from agent_v2.pdf_rendering import (
+            PDFRenderingError,
+            render_markdown_pdf_bytes,
+        )
+
         safe_name = Path(filename).name  # strip any path components
         if not safe_name.endswith(".pdf"):
             safe_name = f"{safe_name}.pdf"
+        try:
+            data = render_markdown_pdf_bytes(content, title=Path(safe_name).stem)
+        except PDFRenderingError as exc:
+            raise SandboxGenerationError(f"PDF 渲染失败：{exc}") from exc
         full = Path(workspace_path) / safe_name
-        data = content.encode("utf-8")
         full.write_bytes(data)
         self._files_written += 1
         self._bytes_written += len(data)

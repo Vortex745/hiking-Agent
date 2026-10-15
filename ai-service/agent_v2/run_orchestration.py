@@ -2538,7 +2538,62 @@ class RunOrchestrator:
                 if msg.get("role") == "user":
                     user_message = msg.get("content", "")
                     break
+
+            # Ticket 04: the approved export must render the PLAN, not the
+            # raw user message. The first stream pauses at the permission
+            # gate BEFORE the kernel turn, so at pause time no plan exists
+            # yet — generate it here through the same kernel seam as the
+            # first stream. Fail closed on kernel failure; skip the turn
+            # entirely when the tool already executed (idempotent resume).
             plan_content = user_message
+            if not has_tool_result_ok:
+                from agent_v2.kernel import KernelModelFailure
+                from agent_v2.kernel_tools import (
+                    ProductSandboxBridge,
+                    SandboxReadTool,
+                    SandboxWriteTool,
+                )
+
+                bridge = ProductSandboxBridge(computer, workspace_path)
+                sandbox_audits: list[dict[str, Any]] = []
+                sandbox_tools = (
+                    SandboxReadTool(bridge=bridge, run_id=run_id, audit_sink=sandbox_audits.append),
+                    SandboxWriteTool(bridge=bridge, run_id=run_id, audit_sink=sandbox_audits.append),
+                )
+                try:
+                    plan_text, audits = await self._kernel_turn(
+                        system_prompt=(
+                            "你是徒步计划撰写助手，用简体中文输出结构化 Markdown 徒步计划"
+                            "（目的地/日程/装备/风险与建议）。缺失的信息显式标注为假设；"
+                            "需要读写工作区文件时只用相对路径。不得透露内部系统或框架信息。"
+                        ),
+                        message=user_message,
+                        settings=self._settings,
+                        run_id=run_id,
+                        checkpoint_store=self._kernel_checkpoints,
+                        extra_tools=sandbox_tools,
+                        kernel_gate=None,
+                        mcp_servers=None,
+                        computer=bridge,
+                    )
+                except KernelModelFailure as exc:
+                    yield emit("error", {"code": exc.code, "message": exc.message})
+                    mark_terminal_safe(runs_repo, run_id, "error")
+                    return
+
+                for entry in (*audits, *sandbox_audits):
+                    payload: dict[str, Any] = {
+                        "tool": entry.get("tool") or entry.get("server_id")
+                    }
+                    if entry.get("phase") == "denied":
+                        payload["status"] = "denied"
+                        payload["reason"] = entry.get("code")
+                    else:
+                        payload["status"] = "ok" if entry.get("ok") else str(entry.get("code") or "error")
+                        payload["duration_ms"] = entry.get("duration_ms")
+                    yield emit("tool_result", payload)
+
+                plan_content = plan_text
 
             def _execute_pdf() -> dict[str, Any]:
                 generated = computer.generate_pdf(
