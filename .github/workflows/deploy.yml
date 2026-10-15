@@ -26,6 +26,13 @@ jobs:
       # evals, which stay not_evaluated otherwise).
       PYTHONUTF8: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      # Contract helpers construct ChatOpenAI(...) on non-calling paths
+      # (factory wiring, identity probes). With openai>=2 that constructor
+      # requires a non-empty key. This value is intentionally fake and is
+      # deliberately NOT paired with OPENAI_BASE_URL, so every cred-gated
+      # live test still records a skip (KERNEL_LIVE_E2E / HIKING_EVAL_LIVE
+      # remain unset; no external model call happens in this job).
+      OPENAI_API_KEY: "ci-placeholder-not-a-credential"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
