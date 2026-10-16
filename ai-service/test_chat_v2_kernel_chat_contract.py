@@ -183,7 +183,7 @@ def test_real_kernel_end_to_end_success_over_http_sse(monkeypatch):
     types = [e["type"] for e in events]
     assert types[:1] == ["run_started"]
     text_events = [e for e in events if e["type"] == "text"]
-    assert len(text_events) == 1 and text_events[0]["payload"]["content"].strip()
+    assert text_events and "".join(e["payload"]["content"] for e in text_events).strip()
 
     terminals = [t for t in types if t in ("done", "error", "cancelled")]
     assert terminals == ["done"]

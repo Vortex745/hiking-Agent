@@ -79,6 +79,34 @@
   --icon-swap-blur: 2px;
   --icon-swap-start-scale: 0.25;
   --icon-swap-ease: var(--ease-in-out);
+  /* Streaming text remix, paced for faster response display. */
+  --p30-word-gap: 20ms;
+  --p30-word-dur: 120ms;
+  --p30-word-ease: var(--text-swap-ease);
+  --stage-bg: var(--bg-body);
+  --stage-fg: var(--text-primary);
+  --stage-muted: var(--text-muted);
+  --stage-border: var(--border-color);
+  --stage-surface: var(--bg-card);
+  --stage-accent: var(--primary);
+  --stage-on-accent: #ffffff;
+}
+
+.streaming-text {
+  color: var(--stage-fg);
+}
+
+.streaming-word {
+  animation: streaming-word-in var(--p30-word-dur) var(--p30-word-ease) both;
+}
+
+@keyframes streaming-word-in {
+  from { opacity: 0; filter: blur(var(--text-swap-blur)); }
+  to { opacity: 1; filter: blur(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .streaming-word { animation: none; }
 }
 
 /* Token 双主题：亮色为默认值，跟随系统深色时切换到 Gemini 暗色板。

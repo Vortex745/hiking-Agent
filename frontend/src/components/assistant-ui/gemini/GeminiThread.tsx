@@ -17,6 +17,7 @@ import Paperclip from 'reicon-react/icons/Paperclip';
 import Download from 'reicon-react/icons/Download';
 import { getConversationMemoryProgress } from '../../../api/conversationMemory';
 import { API } from '../../../api/config';
+import { StreamingText, useStreamingText } from '../../StreamingText';
 import { useRef, useState, createContext, useContext, useCallback, useEffect, useLayoutEffect, type RefObject, type PointerEvent as ReactPointerEvent } from 'react';
 import gsap from 'gsap';
 import { useGSAP } from '@gsap/react';
@@ -142,8 +143,11 @@ type PreviewImage = { src: string; alt: string };
 const MarkdownText = (part: any) => {
   const [previewImage, setPreviewImage] = useState<PreviewImage | null>(null);
   const raw = part.text || part.part?.text || '';
+  const role = useMessage((state) => state.role);
+  const status = useMessage((state) => state.status?.type);
+  const reveal = useStreamingText(raw, role === 'assistant' && status === 'running');
   // Split on bold, images, and links patterns
-  const segments = raw.split(MARKDOWN_PATTERN);
+  const segments = reveal.text.split(MARKDOWN_PATTERN);
 
   useEffect(() => {
     if (!previewImage) return;
@@ -157,7 +161,7 @@ const MarkdownText = (part: any) => {
   }, [previewImage]);
 
   return (
-    <div className="whitespace-pre-wrap leading-relaxed relative">
+    <div className="whitespace-pre-wrap leading-relaxed relative streaming-text" data-full-text={raw}>
       {segments.map((seg: string, i: number) => {
         if (!seg) return null;
         
@@ -216,16 +220,16 @@ const MarkdownText = (part: any) => {
               rel="noopener noreferrer"
               className="text-[#0b57d0] hover:underline dark:text-[#a8c7fa]"
             >
-              {linkText}
+              <StreamingText text={linkText} animate={reveal.animate} />
             </a>
           );
         }
 
         if (seg.startsWith('**') && seg.endsWith('**')) {
-          return <strong key={i} className="font-bold">{seg.slice(2, -2)}</strong>;
+          return <strong key={i} className="font-bold"><StreamingText text={seg.slice(2, -2)} animate={reveal.animate} /></strong>;
         }
         
-        return <span key={i}>{seg}</span>;
+        return <span key={i}><StreamingText text={seg} animate={reveal.animate} /></span>;
       })}
       {previewImage && (
         <div
@@ -822,7 +826,7 @@ const ChatMessage = () => {
   const handleCopy = useCallback(() => {
     // Grab the text content from the message DOM node
     const textEl = msgRef.current?.querySelector('.whitespace-pre-wrap');
-    const text = textEl?.textContent || '';
+    const text = textEl?.getAttribute('data-full-text') || textEl?.textContent || '';
     if (!text.trim()) return;
     navigator.clipboard.writeText(text).then(() => {
       setCopied(true);

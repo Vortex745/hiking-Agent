@@ -3032,7 +3032,21 @@ class RunOrchestrator:
                 )
             )
 
-            response_text, kernel_audit_entries = await self._kernel_turn(
+            deltas: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
+            streamed_text = ""
+            search_enabled = any(t.name == "hiking_knowledge_search" for t in extra_tools)
+
+            async def on_text(delta: str, kernel_audits: list[dict[str, Any]]) -> None:
+                combined_audits = audit_entries + kernel_audits
+                # A search may still happen later in the first model step.
+                # Never publish text which the existing evidence gate could retract.
+                if profile.profile_id in (ProfileId.CHAT, ProfileId.RAG) and search_enabled:
+                    if not has_hiking_knowledge_evidence(combined_audits):
+                        return
+                if delta:
+                    await deltas.put(delta)
+
+            task = asyncio.create_task(self._kernel_turn(
                 system_prompt=system_prompt,
                 message=req.message,
                 settings=self._settings,
@@ -3042,7 +3056,31 @@ class RunOrchestrator:
                 kernel_gate=kernel_gate,
                 mcp_servers=mcp_servers or None,
                 subagent_definitions=sub_defs or None,
-            )
+                on_text=on_text,
+            ))
+            try:
+                heartbeat_at = time.monotonic()
+                while not task.done() or not deltas.empty():
+                    if is_cancelled(self._runs_repo, run_id):
+                        yield emit("cancelled", {"code": "cancelled", "message": "运行已被取消。"})
+                        return
+                    try:
+                        delta = await asyncio.wait_for(deltas.get(), timeout=0.25)
+                    except TimeoutError:
+                        if time.monotonic() - heartbeat_at >= 15:
+                            yield emit("heartbeat", {})
+                            heartbeat_at = time.monotonic()
+                        continue
+                    if is_cancelled(self._runs_repo, run_id):
+                        yield emit("cancelled", {"code": "cancelled", "message": "运行已被取消。"})
+                        return
+                    streamed_text += delta
+                    yield emit("text", {"content": delta})
+                response_text, kernel_audit_entries = await task
+            finally:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
             audit_entries.extend(kernel_audit_entries)
         except KernelModelFailure as exc:
             logger.warning(
@@ -3060,10 +3098,7 @@ class RunOrchestrator:
         ):
             response_text = _NO_KNOWLEDGE_EVIDENCE_RESPONSE
 
-        # Ticket 28/29 AC6: public evidence of degraded sources, executed
-        # and denied tool calls — bound to the run identity, emitted
-        # before the final text so sequence stays monotonic with exactly
-        # one terminal.
+        # Public tool audits follow incremental text and precede completion.
         for entry in audit_entries:
             payload: dict[str, Any] = {"tool": entry.get("tool") or entry.get("server_id")}
             if entry.get("phase") == "mcp_unavailable":
@@ -3091,7 +3126,18 @@ class RunOrchestrator:
                 payload["evidence"] = entry["evidence"]
             yield emit("tool_result", payload)
 
-        yield emit("text", {"content": response_text})
+        if is_cancelled(self._runs_repo, run_id):
+            yield emit("cancelled", {"code": "cancelled", "message": "运行已被取消。"})
+            return
+        if response_text.startswith(streamed_text):
+            remaining = response_text[len(streamed_text):]
+        else:
+            # A tool-calling model step can include a public preamble.
+            # Preserve it on the wire and in conversation history.
+            remaining = "\n\n" + response_text
+            response_text = streamed_text + remaining
+        if remaining:
+            yield emit("text", {"content": remaining})
 
         # Spec #13 phase 2 (T07): persist the assistant reply so
         # conversation history (RAG page restore, snapshots) sees both

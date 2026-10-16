@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from observability.langfuse_setup import get_langchain_callbacks, langchain_run_config
 
@@ -29,13 +29,62 @@ logger = logging.getLogger("ai-service.agent_v2.kernel")
 # Some providers (MiniMax-M3 via OpenAI-compatible endpoints) leak reasoning
 # markers ("<think>…</think>", stray "</mm:think>") into assistant content.
 # Public output must never carry them.
-_REASONING_BLOCK = re.compile(r"<(?:think|thinking|reasoning)>.*?</(?:think|thinking|reasoning)>", re.DOTALL | re.IGNORECASE)
+_REASONING_BLOCK = re.compile(r"<(?:mm:)?(?:think|thinking|reasoning)>.*?(?:</(?:mm:)?(?:think|thinking|reasoning)>|$)", re.DOTALL | re.IGNORECASE)
 _REASONING_TAG = re.compile(r"</?(?:mm:)?(?:think|thinking|reasoning)>", re.IGNORECASE)
 
 
 def _strip_reasoning(text: str) -> str:
     cleaned = _REASONING_BLOCK.sub("", text)
     return _REASONING_TAG.sub("", cleaned)
+
+
+class _StreamingPublicText:
+    """Strip reasoning even when a provider splits its tags across tokens."""
+
+    def __init__(self) -> None:
+        self.pending = ""
+        self.hidden = False
+        self.started = False
+        self.whitespace = ""
+
+    def feed(self, content: str, *, final: bool = False) -> str:
+        self.pending += content
+        visible = ""
+        while self.pending:
+            opening = self.pending.find("<")
+            if opening == -1:
+                if not self.hidden:
+                    visible += self.pending
+                self.pending = ""
+                break
+            if not self.hidden:
+                visible += self.pending[:opening]
+            self.pending = self.pending[opening:]
+            closing = self.pending.find(">")
+            if closing == -1:
+                # Hold only a possible reasoning marker, not arbitrary '<' text.
+                candidates = ("<think>", "</think>", "<thinking>", "</thinking>",
+                              "<reasoning>", "</reasoning>", "<mm:think>", "</mm:think>")
+                if not final and any(tag.startswith(self.pending.lower()) for tag in candidates):
+                    break
+                if not self.hidden:
+                    visible += self.pending
+                self.pending = ""
+                break
+            tag = self.pending[:closing + 1]
+            self.pending = self.pending[closing + 1:]
+            if _REASONING_TAG.fullmatch(tag):
+                self.hidden = not tag.startswith("</")
+            elif not self.hidden:
+                visible += tag
+        visible = self.whitespace + visible
+        if not self.started:
+            visible = visible.lstrip()
+        text = visible.rstrip()
+        self.whitespace = visible[len(text):]
+        if text:
+            self.started = True
+        return text
 
 # Built-in tool groups exposed by the vendored fork's create_agent.
 BUILTIN_TOOL_GROUPS: frozenset[str] = frozenset({"cli", "web", "todo", "task", "skills"})
@@ -289,10 +338,14 @@ async def run_chat_turn(
     computer: Any | None = None,
     approval_callback: Any | None = None,
     subagent_definitions: dict[str, Any] | None = None,
+    on_text: Callable[[str, list[dict[str, Any]]], Awaitable[None]] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Run ONE chat turn through the real UniHarness model loop (T28 entry).
 
-    Returns ``(final_text, audit_entries)``. Audit records bind every tool
+    ``on_text`` receives filtered model deltas when supplied; callers enforce
+    the evidence gate before publishing them. Other kernel consumers retain
+    the single-result invocation. Returns ``(final_text, audit_entries)``.
+    Audit records bind every tool
     execution and every permission denial to the public run identity so the
     stream layer can emit evidence events; adapters and the gate share one
     in-memory sink for the turn.
@@ -355,10 +408,48 @@ async def run_chat_turn(
         invoke_config.update(langchain_run_config())
     try:
         try:
-            result = await asyncio.wait_for(
-                agent.ainvoke({"messages": [("user", message)]}, config=invoke_config),
-                timeout=240,
-            )
+            if on_text is None:
+                result = await asyncio.wait_for(
+                    agent.ainvoke({"messages": [("user", message)]}, config=invoke_config),
+                    timeout=240,
+                )
+            else:
+                result = {}
+                public_text = _StreamingPublicText()
+                step = None
+                async with asyncio.timeout(240):
+                    async for mode, data in agent.astream(
+                        {"messages": [("user", message)]}, config=invoke_config,
+                        stream_mode=["messages", "values"],
+                    ):
+                        if mode == "values":
+                            result = data
+                            continue
+                        chunk, metadata = data
+                        # Compaction, tool models, and subagents are not the reply.
+                        namespace = metadata.get("langgraph_checkpoint_ns", "")
+                        if (metadata.get("langgraph_node") != "model"
+                            or "|" in namespace
+                            or (namespace and not namespace.startswith("model:"))):
+                            continue
+                        if getattr(chunk, "tool_call_chunks", None) or getattr(chunk, "tool_calls", None):
+                            continue
+                        if metadata.get("langgraph_step") != step:
+                            public_text = _StreamingPublicText()
+                            step = metadata.get("langgraph_step")
+                        content = getattr(chunk, "content", "")
+                        if isinstance(content, list):
+                            content = "".join(
+                                block if isinstance(block, str) else block.get("text", "")
+                                for block in content
+                                if isinstance(block, str) or (isinstance(block, dict) and block.get("type") == "text")
+                            )
+                        delta = public_text.feed(content if isinstance(content, str) else "")
+                        if delta:
+                            await on_text(delta, audit_entries)
+                    delta = public_text.feed("", final=True)
+                    if delta:
+                        await on_text(delta, audit_entries)
         except TimeoutError as exc:
             raise KernelModelFailure("model_timeout", "模型响应超时，请稍后重试。") from exc
         text = extract_final_text(result)

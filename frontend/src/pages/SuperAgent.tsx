@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect, useCallback, type ReactNode } from 'react'
 import { API } from '../api/config'
 import {
   createV2StreamConnection,
@@ -32,7 +32,7 @@ import {
   readArtifact as readArtifactFromPayload,
   type V2ConversationState,
 } from '../api/v2Reducer'
-import { useExternalStoreRuntime, AssistantRuntimeProvider, ThreadMessage } from "@assistant-ui/react"
+import { useExternalStoreRuntime, AssistantRuntimeProvider, type ExternalStoreAdapter, type ThreadMessage } from "@assistant-ui/react"
 import { GeminiThread } from '../components/assistant-ui/gemini/GeminiThread'
 import { GeminiSidebar } from '../components/assistant-ui/gemini/GeminiSidebar'
 import X from 'reicon-react/icons/X'
@@ -348,6 +348,18 @@ const convertMessage = (msg: Message, index: number): ThreadMessage => {
   } as unknown as ThreadMessage;
 };
 
+// The external-store hook updates its retained runtime in an effect. Reusing
+// it for a shorter conversation notifies the old index-based message readers
+// before they unmount, which can throw an out-of-bounds error. Key this owner
+// by chat identity so the runtime and all of its readers change together.
+function SessionRuntimeProvider({ adapter, children }: {
+  adapter: ExternalStoreAdapter<ThreadMessage>
+  children: ReactNode
+}) {
+  const runtime = useExternalStoreRuntime(adapter)
+  return <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>
+}
+
 function SuperAgent() {
   const [messages, setMessages] = useState<Message[]>(() => {
     try {
@@ -530,8 +542,7 @@ function SuperAgent() {
   // Ticket 08: v2 event handlers (spec AC2). Map v2 wire events to stable
   // UI state. These are defined as useCallbacks before the recovery effect
   // so the effect can reference them without forward-reference issues.
-  // v2 text is written directly to the messages array (no typewriter queue)
-  // to keep v2 independent of v1's streaming polish (spec AC1).
+  // Store transport deltas immediately; MarkdownText owns visual pacing.
   const handleV2Event = useCallback((event: V2EventEnvelope) => {
     const next = reduceV2Event(v2StateRef.current, event)
     v2StateRef.current = next
@@ -1204,8 +1215,11 @@ function SuperAgent() {
       const firstUserMsg = messages.find(m => m.role === 'user')
       const title = firstUserMsg ? firstUserMsg.content.slice(0, 30) + (firstUserMsg.content.length > 30 ? '...' : '') : '新对话'
       setSessions(prev => {
-        const filtered = prev.filter(s => s.id !== activeSessionId)
-        return [{ id: activeSessionId, chatId: chatIdRef.current, title, date: getTodayDate(), messages }, ...filtered].slice(0, 50)
+        const existing = prev.find(s => s.id === activeSessionId)
+        if (existing) {
+          return prev.map(s => s.id === activeSessionId ? { ...s, chatId: chatIdRef.current, title, date: getTodayDate(), messages } : s)
+        }
+        return [{ id: activeSessionId, chatId: chatIdRef.current, title, date: getTodayDate(), messages }, ...prev].slice(0, 50)
       })
     }
     const newId = generateId()
@@ -1224,12 +1238,11 @@ function SuperAgent() {
       const firstUserMsg = messages.find(m => m.role === 'user')
       const title = firstUserMsg ? firstUserMsg.content.slice(0, 30) + (firstUserMsg.content.length > 30 ? '...' : '') : '新对话'
       setSessions(prev => {
-        const filtered = prev.filter(s => s.id !== activeSessionId)
         const existing = prev.find(s => s.id === activeSessionId)
         if (existing) {
-          return [{ ...existing, chatId: chatIdRef.current, title, date: getTodayDate(), messages }, ...filtered].slice(0, 50)
+          return prev.map(s => s.id === activeSessionId ? { ...s, chatId: chatIdRef.current, title, date: getTodayDate(), messages } : s)
         }
-        return [{ id: activeSessionId, chatId: chatIdRef.current, title, date: getTodayDate(), messages }, ...filtered].slice(0, 50)
+        return [{ id: activeSessionId, chatId: chatIdRef.current, title, date: getTodayDate(), messages }, ...prev].slice(0, 50)
       })
     }
     setActiveSessionId(target.id)
@@ -1406,7 +1419,7 @@ function SuperAgent() {
     handleSend(lastUserText, { replaceFromIndex: lastUserIdx })
   }, [messages, isSending, handleSend])
 
-  const runtime = useExternalStoreRuntime({
+  const runtimeAdapter: ExternalStoreAdapter<ThreadMessage> = {
     messages: messages.map(convertMessage),
     isRunning: isSending || messages.some(m => m.isStreaming),
     onNew: async (appendMessage) => {
@@ -1445,10 +1458,10 @@ function SuperAgent() {
       }
       setIsSending(false)
     }
-  });
+  };
 
   return (
-    <AssistantRuntimeProvider runtime={runtime}>
+    <SessionRuntimeProvider key={chatIdRef.current} adapter={runtimeAdapter}>
       <div className="flex h-full w-full overflow-hidden relative">
         {/* Gemini 风格停靠侧栏：桌面折叠栏 + 移动端抽屉 */}
         <GeminiSidebar
@@ -1573,7 +1586,7 @@ function SuperAgent() {
           />
         </div>
       </div>
-    </AssistantRuntimeProvider>
+    </SessionRuntimeProvider>
   )
 }
 
