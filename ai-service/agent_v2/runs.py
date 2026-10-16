@@ -39,6 +39,17 @@ from agent_v2.persistence import (
 
 logger = logging.getLogger("ai-service.agent_v2.runs")
 
+# Ticket 05 (T07): the bounded window for the model-visible conversation
+# history. The limits apply to the HISTORY only — the current user message
+# is appended by the kernel afterwards and never counts against them.
+HISTORY_MAX_MESSAGES = 20
+HISTORY_MAX_CHARS = 8000
+
+# Newest-first page size for the history scan. The scan stops as soon as
+# the next older completed turn cannot fit the window, so a window-sized
+# conversation is read with one or two pages.
+_HISTORY_PAGE_SIZE = 50
+
 
 @dataclass(frozen=True, slots=True)
 class RunSnapshot:
@@ -535,6 +546,145 @@ class RunRepository:
                 "payload": json.loads(s.payload_json),
             }
             for s in stored
+        ]
+
+    # -- bounded conversation history for the model (Ticket 05 / T07) ---
+
+    def get_recent_completed_history(
+        self,
+        *,
+        conversation_id: str,
+        current_run_id: str | None = None,
+        max_messages: int = HISTORY_MAX_MESSAGES,
+        max_chars: int = HISTORY_MAX_CHARS,
+    ) -> list[dict[str, str]]:
+        """Recent completed conversation turns for the NEXT model turn.
+
+        Server-side read: the caller passes the CURRENT run's
+        conversation_id (and the run itself so it is excluded). Only
+        ``user`` / ``assistant`` messages of naturally completed
+        (``done``) runs qualify; running, failed, cancelled, paused and
+        internal (tool/approval) turns never enter history. Messages are
+        returned oldest-first in stable true insertion order (``rowid``);
+        a turn is ONE whole run, ordered by the run's first inserted
+        message, so runs whose messages interleave in storage (two
+        concurrent completed runs of one conversation) still never split
+        into pseudo-turns.
+
+        The window keeps at most ``max_messages`` messages AND at most
+        ``max_chars`` body characters, trimmed from the OLDEST end by
+        COMPLETE turns: a turn is either fully present or fully absent —
+        never half a fact. When a newer turn does not fit, older turns
+        are omitted with it, so stale constraints can never outrank the
+        newest ones. No completed history at all returns ``[]`` (fresh
+        conversation semantics).
+
+        Storage failures propagate to the caller, which maps them to the
+        explicit ``context_unavailable`` terminal — a broken store must
+        never be silently treated as a fresh conversation.
+        """
+        if not conversation_id:
+            return []
+        completed_run_ids = self.control.list_completed_run_ids(conversation_id)
+        if not completed_run_ids:
+            return []
+
+        def _wanted(message: Any) -> bool:
+            if message.role not in ("user", "assistant"):
+                return False
+            if message.run_id not in completed_run_ids:
+                return False
+            return not (current_run_id is not None and message.run_id == current_run_id)
+
+        def _select(
+            turns: list[list[Any]],
+            *,
+            last_resolved: bool,
+        ) -> tuple[list[list[Any]], bool]:
+            """Newest turns that fit; ``final`` = no older turn can change it.
+
+            Stop at the FIRST turn that would overflow: an unresolved
+            (page-boundary) turn can only grow, so it can never fit later
+            either; and once a turn is dropped, every OLDER turn is
+            dropped with it — stale constraints must never outrank the
+            newest ones.
+            """
+            selected: list[list[Any]] = []
+            used_messages = 0
+            used_chars = 0
+            for turn in turns:
+                if not _wanted(turn[0]):
+                    # Excluded by run status — skipped whole, independent
+                    # of the window.
+                    continue
+                turn_chars = sum(len(message.content) for message in turn)
+                if (
+                    used_messages + len(turn) > max_messages
+                    or used_chars + turn_chars > max_chars
+                ):
+                    return selected, True
+                selected.append(turn)
+                used_messages += len(turn)
+                used_chars += turn_chars
+            # Keep reading only while the oldest turn may still grow.
+            return selected, not turns or last_resolved
+
+        # Newest-first scan. EVERY message of one run belongs to ONE block
+        # keyed by ``run_id`` — a run's messages are never split by other
+        # runs interleaved between them, or trimming would keep half a
+        # pair (an assistant answer without its user question). Blocks are
+        # ordered (newest first) by the run's FIRST inserted message — the
+        # run's start — so a later-starting turn stays last and is
+        # trimmed first; a run whose OLDER message just arrived moves
+        # back with it. The scan stops as soon as the next older block
+        # cannot fit the window, so reading cost stays bounded with the
+        # window.
+        blocks: dict[str, list[Any]] = {}
+        block_order: list[str] = []
+        selected: list[list[Any]] = []
+        offset = 0
+        exhausted = False
+        while True:
+            page = self.checkpoints.get_messages_newest_first(
+                conversation_id=conversation_id,
+                limit=_HISTORY_PAGE_SIZE,
+                offset=offset,
+            )
+            if not page:
+                exhausted = True
+                break
+            offset += len(page)
+            for message in page:
+                block = blocks.get(message.run_id)
+                if block is None:
+                    blocks[message.run_id] = [message]
+                    block_order.append(message.run_id)
+                else:
+                    block.append(message)
+                    # The scan walks newest → oldest, so this message sits
+                    # before every message already seen for the run: the
+                    # run started earlier than the scan thought, and its
+                    # block belongs after the newer-starting ones.
+                    block_order.remove(message.run_id)
+                    block_order.append(message.run_id)
+            selected, final = _select(
+                [blocks[run_id] for run_id in block_order],
+                last_resolved=False,
+            )
+            if final:
+                break
+        if exhausted:
+            # The oldest fetched turn is complete — every message exists.
+            selected, _ = _select(
+                [blocks[run_id] for run_id in block_order],
+                last_resolved=True,
+            )
+
+        ordered: list[Any] = []
+        for turn in reversed(selected):
+            ordered.extend(reversed(turn))
+        return [
+            {"role": message.role, "content": message.content} for message in ordered
         ]
 
     # -- snapshot -------------------------------------------------------

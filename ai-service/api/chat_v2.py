@@ -735,6 +735,35 @@ async def download_artifact(
             detail="Artifact unavailable",
         )
 
+    # Ticket 04: legacy illegal files must not download. PDF artifacts are
+    # re-verified against the same content contract used at publish time
+    # (parse, readable pages, extractable text, unencrypted). A rejected
+    # file yields 410 — the file and the row are NOT deleted, so operators
+    # keep the evidence.
+    if artifact.mime_type == "application/pdf":
+        from agent_v2.artifacts import (
+            MAX_ARTIFACT_BYTES,
+            ArtifactExportError,
+            validate_pdf_bytes,
+        )
+
+        try:
+            file_size = Path(storage_path).stat().st_size
+            if file_size > MAX_ARTIFACT_BYTES:
+                raise ArtifactExportError(
+                    f"PDF 大小 {file_size} 超过上限 {MAX_ARTIFACT_BYTES}"
+                )
+            validate_pdf_bytes(Path(storage_path).read_bytes())
+        except ArtifactExportError as exc:
+            logger.warning(
+                "chat_v2: artifact %s failed PDF content verification: %s",
+                artifact_id, exc,
+            )
+            raise HTTPException(
+                status_code=410,
+                detail="Artifact unavailable",
+            )
+
     # FileResponse streams the file with the original Content-Type and
     # sets Content-Disposition to the public_filename. The storage_path
     # never appears in any response header — only the basename does.

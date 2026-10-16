@@ -1,0 +1,9 @@
+# harness-p0-p1 Ticket 03: test entry point.
+#
+# Runtime dependencies come from the full application requirements; the
+# test tooling is pinned explicitly so a clean environment reproduces the
+# same suite. Do not upgrade unrelated dependencies here.
+-r requirements.txt
+
+pytest==9.0.3
+pytest-asyncio==1.3.0

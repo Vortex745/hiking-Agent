@@ -32,7 +32,9 @@ def test_first_text_arrives_before_kernel_finishes_and_replay_matches(tmp_path):
         events = []
         try:
             while not events or events[-1].type != "text":
-                events.append(await asyncio.wait_for(anext(gen), timeout=2))
+                # Cold tool imports are outside this ordering contract. The
+                # unreleased barrier below proves delivery precedes completion.
+                events.append(await asyncio.wait_for(anext(gen), timeout=10))
             assert not release.is_set()
             assert events[-1].payload["content"] == "先穿登山鞋。"
             stored = repo.get_events_since(run_id=events[-1].run_id, from_seq=0)
@@ -50,7 +52,11 @@ def test_first_text_arrives_before_kernel_finishes_and_replay_matches(tmp_path):
     asyncio.run(scenario())
 
 
-def test_kernel_uses_real_graph_tokens_and_filters_split_reasoning(monkeypatch):
+@pytest.mark.parametrize("history", [None, [
+    {"role": "user", "content": "10月20日出发，两个人"},
+    {"role": "assistant", "content": "已记录日期和人数。"},
+]])
+def test_kernel_uses_real_graph_tokens_and_filters_split_reasoning(monkeypatch, history):
     from langchain_core.language_models.fake_chat_models import FakeListChatModel
     from langchain.agents import create_agent
     from agent_v2 import kernel as module
@@ -61,8 +67,10 @@ def test_kernel_uses_real_graph_tokens_and_filters_split_reasoning(monkeypatch):
 
     class Agent:
         closed = False
+        inputs = None
 
         def astream(self, *args, **kwargs):
+            self.inputs = args[0]
             return graph.astream(*args, **kwargs)
 
         async def aclose(self):
@@ -79,9 +87,11 @@ def test_kernel_uses_real_graph_tokens_and_filters_split_reasoning(monkeypatch):
         async def on_text(text, audits):
             chunks.append(text)
         final, _ = await module.run_chat_turn(system_prompt="test", message="hi",
-            settings=SimpleNamespace(), on_text=on_text)
+            settings=SimpleNamespace(), on_text=on_text, history=history)
         assert len(chunks) > 1
         assert "".join(chunks) == final == "徒步安全第一。"
+        expected = [(entry["role"], entry["content"]) for entry in history or []]
+        assert agent.inputs == {"messages": expected + [("user", "hi")]}
         assert agent.closed
     asyncio.run(scenario())
 
@@ -148,6 +158,40 @@ def test_stream_does_not_leak_failed_or_not_yet_checked_search(tmp_path):
             ChatFlowRequest(message="路线里程", request_id="stream-gate"), subject_id=SUBJECT_ID)]
         text = "".join(e.payload["content"] for e in events if e.type == "text")
         assert text == "资料不足：未检索到可核验的徒步知识，无法提供具体徒步事实。"
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("profile_id", ["chat", "rag"])
+@pytest.mark.parametrize("evidence_state", ["foreign_run", "no_search_tool"])
+def test_stream_gate_uses_current_run_evidence_even_without_search_tool(
+    tmp_path, monkeypatch, profile_id, evidence_state,
+):
+    from agent_v2 import kernel_tools
+
+    if evidence_state == "no_search_tool":
+        monkeypatch.setattr(kernel_tools, "build_chat_extra_tools", lambda *args, **kwargs: ())
+
+    async def scenario():
+        audits = [dict(EVIDENCE[0], run_id="another-run")] if evidence_state == "foreign_run" else []
+
+        async def kernel(**kwargs):
+            await kwargs["on_text"]("不应泄漏的1800米", audits)
+            return "不应泄漏的1800米", audits
+
+        repo = _repo(tmp_path)
+        orch = RunOrchestrator(settings=_settings(), runs_repo=repo,
+                               memory=_FakeMemory(), kernel_turn=kernel)
+        req = ChatFlowRequest(message="路线爬升多少", request_id="stream-current-evidence",
+                              profile_id=profile_id, conversation_id="conv-current-evidence")
+        events = [event async for event in orch.stream_chat(req, subject_id=SUBJECT_ID)]
+        text = "".join(event.payload["content"] for event in events if event.type == "text")
+        assert text == "资料不足：未检索到可核验的徒步知识，无法提供具体徒步事实。"
+        assert [event.type for event in events if event.type in {"done", "error", "cancelled"}] == ["done"]
+        replay = [event async for event in orch.stream_chat(req, subject_id=SUBJECT_ID)]
+        assert [(event.type, event.payload) for event in replay] == [(event.type, event.payload) for event in events]
+        stored = repo.checkpoints.get_messages(conversation_id=req.conversation_id)
+        assert [row.content for row in stored if row.role == "assistant"] == [text]
+
     asyncio.run(scenario())
 
 

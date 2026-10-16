@@ -242,6 +242,55 @@ def compute_sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def validate_pdf_bytes(data: bytes) -> None:
+    """Reject anything that is not a readable, non-empty, unencrypted PDF.
+
+    Ticket 04 (spec AC4): a ``%PDF`` header alone is NOT success. The
+    bytes must parse with pypdf, carry at least one readable page, yield
+    extractable text, and be unencrypted. Text files wearing a ``.pdf``
+    name, truncated/corrupted files, encrypted files, and page-less
+    documents are all rejected with :class:`ArtifactExportError`.
+
+    Used on the publish path (before the artifact row is written) and on
+    the download path (legacy illegal files must not download).
+    """
+    if not data:
+        raise ArtifactExportError("PDF 内容为空：拒绝发布/下载。")
+    if not data.startswith(b"%PDF"):
+        raise ArtifactExportError(
+            "不是 PDF：缺少 %PDF 文件头（文本伪 PDF）。"
+        )
+    if b"%%EOF" not in data[-2048:]:
+        raise ArtifactExportError(
+            "PDF 损坏或被截断：文件尾部缺少 %%EOF 结束标记。"
+        )
+
+    try:
+        from io import BytesIO
+
+        from pypdf import PdfReader
+
+        reader = PdfReader(BytesIO(data))
+    except Exception as exc:
+        raise ArtifactExportError(f"PDF 解析失败：{exc}") from exc
+
+    if reader.is_encrypted:
+        raise ArtifactExportError("PDF 已加密：拒绝发布/下载。")
+    if len(reader.pages) < 1:
+        raise ArtifactExportError("PDF 没有可阅读页面。")
+
+    for page in reader.pages:
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            # A single unreadable page does not condemn the document;
+            # another page may still carry the正文.
+            continue
+        if text.strip():
+            return
+    raise ArtifactExportError("PDF 无可提取正文：疑似伪造或空白文档。")
+
+
 def validate_manifest(
     manifest: ArtifactManifest,
     actual_bytes: bytes,
@@ -542,6 +591,25 @@ def export_artifact_to_host(
             "symlink escape detected", manifest=manifest
         )
 
+    # 4b. Ticket 04: PDF content verification. A %PDF header is not
+    #     enough — the bytes must parse, carry readable pages and
+    #     extractable text, and be unencrypted. Text-fake PDFs, truncated
+    #     or corrupted files, and encrypted files never publish.
+    if manifest.declared_mime == "application/pdf":
+        try:
+            validate_pdf_bytes(actual_bytes)
+        except ArtifactExportError as exc:
+            persist_failed_artifact(
+                runs_repo, run_id, conversation_id, artifact_id,
+                public_filename=manifest.public_filename,
+                mime_type=manifest.declared_mime,
+                size_bytes=manifest.size_bytes,
+                sha256=manifest.sha256,
+                storage_path="",
+                failure_reason=f"pdf content rejected: {exc}",
+            )
+            raise ArtifactExportError(str(exc), manifest=manifest) from exc
+
     # 5. Compute host storage path + persist bytes atomically.
     storage_path = host_storage_path(
         storage_dir, artifact_id, manifest.public_filename
@@ -632,6 +700,7 @@ __all__ = [
     "persist_failed_artifact",
     "validate_declared_mime",
     "validate_manifest",
+    "validate_pdf_bytes",
     "validate_public_filename",
     "validate_relative_path",
     "validate_size_bytes",

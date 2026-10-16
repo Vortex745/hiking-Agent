@@ -70,6 +70,7 @@ from agent_v2.computer import (
     SandboxCreationError,
     SandboxQuotaError,
     SandboxTimeoutError,
+    SandboxUnavailableError,
 )
 from agent_v2.effects import (
     EffectStatus,
@@ -410,6 +411,125 @@ EFFECT_COPY_GENERATE_PDF = EffectCopy(
 )
 
 
+# ---- Ticket 01/02 fix (D1): stable sandbox refusal code on replay --------
+#
+# A deterministic sandbox refusal is recorded as ``FAILED`` with its public
+# code embedded in ``failure_reason``. Every later resume/replay re-derives
+# the public ``error`` from that recorded reason, so the refusal keeps
+# surfacing ``sandbox_unavailable`` — never the generic per-tool failure
+# code (``artifact_generation_failed`` / ``bash_execution_failed``).
+_SANDBOX_UNAVAILABLE_CODE = SandboxUnavailableError.code
+_SANDBOX_UNAVAILABLE_REASON_PREFIX = f"{_SANDBOX_UNAVAILABLE_CODE}: "
+_SANDBOX_UNAVAILABLE_MESSAGE_PREFIX = "沙箱不可用："
+
+
+def _record_sandbox_refusal(
+    runs_repo: RunRepository,
+    effect_key: str,
+    exc: BaseException,
+) -> None:
+    """Mark the effect FAILED, embedding the stable public refusal code."""
+    runs_repo.mark_effect_failed(
+        effect_key,
+        reason=f"{_SANDBOX_UNAVAILABLE_REASON_PREFIX}{exc}",
+    )
+
+
+def _failed_effect_reason_text(reason: str) -> str:
+    """The operator-facing failure reason without the internal marker."""
+    if reason.startswith(_SANDBOX_UNAVAILABLE_REASON_PREFIX):
+        return reason[len(_SANDBOX_UNAVAILABLE_REASON_PREFIX):]
+    return reason
+
+
+def _failed_effect_public_error(copy: EffectCopy, reason: str) -> tuple[str, str]:
+    """Map a recorded FAILED reason to the public ``error`` (code, message).
+
+    Sandbox refusals keep the stable ``sandbox_unavailable`` code (and the
+    original message) on every resume/replay; all other failures keep the
+    per-tool ``copy.failure_code`` mapping.
+    """
+    if reason.startswith(_SANDBOX_UNAVAILABLE_REASON_PREFIX):
+        detail = reason[len(_SANDBOX_UNAVAILABLE_REASON_PREFIX):]
+        return (
+            _SANDBOX_UNAVAILABLE_CODE,
+            f"{_SANDBOX_UNAVAILABLE_MESSAGE_PREFIX}{detail}",
+        )
+    return copy.failure_code, f"{copy.error_failure_prefix}{reason}"
+
+
+# ---- Ticket 30/04: the ONE plan-generation kernel seam ---------------------
+#
+# The chat flow and the approved-export resume render the plan through the
+# SAME kernel turn: one bridge wiring, one system prompt, one ``_kernel_turn``
+# kwargs set and ONE audit → ``tool_result`` mapping. Only the message (the
+# request vs the stored user turn) and the failure handling differ.
+
+_PLAN_SYSTEM_PROMPT = (
+    "你是徒步计划撰写助手，用简体中文输出结构化 Markdown 徒步计划"
+    "（目的地/日程/装备/风险与建议）。缺失的信息显式标注为假设；"
+    "需要读写工作区文件时只用相对路径。不得透露内部系统或框架信息。"
+)
+
+
+async def _kernel_plan_turn(
+    *,
+    kernel_turn: Any,
+    settings: Any,
+    checkpoint_store: Any,
+    computer: Any,
+    workspace_path: str,
+    message: str,
+    run_id: str | None,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Run the plan-writing kernel turn over the run-scoped sandbox bridge.
+
+    Returns ``(plan_text, audit_entries)`` where ``audit_entries`` already
+    merges the kernel's own audits with the sandbox tools' audits, ready
+    for :func:`_tool_result_payloads`. Kernel failures propagate as
+    ``KernelModelFailure``; the caller maps them to its own terminal.
+    """
+    from agent_v2.kernel_tools import (
+        ProductSandboxBridge,
+        SandboxReadTool,
+        SandboxWriteTool,
+    )
+
+    bridge = ProductSandboxBridge(computer, workspace_path)
+    sandbox_audits: list[dict[str, Any]] = []
+    sandbox_tools = (
+        SandboxReadTool(bridge=bridge, run_id=run_id, audit_sink=sandbox_audits.append),
+        SandboxWriteTool(bridge=bridge, run_id=run_id, audit_sink=sandbox_audits.append),
+    )
+    plan_text, audits = await kernel_turn(
+        system_prompt=_PLAN_SYSTEM_PROMPT,
+        message=message,
+        settings=settings,
+        run_id=run_id,
+        checkpoint_store=checkpoint_store,
+        extra_tools=sandbox_tools,
+        kernel_gate=None,
+        mcp_servers=None,
+        computer=bridge,
+    )
+    return plan_text, [*audits, *sandbox_audits]
+
+
+def _tool_result_payloads(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Public ``tool_result`` payloads for kernel audit entries."""
+    payloads: list[dict[str, Any]] = []
+    for entry in entries:
+        payload: dict[str, Any] = {"tool": entry.get("tool") or entry.get("server_id")}
+        if entry.get("phase") == "denied":
+            payload["status"] = "denied"
+            payload["reason"] = entry.get("code")
+        else:
+            payload["status"] = "ok" if entry.get("ok") else str(entry.get("code") or "error")
+            payload["duration_ms"] = entry.get("duration_ms")
+        payloads.append(payload)
+    return payloads
+
+
 async def drive_effect(
     *,
     runs_repo: RunRepository,
@@ -480,7 +600,9 @@ async def drive_effect(
         mark_terminal_safe(runs_repo, run_id, "error")
         return
 
-    # Prior terminal failure — don't re-execute (spec AC3).
+    # Prior terminal failure — don't re-execute (spec AC3). The public
+    # error is derived from the RECORDED reason so a sandbox refusal stays
+    # ``sandbox_unavailable`` on every resume/replay (Ticket 01/02 D1).
     if existing_effect is not None and existing_effect.status == EffectStatus.FAILED.value:
         reason = existing_effect.failure_reason or "未知错误"
         outcome.status = "failed"
@@ -489,14 +611,15 @@ async def drive_effect(
                 "tool": copy.tool_name,
                 "args": tool_args,
             })
+        err_code, err_message = _failed_effect_public_error(copy, reason)
         yield emit("tool_result", {
             "tool": copy.tool_name,
             "status": "error",
-            "content": f"{copy.tool_result_failure_prefix}{reason}",
+            "content": f"{copy.tool_result_failure_prefix}{_failed_effect_reason_text(reason)}",
         })
         yield emit("error", {
-            "code": copy.failure_code,
-            "message": f"{copy.error_failure_prefix}{reason}",
+            "code": err_code,
+            "message": err_message,
         })
         mark_terminal_safe(runs_repo, run_id, "error")
         return
@@ -575,10 +698,11 @@ async def drive_effect(
                     yield emit("tool_result", {
                         "tool": copy.tool_name,
                         "status": "error",
-                        "content": f"{copy.tool_result_failure_prefix}{reason}",
+                        "content": f"{copy.tool_result_failure_prefix}{_failed_effect_reason_text(reason)}",
                     })
-                    err_code = copy.failure_code
-                    err_msg = f"{copy.error_failure_prefix}{reason}"
+                    # Same mapping as the direct FAILED branch — a recorded
+                    # sandbox refusal keeps ``sandbox_unavailable`` (D1).
+                    err_code, err_msg = _failed_effect_public_error(copy, reason)
                 yield emit("error", {"code": err_code, "message": err_msg})
                 mark_terminal_safe(runs_repo, run_id, "error")
             else:
@@ -611,6 +735,28 @@ async def drive_effect(
             yield emit("error", {
                 "code": "sandbox_timeout",
                 "message": f"{copy.timeout_error_message_prefix}{exc}",
+            })
+            mark_terminal_safe(runs_repo, run_id, "error")
+            return
+        except SandboxUnavailableError as exc:
+            # Ticket 01: the placeholder remote sandbox refused BEFORE any
+            # host access. This is a deterministic refusal, not a crash:
+            # nothing executed, so the effect is ``failed`` (never
+            # ``outcome_unknown``, never committed) and a replay cannot
+            # double-execute. The public code is the stable
+            # ``sandbox_unavailable`` — no local fallback is attempted.
+            # Ticket 01/02 D1: the code is recorded WITH the failure reason
+            # so a later resume re-derives the same public error.
+            _record_sandbox_refusal(runs_repo, effect_key, exc)
+            outcome.status = "failed"
+            yield emit("tool_result", {
+                "tool": copy.tool_name,
+                "status": "error",
+                "content": f"{copy.tool_result_failure_prefix}{exc}",
+            })
+            yield emit("error", {
+                "code": _SANDBOX_UNAVAILABLE_CODE,
+                "message": f"{_SANDBOX_UNAVAILABLE_MESSAGE_PREFIX}{exc}",
             })
             mark_terminal_safe(runs_repo, run_id, "error")
             return
@@ -685,6 +831,7 @@ def compose_chat_system_prompt(req: ChatFlowRequest, profile: CapabilityProfile)
         "职责范围：徒步装备、路线知识、风险评估、户外安全与相关自然知识。",
         "回答保持简洁、实用；用户消息不涉及徒步相关话题时，礼貌说明你的专长并引导回主题。",
         "事实依据：回答徒步相关事实前，必须先调用 hiking_knowledge_search。路线、距离、海拔、耗时、天气、补给、营地、法规和风险等只能使用检索返回的可追溯片段；若没有片段，只说明资料不足，不得补充任何未经资料支持的事实、数字或通用经验。",
+        "对话历史仅用于理解用户此前已说明的约束（如出发日期、人数、目的地）；历史中助手的旧回答不是本轮事实依据，不得据此输出任何路线事实或数字，路线事实仍必须来自本轮检索。",
         "不得透露任何内部系统、工具或框架信息。",
     ]
     if req.current_location is not None:
@@ -698,6 +845,30 @@ def compose_chat_system_prompt(req: ChatFlowRequest, profile: CapabilityProfile)
 
 
 _NO_KNOWLEDGE_EVIDENCE_RESPONSE = "资料不足：未检索到可核验的徒步知识，无法提供具体徒步事实。"
+
+# Ticket 02 controlled templates. Without this-turn knowledge evidence the
+# user never sees free model text: greetings, missing-parameter
+# clarifications, and insufficiency each have ONE deterministic wording.
+_CONTROLLED_GREETING_RESPONSE = (
+    "你好！我是徒步助手，可以帮你查询徒步知识、准备装备清单或评估路线风险。"
+    "请告诉我你想了解的内容。"
+)
+_CONTROLLED_CLARIFICATION_RESPONSE = (
+    "为了给出可靠的徒步建议，请补充：路线对象或当前位置、出行时间与天数、"
+    "经验与露营需求。信息齐全后我会先检索知识库再作答。"
+)
+
+_GREETING_TOKENS = (
+    "你好", "您好", "hi", "hello", "嗨", "在吗",
+    "早上好", "上午好", "下午好", "晚上好",
+)
+_CLARIFICATION_MARKERS = ("请问", "请补充", "请提供", "需要知道", "缺少")
+
+# Ticket 02 AC5 (D6): the risk rendering states its limitation like the
+# gear rendering does. Fixed product copy — never model output.
+_RISK_CONTROLLED_LIMITATION = (
+    "风险评估按保守原则生成；实时天气、路况与现场情况需行前核实。"
+)
 
 
 def compose_rag_system_prompt(req: ChatFlowRequest, profile: CapabilityProfile) -> str:
@@ -719,35 +890,167 @@ def compose_rag_system_prompt(req: ChatFlowRequest, profile: CapabilityProfile) 
     )
 
 
-def has_hiking_knowledge_evidence(audit_entries: list[dict[str, Any]]) -> bool:
-    """Allow factual chat output only after a successful non-empty RAG search."""
-    return any(
-        entry.get("tool") == "hiking_knowledge_search"
-        and entry.get("phase") == "result"
-        and entry.get("ok") is True
-        and isinstance(entry.get("evidence"), dict)
-        and entry["evidence"].get("has_chunks") is True
-        for entry in audit_entries
-    )
-
-
-def knowledge_search_attempted_without_evidence(
-    audit_entries: list[dict[str, Any]],
+def has_hiking_knowledge_evidence(
+    audit_entries: list[dict[str, Any]], *, run_id: str | None = None
 ) -> bool:
-    """Fabrication signature: the knowledge tool was attempted this turn
-    (called, denied, or errored) but produced no retrievable chunks.
+    """True only when THIS turn ran a successful, non-empty, traceable
+    knowledge retrieval.
 
-    Only this signature triggers the fail-closed replacement — outputs
-    grounded in other successful tool executions (gear checklist, risk
-    classification, weather) pass through, and so does a turn that never
-    attempted the search. The system prompt mandates search-first; a
-    semantic-entailment gate for the never-searched turn is the planned
-    second layer (see project TODO).
+    Run-scoped (Ticket 02 AC3): an entry explicitly bound to a different
+    run never grounds the current turn — evidence cannot be borrowed from
+    another run's audit trail. Entries without a ``run_id`` belong to the
+    per-turn sink by construction and still count.
     """
-    attempted = any(
-        entry.get("tool") == "hiking_knowledge_search" for entry in audit_entries
+    for entry in audit_entries:
+        if entry.get("tool") != "hiking_knowledge_search":
+            continue
+        entry_run = entry.get("run_id")
+        if run_id is not None and entry_run is not None and entry_run != run_id:
+            continue
+        if (
+            entry.get("phase") == "result"
+            and entry.get("ok") is True
+            and isinstance(entry.get("evidence"), dict)
+            and entry["evidence"].get("has_chunks") is True
+        ):
+            return True
+    return False
+
+
+def _successful_controlled_entries(
+    audit_entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Validated ``controlled`` payloads from successful domain tools."""
+    controlled_entries: list[dict[str, Any]] = []
+    for entry in audit_entries:
+        if entry.get("phase") != "result" or entry.get("ok") is not True:
+            continue
+        controlled = entry.get("controlled")
+        if isinstance(controlled, dict) and controlled.get("ok") is True:
+            controlled_entries.append(controlled)
+    return controlled_entries
+
+
+def _render_gear_controlled(controlled: dict[str, Any]) -> str:
+    lines = ["装备清单（依据 gear_checklist 工具的结构化结果生成，非模型自由发挥）："]
+    context: list[str] = []
+    if isinstance(controlled.get("days"), int):
+        context.append(f"天数 {controlled['days']}")
+    context.append(f"季节 {controlled.get('season') or '未指定'}")
+    context.append(f"经验 {controlled.get('experience') or '未指定'}")
+    context.append(f"露营 {'是' if controlled.get('camping') else '否'}")
+    lines.append("行程参数：" + "，".join(context) + "。")
+    checklist = controlled.get("checklist")
+    if isinstance(checklist, dict):
+        for category, items in checklist.items():
+            if items:
+                lines.append(f"- {category}：{'、'.join(str(i) for i in items)}")
+    limitations = controlled.get("limitations")
+    if isinstance(limitations, str) and limitations:
+        lines.append(f"局限：{limitations}")
+    return "\n".join(lines)
+
+
+def _render_risk_controlled(controlled: dict[str, Any]) -> str:
+    lines = ["风险评估（依据 risk_assessment 工具的结构化结果生成，非模型自由发挥）："]
+    lines.append(
+        f"对象：{controlled.get('destination') or '未指定'}；"
+        f"风险等级：{controlled.get('risk_level')}。"
     )
-    return attempted and not has_hiking_knowledge_evidence(audit_entries)
+    for reason in controlled.get("reasons") or []:
+        lines.append(f"- {reason}")
+    recommendation = controlled.get("recommendation")
+    if isinstance(recommendation, str) and recommendation:
+        lines.append(f"建议：{recommendation}")
+    cancel_conditions = controlled.get("cancel_conditions") or []
+    if cancel_conditions:
+        lines.append("取消条件：" + "、".join(str(c) for c in cancel_conditions) + "。")
+    alternatives = controlled.get("alternatives") or []
+    if alternatives:
+        lines.append("备选：" + "、".join(str(a) for a in alternatives) + "。")
+    # AC5 (D6): 依据 AND 局限, same controlled-template style as gear.
+    lines.append(f"局限：{_RISK_CONTROLLED_LIMITATION}")
+    return "\n".join(lines)
+
+
+def build_controlled_domain_reply(
+    audit_entries: list[dict[str, Any]],
+) -> str | None:
+    """Render the deterministic answer for successful domain tools.
+
+    Ticket 02 AC5/AC6: after gear_checklist / risk_assessment succeed, the
+    public answer is CONSTRUCTED from the tools' validated fields with
+    basis and limitations — the model's free text is dropped, so it cannot
+    attach unsupported route numbers, live weather, or other facts.
+    Returns ``None`` when no valid controlled result exists (failures and
+    invalid payloads never fake a success).
+    """
+    blocks: list[str] = []
+    for controlled in _successful_controlled_entries(audit_entries):
+        tool = controlled.get("tool")
+        if tool == "gear_checklist":
+            blocks.append(_render_gear_controlled(controlled))
+        elif tool == "risk_assessment":
+            blocks.append(_render_risk_controlled(controlled))
+    if not blocks:
+        return None
+    return "\n\n".join(blocks)
+
+
+def _is_greeting_message(message: str) -> bool:
+    text = (message or "").strip().strip("，。！？!?~～ \n\r\t")
+    if not text or len(text) > 16:
+        return False
+    lowered = text.lower()
+    return any(lowered.startswith(token) for token in _GREETING_TOKENS)
+
+
+def _is_clarification_request(model_text: str) -> bool:
+    """The model asked a clarifying question instead of answering.
+
+    Used only to SELECT a controlled template — the model's wording is
+    never shown to the user, so a claim smuggled into a "question" is
+    still dropped.
+    """
+    body = model_text or ""
+    return ("？" in body or "?" in body) and any(
+        marker in body for marker in _CLARIFICATION_MARKERS
+    )
+
+
+def apply_chat_turn_evidence_gate(
+    model_text: str,
+    audit_entries: list[dict[str, Any]],
+    *,
+    req: ChatFlowRequest,
+    run_id: str | None = None,
+) -> str:
+    """Decide the public chat/rag answer for one turn (Ticket 02).
+
+    Order (first match wins):
+
+    1. this-turn successful non-empty traceable retrieval → the model's
+       free reply passes (AC1/AC7);
+    2. a valid controlled domain result (gear/risk) → deterministic
+       rendering of the controlled fields (AC5/AC6);
+    3. a greeting user message → controlled greeting template (AC4);
+    4. a clarifying model question → controlled clarification template
+       whose fields are the canonical request items (AC4);
+    5. otherwise → the insufficiency template (AC1).
+
+    The result is what the stream emits, what the client finally sees, and
+    what gets persisted — one shared decision, no second path (AC2).
+    """
+    if has_hiking_knowledge_evidence(audit_entries, run_id=run_id):
+        return model_text
+    controlled = build_controlled_domain_reply(audit_entries)
+    if controlled is not None:
+        return controlled
+    if _is_greeting_message(req.message):
+        return _CONTROLLED_GREETING_RESPONSE
+    if _is_clarification_request(model_text):
+        return _CONTROLLED_CLARIFICATION_RESPONSE
+    return _NO_KNOWLEDGE_EVIDENCE_RESPONSE
 
 
 def _tool_result_summary(entry: dict[str, Any]) -> str:
@@ -1444,8 +1747,8 @@ class RunOrchestrator:
             return
         except ComputerError as exc:
             yield emit("error", {
-                "code": "sandbox_unavailable",
-                "message": f"沙箱不可用：{exc}",
+                "code": _SANDBOX_UNAVAILABLE_CODE,
+                "message": f"{_SANDBOX_UNAVAILABLE_MESSAGE_PREFIX}{exc}",
             })
             mark_terminal_safe(runs_repo, run_id, "error")
             return
@@ -1691,8 +1994,8 @@ class RunOrchestrator:
             return
         except ComputerError as exc:
             yield emit("error", {
-                "code": "sandbox_unavailable",
-                "message": f"沙箱不可用：{exc}",
+                "code": _SANDBOX_UNAVAILABLE_CODE,
+                "message": f"{_SANDBOX_UNAVAILABLE_MESSAGE_PREFIX}{exc}",
             })
             mark_terminal_safe(runs_repo, run_id, "error")
             return
@@ -1815,50 +2118,26 @@ class RunOrchestrator:
             # Ticket 30: the hiking-plan content is generated by the REAL
             # UniHarness model loop (see the method docstring).
             from agent_v2.kernel import KernelModelFailure
-            from agent_v2.kernel_tools import (
-                ProductSandboxBridge,
-                SandboxReadTool,
-                SandboxWriteTool,
-            )
 
-            bridge = ProductSandboxBridge(computer, workspace_path)
-            sandbox_audits: list[dict[str, Any]] = []
-            sandbox_tools = (
-                SandboxReadTool(bridge=bridge, run_id=run_id, audit_sink=sandbox_audits.append),
-                SandboxWriteTool(bridge=bridge, run_id=run_id, audit_sink=sandbox_audits.append),
-            )
             # In-workspace read/write are kernel-governed self-service ops
             # (hard boundary = workspace chdir + path guard + env isolation);
             # the product policy ladder re-enters at generate_pdf/export below.
             try:
-                plan_text, audits = await self._kernel_turn(
-                    system_prompt=(
-                        "你是徒步计划撰写助手，用简体中文输出结构化 Markdown 徒步计划"
-                        "（目的地/日程/装备/风险与建议）。缺失的信息显式标注为假设；"
-                        "需要读写工作区文件时只用相对路径。不得透露内部系统或框架信息。"
-                    ),
-                    message=req.message,
+                plan_text, plan_audit_entries = await _kernel_plan_turn(
+                    kernel_turn=self._kernel_turn,
                     settings=self._settings,
-                    run_id=run_id,
                     checkpoint_store=self._kernel_checkpoints,
-                    extra_tools=sandbox_tools,
-                    kernel_gate=None,
-                    mcp_servers=None,
-                    computer=bridge,
+                    computer=computer,
+                    workspace_path=workspace_path,
+                    message=req.message,
+                    run_id=run_id,
                 )
             except KernelModelFailure as exc:
                 yield emit("error", {"code": exc.code, "message": exc.message})
                 mark_terminal_safe(runs_repo, run_id, "error")
                 return
 
-            for entry in (*audits, *sandbox_audits):
-                payload: dict[str, Any] = {"tool": entry.get("tool") or entry.get("server_id")}
-                if entry.get("phase") == "denied":
-                    payload["status"] = "denied"
-                    payload["reason"] = entry.get("code")
-                else:
-                    payload["status"] = "ok" if entry.get("ok") else str(entry.get("code") or "error")
-                    payload["duration_ms"] = entry.get("duration_ms")
+            for payload in _tool_result_payloads(plan_audit_entries):
                 yield emit("tool_result", payload)
 
             plan_content = plan_text
@@ -1881,6 +2160,21 @@ class RunOrchestrator:
                 yield emit("error", {
                     "code": "sandbox_timeout",
                     "message": f"沙箱命令超时：{exc}",
+                })
+                mark_terminal_safe(runs_repo, run_id, "error")
+                return
+            except SandboxUnavailableError as exc:
+                # Ticket 01: placeholder remote sandbox refused before any
+                # host access — surface the stable public code and stop.
+                # No artifact is published and no local fallback runs.
+                yield emit("tool_result", {
+                    "tool": "generate_pdf",
+                    "status": "error",
+                    "content": f"PDF 生成失败：{exc}",
+                })
+                yield emit("error", {
+                    "code": _SANDBOX_UNAVAILABLE_CODE,
+                    "message": f"{_SANDBOX_UNAVAILABLE_MESSAGE_PREFIX}{exc}",
                 })
                 mark_terminal_safe(runs_repo, run_id, "error")
                 return
@@ -2354,7 +2648,36 @@ class RunOrchestrator:
                 if msg.get("role") == "user":
                     user_message = msg.get("content", "")
                     break
+
+            # Ticket 04: the approved export must render the PLAN, not the
+            # raw user message. The first stream pauses at the permission
+            # gate BEFORE the kernel turn, so at pause time no plan exists
+            # yet — generate it here through the same kernel seam as the
+            # first stream. Fail closed on kernel failure; skip the turn
+            # entirely when the tool already executed (idempotent resume).
             plan_content = user_message
+            if not has_tool_result_ok:
+                from agent_v2.kernel import KernelModelFailure
+
+                try:
+                    plan_text, plan_audit_entries = await _kernel_plan_turn(
+                        kernel_turn=self._kernel_turn,
+                        settings=self._settings,
+                        checkpoint_store=self._kernel_checkpoints,
+                        computer=computer,
+                        workspace_path=workspace_path,
+                        message=user_message,
+                        run_id=run_id,
+                    )
+                except KernelModelFailure as exc:
+                    yield emit("error", {"code": exc.code, "message": exc.message})
+                    mark_terminal_safe(runs_repo, run_id, "error")
+                    return
+
+                for payload in _tool_result_payloads(plan_audit_entries):
+                    yield emit("tool_result", payload)
+
+                plan_content = plan_text
 
             def _execute_pdf() -> dict[str, Any]:
                 generated = computer.generate_pdf(
@@ -3032,16 +3355,50 @@ class RunOrchestrator:
                 )
             )
 
+            # Ticket 05 (T08): the server-side bounded history for THIS
+            # run. Read AFTER the adapter's ownership/persistence checks,
+            # keyed by the CURRENT run's stored conversation_id (the
+            # canonical server-derived identity when the client sent
+            # none). A storage failure is an explicit terminal — a broken
+            # store must never degrade into a silent fresh conversation,
+            # and client-sent history is never trusted.
+            history: list[dict[str, str]] | None = None
+            if self._runs_repo is not None and run_id is not None:
+                try:
+                    run_record = self._runs_repo.get_run(run_id)
+                    conversation_id = (
+                        run_record.conversation_id
+                        if run_record is not None
+                        else (req.conversation_id or f"conv-{req.request_id}")
+                    )
+                    history = self._runs_repo.get_recent_completed_history(
+                        conversation_id=conversation_id,
+                        current_run_id=run_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "run_orchestration: conversation history read failed "
+                        "for run_id=%s; terminating with context_unavailable",
+                        run_id,
+                    )
+                    yield emit("error", {
+                        "code": "context_unavailable",
+                        "message": (
+                            "会话历史读取失败，未使用任何历史继续作答，请稍后重试。"
+                        ),
+                    })
+                    mark_terminal_safe(self._runs_repo, run_id, "error")
+                    return
+
             deltas: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
             streamed_text = ""
-            search_enabled = any(t.name == "hiking_knowledge_search" for t in extra_tools)
 
             async def on_text(delta: str, kernel_audits: list[dict[str, Any]]) -> None:
                 combined_audits = audit_entries + kernel_audits
                 # A search may still happen later in the first model step.
                 # Never publish text which the existing evidence gate could retract.
-                if profile.profile_id in (ProfileId.CHAT, ProfileId.RAG) and search_enabled:
-                    if not has_hiking_knowledge_evidence(combined_audits):
+                if profile.profile_id in (ProfileId.CHAT, ProfileId.RAG):
+                    if not has_hiking_knowledge_evidence(combined_audits, run_id=run_id):
                         return
                 if delta:
                     await deltas.put(delta)
@@ -3056,6 +3413,7 @@ class RunOrchestrator:
                 kernel_gate=kernel_gate,
                 mcp_servers=mcp_servers or None,
                 subagent_definitions=sub_defs or None,
+                history=history,
                 on_text=on_text,
             ))
             try:
@@ -3093,10 +3451,31 @@ class RunOrchestrator:
             mark_terminal_safe(self._runs_repo, run_id, "error")
             return
 
-        if profile.profile_id in (ProfileId.CHAT, ProfileId.RAG) and (
-            knowledge_search_attempted_without_evidence(audit_entries)
-        ):
-            response_text = _NO_KNOWLEDGE_EVIDENCE_RESPONSE
+        # Ticket 02 AC7 (mid-turn): a cancel observed while THIS kernel
+        # turn was in flight must not leak the late answer. The single
+        # ``cancelled`` terminal is emitted here — before any tool_result
+        # / text event and before the assistant reply is persisted — so
+        # the stream keeps exactly one terminal and zero late text.
+        if is_cancelled(self._runs_repo, run_id):
+            yield emit("cancelled", {
+                "code": "cancelled",
+                "message": "运行已被取消。",
+            })
+            return
+
+        # Ticket 02 (spec T03/T04): the turn evidence gate. Free factual
+        # text requires THIS-turn successful non-empty traceable retrieval;
+        # controlled domain results render from validated fields; anything
+        # else falls back to a controlled template. The decision is made
+        # ONCE here — the text event, the final result, and the persisted
+        # history all carry this same content (AC2).
+        if profile.profile_id in (ProfileId.CHAT, ProfileId.RAG):
+            response_text = apply_chat_turn_evidence_gate(
+                response_text,
+                audit_entries,
+                req=req,
+                run_id=run_id,
+            )
 
         # Public tool audits follow incremental text and precede completion.
         for entry in audit_entries:

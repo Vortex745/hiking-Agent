@@ -1,12 +1,16 @@
 fastapi>=0.118.0
-uvicorn[standard]==0.30.0
-python-dotenv==1.0.1
+uvicorn[standard]>=0.31.1,<1
+# Shared with DeepEval (>=1.1.1); app + eval requirements must resolve together.
+python-dotenv>=1.1.1,<2
 python-multipart>=0.0.9
-httpx==0.27.0
-openai==1.50.0
+httpx>=0.27.1,<0.29
+# harness-p0-p1 Ticket 03: openai 2.x is the working SDK line; the old
+# ==1.50.0 pin conflicts with langchain-openai>=1.4 (which requires
+# openai>=1.58 and supports 2.x).
+openai>=2.45,<3
 langfuse>=3.0.0
 langchain>=1.3.0
-langchain-openai>=1.4.0
+langchain-openai>=1.4,<2
 langchain-core>=1.5.0
 langchain-text-splitters>=0.3.0
 langgraph==1.2.6
@@ -15,6 +19,10 @@ psycopg[binary]>=3.2.0
 redis>=5.1.0
 beautifulsoup4>=4.12.0
 lxml>=5.3.0
+# Ticket 04 (PDF rendering) + Ticket 03 (explicit declaration):
+# markdown → HTML and PDF parse/verify, both pinned to the working majors.
+mistune>=3,<4
+pypdf>=6.10,<7
 reportlab>=4.2.0
 numpy>=1.26.0,<2.0.0
 langchain-community>=0.3.0
@@ -22,3 +30,7 @@ tavily-python>=0.7.0
 ormsgpack>=1.7.0
 pymupdf4llm>=0.0.17
 sqlite-vec>=0.1.6
+# harness-p0-p1 Ticket 07: jieba is imported at module level by
+# rag/hybrid_retrieval.py, rag/sqlite_store.py and eval_fts5_chinese.py.
+# Declare it so a clean checkout can collect the backend regression.
+jieba>=0.42.1,<0.43
