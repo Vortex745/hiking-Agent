@@ -43,6 +43,12 @@ services:
       MEMORY_STORE_PATH: /app/memory_store
       MEMORY_ENABLED: ${MEMORY_ENABLED:-true}
       AMAP_API_KEY: ${AMAP_API_KEY:-}
+      # Ticket 06: production explicitly disables trace export instead of
+      # relying on empty credentials; self-hosted Langfuse can override.
+      LANGFUSE_ENABLED: ${LANGFUSE_ENABLED:-false}
+      OBSERVABILITY_SAMPLE_RATIO: ${OBSERVABILITY_SAMPLE_RATIO:-1.0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
     volumes:
       - ai-memory:/app/memory_store
       - ai-rag-docs:/app/rag_docs
