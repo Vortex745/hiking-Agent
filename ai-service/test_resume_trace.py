@@ -119,6 +119,15 @@ def test_two_resumes_of_same_run_get_distinct_traces(spans, monkeypatch):
         assert span_.attributes["run.id"] == "run-1"
 
 
+def test_server_derived_conversation_id_falls_back_to_request_id():
+    # The first stream has no client conversation id, so the server derives
+    # ``conv-<request_id>``. A resume must land in the same session instead
+    # of splitting the run across two Langfuse sessions.
+    assert chat_v2._session_key(None, "req-1") == "req-1"
+    assert chat_v2._session_key("conv-req-1", "req-1") == "req-1"
+    assert chat_v2._session_key("conv-1", "req-1") == "conv-1"
+
+
 def test_resume_failure_marks_span_and_still_releases(spans, monkeypatch):
     orchestrator = _Orchestrator(fail=True)
     with pytest.raises(RuntimeError):

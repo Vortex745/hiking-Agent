@@ -23,6 +23,16 @@ _SECRET_PATTERNS = (
     re.compile(r"(?i)\b(api[_-]?key|token|secret|password)\s*[=:]\s*[^\s,;]+"),
 )
 
+# Location values may be embedded in free text (the product puts the
+# authorized location into a system prompt), so key=value pairs must be
+# scrubbed even when the message is not a structured mapping. Addresses
+# contain spaces, so the value terminates at a line break or punctuation.
+_LOCATION_PATTERNS = (
+    re.compile(
+        r"(?i)\b(latitude|longitude|lat|lng|adcode|address)\s*[=:]\s*[^\n，,；;。]+"
+    ),
+)
+
 _DENIED_KEYS = {
     "authorization",
     "cookie",
@@ -44,9 +54,11 @@ _DENIED_KEYS = {
 
 
 def scrub_text(value: str, limit: int = TOOL_OUTPUT_LIMIT) -> str:
-    """Redact credentials and truncate to ``limit`` characters."""
+    """Redact credentials/location values and truncate to ``limit`` chars."""
     text = "" if value is None else str(value)
     for pattern in _SECRET_PATTERNS:
+        text = pattern.sub(REDACTED, text)
+    for pattern in _LOCATION_PATTERNS:
         text = pattern.sub(REDACTED, text)
     if limit and len(text) > limit:
         return text[:limit] + f"...[truncated {len(text) - limit} chars]"

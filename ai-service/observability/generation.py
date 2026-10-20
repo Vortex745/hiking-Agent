@@ -112,11 +112,22 @@ def _apply_usage(
 
 
 def _usage_from_chunk(chunk: Any) -> tuple[int | None, int | None]:
-    metadata = getattr(chunk, "usage_metadata", None) or {}
+    # Streaming implementations yield ChatGenerationChunk in production
+    # (usage lives on ``chunk.message``); lightweight fakes yield the
+    # message chunk directly.
+    carriers = (chunk, getattr(chunk, "message", None))
+    metadata: dict = {}
+    response_metadata: dict = {}
+    for carrier in carriers:
+        if carrier is None:
+            continue
+        metadata = getattr(carrier, "usage_metadata", None) or {}
+        response_metadata = getattr(carrier, "response_metadata", None) or {}
+        if metadata:
+            break
     input_tokens = metadata.get("input_tokens")
     output_tokens = metadata.get("output_tokens")
     if input_tokens is None and output_tokens is None:
-        response_metadata = getattr(chunk, "response_metadata", None) or {}
         usage = response_metadata.get("token_usage") or {}
         input_tokens = usage.get("prompt_tokens")
         output_tokens = usage.get("completion_tokens")
@@ -124,7 +135,9 @@ def _usage_from_chunk(chunk: Any) -> tuple[int | None, int | None]:
 
 
 def _chunk_text(chunk: Any) -> str:
-    content = getattr(chunk, "content", "")
+    content = getattr(chunk, "content", None)
+    if content is None:
+        content = getattr(getattr(chunk, "message", None), "content", "")
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -195,18 +208,23 @@ def trace_chat_model(model: Any) -> Any:
             started = time.perf_counter()
             chunks: list[str] = []
             input_tokens = output_tokens = None
+            first_token_ms = None
             with tracing.start_span("chat.generation", attrs) as span:
                 try:
                     async for chunk in original_astream(
                         messages, stop=stop, run_manager=run_manager, **kwargs
                     ):
-                        if not chunks:
+                        text = _chunk_text(chunk)
+                        if text and first_token_ms is None:
+                            first_token_ms = round(
+                                (time.perf_counter() - started) * 1000, 1
+                            )
                             span.set_attribute(
                                 "gen_ai.response.time_to_first_token_ms",
-                                round((time.perf_counter() - started) * 1000, 1),
+                                first_token_ms,
                             )
                         if len("".join(chunks)) < _MAX_TEXT:
-                            chunks.append(_chunk_text(chunk))
+                            chunks.append(text)
                         chunk_input, chunk_output = _usage_from_chunk(chunk)
                         input_tokens = chunk_input if chunk_input is not None else input_tokens
                         output_tokens = (
@@ -231,18 +249,23 @@ def trace_chat_model(model: Any) -> Any:
             started = time.perf_counter()
             chunks: list[str] = []
             input_tokens = output_tokens = None
+            first_token_ms = None
             with tracing.start_span("chat.generation", attrs) as span:
                 try:
                     for chunk in original_stream(
                         messages, stop=stop, run_manager=run_manager, **kwargs
                     ):
-                        if not chunks:
+                        text = _chunk_text(chunk)
+                        if text and first_token_ms is None:
+                            first_token_ms = round(
+                                (time.perf_counter() - started) * 1000, 1
+                            )
                             span.set_attribute(
                                 "gen_ai.response.time_to_first_token_ms",
-                                round((time.perf_counter() - started) * 1000, 1),
+                                first_token_ms,
                             )
                         if len("".join(chunks)) < _MAX_TEXT:
-                            chunks.append(_chunk_text(chunk))
+                            chunks.append(text)
                         chunk_input, chunk_output = _usage_from_chunk(chunk)
                         input_tokens = chunk_input if chunk_input is not None else input_tokens
                         output_tokens = (

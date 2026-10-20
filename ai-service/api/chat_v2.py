@@ -273,6 +273,19 @@ def _cleanup_sandbox(
 # :mod:`agent_v2.run_orchestration`; this adapter only renders SSE.
 
 
+def _session_key(conversation_id: str | None, request_id: str) -> str:
+    """Resolve the trace session key without conflating it with request ids.
+
+    A client-supplied conversation id groups every run of that conversation.
+    Server-derived ids (``conv-<request_id>``) are an implementation detail of
+    a single run, so they fall back to the original request id — otherwise the
+    first stream and its resume would land in different sessions.
+    """
+    if conversation_id and conversation_id != f"conv-{request_id}":
+        return conversation_id
+    return request_id or conversation_id or ""
+
+
 def _build_run_orchestrator(runtime: Any) -> RunOrchestrator:
     """Resolve the v2 runtime into typed orchestrator dependencies.
 
@@ -361,7 +374,9 @@ async def chat_v2_sse(req: ChatV2Request, request: Request):
     async def guarded_stream() -> AsyncGenerator[str, None]:
         # 会话聚合：conversation_id 优先，退回 request_id。request_id 与
         # session 是两个概念，不得互相冒充（见关联键规格）。
-        session_token = tracing.set_session(req.conversation_id or req.request_id)
+        session_token = tracing.set_session(
+            _session_key(req.conversation_id, req.request_id)
+        )
         parent_context = tracing.extract_traceparent(
             request.headers.get("traceparent")
         )
@@ -999,7 +1014,7 @@ async def chat_v2_resume(
         # original stream's tree. `run.id` + the session keep both
         # executions searchable together in Langfuse.
         session_token = tracing.set_session(
-            run.conversation_id or run.request_id
+            _session_key(run.conversation_id, run.request_id)
         )
         try:
             with tracing.start_span(

@@ -202,6 +202,25 @@ def test_json_formatter_emits_pinned_keys():
     assert set(payload).issuperset({"ts", "level", "event", "msg"})
 
 
+def test_json_formatter_includes_redacted_exception_detail():
+    import json
+
+    formatter = JsonFormatter()
+    try:
+        raise RuntimeError("boom Authorization: Bearer supersecret-token")
+    except RuntimeError:
+        import sys
+
+        record = logging.LogRecord(
+            "ai-service.http", logging.ERROR, __file__, 1, "failed", None,
+            sys.exc_info(),
+        )
+        payload = json.loads(formatter.format(record))
+
+    assert "RuntimeError" in payload["exc_info"]
+    assert "supersecret-token" not in payload["exc_info"]
+
+
 def test_configure_logging_is_idempotent():
     configure_logging()
     configure_logging()

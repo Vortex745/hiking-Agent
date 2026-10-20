@@ -68,6 +68,10 @@ class JsonFormatter(logging.Formatter):
                 payload[key] = value
         for key in _PINNED_KEYS:
             payload.setdefault(key, "")
+        if record.exc_info:
+            payload["exc_info"] = scrub_text(
+                self.formatException(record.exc_info), 4000
+            )
         return json.dumps(payload, ensure_ascii=False)
 
 

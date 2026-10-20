@@ -169,6 +169,46 @@ async def test_astream_records_ttft_usage_and_output(spans):
 
 
 @pytest.mark.asyncio
+async def test_astream_handles_chat_generation_chunks(spans):
+    """Production ``_astream`` yields ChatGenerationChunk, not AIMessageChunk."""
+    from langchain_core.outputs import ChatGenerationChunk
+
+    class _ProductionShapedModel:
+        model_name = "gpt-test"
+        temperature = 0
+        _llm_type = "openai"
+
+        async def _astream(self, messages, stop=None, run_manager=None, **kwargs):
+            yield ChatGenerationChunk(
+                message=AIMessageChunk(
+                    content="",
+                    usage_metadata=None,
+                )
+            )
+            yield ChatGenerationChunk(message=AIMessageChunk(content="hel"))
+            yield ChatGenerationChunk(
+                message=AIMessageChunk(
+                    content="lo",
+                    usage_metadata={
+                        "input_tokens": 12,
+                        "output_tokens": 8,
+                        "total_tokens": 20,
+                    },
+                )
+            )
+
+    model = trace_chat_model(_ProductionShapedModel())
+    chunks = [chunk async for chunk in model._astream([HumanMessage(content="hi")])]
+
+    assert "".join(chunk.message.content for chunk in chunks) == "hello"
+    attrs = dict(spans.get_finished_spans()[0].attributes)
+    assert attrs["gen_ai.usage.input_tokens"] == 12
+    assert attrs["gen_ai.usage.output_tokens"] == 8
+    assert attrs["gen_ai.output.messages"] == "hello"
+    assert "gen_ai.response.time_to_first_token_ms" in attrs
+
+
+@pytest.mark.asyncio
 async def test_error_is_recorded_and_reraised(spans):
     model = trace_chat_model(_FakeModel(fail=True))
     with pytest.raises(RuntimeError):
@@ -195,6 +235,24 @@ async def test_missing_usage_is_marked_not_fabricated(spans, monkeypatch):
     assert attrs["gen_ai.usage.details"] == "missing"
     assert "gen_ai.usage.input_tokens" not in attrs
     assert "gen_ai.usage.output_tokens" not in attrs
+
+
+def test_authorized_location_is_redacted_from_free_text():
+    from observability.redaction import scrub_text
+
+    prompt = (
+        "用户授权的当前位置上下文：province=浙江省，city=杭州市，"
+        "district=西湖区，adcode=330106，address=文三路 123 号 5 幢，"
+        "source=browser。坐标 latitude=30.123456，longitude=120.654321。"
+    )
+    cleaned = scrub_text(prompt)
+
+    assert "文三路" not in cleaned
+    assert "123 号" not in cleaned
+    assert "30.123456" not in cleaned
+    assert "120.654321" not in cleaned
+    assert "330106" not in cleaned
+    assert "province=浙江省" in cleaned
 
 
 def test_sensitive_input_is_redacted(spans):
