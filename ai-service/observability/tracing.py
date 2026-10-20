@@ -164,6 +164,19 @@ def attributes(extra: dict | None = None) -> dict:
     return merged
 
 
+def generation_attributes(**fields: Any) -> dict:
+    """Neutral entry point for generation fields; dialect stays in the adapter."""
+    from observability.export.langfuse import generation_attributes as build
+
+    return build(**fields)
+
+
+def observation_attributes(kind: str) -> dict:
+    from observability.export.langfuse import observation_attributes as build
+
+    return build(kind)
+
+
 @contextmanager
 def start_span(
     name: str,
@@ -190,15 +203,24 @@ def start_span(
 
     try:
         if span_context is not None:
-            manager = tracer.start_as_current_span(
+            span = tracer.start_span(
                 name, context=span_context, attributes=attributes(attrs)
             )
         else:
-            manager = tracer.start_as_current_span(name, attributes=attributes(attrs))
-        with manager as span:
-            yield span
+            span = tracer.start_span(name, attributes=attributes(attrs))
     except Exception as exc:  # pragma: no cover - exporter/backend failures
-        logger.warning("span %s failed: %s", name, exc)
+        logger.warning("span %s could not start: %s", name, exc)
+        yield NULL_SPAN
+        return
+
+    from opentelemetry import trace as otel_trace
+
+    # record_exception=False: business exceptions are sanitized by the caller
+    # via ``record_exception``; raw stack traces may contain secrets.
+    with otel_trace.use_span(
+        span, end_on_exit=True, record_exception=False, set_status_on_exception=False
+    ):
+        yield span
 
 
 def current_span() -> Any:

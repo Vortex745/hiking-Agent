@@ -172,12 +172,16 @@ def build_chat_model(settings: Any) -> Any:
     try:
         from langchain_openai import ChatOpenAI
 
-        return ChatOpenAI(
-            model=settings.openai_model,
-            base_url=settings.openai_base_url,
-            api_key=settings.openai_api_key,
-            temperature=0,
-            max_retries=3,
+        from observability.generation import trace_chat_model
+
+        return trace_chat_model(
+            ChatOpenAI(
+                model=settings.openai_model,
+                base_url=settings.openai_base_url,
+                api_key=settings.openai_api_key,
+                temperature=0,
+                max_retries=3,
+            )
         )
     except Exception as exc:
         raise KernelModelFailure(

@@ -88,7 +88,7 @@ def generation_attributes(
     if tools:
         attrs["gen_ai.request.tool.names"] = tools
     if usage_missing:
-        attrs["langfuse.observation.usage_details"] = None
+        attrs["gen_ai.usage.details"] = "missing"
     else:
         if usage_input is not None:
             attrs["gen_ai.usage.input_tokens"] = usage_input
