@@ -74,11 +74,11 @@ def test_turn_span_is_parent_of_tool_and_nested_generation(spans, monkeypatch):
     assert text == "ok"
 
     by_name = {span.name: span for span in spans.get_finished_spans()}
-    assert "chat.turn" in by_name
+    assert "agent.turn" in by_name
     assert "tool.search_docs" in by_name
     assert "chat.generation" in by_name
 
-    turn = by_name["chat.turn"]
+    turn = by_name["agent.turn"]
     assert turn.attributes["run.id"] == "run-42"
     assert turn.attributes["gen_ai.operation.name"] == "invoke_agent"
 
@@ -98,6 +98,6 @@ def test_turn_failure_sets_error_status(spans, monkeypatch):
     with pytest.raises(kernel_mod.KernelModelFailure):
         _run(monkeypatch, _FakeAgent(fail=True))
 
-    turn = [s for s in spans.get_finished_spans() if s.name == "chat.turn"][0]
+    turn = [s for s in spans.get_finished_spans() if s.name == "agent.turn"][0]
     assert turn.status.status_code.name == "ERROR"
     assert turn.attributes["error.type"] == "KernelModelFailure"

@@ -994,12 +994,35 @@ async def chat_v2_resume(
         )
 
     async def guarded_resume_stream() -> AsyncGenerator[str, None]:
+        # Ticket 05: a resume is a separate HTTP execution, so it always
+        # opens a NEW root trace (`chat.resume`) instead of joining the
+        # original stream's tree. `run.id` + the session keep both
+        # executions searchable together in Langfuse.
+        session_token = tracing.set_session(
+            run.conversation_id or run.request_id
+        )
         try:
-            async for item in orchestrator.stream_resume(
-                run_id=run_id, from_seq=from_seq
-            ):
-                yield item if isinstance(item, str) else _sse_frame(item)
+            with tracing.start_span(
+                "chat.resume",
+                {
+                    "http.route": "/api/v2/chat/resume/{run_id}",
+                    "request.id": run.request_id,
+                    "run.id": run_id,
+                    "conversation.id": run.conversation_id or "",
+                },
+                root=True,
+            ) as span:
+                try:
+                    async for item in orchestrator.stream_resume(
+                        run_id=run_id, from_seq=from_seq
+                    ):
+                        yield item if isinstance(item, str) else _sse_frame(item)
+                    tracing.mark_ok(span)
+                except BaseException as exc:
+                    tracing.record_exception(span, exc)
+                    raise
         finally:
+            tracing.reset_session(session_token)
             leases.release()
 
     return StreamingResponse(

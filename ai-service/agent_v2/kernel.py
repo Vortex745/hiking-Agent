@@ -433,7 +433,7 @@ async def run_chat_turn(
         subagent_definitions=dict(subagent_definitions) if subagent_definitions else {},
     )
     with tracing.start_span(
-        "chat.turn",
+        "agent.turn",
         {
             "run.id": run_id or "",
             "gen_ai.operation.name": "invoke_agent",
