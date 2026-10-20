@@ -22,6 +22,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
+from observability import tracing
+from observability.callbacks import ToolSpanCallbackHandler
+
 logger = logging.getLogger("ai-service.agent_v2.kernel")
 
 # Some providers (MiniMax-M3 via OpenAI-compatible endpoints) leak reasoning
@@ -429,81 +432,103 @@ async def run_chat_turn(
         approval_callback=approval_callback,
         subagent_definitions=dict(subagent_definitions) if subagent_definitions else {},
     )
-    try:
-        agent = await assemble_kernel_agent(config, settings)
-    except KernelAssemblyError as exc:
-        logger.exception("chat kernel assembly failed")
-        raise KernelModelFailure("kernel_unavailable", "Agent 内核暂不可用，请稍后重试。") from exc
-
-    invoke_config = (
-        {"configurable": {"thread_id": f"v2:chat:{run_id}"}}
-        if checkpointer is not None
-        else None
-    )
-    # Ticket 05 (T08): ONE input construction for every kernel invocation —
-    # bounded history first, the current user message appended exactly once.
-    input_messages = build_kernel_messages(message=message, history=history)
-    try:
+    with tracing.start_span(
+        "chat.turn",
+        {
+            "run.id": run_id or "",
+            "gen_ai.operation.name": "invoke_agent",
+        },
+    ) as turn_span:
         try:
-            if on_text is None:
-                result = await asyncio.wait_for(
-                    agent.ainvoke({"messages": input_messages}, config=invoke_config),
-                    timeout=240,
-                )
-            else:
-                result = {}
-                public_text = _StreamingPublicText()
-                step = None
-                async with asyncio.timeout(240):
-                    async for mode, data in agent.astream(
-                        {"messages": input_messages}, config=invoke_config,
-                        stream_mode=["messages", "values"],
-                    ):
-                        if mode == "values":
-                            result = data
-                            continue
-                        chunk, metadata = data
-                        # Compaction, tool models, and subagents are not the reply.
-                        namespace = metadata.get("langgraph_checkpoint_ns", "")
-                        if (metadata.get("langgraph_node") != "model"
-                            or "|" in namespace
-                            or (namespace and not namespace.startswith("model:"))):
-                            continue
-                        if getattr(chunk, "tool_call_chunks", None) or getattr(chunk, "tool_calls", None):
-                            continue
-                        if metadata.get("langgraph_step") != step:
-                            public_text = _StreamingPublicText()
-                            step = metadata.get("langgraph_step")
-                        content = getattr(chunk, "content", "")
-                        if isinstance(content, list):
-                            content = "".join(
-                                block if isinstance(block, str) else block.get("text", "")
-                                for block in content
-                                if isinstance(block, str) or (isinstance(block, dict) and block.get("type") == "text")
-                            )
-                        delta = public_text.feed(content if isinstance(content, str) else "")
-                        if delta:
-                            await on_text(delta, audit_entries)
-                    delta = public_text.feed("", final=True)
-                    if delta:
-                        await on_text(delta, audit_entries)
-        except TimeoutError as exc:
-            raise KernelModelFailure("model_timeout", "模型响应超时，请稍后重试。") from exc
-        text = extract_final_text(result)
-    except KernelModelFailure:
-        raise
-    except Exception as exc:
-        logger.exception("chat kernel run failed")
-        raise KernelModelFailure(
-            "kernel_run_failed",
-            "生成回复失败，请稍后重试。",
-        ) from exc
-    finally:
-        await agent.aclose()
+            try:
+                agent = await assemble_kernel_agent(config, settings)
+            except KernelAssemblyError as exc:
+                logger.exception("chat kernel assembly failed")
+                raise KernelModelFailure(
+                    "kernel_unavailable", "Agent 内核暂不可用，请稍后重试。"
+                ) from exc
 
-    if not text:
-        raise KernelModelFailure("empty_model_output", "未生成有效回复，请重试。")
-    return text, audit_entries
+            invoke_config = (
+                {"configurable": {"thread_id": f"v2:chat:{run_id}"}}
+                if checkpointer is not None
+                else None
+            )
+            # Ticket 04: only tool spans ride on callbacks. Generations are
+            # traced by the model decorator (ticket 03), avoiding duplicate
+            # generation nodes.
+            if tracing.tracing_enabled():
+                invoke_config = dict(invoke_config or {})
+                invoke_config["callbacks"] = [
+                    ToolSpanCallbackHandler(parent_span=turn_span)
+                ]
+            # Ticket 05 (T08): ONE input construction for every kernel invocation —
+            # bounded history first, the current user message appended exactly once.
+            input_messages = build_kernel_messages(message=message, history=history)
+            try:
+                try:
+                    if on_text is None:
+                        result = await asyncio.wait_for(
+                            agent.ainvoke({"messages": input_messages}, config=invoke_config),
+                            timeout=240,
+                        )
+                    else:
+                        result = {}
+                        public_text = _StreamingPublicText()
+                        step = None
+                        async with asyncio.timeout(240):
+                            async for mode, data in agent.astream(
+                                {"messages": input_messages}, config=invoke_config,
+                                stream_mode=["messages", "values"],
+                            ):
+                                if mode == "values":
+                                    result = data
+                                    continue
+                                chunk, metadata = data
+                                # Compaction, tool models, and subagents are not the reply.
+                                namespace = metadata.get("langgraph_checkpoint_ns", "")
+                                if (metadata.get("langgraph_node") != "model"
+                                    or "|" in namespace
+                                    or (namespace and not namespace.startswith("model:"))):
+                                    continue
+                                if getattr(chunk, "tool_call_chunks", None) or getattr(chunk, "tool_calls", None):
+                                    continue
+                                if metadata.get("langgraph_step") != step:
+                                    public_text = _StreamingPublicText()
+                                    step = metadata.get("langgraph_step")
+                                content = getattr(chunk, "content", "")
+                                if isinstance(content, list):
+                                    content = "".join(
+                                        block if isinstance(block, str) else block.get("text", "")
+                                        for block in content
+                                        if isinstance(block, str) or (isinstance(block, dict) and block.get("type") == "text")
+                                    )
+                                delta = public_text.feed(content if isinstance(content, str) else "")
+                                if delta:
+                                    await on_text(delta, audit_entries)
+                            delta = public_text.feed("", final=True)
+                            if delta:
+                                await on_text(delta, audit_entries)
+                except TimeoutError as exc:
+                    raise KernelModelFailure("model_timeout", "模型响应超时，请稍后重试。") from exc
+                text = extract_final_text(result)
+            except KernelModelFailure:
+                raise
+            except Exception as exc:
+                logger.exception("chat kernel run failed")
+                raise KernelModelFailure(
+                    "kernel_run_failed",
+                    "生成回复失败，请稍后重试。",
+                ) from exc
+            finally:
+                await agent.aclose()
+
+            if not text:
+                raise KernelModelFailure("empty_model_output", "未生成有效回复，请重试。")
+            tracing.mark_ok(turn_span)
+            return text, audit_entries
+        except BaseException as exc:
+            tracing.record_exception(turn_span, exc)
+            raise
 
 
 async def run_toolless_chat(

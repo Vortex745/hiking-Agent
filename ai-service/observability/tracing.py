@@ -27,6 +27,7 @@ _tracer: Any | None = None
 _provider: Any | None = None
 _initialized = False
 _shutdown = False
+_init_failed = False
 
 
 class _NullSpan:
@@ -91,7 +92,7 @@ def _sample_ratio() -> float:
 
 def _ensure_provider() -> None:
     """Initialize the OTel provider once, if tracing is configured."""
-    global _tracer, _provider, _initialized
+    global _tracer, _provider, _initialized, _init_failed
     if _initialized:
         return
     _initialized = True
@@ -102,7 +103,7 @@ def _ensure_provider() -> None:
         from opentelemetry.sdk.resources import Resource
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
-        from opentelemetry.sdk.trace.sampling import ParentBased, TraceIDRatioBased
+        from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
 
         from observability.export.langfuse import RESOURCE_ATTRIBUTES, build_exporter
 
@@ -115,7 +116,7 @@ def _ensure_provider() -> None:
         )
         provider = TracerProvider(
             resource=resource,
-            sampler=ParentBased(TraceIDRatioBased(_sample_ratio())),
+            sampler=ParentBased(TraceIdRatioBased(_sample_ratio())),
         )
         # BatchSpanProcessor exports off the request path; failures are logged
         # by OTel and never raised into business code.
@@ -140,10 +141,13 @@ def _ensure_provider() -> None:
         logger.warning("tracing initialization failed, continuing disabled: %s", exc)
         _tracer = None
         _provider = None
+        _init_failed = True
 
 
 def get_tracer() -> Any | None:
     _ensure_provider()
+    if _init_failed:
+        return None
     if _tracer is not None:
         return _tracer
     if getattr(settings, "langfuse_enabled", False) and tracing_enabled():
