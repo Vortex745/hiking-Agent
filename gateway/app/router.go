@@ -15,7 +15,11 @@ import (
 // NewRouter builds the gateway HTTP router for both local servers and Vercel Functions.
 func NewRouter(cfg *config.Config) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
-	r := gin.Default()
+	r := gin.New()
+	// Correlation ids first so every downstream log line (including recovery)
+	// carries request_id/trace_id, and panics still produce a 500 summary.
+	r.Use(middleware.RequestObservabilityMiddleware())
+	r.Use(gin.Recovery())
 
 	// Trust only the configured proxies so c.ClientIP() (rate limiting,
 	// subject cookies) resolves the real client IP behind the frontend

@@ -23,6 +23,11 @@ func proxyRequest(c *gin.Context, method, url string, body io.Reader) {
 	if contentType := c.Request.Header.Get("Content-Type"); contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
+	for _, header := range []string{"X-Request-ID", "traceparent"} {
+		if value := c.Request.Header.Get(header); value != "" {
+			req.Header.Set(header, value)
+		}
+	}
 
 	client := &http.Client{}
 	resp, err := client.Do(req)

@@ -292,7 +292,7 @@ func proxyV2Stream(c *gin.Context, method, url string, body io.Reader) {
 	}
 	// Forward idempotency-relevant headers. X-Idempotency-Key is the
 	// canonical v2 header; X-Request-Id is a common alias.
-	for _, h := range []string{"X-Idempotency-Key", "X-Request-Id"} {
+	for _, h := range []string{"X-Idempotency-Key", "X-Request-Id", "traceparent"} {
 		if v := c.Request.Header.Get(h); v != "" {
 			req.Header.Set(h, v)
 		}
@@ -373,7 +373,7 @@ func proxyV2Request(c *gin.Context, method, url string, body io.Reader) {
 	if cookie := c.Request.Header.Get("Cookie"); cookie != "" {
 		req.Header.Set("Cookie", cookie)
 	}
-	for _, h := range []string{"X-Idempotency-Key", "X-Request-Id"} {
+	for _, h := range []string{"X-Idempotency-Key", "X-Request-Id", "traceparent"} {
 		if v := c.Request.Header.Get(h); v != "" {
 			req.Header.Set(h, v)
 		}
