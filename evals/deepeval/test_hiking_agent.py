@@ -85,7 +85,7 @@ def run_traced_chat(prompt: str) -> str:
                         path="/api/v2/chat/sse",
                         json={
                             "message": prompt,
-                            "request_id": f"deepeval-{uuid.uuid4().hex}",
+                            "request_id": f"eval-deepeval-{uuid.uuid4().hex}",
                             "conversation_id": f"deepeval-{uuid.uuid4().hex[:12]}",
                             "profile_id": "chat",
                         },

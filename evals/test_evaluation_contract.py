@@ -1016,11 +1016,11 @@ def test_deepeval_suite_does_not_swallow_target_errors() -> None:
 
 def test_report_aggregates_scenario_matrix(tmp_path: Path) -> None:
     sufficient, env = _run_single_chat(
-        tmp_path, SUFFICIENT_FIXTURE, "一路上的海拔与里程？", prefix="matrix-suff"
+        tmp_path, SUFFICIENT_FIXTURE, "一路上的海拔与里程？", prefix="eval-matrix-suff"
     )
     try:
         error_record, env_error = _run_single_chat(
-            tmp_path, ERROR_TERMINAL_FIXTURE, "服务不可用时应该怎样？", prefix="matrix-err"
+            tmp_path, ERROR_TERMINAL_FIXTURE, "服务不可用时应该怎样？", prefix="eval-matrix-err"
         )
     finally:
         env.close()

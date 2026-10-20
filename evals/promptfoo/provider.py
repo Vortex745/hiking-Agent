@@ -46,7 +46,7 @@ async def evaluate(prompt: str, variables: dict[str, Any]) -> dict[str, Any]:
                     path="/api/v2/chat/sse",
                     json={
                         "message": prompt,
-                        "request_id": f"pf-{uuid.uuid4().hex}",
+                        "request_id": f"eval-pf-{uuid.uuid4().hex}",
                         "conversation_id": f"pf-{case_id}-{uuid.uuid4().hex[:8]}",
                         "profile_id": "chat",
                     },
