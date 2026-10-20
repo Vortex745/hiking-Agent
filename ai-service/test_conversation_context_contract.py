@@ -525,7 +525,6 @@ def _run_through_kernel(
         return agent
 
     monkeypatch.setattr(kernel_module, "assemble_kernel_agent", _fake_assemble)
-    monkeypatch.setattr(kernel_module, "get_langchain_callbacks", lambda: [])
 
     kwargs = dict(
         system_prompt="sp",

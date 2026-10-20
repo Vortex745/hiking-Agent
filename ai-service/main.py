@@ -20,6 +20,11 @@ async def lifespan(app: FastAPI):
     if settings.rag_docs_api_url:
         logger.info(f"RAG Docs API: {settings.rag_docs_api_url}")
 
+    # 可观测性初始化：追踪关闭或凭据缺失时保持 no-op，不阻止启动。
+    from observability import tracing
+
+    tracing.get_tracer()
+
     # Ticket 03：Chat v2 启动守护 —— Vercel + v2 enabled 必须失败，不使用临时文件系统
     # 守护在所有其他装配之前执行，确保 v2 永远不会在不支持它的环境中启动
     from agent_v2.startup import V2StartupError, assemble_v2_runtime, check_v2_startup_guard
@@ -70,6 +75,11 @@ async def lifespan(app: FastAPI):
         release_v2_runtime(v2_runtime)
     except Exception as exc:
         logger.warning(f"v2 runtime release failed: {exc}")
+
+    # 退出前刷新已产生的 span；重复调用安全，追踪关闭时为零操作。
+    from observability import tracing
+
+    tracing.shutdown_tracing()
 
     logger.info("Shutting down ai-hiking AI Service...")
 

@@ -88,7 +88,7 @@ from agent_v2.runs import (
 )
 from config import settings
 from api.memory_v2 import resolve_request_subject, set_subject_cookie
-from observability.langfuse_setup import reset_langfuse_session, set_langfuse_session
+from observability import tracing
 
 logger = logging.getLogger("ai-service.chat_v2")
 
@@ -359,16 +359,40 @@ async def chat_v2_sse(req: ChatV2Request, request: Request):
     )
 
     async def guarded_stream() -> AsyncGenerator[str, None]:
-        # Langfuse session 聚合：conversation_id 优先，退回 request_id。
-        # 在生成器任务内设置，确保内核 turn 的执行上下文可见。
-        session_token = set_langfuse_session(req.conversation_id or req.request_id)
+        # 会话聚合：conversation_id 优先，退回 request_id。request_id 与
+        # session 是两个概念，不得互相冒充（见关联键规格）。
+        session_token = tracing.set_session(req.conversation_id or req.request_id)
+        parent_context = tracing.extract_traceparent(
+            request.headers.get("traceparent")
+        )
+        run_id_recorded = False
         try:
-            async for item in orchestrator.stream_chat(
-                flow_req, subject_id=getattr(request.state, "subject_id", None)
-            ):
-                yield item if isinstance(item, str) else _sse_frame(item)
+            with tracing.start_span(
+                "chat.request",
+                {
+                    "http.route": "/api/v2/chat/sse",
+                    "request.id": req.request_id,
+                    "profile.id": req.profile_id,
+                },
+                context=parent_context,
+            ) as span:
+                try:
+                    async for item in orchestrator.stream_chat(
+                        flow_req,
+                        subject_id=getattr(request.state, "subject_id", None),
+                    ):
+                        if not run_id_recorded:
+                            run_id = getattr(item, "run_id", "")
+                            if run_id:
+                                span.set_attribute("run.id", run_id)
+                                run_id_recorded = True
+                        yield item if isinstance(item, str) else _sse_frame(item)
+                    tracing.mark_ok(span)
+                except BaseException as exc:
+                    tracing.record_exception(span, exc)
+                    raise
         finally:
-            reset_langfuse_session(session_token)
+            tracing.reset_session(session_token)
             leases.release()
 
     response = StreamingResponse(

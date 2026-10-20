@@ -74,6 +74,11 @@ class Settings:
     langfuse_public_key: str = ""
     langfuse_secret_key: str = ""
     langfuse_base_url: str = "https://cloud.langfuse.com"
+    # OpenTelemetry 头部采样比例（ParentBased(TraceIDRatioBased)）。
+    observability_sample_ratio: float = 1.0
+    # stdout 日志配置：level 为 Python 日志级别，format 支持 json/text。
+    log_level: str = "INFO"
+    log_format: str = "json"
 
     def _default_runtime_dir(self, name: str) -> str:
         if os.getenv("VERCEL"):
@@ -195,6 +200,14 @@ class Settings:
         self.langfuse_base_url = os.getenv(
             "LANGFUSE_BASE_URL", "https://cloud.langfuse.com"
         )
+        try:
+            self.observability_sample_ratio = float(
+                os.getenv("OBSERVABILITY_SAMPLE_RATIO", "1.0")
+            )
+        except ValueError:
+            self.observability_sample_ratio = 1.0
+        self.log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+        self.log_format = os.getenv("LOG_FORMAT", "json").lower()
 
         return self
 

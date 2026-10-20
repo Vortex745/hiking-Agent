@@ -22,8 +22,6 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
-from observability.langfuse_setup import get_langchain_callbacks, langchain_run_config
-
 logger = logging.getLogger("ai-service.agent_v2.kernel")
 
 # Some providers (MiniMax-M3 via OpenAI-compatible endpoints) leak reasoning
@@ -438,14 +436,6 @@ async def run_chat_turn(
         if checkpointer is not None
         else None
     )
-    # Langfuse observability: callbacks propagate through the whole LangGraph
-    # run tree (chain/tool/generation), session id rides on config metadata
-    # via the request-bound ContextVar. Empty list when tracing is disabled.
-    _lf_callbacks = get_langchain_callbacks()
-    if _lf_callbacks:
-        invoke_config = dict(invoke_config) if invoke_config else {}
-        invoke_config["callbacks"] = _lf_callbacks
-        invoke_config.update(langchain_run_config())
     # Ticket 05 (T08): ONE input construction for every kernel invocation —
     # bounded history first, the current user message appended exactly once.
     input_messages = build_kernel_messages(message=message, history=history)
