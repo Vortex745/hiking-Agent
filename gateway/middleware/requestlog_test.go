@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ai-hiking/gateway/handler"
+
 	"github.com/gin-gonic/gin"
 )
 
@@ -170,5 +172,86 @@ func TestGeneratedRequestIDsAreUnique(t *testing.T) {
 	}
 	if !regexp.MustCompile(`^\d+-\d+$`).MatchString(newRequestID()) {
 		t.Fatal("request id is not timestamp+sequence")
+	}
+}
+
+func TestPanicIsReportedAsStructuredErrorLine(t *testing.T) {
+	var buffer bytes.Buffer
+	original := logOutput
+	logOutput = &buffer
+	t.Cleanup(func() { logOutput = original })
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(RequestObservabilityMiddleware())
+	router.Use(RecoveryWithLog())
+	router.GET("/panic", func(c *gin.Context) {
+		panic("kaboom")
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/panic", nil)
+	req.Header.Set(RequestIDHeader, "20261020T220000000-77")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("panic should map to 500, got %d", recorder.Code)
+	}
+	logs := buffer.String()
+	if !strings.Contains(logs, `"event":"request.failed"`) {
+		t.Fatalf("missing error line: %s", logs)
+	}
+	if !strings.Contains(logs, `"error_type":"panic"`) {
+		t.Fatalf("panic not classified: %s", logs)
+	}
+	if !strings.Contains(logs, `"request_id":"20261020T220000000-77"`) {
+		t.Fatalf("panic line missing request_id: %s", logs)
+	}
+	if !strings.Contains(logs, `"error_msg":"kaboom"`) {
+		t.Fatalf("panic message missing: %s", logs)
+	}
+	if strings.Contains(logs, "goroutine") {
+		t.Fatalf("stack trace must not be logged: %s", logs)
+	}
+}
+
+func TestUpstreamUnreachableReportsHandlerError(t *testing.T) {
+	var buffer bytes.Buffer
+	original := logOutput
+	logOutput = &buffer
+	t.Cleanup(func() { logOutput = original })
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(RequestObservabilityMiddleware())
+	handlerUnderTest := handler.NewChatV2Handler("http://127.0.0.1:1")
+	router.GET("/api/v2/chat/snapshot/:run_id", handlerUnderTest.ChatV2Snapshot)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/chat/snapshot/run-1", nil)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unreachable upstream should map to 503, got %d", recorder.Code)
+	}
+	logs := buffer.String()
+	if !strings.Contains(logs, `"error_type":"handler_error"`) {
+		t.Fatalf("handler error not classified: %s", logs)
+	}
+	var payload map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(logs), "\n") {
+		var decoded map[string]any
+		if err := json.Unmarshal([]byte(line), &decoded); err != nil {
+			t.Fatalf("log line is not JSON: %s", line)
+		}
+		if decoded["event"] == "request.failed" {
+			payload = decoded
+		}
+	}
+	if payload == nil {
+		t.Fatalf("missing request.failed line: %s", logs)
+	}
+	if message, _ := payload["error_msg"].(string); message == "" {
+		t.Fatalf("error_msg must describe the upstream failure: %s", logs)
 	}
 }

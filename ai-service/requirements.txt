@@ -34,3 +34,8 @@ sqlite-vec>=0.1.6
 # rag/hybrid_retrieval.py, rag/sqlite_store.py and eval_fts5_chinese.py.
 # Declare it so a clean checkout can collect the backend regression.
 jieba>=0.42.1,<0.43
+# observability: OpenTelemetry is a direct dependency of
+# observability/tracing.py and observability/export/langfuse.py; do not rely
+# on it arriving transitively via langfuse.
+opentelemetry-sdk>=1.44.0,<2
+opentelemetry-exporter-otlp-proto-http>=1.44.0,<2

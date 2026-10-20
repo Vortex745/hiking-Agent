@@ -8,58 +8,129 @@ truncated rather than dropped so diagnostics stay useful.
 
 from __future__ import annotations
 
+import json
 import re
 
 REDACTED = "[REDACTED]"
 TOOL_OUTPUT_LIMIT = 4000
 DOCUMENT_LIMIT = 160
 DOCUMENT_COUNT_LIMIT = 25
+_MAX_STRUCTURED_DEPTH = 3
 
 _SECRET_PATTERNS = (
     re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+"),
     re.compile(r"\bsk-[A-Za-z0-9._-]{8,}"),
     re.compile(r"\bpk-lf-[A-Za-z0-9._-]+"),
     re.compile(r"\bsk-lf-[A-Za-z0-9._-]+"),
-    re.compile(r"(?i)\b(api[_-]?key|token|secret|password)\s*[=:]\s*[^\s,;]+"),
+    # Header-shaped credentials: keep the header name, drop the value.
+    re.compile(r"(?i)\bauthorization\s*:\s*(?:basic|bearer)\s+[^\s,;]+"),
+    re.compile(r"(?i)\bcookie\s*:\s*[^\n;]+"),
+    re.compile(r"(?i)\bx-api-key\s*:\s*[^\s,;]+"),
+    # Token/key assignments, including suffixed names (``access_token=``).
+    re.compile(r"(?i)\b[\w-]*(?:access_token|refresh_token|id_token)\s*[=:]\s*[^\s,;&]+"),
+    re.compile(r"(?i)\b[\w-]*(?:api[_-]?key|apikey|secret|password)\s*[=:]\s*[^\s,;&]+"),
+    re.compile(r"(?i)\b[\w-]*token\s*[=:]\s*[^\s,;&]+"),
 )
 
 # Location values may be embedded in free text (the product puts the
 # authorized location into a system prompt), so key=value pairs must be
 # scrubbed even when the message is not a structured mapping. Addresses
 # contain spaces, so the value terminates at a line break or punctuation.
+# The optional prefix keeps ``user_latitude=`` covered while leaving
+# metrics such as ``latency=`` untouched (the separator must follow).
 _LOCATION_PATTERNS = (
     re.compile(
-        r"(?i)\b(latitude|longitude|lat|lng|adcode|address)\s*[=:]\s*[^\n，,；;。]+"
+        r"(?i)\b[\w-]*(?:latitude|longitude|adcode|address|addr|lat|lng|lon)"
+        r"\s*[=:]\s*[^\n，,；;。]+"
     ),
+)
+
+# JSON fragments that are not valid JSON on their own (e.g. truncated
+# payloads) still need key-based redaction.
+_QUOTED_KEY_PATTERN = re.compile(
+    r"""(?P<quote>["'])(?P<key>lat|lng|lon|latitude|longitude|adcode|address|addr|"""
+    r"""memory|memory_body|token|secret|password|cookie|authorization)"""
+    r"""(?P=quote)\s*:\s*"""
+    r"""(?P<value>"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^,}\]\n]+)""",
+    re.IGNORECASE,
 )
 
 _DENIED_KEYS = {
     "authorization",
     "cookie",
-    "set-cookie",
-    "x-api-key",
+    "set_cookie",
+    "x_api_key",
     "api_key",
     "apikey",
     "secret",
     "password",
     "token",
+    "access_token",
+    "refresh_token",
+    "id_token",
     "latitude",
     "longitude",
     "lat",
     "lng",
+    "lon",
+    "adcode",
     "address",
+    "addr",
     "memory",
     "memory_body",
 }
 
+# Suffixed variants (``user_latitude``, ``session_token``) are just as
+# sensitive as the bare key. Bare metrics such as ``latency``/``token_count``
+# never end with these suffixes, so they stay readable.
+_DENIED_KEY_SUFFIXES = (
+    "_lat",
+    "_lng",
+    "_lon",
+    "_latitude",
+    "_longitude",
+    "_adcode",
+    "_address",
+    "_addr",
+    "_memory",
+    "_token",
+    "_secret",
+    "_password",
+    "_cookie",
+    "_authorization",
+)
 
-def scrub_text(value: str, limit: int = TOOL_OUTPUT_LIMIT) -> str:
+
+def is_denied_key(key) -> bool:
+    """True when a mapping key belongs to the reject list."""
+    text = str(key).strip().lower().replace("-", "_")
+    if text in _DENIED_KEYS:
+        return True
+    return text.endswith(_DENIED_KEY_SUFFIXES)
+
+
+def scrub_text(value: str, limit: int = TOOL_OUTPUT_LIMIT, *, _depth: int = 0) -> str:
     """Redact credentials/location values and truncate to ``limit`` chars."""
     text = "" if value is None else str(value)
+    stripped = text.strip()
+    if _depth < _MAX_STRUCTURED_DEPTH and stripped[:1] in {"{", "["}:
+        try:
+            parsed = json.loads(stripped)
+        except (TypeError, ValueError):
+            parsed = None
+        if parsed is not None:
+            text = json.dumps(
+                sanitize_mapping(parsed, depth=_depth), ensure_ascii=False
+            )
     for pattern in _SECRET_PATTERNS:
         text = pattern.sub(REDACTED, text)
     for pattern in _LOCATION_PATTERNS:
         text = pattern.sub(REDACTED, text)
+    text = _QUOTED_KEY_PATTERN.sub(
+        lambda match: f"{match.group('quote')}{match.group('key')}"
+        f"{match.group('quote')}: \"{REDACTED}\"",
+        text,
+    )
     if limit and len(text) > limit:
         return text[:limit] + f"...[truncated {len(text) - limit} chars]"
     return text
@@ -73,7 +144,7 @@ def sanitize_mapping(value, *, depth: int = 0):
         cleaned = {}
         for key, item in value.items():
             key_text = str(key)
-            if key_text.lower() in _DENIED_KEYS:
+            if is_denied_key(key_text):
                 cleaned[key_text] = REDACTED
             else:
                 cleaned[key_text] = sanitize_mapping(item, depth=depth + 1)
@@ -81,7 +152,7 @@ def sanitize_mapping(value, *, depth: int = 0):
     if isinstance(value, (list, tuple)):
         return [sanitize_mapping(item, depth=depth + 1) for item in value]
     if isinstance(value, str):
-        return scrub_text(value)
+        return scrub_text(value, _depth=depth + 1)
     return value
 
 
@@ -91,6 +162,17 @@ def sanitize_messages(messages) -> list[dict]:
     for message in messages or []:
         role = getattr(message, "type", None) or getattr(message, "role", "unknown")
         content = getattr(message, "content", message)
+        if str(role) == "tool":
+            # Tool messages carry full retrieved documents; only their size
+            # may leave the process.
+            result.append(
+                {
+                    "role": "tool",
+                    "content": REDACTED,
+                    "content.length": len(str(content or "")),
+                }
+            )
+            continue
         result.append({"role": str(role), "content": scrub_text(content)})
     return result
 

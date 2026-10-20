@@ -21,3 +21,6 @@ faiss-cpu>=1.9.0
 numpy>=1.26.0,<2.0.0
 langchain-postgres>=0.0.12
 langchain-community>=0.3.0
+# observability: spans are produced/exported directly by observability/*.
+opentelemetry-sdk>=1.44.0,<2
+opentelemetry-exporter-otlp-proto-http>=1.44.0,<2

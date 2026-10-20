@@ -207,8 +207,10 @@ def trace_chat_model(model: Any) -> Any:
             attrs = _request_attributes(model, messages, kwargs)
             started = time.perf_counter()
             chunks: list[str] = []
+            written = 0
             input_tokens = output_tokens = None
             first_token_ms = None
+            error: BaseException | None = None
             with tracing.start_span("chat.generation", attrs) as span:
                 try:
                     async for chunk in original_astream(
@@ -223,8 +225,9 @@ def trace_chat_model(model: Any) -> Any:
                                 "gen_ai.response.time_to_first_token_ms",
                                 first_token_ms,
                             )
-                        if len("".join(chunks)) < _MAX_TEXT:
+                        if written < _MAX_TEXT:
                             chunks.append(text)
+                            written += len(text)
                         chunk_input, chunk_output = _usage_from_chunk(chunk)
                         input_tokens = chunk_input if chunk_input is not None else input_tokens
                         output_tokens = (
@@ -232,13 +235,18 @@ def trace_chat_model(model: Any) -> Any:
                         )
                         yield chunk
                 except BaseException as exc:
+                    error = exc
                     tracing.record_exception(span, exc)
                     raise
-                _apply_usage(span, input_tokens, output_tokens)
-                span.set_attribute(
-                    "gen_ai.output.messages", scrub_text("".join(chunks), _MAX_TEXT)
-                )
-                tracing.mark_ok(span)
+                finally:
+                    # Cancellation and client disconnect still report the
+                    # usage collected so far; only real failures skip mark_ok.
+                    _apply_usage(span, input_tokens, output_tokens)
+                    span.set_attribute(
+                        "gen_ai.output.messages", scrub_text("".join(chunks), _MAX_TEXT)
+                    )
+                    if error is None:
+                        tracing.mark_ok(span)
 
         model._astream = traced_astream
 
@@ -248,8 +256,10 @@ def trace_chat_model(model: Any) -> Any:
             attrs = _request_attributes(model, messages, kwargs)
             started = time.perf_counter()
             chunks: list[str] = []
+            written = 0
             input_tokens = output_tokens = None
             first_token_ms = None
+            error: BaseException | None = None
             with tracing.start_span("chat.generation", attrs) as span:
                 try:
                     for chunk in original_stream(
@@ -264,8 +274,9 @@ def trace_chat_model(model: Any) -> Any:
                                 "gen_ai.response.time_to_first_token_ms",
                                 first_token_ms,
                             )
-                        if len("".join(chunks)) < _MAX_TEXT:
+                        if written < _MAX_TEXT:
                             chunks.append(text)
+                            written += len(text)
                         chunk_input, chunk_output = _usage_from_chunk(chunk)
                         input_tokens = chunk_input if chunk_input is not None else input_tokens
                         output_tokens = (
@@ -273,13 +284,16 @@ def trace_chat_model(model: Any) -> Any:
                         )
                         yield chunk
                 except BaseException as exc:
+                    error = exc
                     tracing.record_exception(span, exc)
                     raise
-                _apply_usage(span, input_tokens, output_tokens)
-                span.set_attribute(
-                    "gen_ai.output.messages", scrub_text("".join(chunks), _MAX_TEXT)
-                )
-                tracing.mark_ok(span)
+                finally:
+                    _apply_usage(span, input_tokens, output_tokens)
+                    span.set_attribute(
+                        "gen_ai.output.messages", scrub_text("".join(chunks), _MAX_TEXT)
+                    )
+                    if error is None:
+                        tracing.mark_ok(span)
 
         model._stream = traced_stream
 

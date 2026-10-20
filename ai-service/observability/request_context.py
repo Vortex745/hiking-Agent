@@ -31,14 +31,14 @@ def generate_request_id() -> str:
 def valid_request_id(value: str | None) -> str | None:
     if not value:
         return None
-    return value if _REQUEST_ID_RE.match(value) else None
+    return value if _REQUEST_ID_RE.fullmatch(value) else None
 
 
 def parse_traceparent(value: str | None) -> str | None:
     """Return the trace id when ``value`` is a valid W3C traceparent."""
     if not value:
         return None
-    match = _TRACEPARENT_RE.match(value.strip())
+    match = _TRACEPARENT_RE.fullmatch(value.strip())
     if not match:
         return None
     if match.group("version") == "ff":

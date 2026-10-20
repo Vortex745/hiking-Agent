@@ -386,11 +386,18 @@ async def chat_v2_sse(req: ChatV2Request, request: Request):
                 "chat.request",
                 {
                     "http.route": "/api/v2/chat/sse",
-                    "request.id": req.request_id,
+                    "request.id": getattr(request.state, "request_id", "")
+                    or req.request_id,
+                    "client.request.id": req.request_id,
                     "profile.id": req.profile_id,
                 },
                 context=parent_context,
             ) as span:
+                # StreamingResponse iterates the body in a child task, so a
+                # ContextVar set here is not visible to the middleware that
+                # writes the summary line. Publish the id on the shared ASGI
+                # state instead.
+                request.state.trace_id = tracing.current_trace_id()
                 try:
                     async for item in orchestrator.stream_chat(
                         flow_req,
@@ -1021,12 +1028,15 @@ async def chat_v2_resume(
                 "chat.resume",
                 {
                     "http.route": "/api/v2/chat/resume/{run_id}",
-                    "request.id": run.request_id,
+                    "request.id": getattr(request.state, "request_id", "")
+                    or run.request_id,
+                    "client.request.id": run.request_id,
                     "run.id": run_id,
                     "conversation.id": run.conversation_id or "",
                 },
                 root=True,
             ) as span:
+                request.state.trace_id = tracing.current_trace_id()
                 try:
                     async for item in orchestrator.stream_resume(
                         run_id=run_id, from_seq=from_seq

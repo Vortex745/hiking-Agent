@@ -19,7 +19,7 @@ func NewRouter(cfg *config.Config) *gin.Engine {
 	// Correlation ids first so every downstream log line (including recovery)
 	// carries request_id/trace_id, and panics still produce a 500 summary.
 	r.Use(middleware.RequestObservabilityMiddleware())
-	r.Use(gin.Recovery())
+	r.Use(middleware.RecoveryWithLog())
 
 	// Trust only the configured proxies so c.ClientIP() (rate limiting,
 	// subject cookies) resolves the real client IP behind the frontend

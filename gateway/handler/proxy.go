@@ -32,6 +32,7 @@ func proxyRequest(c *gin.Context, method, url string, body io.Reader) {
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
+		_ = c.Error(err)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "AI service unreachable"})
 		return
 	}
@@ -84,6 +85,7 @@ func proxyHealthRequest(c *gin.Context, module, url, fallbackURL string) {
 
 	resp, err := client.Do(req)
 	if err != nil {
+		_ = c.Error(err)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "AI service unreachable"})
 		return
 	}
@@ -109,6 +111,7 @@ func proxyHealthRequest(c *gin.Context, module, url, fallbackURL string) {
 
 	fallbackResp, err := client.Do(fallbackReq)
 	if err != nil {
+		_ = c.Error(err)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "AI service unreachable"})
 		return
 	}

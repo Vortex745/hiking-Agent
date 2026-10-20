@@ -5,6 +5,7 @@ must stay optional.
 """
 
 import asyncio
+import time
 
 import pytest
 
@@ -191,6 +192,14 @@ def test_provider_uses_batch_processor_and_registers_exit_flush(monkeypatch):
     active = list(registered_processors)
     assert any(isinstance(p, BatchSpanProcessor) for p in active)
     assert not any(isinstance(p, SimpleSpanProcessor) for p in active)
+    # Redaction runs before the batch processor queues the span.
+    from observability.export.redaction import RedactingSpanProcessor
+
+    assert isinstance(active[0], RedactingSpanProcessor)
+    batch_index = next(
+        index for index, p in enumerate(active) if isinstance(p, BatchSpanProcessor)
+    )
+    assert batch_index > 0
     assert tracing.shutdown_tracing in registered
 
     tracing.shutdown_tracing()
@@ -281,3 +290,83 @@ def test_sampled_parent_keeps_children(monkeypatch):
     assert spans[0].context.trace_id == parent.trace_id
     assert spans[0].parent.span_id == parent.span_id
 
+
+
+def test_client_traceparent_cannot_disable_sampling(monkeypatch):
+    """An inbound ``-00`` flag must not switch our sampling decision off."""
+    provider, exporter = _sampling_provider(1.0)
+    monkeypatch.setattr(tracing, "_tracer", provider.get_tracer("test"))
+
+    trace_id = "a" * 32
+    context = tracing.extract_traceparent(f"00-{trace_id}-{'b' * 16}-00")
+    assert context is not None
+
+    with tracing.start_span("chat.request", context=context):
+        pass
+
+    spans = exporter.get_finished_spans()
+    assert [span.name for span in spans] == ["chat.request"]
+    assert format(spans[0].context.trace_id, "032x") == trace_id
+
+
+def _stub_provider_init(monkeypatch, counter):
+    import opentelemetry.trace as otel_trace
+
+    from observability.export import langfuse as adapter
+
+    def _build():
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+            InMemorySpanExporter,
+        )
+
+        counter.append(1)
+        # Widen the initialization window so a missing lock is observable.
+        time.sleep(0.05)
+        return InMemorySpanExporter()
+
+    monkeypatch.setattr(adapter, "build_exporter", _build)
+    monkeypatch.setattr(otel_trace, "set_tracer_provider", lambda _p: None)
+    monkeypatch.setattr(tracing.atexit, "register", lambda _f: None)
+    monkeypatch.setattr(tracing, "_provider", None)
+    monkeypatch.setattr(tracing, "_tracer", None)
+
+
+def test_concurrent_get_tracer_initializes_once(monkeypatch):
+    import threading
+    import time
+
+    _enable(monkeypatch)
+    counter: list[int] = []
+    _stub_provider_init(monkeypatch, counter)
+
+    results: list[object] = []
+    barrier = threading.Barrier(8)
+
+    def _call():
+        barrier.wait()
+        results.append(tracing.get_tracer())
+
+    threads = [threading.Thread(target=_call) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(counter) == 1
+    assert len(results) == 8
+    assert all(result is tracing._tracer for result in results)
+    tracing.shutdown_tracing()
+
+
+def test_shutdown_makes_the_facade_return_no_op(monkeypatch):
+    _enable(monkeypatch)
+    counter: list[int] = []
+    _stub_provider_init(monkeypatch, counter)
+
+    assert tracing.get_tracer() is not None
+    tracing.shutdown_tracing()
+
+    assert tracing.get_tracer() is None
+    with tracing.start_span("chat.request") as span:
+        span.set_attribute("run.id", "run-1")
+    assert tracing.current_trace_id() == ""

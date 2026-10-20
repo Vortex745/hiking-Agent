@@ -16,7 +16,12 @@ from contextvars import ContextVar
 from typing import Any
 
 from config import settings
-from observability.redaction import scrub_text
+from observability.redaction import (
+    REDACTED,
+    is_denied_key,
+    sanitize_mapping,
+    scrub_text,
+)
 from observability.request_context import (
     REQUEST_ID_HEADER,
     TRACEPARENT_HEADER,
@@ -35,6 +40,7 @@ _PINNED_KEYS = (
     "msg",
     "request_id",
     "trace_id",
+    "method",
     "route",
     "status",
     "duration_ms",
@@ -54,18 +60,33 @@ class JsonFormatter(logging.Formatter):
             "level": record.levelname,
             "event": record.name,
             "msg": scrub_text(record.getMessage(), 2000),
-            "request_id": getattr(record, "request_id", None) or request_id_var.get(),
-            "trace_id": getattr(record, "trace_id", None) or trace_id_var.get(),
+            "request_id": getattr(record, "request_id", None)
+            or request_id_var.get()
+            or "",
+            "trace_id": getattr(record, "trace_id", None) or trace_id_var.get() or "",
         }
         for key, value in record.__dict__.items():
             if key in _STANDARD_ATTRS or key.startswith("_"):
                 continue
             if key in {"ts", "level", "msg"}:
                 continue
+            if is_denied_key(key):
+                payload[key] = REDACTED
+                continue
             if isinstance(value, str):
                 payload[key] = scrub_text(value)
             elif isinstance(value, (int, float, bool)) or value is None:
                 payload[key] = value
+            elif isinstance(value, (dict, list, tuple)):
+                try:
+                    payload[key] = scrub_text(
+                        json.dumps(
+                            sanitize_mapping(value), ensure_ascii=False, default=str
+                        ),
+                        2000,
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    payload[key] = REDACTED
         for key in _PINNED_KEYS:
             payload.setdefault(key, "")
         if record.exc_info:
@@ -140,6 +161,9 @@ class RequestContextMiddleware:
 
         request_token = request_id_var.set(request_id)
         trace_token = trace_id_var.set(trace_id or "")
+        # Publish the correlation id on the ASGI scope so handlers (and their
+        # spans) use exactly the id that appears in the request summary line.
+        scope.setdefault("state", {})["request_id"] = request_id
         started = time.perf_counter()
         status_code = 500
         error: BaseException | None = None
@@ -164,13 +188,20 @@ class RequestContextMiddleware:
             duration_ms = round((time.perf_counter() - started) * 1000, 1)
             route = scope.get("route")
             route_path = getattr(route, "path", None) or scope.get("path", "")
+            # A span started during the request publishes its trace id on the
+            # logging context; streaming handlers additionally publish it on
+            # the shared ASGI state because their body runs in a child task.
+            state_trace_id = (scope.get("state") or {}).get("trace_id", "")
+            effective_trace_id = trace_id or state_trace_id or trace_id_var.get() or ""
+            method = scope.get("method", "")
             logger = logging.getLogger("ai-service.http")
             logger.info(
                 "request completed",
                 extra={
                     "event": "request.completed",
                     "request_id": request_id,
-                    "trace_id": trace_id or "",
+                    "trace_id": effective_trace_id,
+                    "method": method,
                     "route": route_path,
                     "status": status_code,
                     "duration_ms": duration_ms,
@@ -182,7 +213,8 @@ class RequestContextMiddleware:
                     extra={
                         "event": "request.failed",
                         "request_id": request_id,
-                        "trace_id": trace_id or "",
+                        "trace_id": effective_trace_id,
+                        "method": method,
                         "route": route_path,
                         "status": status_code,
                         "duration_ms": duration_ms,

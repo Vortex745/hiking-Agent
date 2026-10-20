@@ -303,6 +303,7 @@ func proxyV2Stream(c *gin.Context, method, url string, body io.Reader) {
 	resp, err := client.Do(req)
 	if err != nil {
 		// Upstream unreachable — 503, no fake terminal (spec AC3).
+		_ = c.Error(err)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "AI service unreachable"})
 		return
 	}
@@ -382,6 +383,7 @@ func proxyV2Request(c *gin.Context, method, url string, body io.Reader) {
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
+		_ = c.Error(err)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "AI service unreachable"})
 		return
 	}

@@ -12,7 +12,9 @@ initialization fails, every helper degrades to a no-op and chat keeps working.
 from __future__ import annotations
 
 import atexit
+import asyncio
 import logging
+import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Iterator
@@ -28,6 +30,9 @@ _provider: Any | None = None
 _initialized = False
 _shutdown = False
 _init_failed = False
+# Initialization happens on the first request thread; concurrent callers must
+# not each build an exporter/provider.
+_init_lock = threading.Lock()
 
 
 class _NullSpan:
@@ -93,60 +98,70 @@ def _sample_ratio() -> float:
 def _ensure_provider() -> None:
     """Initialize the OTel provider once, if tracing is configured."""
     global _tracer, _provider, _initialized, _init_failed
-    if _initialized:
+    if _initialized or _init_failed or _shutdown:
         return
-    _initialized = True
-    if not tracing_enabled():
-        return
-    try:
-        from opentelemetry import trace
-        from opentelemetry.sdk.resources import Resource
-        from opentelemetry.sdk.trace import TracerProvider
-        from opentelemetry.sdk.trace.export import BatchSpanProcessor
-        from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
+    with _init_lock:
+        # Double check: the first thread may have finished while we waited.
+        if _initialized or _init_failed or _shutdown:
+            return
+        if not tracing_enabled():
+            _initialized = True
+            return
+        try:
+            from opentelemetry import trace
+            from opentelemetry.sdk.resources import Resource
+            from opentelemetry.sdk.trace import TracerProvider
+            from opentelemetry.sdk.trace.export import BatchSpanProcessor
+            from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
 
-        from observability.export.langfuse import RESOURCE_ATTRIBUTES, build_exporter
+            from observability.export.langfuse import RESOURCE_ATTRIBUTES, build_exporter
+            from observability.export.redaction import RedactingSpanProcessor
 
-        resource = Resource.create(
-            {
-                **RESOURCE_ATTRIBUTES,
-                "service.version": getattr(settings, "app_version", "0.1.0"),
-                "deployment.environment": getattr(settings, "environment", "dev"),
-            }
-        )
-        provider = TracerProvider(
-            resource=resource,
-            sampler=ParentBased(TraceIdRatioBased(_sample_ratio())),
-        )
-        # BatchSpanProcessor exports off the request path; failures are logged
-        # by OTel and never raised into business code.
-        provider.add_span_processor(
-            BatchSpanProcessor(
-                build_exporter(),
-                max_queue_size=2048,
-                schedule_delay_millis=1000,
-                max_export_batch_size=512,
-                export_timeout_millis=5000,
+            resource = Resource.create(
+                {
+                    **RESOURCE_ATTRIBUTES,
+                    "service.version": getattr(settings, "app_version", "0.1.0"),
+                    "deployment.environment": getattr(settings, "environment", "dev"),
+                }
             )
-        )
-        trace.set_tracer_provider(provider)
-        _provider = provider
-        _tracer = provider.get_tracer("ai-service")
-        _shutdown = False
-        atexit.register(shutdown_tracing)
-        logger.info(
-            "tracing enabled (sample_ratio=%s)", _sample_ratio()
-        )
-    except Exception as exc:  # pragma: no cover - defensive path
-        logger.warning("tracing initialization failed, continuing disabled: %s", exc)
-        _tracer = None
-        _provider = None
-        _init_failed = True
+            provider = TracerProvider(
+                resource=resource,
+                sampler=ParentBased(TraceIdRatioBased(_sample_ratio())),
+            )
+            # Redaction must run before the batch processor queues the span, so
+            # the exporter never observes a raw cookie/address/token value.
+            provider.add_span_processor(RedactingSpanProcessor())
+            # BatchSpanProcessor exports off the request path; failures are logged
+            # by OTel and never raised into business code.
+            provider.add_span_processor(
+                BatchSpanProcessor(
+                    build_exporter(),
+                    max_queue_size=2048,
+                    schedule_delay_millis=1000,
+                    max_export_batch_size=512,
+                    export_timeout_millis=5000,
+                )
+            )
+            trace.set_tracer_provider(provider)
+            _provider = provider
+            _tracer = provider.get_tracer("ai-service")
+            _initialized = True
+            atexit.register(shutdown_tracing)
+            logger.info("tracing enabled (sample_ratio=%s)", _sample_ratio())
+        except Exception as exc:  # pragma: no cover - defensive path
+            logger.warning(
+                "tracing initialization failed, continuing disabled: %s", exc
+            )
+            _tracer = None
+            _provider = None
+            _init_failed = True
 
 
 def get_tracer() -> Any | None:
+    if _shutdown:
+        return None
     _ensure_provider()
-    if _init_failed:
+    if _shutdown or _init_failed:
         return None
     if _tracer is not None:
         return _tracer
@@ -179,6 +194,24 @@ def observation_attributes(kind: str) -> dict:
     from observability.export.langfuse import observation_attributes as build
 
     return build(kind)
+
+
+def _publish_trace_id(span: Any) -> None:
+    """Put the live trace id on the logging context.
+
+    The request summary line is written after the span ends, so the value is
+    deliberately not reset: logs emitted for this request keep correlating
+    with the exported trace even when the gateway sent no traceparent.
+    """
+    try:
+        span_context = span.get_span_context()
+        if not getattr(span_context, "is_valid", False):
+            return None
+        from observability.logging_setup import trace_id_var
+
+        trace_id_var.set(format(span_context.trace_id, "032x"))
+    except Exception:  # pragma: no cover - defensive
+        return None
 
 
 @contextmanager
@@ -219,6 +252,8 @@ def start_span(
 
     from opentelemetry import trace as otel_trace
 
+    _publish_trace_id(span)
+
     # record_exception=False: business exceptions are sanitized by the caller
     # via ``record_exception``; raw stack traces may contain secrets.
     with otel_trace.use_span(
@@ -243,6 +278,10 @@ def current_trace_id() -> str:
 
 def record_exception(span: Any, exc: BaseException) -> None:
     """Mark the span failed without exporting raw (possibly secret) text."""
+    # A closed stream (browser stop/disconnect) is a normal end, not a
+    # failure: the span keeps its UNSET status and already-collected usage.
+    if isinstance(exc, (GeneratorExit, asyncio.CancelledError)):
+        return None
     from observability.redaction import sanitize_error
 
     try:
@@ -269,6 +308,7 @@ def extract_traceparent(header: str | None) -> Any | None:
     if not header:
         return None
     from opentelemetry import trace
+    from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
     from opentelemetry.trace.propagation.tracecontext import (
         TraceContextTextMapPropagator,
     )
@@ -277,7 +317,16 @@ def extract_traceparent(header: str | None) -> Any | None:
     remote = trace.get_current_span(context).get_span_context()
     if remote is None or not getattr(remote, "is_valid", False):
         return None
-    return context
+    # The sampling decision belongs to this service: a client sending
+    # ``-00`` only means "I did not sample", not "do not trace me".
+    local = SpanContext(
+        trace_id=remote.trace_id,
+        span_id=remote.span_id,
+        is_remote=True,
+        trace_flags=TraceFlags(TraceFlags.SAMPLED),
+        trace_state=remote.trace_state,
+    )
+    return trace.set_span_in_context(NonRecordingSpan(local), context)
 
 
 def force_flush(timeout_millis: int = 5000) -> bool:

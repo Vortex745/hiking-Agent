@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"regexp"
 	"sync"
@@ -25,7 +26,7 @@ var (
 	traceparentPattern = regexp.MustCompile(`^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$`)
 	requestSequence    uint64
 	logMu              sync.Mutex
-	logOutput io.Writer = os.Stdout
+	logOutput          io.Writer = os.Stdout
 )
 
 // newRequestID mirrors the AI service format: timestamp + atomic sequence.
@@ -61,6 +62,19 @@ func writeLog(payload map[string]any) {
 	}
 	encoded = append(encoded, '\n')
 	_, _ = logOutput.Write(encoded)
+}
+
+// RecoveryWithLog turns a panic into a 500 and records the panic value as a
+// structured error. Gin's default recovery only writes a stack trace to
+// stderr; the request summary line would then report a bare 500 with no
+// cause. Stack traces are deliberately not logged.
+func RecoveryWithLog() gin.HandlerFunc {
+	return gin.CustomRecovery(func(c *gin.Context, recovered any) {
+		message := fmt.Sprintf("%v", recovered)
+		c.Set("panic_error", message)
+		_ = c.Error(fmt.Errorf("panic: %s", message))
+		c.AbortWithStatus(http.StatusInternalServerError)
+	})
 }
 
 // RequestObservabilityMiddleware assigns/validates correlation ids and emits
@@ -115,8 +129,11 @@ func RequestObservabilityMiddleware() gin.HandlerFunc {
 		if status >= 500 || len(c.Errors) > 0 {
 			errorType := "upstream_error"
 			errorMessage := ""
-			if len(c.Errors) > 0 {
-				errorType = fmt.Sprintf("%v", c.Errors.Last().Type)
+			if panicValue, ok := c.Get("panic_error"); ok {
+				errorType = "panic"
+				errorMessage = fmt.Sprintf("%v", panicValue)
+			} else if len(c.Errors) > 0 {
+				errorType = "handler_error"
 				errorMessage = c.Errors.Last().Error()
 			}
 			writeLog(map[string]any{

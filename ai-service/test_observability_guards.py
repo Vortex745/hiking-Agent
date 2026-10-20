@@ -61,7 +61,7 @@ FORBIDDEN_CAPABILITY_SYMBOLS = (
 _FORBIDDEN_SYMBOL_RE = re.compile(
     r"\b(" + "|".join(re.escape(s) for s in FORBIDDEN_CAPABILITY_SYMBOLS) + r")\b"
 )
-_DIALECT_KEY_RE = re.compile(r'"langfuse\.[a-z]')
+_DIALECT_KEY_RE = re.compile(r"""['"]langfuse\.[a-z]""")
 _LANGFUSE_IMPORT_RE = re.compile(
     r"^\s*(?:from\s+langfuse(?:\.\w+)*\s+import|import\s+langfuse(?:\.\w+)*)",
     re.MULTILINE,
@@ -105,6 +105,7 @@ def _business_files() -> list[Path]:
         if any(part.startswith(_EXCLUDED_DIR_PREFIXES) for part in parts):
             continue
         result.append(path)
+    assert result, "no business files found: the static guard would pass vacuously"
     return result
 
 
@@ -151,6 +152,11 @@ def test_dialect_and_import_guards_detect_introduced_violations():
     """Red baseline for both static scans."""
     synthetic_dialect = 'attrs = {"langfuse.session.id": session}'
     assert _DIALECT_KEY_RE.search(synthetic_dialect)
+
+    # Single-quoted dialect keys (``{'langfuse.x': y}``) must be detected too,
+    # otherwise the scan can silently pass.
+    synthetic_single = "attrs = {'langfuse.session.id': session}"
+    assert _DIALECT_KEY_RE.search(synthetic_single)
 
     synthetic_import = "from langfuse import Langfuse\n"
     assert _LANGFUSE_IMPORT_RE.search(synthetic_import)

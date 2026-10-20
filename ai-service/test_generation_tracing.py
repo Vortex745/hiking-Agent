@@ -264,3 +264,144 @@ def test_sensitive_input_is_redacted(spans):
     )
     attrs = dict(spans.get_finished_spans()[0].attributes)
     assert "super-secret" not in attrs["gen_ai.input.messages"]
+
+
+@pytest.mark.asyncio
+async def test_client_disconnect_is_not_an_error_and_keeps_usage(spans):
+    model = trace_chat_model(_FakeModel())
+    stream = model._astream([HumanMessage(content="hi")])
+    first = await stream.__anext__()
+    assert first.content == "he"
+    # Browser stop / connection drop closes the generator early.
+    await stream.aclose()
+
+    finished = spans.get_finished_spans()
+    assert len(finished) == 1
+    attrs = dict(finished[0].attributes)
+    assert finished[0].status.status_code.name != "ERROR"
+    assert "error.type" not in attrs
+    assert attrs["gen_ai.usage.input_tokens"] == 7
+    assert attrs["gen_ai.usage.output_tokens"] == 0
+    assert attrs["gen_ai.output.messages"] == "he"
+
+
+def test_sync_stream_close_is_not_an_error(spans):
+    class _SyncStreamModel:
+        model_name = "gpt-test"
+        temperature = 0
+        _llm_type = "openai"
+
+        def _stream(self, messages, stop=None, run_manager=None, **kwargs):
+            yield AIMessageChunk(
+                content="he",
+                usage_metadata={
+                    "input_tokens": 4,
+                    "output_tokens": 1,
+                    "total_tokens": 5,
+                },
+            )
+            yield AIMessageChunk(content="llo")
+
+    model = trace_chat_model(_SyncStreamModel())
+    stream = model._stream([HumanMessage(content="hi")])
+    assert next(stream).content == "he"
+    stream.close()
+
+    finished = spans.get_finished_spans()
+    assert len(finished) == 1
+    attrs = dict(finished[0].attributes)
+    assert finished[0].status.status_code.name != "ERROR"
+    assert "error.type" not in attrs
+    assert attrs["gen_ai.usage.input_tokens"] == 4
+    assert attrs["gen_ai.output.messages"] == "he"
+
+
+def test_export_redacts_span_attributes_before_they_leave_the_process():
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    from observability.export.redaction import RedactingSpanProcessor
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(RedactingSpanProcessor())
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    tracer = provider.get_tracer("test")
+    with tracer.start_as_current_span("chat.generation") as span:
+        span.set_attribute("cookie", "session=abc123")
+        span.set_attribute("address", "文三路 123 号")
+        span.set_attribute("note", "Authorization: Bearer supersecret-token")
+        span.set_attribute("gen_ai.usage.input_tokens", 7)
+
+    attrs = dict(exporter.get_finished_spans()[0].attributes)
+    assert attrs["cookie"] == "[REDACTED]"
+    assert attrs["address"] == "[REDACTED]"
+    assert "supersecret-token" not in attrs["note"]
+    assert attrs["gen_ai.usage.input_tokens"] == 7
+
+
+def test_tool_messages_are_not_copied_into_generation_input(spans):
+    import asyncio
+    import json
+
+    from langchain_core.messages import ToolMessage
+
+    document = "完整检索文档：西湖十景包括苏堤春晓与曲院风荷。"
+    model = trace_chat_model(_FakeModel())
+    asyncio.run(
+        model._agenerate(
+            [
+                HumanMessage(content="hi"),
+                ToolMessage(content=document, tool_call_id="call-1"),
+            ]
+        )
+    )
+
+    raw = dict(spans.get_finished_spans()[0].attributes)["gen_ai.input.messages"]
+    assert document not in raw
+    messages = json.loads(raw)
+    tool = [message for message in messages if message["role"] == "tool"][0]
+    assert tool["content"] == "[REDACTED]"
+    assert tool["content.length"] == len(document)
+
+
+def test_denied_key_matching_uses_suffixes_without_hitting_metrics():
+    from observability.redaction import is_denied_key
+
+    assert is_denied_key("cookie")
+    assert is_denied_key("Authorization")
+    assert is_denied_key("user_latitude")
+    assert is_denied_key("user-address")
+    assert is_denied_key("memory_body")
+    assert is_denied_key("session_token")
+    assert not is_denied_key("latency")
+    assert not is_denied_key("token_count")
+    assert not is_denied_key("input_tokens")
+
+
+def test_structured_json_text_is_redacted_key_by_key():
+    from observability.redaction import scrub_text
+
+    cleaned = scrub_text('{"lat": 30.1, "city": "杭州", "adcode": "330106"}')
+
+    assert "30.1" not in cleaned
+    assert "330106" not in cleaned
+    assert "杭州" in cleaned
+
+
+def test_key_value_credentials_and_locations_are_redacted():
+    from observability.redaction import scrub_text
+
+    assert "30.1" not in scrub_text("user_latitude=30.1")
+    assert "dXNlcjpwYXNz" not in scrub_text("Authorization: Basic dXNlcjpwYXNz")
+    assert "abc" not in scrub_text("Cookie: session=abc")
+    assert "sk-live-9f8e7d6c" not in scrub_text("X-Api-Key: sk-live-9f8e7d6c")
+    assert "tok-123456" not in scrub_text("access_token=tok-123456")
+    assert "30.1" not in scrub_text('attrs {"lat": 30.1} trailing')
+    # Metric names that merely contain a denied word stay readable.
+    assert scrub_text("latency=5") == "latency=5"
+    assert scrub_text("token_count=3") == "token_count=3"
