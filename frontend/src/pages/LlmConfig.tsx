@@ -26,6 +26,7 @@ import {
   LlmConfigDraftSection,
   LlmConfigSection,
   LlmConfigSnapshot,
+  LlmSection,
   ModelInfo,
   ModelUsage,
   repairModelSelection,
@@ -151,12 +152,14 @@ function ModelCombobox({
   onChange,
   baseUrl,
   apiKey,
+  section,
   usage,
 }: {
   value: string
   onChange: (v: string) => void
   baseUrl: string
   apiKey: string
+  section: LlmSection
   usage: ModelUsage
 }) {
   const [models, setModels] = useState<ModelInfo[]>([])
@@ -174,8 +177,8 @@ function ModelCombobox({
   }, [baseUrl, apiKey])
 
   const handleFetch = useCallback(async () => {
-    if (!baseUrl || !apiKey) {
-      setError('请先填写 Base URL 和 API Key')
+    if (!baseUrl.trim()) {
+      setError('请先填写 Base URL')
       return
     }
     setLoading(true)
@@ -183,7 +186,11 @@ function ModelCombobox({
     setModels([])
     setOpen(false)
     try {
-      const fetched = await fetchModels(baseUrl, apiKey)
+      // 未填写新 key 时走后端测试接口：服务端用已存密钥取模型列表；
+      // 若 Base URL 也被改了，后端会返回 400 并说明必须先提供 key。
+      const fetched = apiKey.trim()
+        ? await fetchModels(baseUrl, apiKey)
+        : (await testLlmConfig(section, baseUrl)).models.map(id => ({ id }))
       const filtered = filterModelsByUsage(fetched, usage)
       setModels(filtered)
       setQuery('')
@@ -200,7 +207,7 @@ function ModelCombobox({
     } finally {
       setLoading(false)
     }
-  }, [apiKey, baseUrl, onChange, usage, value])
+  }, [apiKey, baseUrl, onChange, section, usage, value])
 
   const handleSelect = (modelId: string) => {
     setQuery('')
@@ -709,6 +716,7 @@ function LlmConfig() {
                   <ModelCombobox
                     apiKey={draft.llm.apiKey}
                     baseUrl={draft.llm.baseUrl}
+                    section="llm"
                     usage="llm"
                     value={draft.llm.model}
                     onChange={(v) => updateLlm('model', v)}
@@ -763,6 +771,7 @@ function LlmConfig() {
                   <ModelCombobox
                     apiKey={draft.embedding.apiKey}
                     baseUrl={draft.embedding.baseUrl}
+                    section="embedding"
                     usage="embedding"
                     value={draft.embedding.model}
                     onChange={(v) => updateEmbedding('model', v)}
@@ -836,6 +845,7 @@ function LlmConfig() {
                   <ModelCombobox
                     apiKey={draft.rerank.apiKey}
                     baseUrl={draft.rerank.baseUrl}
+                    section="rerank"
                     usage="rerank"
                     value={draft.rerank.model}
                     onChange={(v) => updateRerank('model', v)}

@@ -247,6 +247,18 @@ def test_update_runtime_config_creates_missing_env_file(tmp_path):
     assert settings.embedding_model == "fresh-embed"
 
 
+def test_update_runtime_config_defaults_to_module_env_path(tmp_path, monkeypatch):
+    """Default target is config.ENV_PATH, not a freshly recomputed path."""
+    env_path = _write_env(tmp_path / ".env", "OPENAI_MODEL=old-model\n")
+    monkeypatch.setattr(config, "ENV_PATH", env_path)
+
+    changed = config.update_runtime_config({"llm": {"model": "default-path-model"}})
+
+    assert changed == ["OPENAI_MODEL"]
+    assert dotenv_values(env_path)["OPENAI_MODEL"] == "default-path-model"
+    assert settings.openai_model == "default-path-model"
+
+
 def test_update_runtime_config_retries_transient_replace_permission_error(
     tmp_path, monkeypatch
 ):
@@ -341,7 +353,7 @@ def _restore_hiking_knowledge_stack(hk, saved):
     hk._retrieval_stack_fingerprint = fingerprint
 
 
-def test_retrieval_stack_rebuilds_and_closes_old_on_config_change(monkeypatch):
+def test_retrieval_stack_rebuilds_on_config_change(monkeypatch):
     import rag.retrieve_subgraph as retrieve_subgraph
 
     hk, saved = _reset_hiking_knowledge_stack()
@@ -373,7 +385,6 @@ def test_retrieval_stack_rebuilds_and_closes_old_on_config_change(monkeypatch):
         assert again_retriever is first_retriever
         assert again_subgraph is first_subgraph
         assert len(created_retrievers) == 1
-        assert first_retriever.close_calls == 0
 
         changes = (
             ("embedding_base_url", "https://embed-b.example/v1"),
@@ -387,9 +398,12 @@ def test_retrieval_stack_rebuilds_and_closes_old_on_config_change(monkeypatch):
             current_retriever, _ = hk._get_retrieval_stack()
             assert current_retriever is created_retrievers[index]
             assert len(created_retrievers) == index + 1
-            assert created_retrievers[index - 1].close_calls == 1
 
         assert built_retrievers == created_retrievers
+        # Stale stacks are only dereferenced. An immediate close would pull the
+        # SQLite connection from under requests still using the old stack, so
+        # the connection is left to the garbage collector.
+        assert all(retriever.close_calls == 0 for retriever in created_retrievers)
     finally:
         _restore_hiking_knowledge_stack(hk, saved)
 

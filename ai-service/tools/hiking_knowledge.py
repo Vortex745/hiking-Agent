@@ -69,31 +69,16 @@ def _embedding_fingerprint() -> tuple[Any, ...]:
     )
 
 
-def _close_retriever(retriever: VectorStoreRetriever) -> None:
-    """关闭被替换的检索栈，释放 SQLite 连接。
-
-    VectorStoreRetriever 自身暂无 close()（其 SQLite 适配器有），优先调用
-    公开 close，否则回退到公开 sqlite_store.close()。
-    """
-    try:
-        closer = getattr(retriever, "close", None)
-        if callable(closer):
-            closer()
-            return
-        store = getattr(retriever, "sqlite_store", None)
-        store_closer = getattr(store, "close", None)
-        if callable(store_closer):
-            store_closer()
-    except Exception as exc:  # 关闭失败不应影响后续检索
-        logger.warning("closing stale retrieval stack failed: %s", exc)
-
-
 def _get_retrieval_stack() -> tuple[VectorStoreRetriever, Any]:
     """Lazily build the retriever + compiled subgraph, keyed by config fingerprint.
 
     惰性构建保持 import 无副作用（不打开数据库文件）；构建与替换持锁。
-    配置页保存 embedding 配置后指纹变化：先构建新栈，成功后再关闭并替换
-    旧栈（构建失败时保留旧栈可用）。
+    配置页保存 embedding 配置后指纹变化：先构建新栈，成功后再替换旧栈
+    （构建失败时保留旧栈可用）。
+
+    旧栈只丢弃引用，不显式 close：重建可能发生在其他请求仍在用旧栈检索时，
+    此时关闭它会抽走其 SQLite 连接。引用归零后由 GC 关闭，天然等待在飞
+    请求释放旧栈。
     """
     global _retriever, _subgraph, _retrieval_stack_fingerprint
     with _retrieval_stack_lock:
@@ -110,12 +95,9 @@ def _get_retrieval_stack() -> tuple[VectorStoreRetriever, Any]:
                 retriever=retriever,
                 parent_retriever_fn=_make_parent_retriever_fn(retriever),
             )
-            stale_retriever = _retriever
             _retriever = retriever
             _subgraph = subgraph
             _retrieval_stack_fingerprint = fingerprint
-            if stale_retriever is not None:
-                _close_retriever(stale_retriever)
     return _retriever, _subgraph
 
 

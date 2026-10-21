@@ -68,3 +68,4 @@ class LlmConfigTestRequest(BaseModel):
 class LlmConfigTestResponse(BaseModel):
     latency_ms: int
     model_count: int
+    models: list[str]
