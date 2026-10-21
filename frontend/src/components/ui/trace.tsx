@@ -92,6 +92,8 @@ function TraceDescription({
 function TraceCollapsible({
   className,
   children,
+  open,
+  onOpenChange,
   ...props
 }: Omit<React.ComponentProps<typeof Collapsible>, "asChild" | "open"> &
   (
@@ -104,13 +106,33 @@ function TraceCollapsible({
       }
   )) {
   const contentId = React.useId()
+  // The collapse animation must not run on first mount: an already-expanded
+  // trace should appear without moving. Latch animation on once the open
+  // state changes, whether from a user toggle or a programmatic (status)
+  // change. The CSS animation selector requires this attribute.
+  const [animate, setAnimate] = React.useState(false)
+  const previousOpen = React.useRef(open)
+  if (open !== undefined && previousOpen.current !== open) {
+    previousOpen.current = open
+    setAnimate(true)
+  }
+  const handleOpenChange = React.useCallback(
+    (nextOpen: boolean) => {
+      setAnimate(true)
+      onOpenChange?.(nextOpen)
+    },
+    [onOpenChange],
+  )
 
   return (
     <TraceCollapsibleIdContext.Provider value={contentId}>
       <Collapsible
         data-slot="trace-collapsible"
+        data-animate={animate ? "true" : undefined}
         className={cn("flex w-full min-w-0 flex-col", className)}
         {...props}
+        open={open}
+        onOpenChange={handleOpenChange}
       >
         {children}
       </Collapsible>

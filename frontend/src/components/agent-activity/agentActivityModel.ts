@@ -31,10 +31,14 @@ export interface ActivityLine {
   description?: string;
   /** Present on tool lines so results can close the right call. */
   toolName?: string;
+  /** Present on approval lines so resolutions match the right approval. */
+  approvalId?: string;
 }
 
 export interface AgentActivityModel {
   visible: boolean;
+  /** Summary status; the presenter must not re-derive it from the lines. */
+  status: ActivityStatus;
   summary: string;
   defaultExpanded: boolean;
   lines: ActivityLine[];
@@ -143,6 +147,70 @@ function isUnresolvedApproval(metadata: Record<string, unknown> | undefined) {
   return !status || !RESOLVED_APPROVAL_STATUSES.has(status);
 }
 
+/**
+ * Returns the index of the first line matching `match`, searching forward
+ * from the start (FIFO call pairing) or backward from the end (most recent
+ * pending approval). Returns -1 when nothing matches.
+ */
+function findLineIndex(
+  lines: readonly ActivityLine[],
+  match: (line: ActivityLine) => boolean,
+  direction: 'forward' | 'backward' = 'forward',
+): number {
+  if (direction === 'forward') {
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i];
+      if (line && match(line)) return i;
+    }
+    return -1;
+  }
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i];
+    if (line && match(line)) return i;
+  }
+  return -1;
+}
+
+function findRunningToolLine(
+  lines: readonly ActivityLine[],
+  tool: string,
+): number {
+  return findLineIndex(
+    lines,
+    line =>
+      line.kind === 'tool' && line.toolName === tool && line.status === 'running',
+  );
+}
+
+function findPendingApprovalLine(
+  lines: readonly ActivityLine[],
+  approvalId: string | undefined,
+  tool: string | undefined,
+): number {
+  const isPendingApproval = (line: ActivityLine) =>
+    line.kind === 'approval' && line.status === 'pending';
+
+  if (approvalId) {
+    const byId = findLineIndex(
+      lines,
+      line => isPendingApproval(line) && line.approvalId === approvalId,
+      'backward',
+    );
+    if (byId >= 0) return byId;
+  }
+
+  if (tool) {
+    const byTool = findLineIndex(
+      lines,
+      line => isPendingApproval(line) && line.toolName === tool,
+      'backward',
+    );
+    if (byTool >= 0) return byTool;
+  }
+
+  return findLineIndex(lines, isPendingApproval, 'backward');
+}
+
 function pushToolLine(
   lines: ActivityLine[],
   index: number,
@@ -172,6 +240,7 @@ export function buildAgentActivity(input: {
   // Tracks whether the last meaningful event is an unresolved approval.
   let lastApprovalUnresolved = false;
   let hasRejectedApproval = false;
+  let hasExpiredApproval = false;
 
   events.forEach((event, index) => {
     const metadata = event.metadata;
@@ -182,14 +251,8 @@ export function buildAgentActivity(input: {
         if (!tool) return;
         lastApprovalUnresolved = false;
 
-        const alreadyRunning = lines.some(
-          line =>
-            line.kind === 'tool' &&
-            line.toolName === tool &&
-            line.status === 'running',
-        );
-        if (alreadyRunning) return;
-
+        // Every call creates a line, including parallel calls to the same
+        // tool. Results pair with the earliest still-running call (FIFO).
         lines.push({
           id: `event-${index}`,
           kind: 'tool',
@@ -217,19 +280,7 @@ export function buildAgentActivity(input: {
         const lineStatus: ActivityStatus = succeeded ? 'done' : 'error';
         const description = succeeded ? formatDuration(metadata?.duration_ms) : undefined;
 
-        let runningIndex = -1;
-        for (let i = lines.length - 1; i >= 0; i -= 1) {
-          const candidate = lines[i];
-          if (
-            candidate &&
-            candidate.kind === 'tool' &&
-            candidate.toolName === tool &&
-            candidate.status === 'running'
-          ) {
-            runningIndex = i;
-            break;
-          }
-        }
+        const runningIndex = findRunningToolLine(lines, tool);
 
         if (runningIndex >= 0) {
           const running = lines[runningIndex];
@@ -274,6 +325,7 @@ export function buildAgentActivity(input: {
 
       case 'approval_required': {
         const tool = readMetadataText(metadata, 'tool');
+        const approvalId = readMetadataText(metadata, 'approval_id');
         const message =
           readMetadataText(metadata, 'message') ?? readText(event.content);
         lastApprovalUnresolved = isUnresolvedApproval(metadata);
@@ -285,6 +337,7 @@ export function buildAgentActivity(input: {
           title: tool ? `等待确认：${toolAction(tool)}` : '等待你的确认',
         };
         if (tool) line.toolName = tool;
+        if (approvalId) line.approvalId = approvalId;
         if (message) line.description = message;
         lines.push(line);
         return;
@@ -295,29 +348,21 @@ export function buildAgentActivity(input: {
         // so the wait line can settle without the presenter knowing about
         // approvals.
         const tool = readMetadataText(metadata, 'tool');
+        const approvalId = readMetadataText(metadata, 'approval_id');
         const decision = readMetadataText(metadata, 'decision');
         const status = readMetadataText(metadata, 'status');
-        const approved = decision === 'approve' || status === 'approved';
-        const rejected = decision === 'reject' || status === 'rejected';
-        if (!approved && !rejected) return;
+        const expired = decision === 'expired' || status === 'expired';
+        const approved =
+          !expired && (decision === 'approve' || status === 'approved');
+        const rejected =
+          !expired && (decision === 'reject' || status === 'rejected');
+        if (!approved && !rejected && !expired) return;
 
         lastApprovalUnresolved = false;
         if (rejected) hasRejectedApproval = true;
+        if (expired) hasExpiredApproval = true;
 
-        let pendingIndex = -1;
-        for (let i = lines.length - 1; i >= 0; i -= 1) {
-          const candidate = lines[i];
-          if (
-            !candidate ||
-            candidate.kind !== 'approval' ||
-            candidate.status !== 'pending'
-          ) {
-            continue;
-          }
-          if (tool && candidate.toolName && candidate.toolName !== tool) continue;
-          pendingIndex = i;
-          break;
-        }
+        const pendingIndex = findPendingApprovalLine(lines, approvalId, tool);
         if (pendingIndex < 0) return;
 
         const pending = lines[pendingIndex];
@@ -328,12 +373,12 @@ export function buildAgentActivity(input: {
           : pending.toolName
             ? toolAction(pending.toolName)
             : pending.title.replace(/^等待确认[:：]\s*/, '');
+        const prefix = approved ? '已确认' : expired ? '已过期' : '已拒绝';
         const settled: ActivityLine = {
           ...pending,
           status: approved ? 'done' : 'error',
-          title: `${approved ? '已确认' : '已拒绝'}：${action}`,
+          title: `${prefix}：${action}`,
         };
-        delete settled.description;
         const resolvedMessage = readMetadataText(metadata, 'message');
         if (resolvedMessage) settled.description = resolvedMessage;
         lines[pendingIndex] = settled;
@@ -347,6 +392,9 @@ export function buildAgentActivity(input: {
   });
 
   const hadEventLines = lines.length > 0;
+  // An unresolved approval wins even while `isStreaming` keeps the message
+  // running: the run is paused waiting for the user, not generating.
+  const approvalWait = lastApprovalUnresolved;
 
   if (!isRunning) {
     // A completed run settles every still-running line. Errors and pending
@@ -357,7 +405,7 @@ export function buildAgentActivity(input: {
         lines[i] = { ...line, status: 'done' };
       }
     }
-  } else {
+  } else if (!approvalWait) {
     const hasRunningLine = lines.some(line => line.status === 'running');
     if (hadEventLines) {
       if (!hasRunningLine && hasText) {
@@ -388,23 +436,33 @@ export function buildAgentActivity(input: {
   if (!isRunning && lines.length === 0) {
     return {
       visible: false,
+      status: 'done',
       summary: '',
       defaultExpanded: false,
       lines: [],
     };
   }
 
-  const approvalWait = !isRunning && lastApprovalUnresolved;
   const hasError = lines.some(line => line.status === 'error');
   const stepCount = lines.filter(
     line => line.kind === 'tool' || line.kind === 'artifact',
   ).length;
+
+  const status: ActivityStatus = approvalWait
+    ? 'pending'
+    : hasRejectedApproval || hasExpiredApproval || hasError
+      ? 'error'
+      : isRunning
+        ? 'running'
+        : 'done';
 
   let summary: string;
   if (approvalWait) {
     summary = '等待你的确认';
   } else if (hasRejectedApproval) {
     summary = '操作已拒绝';
+  } else if (hasExpiredApproval) {
+    summary = '确认已过期';
   } else if (hasError) {
     summary = '有步骤执行失败';
   } else if (isRunning) {
@@ -421,8 +479,10 @@ export function buildAgentActivity(input: {
 
   return {
     visible: true,
+    status,
     summary,
-    defaultExpanded: isRunning || approvalWait || hasError || hasRejectedApproval,
+    defaultExpanded:
+      isRunning || approvalWait || hasRejectedApproval || hasExpiredApproval || hasError,
     lines,
   };
 }

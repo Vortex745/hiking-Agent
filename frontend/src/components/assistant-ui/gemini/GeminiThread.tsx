@@ -34,7 +34,6 @@ interface GeminiThreadProps {
   /** Called when user clicks "regenerate" — parent should resend the last user prompt */
   onRegenerate?: () => void;
   onUploadClick?: () => void;
-  onConfirmTool?: (confirmationId: string, action: 'confirm' | 'reject') => void;
   /** Real message count from the parent page's state (for accurate memory meter) */
   realMessageCount?: number;
 }
@@ -42,12 +41,11 @@ interface GeminiThreadProps {
 /** Context to pass callbacks down to ChatMessage without prop drilling */
 const ThreadActionsContext = createContext<{
   onRegenerate?: () => void;
-  onConfirmTool?: (confirmationId: string, action: 'confirm' | 'reject') => void;
   realMessageCount: number;
 }>({ realMessageCount: 0 });
 
-export const GeminiThread = ({ emptyTitle, onRegenerate, onUploadClick, onConfirmTool, realMessageCount = 0 }: GeminiThreadProps) => (
-  <ThreadActionsContext.Provider value={{ onRegenerate, onConfirmTool, realMessageCount }}>
+export const GeminiThread = ({ emptyTitle, onRegenerate, onUploadClick, realMessageCount = 0 }: GeminiThreadProps) => (
+  <ThreadActionsContext.Provider value={{ onRegenerate, realMessageCount }}>
     <ThreadPrimitive.Root className="h-full bg-[#fdfcfc] dark:bg-[#131314] flex flex-col overflow-hidden w-full relative">
       <AuiIf condition={(s) => s.thread.isEmpty}>
         <EmptyState emptyTitle={emptyTitle} onUploadClick={onUploadClick} />
