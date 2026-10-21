@@ -1,167 +1,260 @@
-import { API } from './config'
+import { API, API_ORIGIN } from './config'
 
-export type ModelProvider = 'openai-compatible'
+// The config endpoint lives on the same AI-service v1 base as `API` in
+// config.ts. `API_ORIGIN` is either the configured base (…/api/v1) or empty,
+// in which case the dev proxy serves /api/v1.
+const LLM_CONFIG_ENDPOINT = `${API_ORIGIN || '/api/v1'}/llm-config`
+const LLM_CONFIG_TEST_ENDPOINT = `${LLM_CONFIG_ENDPOINT}/test`
 
-export interface LlmModelConfig {
-  provider: ModelProvider
+const DEFAULT_EMBEDDING_DIMENSIONS = 1536
+
+export type ModelUsage = 'llm' | 'embedding' | 'rerank'
+export type LlmSection = ModelUsage
+
+/** Server-side view of one section; keys are never returned in plain text. */
+export interface LlmConfigSection {
   baseUrl: string
-  apiKey: string
   model: string
+  apiKeyMasked: string
+  apiKeySet: boolean
 }
 
-export interface EmbeddingModelConfig {
-  provider: ModelProvider
-  baseUrl: string
-  apiKey: string
-  model: string
+export interface EmbeddingConfigSection extends LlmConfigSection {
   dimensions: number
 }
 
-export interface RerankModelConfig {
-  provider: ModelProvider
-  baseUrl: string
-  apiKey: string
-  model: string
-}
-
-export interface LlmSettings {
-  llm: LlmModelConfig
-  embedding: EmbeddingModelConfig
-  rerank: RerankModelConfig
+export interface LlmConfigSnapshot {
+  llm: LlmConfigSection
+  embedding: EmbeddingConfigSection
+  rerank: LlmConfigSection
   updatedAt: string | null
+  indexDimensions: number | null
 }
 
-interface StorageLike {
-  getItem(key: string): string | null
-  setItem(key: string, value: string): void
-  removeItem(key: string): void
+export interface LlmConfigSaveResult extends LlmConfigSnapshot {
+  reindexRecommended: boolean
 }
 
-export const LLM_SETTINGS_STORAGE_KEY = 'ai-hiking-llm-settings'
-
-export const DEFAULT_LLM_SETTINGS: LlmSettings = {
-  llm: {
-    provider: 'openai-compatible',
-    baseUrl: '',
-    apiKey: '',
-    model: 'deepseek-v4-flash',
-  },
-  embedding: {
-    provider: 'openai-compatible',
-    baseUrl: '',
-    apiKey: '',
-    model: 'text-embedding-3-small',
-    dimensions: 1536,
-  },
-  rerank: {
-    provider: 'openai-compatible',
-    baseUrl: '',
-    apiKey: '',
-    model: 'Qwen/Qwen3-Reranker-8B',
-  },
-  updatedAt: null,
+/** Editable draft; an empty apiKey means "keep the stored key". */
+export interface LlmConfigDraftSection {
+  baseUrl: string
+  model: string
+  apiKey: string
 }
 
-const PROVIDERS: ModelProvider[] = ['openai-compatible']
+export interface EmbeddingConfigDraft extends LlmConfigDraftSection {
+  dimensions: number | null
+}
 
-function browserStorage(): StorageLike | null {
-  if (typeof window === 'undefined') return null
-  return window.localStorage
+export interface LlmConfigDraft {
+  llm: LlmConfigDraftSection
+  embedding: EmbeddingConfigDraft
+  rerank: LlmConfigDraftSection
+}
+
+export interface LlmConfigTestResult {
+  latencyMs: number
+  modelCount: number
+}
+
+export class LlmConfigError extends Error {
+  readonly status: number
+  readonly detail: string
+
+  constructor(status: number, detail: string) {
+    super(detail)
+    this.name = 'LlmConfigError'
+    this.status = status
+    this.detail = detail
+  }
+}
+
+export function isLlmConfigError(value: unknown): value is LlmConfigError {
+  return value instanceof LlmConfigError
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
 }
 
-function normalizeProvider(value: unknown, fallback: ModelProvider): ModelProvider {
-  return typeof value === 'string' && PROVIDERS.includes(value as ModelProvider)
-    ? value as ModelProvider
-    : fallback
+function asText(value: unknown, fallback = ''): string {
+  return typeof value === 'string' ? value : fallback
 }
 
-function normalizeText(value: unknown, fallback: string): string {
-  if (typeof value !== 'string') return fallback
-  const trimmed = value.trim()
-  return trimmed || fallback
+function asFiniteNumber(value: unknown): number | null {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return null
 }
 
-function normalizeSecret(value: unknown): string {
-  return typeof value === 'string' ? value.trim() : ''
+function readSection(value: unknown): LlmConfigSection {
+  const record = isRecord(value) ? value : {}
+  const apiKeyMasked = asText(record.api_key_masked)
+  return {
+    baseUrl: asText(record.base_url),
+    model: asText(record.model),
+    apiKeyMasked,
+    apiKeySet: typeof record.api_key_set === 'boolean' ? record.api_key_set : apiKeyMasked.length > 0,
+  }
 }
 
-function normalizeNumber(value: unknown, fallback: number, min: number, max: number): number {
-  const parsed = typeof value === 'number' ? value : Number(value)
-  if (!Number.isFinite(parsed)) return fallback
-  return Math.min(max, Math.max(min, parsed))
-}
-
-export function normalizeLlmSettings(value: unknown): LlmSettings {
+function normalizeSnapshot(value: unknown): LlmConfigSnapshot {
   const root = isRecord(value) ? value : {}
-  const llm = isRecord(root.llm) ? root.llm : {}
-  const embedding = isRecord(root.embedding) ? root.embedding : {}
-  const rerank = isRecord(root.rerank) ? root.rerank : {}
+  const embeddingRecord = isRecord(root.embedding) ? root.embedding : {}
+  const embedding = readSection(embeddingRecord)
+  const dimensions = asFiniteNumber(embeddingRecord.dimensions) ?? DEFAULT_EMBEDDING_DIMENSIONS
+  const indexDimensions = asFiniteNumber(root.index_dimensions)
 
   return {
+    llm: readSection(root.llm),
+    embedding: {
+      ...embedding,
+      dimensions: Math.round(dimensions),
+    },
+    rerank: readSection(root.rerank),
+    updatedAt: typeof root.updated_at === 'string' ? root.updated_at : null,
+    indexDimensions: indexDimensions === null ? null : Math.round(indexDimensions),
+  }
+}
+
+/** Build a blank-key draft so password inputs never contain server values. */
+export function draftFromSnapshot(snapshot: LlmConfigSnapshot): LlmConfigDraft {
+  return {
     llm: {
-      provider: normalizeProvider(llm.provider, DEFAULT_LLM_SETTINGS.llm.provider),
-      baseUrl: normalizeText(llm.baseUrl, DEFAULT_LLM_SETTINGS.llm.baseUrl),
-      apiKey: normalizeSecret(llm.apiKey),
-      model: sanitizeStoredModel(
-        normalizeText(llm.model, DEFAULT_LLM_SETTINGS.llm.model),
-        'llm',
-        DEFAULT_LLM_SETTINGS.llm.model,
-      ),
+      baseUrl: snapshot.llm.baseUrl,
+      model: snapshot.llm.model,
+      apiKey: '',
     },
     embedding: {
-      provider: normalizeProvider(embedding.provider, DEFAULT_LLM_SETTINGS.embedding.provider),
-      baseUrl: normalizeText(embedding.baseUrl, DEFAULT_LLM_SETTINGS.embedding.baseUrl),
-      apiKey: normalizeSecret(embedding.apiKey),
-      model: sanitizeStoredModel(
-        normalizeText(embedding.model, DEFAULT_LLM_SETTINGS.embedding.model),
-        'embedding',
-        DEFAULT_LLM_SETTINGS.embedding.model,
-      ),
-      dimensions: Math.round(normalizeNumber(embedding.dimensions, DEFAULT_LLM_SETTINGS.embedding.dimensions, 64, 4096)),
+      baseUrl: snapshot.embedding.baseUrl,
+      model: snapshot.embedding.model,
+      dimensions: snapshot.embedding.dimensions,
+      apiKey: '',
     },
     rerank: {
-      provider: normalizeProvider(rerank.provider, DEFAULT_LLM_SETTINGS.rerank.provider),
-      baseUrl: normalizeText(rerank.baseUrl, DEFAULT_LLM_SETTINGS.rerank.baseUrl),
-      apiKey: normalizeSecret(rerank.apiKey),
-      model: sanitizeStoredModel(
-        normalizeText(rerank.model, DEFAULT_LLM_SETTINGS.rerank.model),
-        'rerank',
-        DEFAULT_LLM_SETTINGS.rerank.model,
-      ),
+      baseUrl: snapshot.rerank.baseUrl,
+      model: snapshot.rerank.model,
+      apiKey: '',
     },
-    updatedAt: typeof root.updatedAt === 'string' ? root.updatedAt : null,
   }
 }
 
-export function loadLlmSettings(storage: StorageLike | null = browserStorage()): LlmSettings {
-  if (!storage) return DEFAULT_LLM_SETTINGS
+type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 
+function defaultFetch(): FetchLike {
+  return globalThis.fetch.bind(globalThis)
+}
+
+function readDetail(payload: unknown, fallback: string): string {
+  if (!isRecord(payload)) return fallback
+  const detail = payload.detail ?? payload.error ?? payload.message
+  return typeof detail === 'string' && detail.trim() ? detail.trim() : fallback
+}
+
+async function responseError(response: Response): Promise<LlmConfigError> {
+  const fallback = `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ''}`
+  const text = await response.text().catch(() => '')
+  if (!text.trim()) return new LlmConfigError(response.status, fallback)
   try {
-    const raw = storage.getItem(LLM_SETTINGS_STORAGE_KEY)
-    if (!raw) return DEFAULT_LLM_SETTINGS
-    return normalizeLlmSettings(JSON.parse(raw))
+    return new LlmConfigError(response.status, readDetail(JSON.parse(text), fallback))
   } catch {
-    return DEFAULT_LLM_SETTINGS
+    return new LlmConfigError(response.status, text.trim())
   }
 }
 
-export function saveLlmSettings(value: unknown, storage: StorageLike | null = browserStorage()): LlmSettings {
-  const settings = {
-    ...normalizeLlmSettings(value),
-    updatedAt: new Date().toISOString(),
-  }
-
-  storage?.setItem(LLM_SETTINGS_STORAGE_KEY, JSON.stringify(settings))
-  return settings
+export async function fetchLlmConfig(
+  fetcher: FetchLike = defaultFetch(),
+): Promise<LlmConfigSnapshot> {
+  const response = await fetcher(LLM_CONFIG_ENDPOINT, {
+    method: 'GET',
+    headers: { Accept: 'application/json' },
+    cache: 'no-store',
+  })
+  if (!response.ok) throw await responseError(response)
+  return normalizeSnapshot(await response.json())
 }
 
-export function clearLlmSettings(storage: StorageLike | null = browserStorage()): LlmSettings {
-  storage?.removeItem(LLM_SETTINGS_STORAGE_KEY)
-  return DEFAULT_LLM_SETTINGS
+function toWireSection(section: LlmConfigDraftSection): Record<string, unknown> {
+  const wire: Record<string, unknown> = {
+    base_url: section.baseUrl.trim(),
+    model: section.model.trim(),
+  }
+  const apiKey = section.apiKey.trim()
+  if (apiKey) wire.api_key = apiKey
+  return wire
+}
+
+/**
+ * Save the editable draft. Empty keys are omitted so the backend keeps the
+ * stored secret. The response is the fresh server view plus the reindex hint.
+ */
+export async function saveLlmConfig(
+  draft: LlmConfigDraft,
+  fetcher: FetchLike = defaultFetch(),
+): Promise<LlmConfigSaveResult> {
+  const embedding = toWireSection(draft.embedding)
+  if (draft.embedding.dimensions !== null && Number.isFinite(draft.embedding.dimensions)) {
+    embedding.dimensions = Math.round(draft.embedding.dimensions)
+  }
+
+  const response = await fetcher(LLM_CONFIG_ENDPOINT, {
+    method: 'PUT',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      llm: toWireSection(draft.llm),
+      embedding,
+      rerank: toWireSection(draft.rerank),
+    }),
+  })
+  if (!response.ok) throw await responseError(response)
+
+  const payload: unknown = await response.json()
+  return {
+    ...normalizeSnapshot(payload),
+    reindexRecommended: isRecord(payload) && payload.reindex_recommended === true,
+  }
+}
+
+/**
+ * Probe one section through the backend. Empty base URL / API key fall back to
+ * the stored server values, so a masked key can still be tested.
+ */
+export async function testLlmConfig(
+  section: LlmSection,
+  baseUrl?: string,
+  apiKey?: string,
+  fetcher: FetchLike = defaultFetch(),
+): Promise<LlmConfigTestResult> {
+  const body: Record<string, unknown> = { section }
+  if (baseUrl?.trim()) body.base_url = baseUrl.trim()
+  if (apiKey?.trim()) body.api_key = apiKey.trim()
+
+  const response = await fetcher(LLM_CONFIG_TEST_ENDPOINT, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  })
+  if (!response.ok) throw await responseError(response)
+
+  const payload: unknown = await response.json()
+  const latency = isRecord(payload) ? asFiniteNumber(payload.latency_ms) : null
+  const modelCount = isRecord(payload) ? asFiniteNumber(payload.model_count) : null
+  if (latency === null || modelCount === null) {
+    throw new Error('测速响应格式异常')
+  }
+  return {
+    latencyMs: Math.max(1, Math.round(latency)),
+    modelCount: Math.round(modelCount),
+  }
 }
 
 export function maskApiKey(value: string): string {
@@ -191,14 +284,6 @@ export interface ModelsResponse {
   data?: ModelInfo[]
   models?: string[]
 }
-
-export interface SpeedTestMeasurement {
-  latencyMs: number
-  modelCount: number
-}
-
-export type ModelUsage = 'llm' | 'embedding' | 'rerank'
-type InferredModelUsage = ModelUsage | 'other' | 'unknown'
 
 export function filterModelList(models: ModelInfo[], query: string): ModelInfo[] {
   const keyword = query.trim().toLowerCase()
@@ -272,6 +357,8 @@ function collectModelHints(model: ModelInfo): string {
     .toLowerCase()
 }
 
+type InferredModelUsage = ModelUsage | 'other' | 'unknown'
+
 function inferModelUsageFromHints(hints: string, fallback: 'llm' | 'unknown'): InferredModelUsage {
   if (!hints.trim()) return fallback
 
@@ -304,17 +391,6 @@ export function filterModelsByUsage(models: ModelInfo[], usage: ModelUsage): Mod
   return models.filter(model => inferModelUsage(model) === usage)
 }
 
-function sanitizeStoredModel(model: string, usage: ModelUsage, fallback: string): string {
-  const trimmed = normalizeText(model, fallback)
-  const inferred = inferModelUsageFromHints(trimmed.toLowerCase(), 'unknown')
-
-  if (inferred !== 'unknown' && inferred !== usage) {
-    return fallback
-  }
-
-  return trimmed
-}
-
 export function repairModelSelection(
   currentModel: string,
   usage: ModelUsage,
@@ -334,23 +410,6 @@ export function repairModelSelection(
   return trimmed
 }
 
-type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
-
-function defaultFetch(): FetchLike {
-  return globalThis.fetch.bind(globalThis)
-}
-
-function defaultNow(): number {
-  if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
-    return performance.now()
-  }
-  return Date.now()
-}
-
-export function canRunSpeedTest(baseUrl: string, apiKey: string): boolean {
-  return Boolean(baseUrl.trim() && apiKey.trim())
-}
-
 export async function fetchModels(
   baseUrl: string,
   apiKey: string,
@@ -363,13 +422,8 @@ export async function fetchModels(
   })
 
   if (!resp.ok) {
-    const text = await resp.text().catch(() => '')
-    let message = `HTTP ${resp.status}`
-    try {
-      const payload = JSON.parse(text)
-      message = payload.detail ?? payload.error ?? message
-    } catch {}
-    throw new Error(message)
+    const error = await responseError(resp)
+    throw new Error(error.message)
   }
 
   const data: ModelsResponse = await resp.json()
@@ -382,24 +436,4 @@ export async function fetchModels(
       .map(id => ({ id }))
   }
   return []
-}
-
-export async function measureModelLatency(
-  baseUrl: string,
-  apiKey: string,
-  options: {
-    fetcher?: FetchLike
-    now?: () => number
-  } = {},
-): Promise<SpeedTestMeasurement> {
-  const fetcher = options.fetcher ?? defaultFetch()
-  const now = options.now ?? defaultNow
-  const start = now()
-  const models = await fetchModels(baseUrl, apiKey, fetcher)
-  const end = now()
-
-  return {
-    latencyMs: Math.max(1, Math.round(end - start)),
-    modelCount: models.length,
-  }
 }
