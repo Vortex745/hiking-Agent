@@ -7,6 +7,7 @@
 import logging
 import os
 import time
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -26,29 +27,37 @@ from rag.sqlite_schema import read_vec0_dimensions
 
 logger = logging.getLogger("ai-service.llm_config")
 
-_ALLOWED_ORIGINS = frozenset(
-    {
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:4173",
-        "http://127.0.0.1:4173",
-    }
-)
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_ALLOWED_ORIGIN_SCHEMES = frozenset({"http", "https"})
+_CLIENT_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})
+
+
+def _is_allowed_origin(origin: str) -> bool:
+    """Origin 必须可解析为本机 http(s) 来源；端口不限（兼容任意 dev server 端口）。"""
+    try:
+        parsed = urlsplit(origin)
+        # 访问 port 会校验端口语法；非法端口同样视为畸形 Origin。
+        _ = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme in _ALLOWED_ORIGIN_SCHEMES
+        and parsed.hostname in _LOOPBACK_HOSTS
+    )
 
 
 def require_local_request(request: Request) -> None:
-    """拒绝非本机来源、非白名单 Origin 与 Vercel 环境。"""
+    """拒绝非本机来源、非本机 Origin 与 Vercel 环境。"""
     if os.getenv("VERCEL"):
         raise HTTPException(status_code=403, detail="llm-config 在 Vercel 环境不可用")
 
     client = request.client
-    if client is None or client.host not in _LOOPBACK_HOSTS:
+    if client is None or client.host not in _CLIENT_LOOPBACK_HOSTS:
         raise HTTPException(status_code=403, detail="llm-config 仅允许本机访问")
 
     origin = request.headers.get("origin")
-    if origin and origin not in _ALLOWED_ORIGINS:
-        raise HTTPException(status_code=403, detail="Origin 不在允许列表")
+    if origin is not None and not _is_allowed_origin(origin):
+        raise HTTPException(status_code=403, detail="Origin 必须为本机 http(s) 来源")
 
 
 llm_config_router = APIRouter(
@@ -203,20 +212,38 @@ async def test_llm_config(
 ) -> LlmConfigTestResponse:
     """探测上游 /models；空 base_url/api_key 回退已存配置，不落盘。"""
     base_url_attr, api_key_attr = _SECTION_SETTINGS_ATTRS[payload.section]
-    base_url = (payload.base_url or "").strip() or getattr(settings, base_url_attr)
-    if not base_url.strip():
+    requested_base_url = (payload.base_url or "").strip()
+    requested_api_key = (payload.api_key or "").strip()
+    stored_base_url = (getattr(settings, base_url_attr) or "").strip()
+    stored_api_key = (getattr(settings, api_key_attr) or "").strip()
+
+    # 禁止把已存密钥转发到请求指定的新主机：base_url 变了就必须自带 key。
+    if (
+        requested_base_url
+        and not requested_api_key
+        and requested_base_url.rstrip("/") != stored_base_url.rstrip("/")
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "请求的 base_url 与已存配置不同且未提供 api_key；"
+                "为避免把已存密钥发送到新主机，测试被拒绝"
+            ),
+        )
+
+    base_url = requested_base_url or stored_base_url
+    if not base_url:
         raise HTTPException(
             status_code=400, detail=f"{payload.section}.base_url 未配置"
         )
-    api_key = (payload.api_key or "").strip() or getattr(settings, api_key_attr)
-    url = f"{base_url.strip().rstrip('/')}/models"
+    api_key = requested_api_key or stored_api_key
+    url = f"{base_url.rstrip('/')}/models"
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
     started = time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT_SECONDS) as upstream:
-            response = await upstream.get(
-                url, headers={"Authorization": f"Bearer {api_key}"}
-            )
+            response = await upstream.get(url, headers=headers)
     except httpx.RequestError:
         logger.warning("llm-config probe cannot connect section=%s", payload.section)
         raise HTTPException(status_code=502, detail="无法连接上游模型服务")
@@ -233,6 +260,17 @@ async def test_llm_config(
         data = response.json()
     except ValueError:
         raise HTTPException(status_code=502, detail="上游响应不是有效 JSON")
-    models = data.get("data") if isinstance(data, dict) else None
-    model_count = len(models) if isinstance(models, list) else 0
-    return LlmConfigTestResponse(latency_ms=latency_ms, model_count=model_count)
+    entries = data.get("data") if isinstance(data, dict) else None
+    entries = entries if isinstance(entries, list) else []
+    model_ids = [
+        entry["id"].strip()
+        for entry in entries
+        if isinstance(entry, dict)
+        and isinstance(entry.get("id"), str)
+        and entry["id"].strip()
+    ]
+    return LlmConfigTestResponse(
+        latency_ms=latency_ms,
+        model_count=len(entries),
+        models=model_ids,
+    )

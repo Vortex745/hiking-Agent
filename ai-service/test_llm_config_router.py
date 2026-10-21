@@ -162,10 +162,38 @@ def test_guard_rejects_disallowed_origin(guarded_client):
     assert response.status_code == 403
 
 
-def test_guard_allows_loopback_with_allowed_origin(guarded_client):
-    response = guarded_client.get(BASE_URL, headers={"Origin": "http://localhost:5173"})
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+        "https://localhost:4173",
+        "http://[::1]:8080",
+        "http://localhost",
+    ],
+)
+def test_guard_allows_loopback_origin_on_any_port(origin, guarded_client):
+    response = guarded_client.get(BASE_URL, headers={"Origin": origin})
 
     assert response.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "",
+        "not-a-url",
+        "http://",
+        "null",
+        "ftp://localhost:5173",
+        "http://localhost:bad-port",
+        "http://localhost.evil.example:5174",
+    ],
+)
+def test_guard_rejects_malformed_or_non_loopback_origin(origin, guarded_client):
+    response = guarded_client.get(BASE_URL, headers={"Origin": origin})
+
+    assert response.status_code == 403
 
 
 def test_guard_rejects_vercel_environment(guarded_client, monkeypatch):
@@ -470,6 +498,7 @@ def test_probe_falls_back_to_stored_base_url_and_key(
     assert isinstance(body["latency_ms"], int)
     assert body["latency_ms"] >= 0
     assert body["model_count"] == 3
+    assert body["models"] == ["m-a", "m-b", "m-c"]
     assert fake_upstream.last_request["url"] == f"https://{section}.example/v1/models"
     assert fake_upstream.last_request["headers"] == {
         "Authorization": f"Bearer {section}-stored-secret"
@@ -498,6 +527,76 @@ def test_probe_prefers_explicit_base_url_and_key(client, monkeypatch, fake_upstr
     assert fake_upstream.last_request["headers"] == {
         "Authorization": "Bearer explicit-key"
     }
+
+
+def test_probe_rejects_new_base_url_without_api_key(client, monkeypatch, fake_upstream):
+    """Never forward the stored key to a host chosen by the request."""
+    monkeypatch.setattr(settings, "openai_base_url", "https://stored.example/v1")
+    monkeypatch.setattr(settings, "openai_api_key", "stored-secret-key")
+
+    response = client.post(
+        TEST_URL,
+        json={"section": "llm", "base_url": "https://attacker.example/v1"},
+    )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "base_url" in detail
+    assert "api_key" in detail
+    assert "stored-secret-key" not in response.text
+    # The stored key was never sent anywhere.
+    assert fake_upstream.last_request == {}
+
+
+def test_probe_treats_trailing_slash_as_same_base_url(client, monkeypatch, fake_upstream):
+    monkeypatch.setattr(settings, "openai_base_url", "https://stored.example/v1/")
+    monkeypatch.setattr(settings, "openai_api_key", "stored-secret-key")
+
+    response = client.post(
+        TEST_URL,
+        json={"section": "llm", "base_url": "https://stored.example/v1"},
+    )
+
+    assert response.status_code == 200
+    assert fake_upstream.last_request["url"] == "https://stored.example/v1/models"
+    assert fake_upstream.last_request["headers"] == {
+        "Authorization": "Bearer stored-secret-key"
+    }
+
+
+def test_probe_omits_authorization_without_any_key(client, monkeypatch, fake_upstream):
+    monkeypatch.setattr(settings, "openai_base_url", "https://llm.example/v1")
+    monkeypatch.setattr(settings, "openai_api_key", "")
+
+    response = client.post(TEST_URL, json={"section": "llm"})
+
+    assert response.status_code == 200
+    assert fake_upstream.last_request["headers"] == {}
+    assert "Authorization" not in fake_upstream.last_request["headers"]
+
+
+def test_probe_returns_model_ids_from_upstream_data(client, monkeypatch, fake_upstream):
+    monkeypatch.setattr(settings, "openai_base_url", "https://llm.example/v1")
+    monkeypatch.setattr(settings, "openai_api_key", "stored-key")
+    fake_upstream.response = _FakeUpstreamResponse(
+        payload={
+            "data": [
+                {"id": "model-a"},
+                {"id": 123},
+                "not-a-dict",
+                {"id": ""},
+                {"id": "model-b"},
+                {},
+            ]
+        }
+    )
+
+    response = client.post(TEST_URL, json={"section": "llm"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["models"] == ["model-a", "model-b"]
+    assert body["model_count"] == 6
 
 
 @pytest.mark.parametrize(

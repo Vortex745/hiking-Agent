@@ -55,6 +55,7 @@ export interface LlmConfigDraft {
 export interface LlmConfigTestResult {
   latencyMs: number
   modelCount: number
+  models: string[]
 }
 
 export class LlmConfigError extends Error {
@@ -251,9 +252,14 @@ export async function testLlmConfig(
   if (latency === null || modelCount === null) {
     throw new Error('测速响应格式异常')
   }
+  const rawModels = isRecord(payload) ? payload.models : null
+  const models = Array.isArray(rawModels)
+    ? rawModels.filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+    : []
   return {
     latencyMs: Math.max(1, Math.round(latency)),
     modelCount: Math.round(modelCount),
+    models,
   }
 }
 

@@ -430,7 +430,7 @@ def update_runtime_config(
     if not env_updates:
         return []
 
-    target = Path(env_path) if env_path is not None else Path(__file__).with_name(".env")
+    target = Path(env_path) if env_path is not None else ENV_PATH
 
     with _RUNTIME_CONFIG_LOCK:
         current_values = _read_env_values(target)
