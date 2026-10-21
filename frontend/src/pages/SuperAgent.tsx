@@ -584,6 +584,26 @@ function SuperAgent() {
     if (event.type === 'approval.resolved') {
       setV2ApprovalState('resolved')
       setPendingApproval(null)
+
+      // Forward the resolution into the message's trace events so the inline
+      // activity trace settles its approval wait line.
+      const traceEvent: AgentTraceEvent = {
+        type: 'approval_resolved',
+        content: '',
+        metadata: event.payload as Record<string, unknown>,
+      }
+      setMessages(prev => {
+        const updated = [...prev]
+        const last = updated[updated.length - 1]
+        if (last && last.role === 'assistant') {
+          updated[updated.length - 1] = {
+            ...last,
+            traceEvents: [...(last.traceEvents || []), traceEvent],
+            isStreaming: true,
+          }
+        }
+        return updated
+      })
     }
     if (event.type === 'memory.consent_required') {
       setPendingMemoryConsent(next.pendingMemoryConsent)
