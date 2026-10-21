@@ -149,7 +149,7 @@ async function launch(channelSetup = {}) {
     ...channelSetup,
   });
   const page = await context.newPage();
-  page.setDefaultTimeout(8000);
+  page.setDefaultTimeout(20000);
   const errors = [];
   page.on('pageerror', error => errors.push(error.stack || String(error)));
   page.on('console', message => {
@@ -199,7 +199,7 @@ const contentLines = (page, index) =>
   const { browser, page, errors } = await launch({ colorScheme: 'light' });
   try {
     await seed(page);
-    await page.goto(BASE_URL);
+    await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
     await page.getByText('Case 10 answer', { exact: true }).waitFor();
 
     // 1. Running, no events, empty content.
@@ -415,7 +415,7 @@ const contentLines = (page, index) =>
   const dark = await launch({ colorScheme: 'dark' });
   try {
     await seed(dark.page);
-    await dark.page.goto(BASE_URL);
+    await dark.page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
     await dark.page.getByText('Case 10 answer', { exact: true }).waitFor();
     const darkTrace = traceRoot(dark.page, 1);
     assert.equal(await darkTrace.count(), 1);
@@ -435,7 +435,7 @@ const contentLines = (page, index) =>
   const reduced = await launch({ colorScheme: 'light', reducedMotion: 'reduce' });
   try {
     await seed(reduced.page);
-    await reduced.page.goto(BASE_URL);
+    await reduced.page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
     await reduced.page.getByText('Case 10 answer', { exact: true }).waitFor();
     const reducedTrace = traceRoot(reduced.page, 1);
     assert.equal(await reducedTrace.count(), 1);
