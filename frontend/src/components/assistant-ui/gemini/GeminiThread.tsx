@@ -18,6 +18,11 @@ import Download from 'reicon-react/icons/Download';
 import { getConversationMemoryProgress } from '../../../api/conversationMemory';
 import { API } from '../../../api/config';
 import { StreamingText, useStreamingText } from '../../StreamingText';
+import { AgentActivityTrace } from '../../agent-activity/AgentActivityTrace';
+import {
+  buildAgentActivity,
+  readActivityEvents,
+} from '../../agent-activity/agentActivityModel';
 import { useRef, useState, createContext, useContext, useCallback, useEffect, useLayoutEffect, type RefObject, type PointerEvent as ReactPointerEvent } from 'react';
 import gsap from 'gsap';
 import { useGSAP } from '@gsap/react';
@@ -29,7 +34,6 @@ interface GeminiThreadProps {
   /** Called when user clicks "regenerate" — parent should resend the last user prompt */
   onRegenerate?: () => void;
   onUploadClick?: () => void;
-  onConfirmTool?: (confirmationId: string, action: 'confirm' | 'reject') => void;
   /** Real message count from the parent page's state (for accurate memory meter) */
   realMessageCount?: number;
 }
@@ -37,12 +41,11 @@ interface GeminiThreadProps {
 /** Context to pass callbacks down to ChatMessage without prop drilling */
 const ThreadActionsContext = createContext<{
   onRegenerate?: () => void;
-  onConfirmTool?: (confirmationId: string, action: 'confirm' | 'reject') => void;
   realMessageCount: number;
 }>({ realMessageCount: 0 });
 
-export const GeminiThread = ({ emptyTitle, onRegenerate, onUploadClick, onConfirmTool, realMessageCount = 0 }: GeminiThreadProps) => (
-  <ThreadActionsContext.Provider value={{ onRegenerate, onConfirmTool, realMessageCount }}>
+export const GeminiThread = ({ emptyTitle, onRegenerate, onUploadClick, realMessageCount = 0 }: GeminiThreadProps) => (
+  <ThreadActionsContext.Provider value={{ onRegenerate, realMessageCount }}>
     <ThreadPrimitive.Root className="h-full bg-[#fdfcfc] dark:bg-[#131314] flex flex-col overflow-hidden w-full relative">
       <AuiIf condition={(s) => s.thread.isEmpty}>
         <EmptyState emptyTitle={emptyTitle} onUploadClick={onUploadClick} />
@@ -321,73 +324,13 @@ const ArtifactList = ({ artifacts }: { artifacts: any[] }) => {
 }
 
 const CustomToolCall = (part: any) => {
-  const { onConfirmTool } = useContext(ThreadActionsContext);
   const toolName = part.toolName || part.part?.toolName;
   const args = part.args || part.part?.args;
   
   if (toolName === "traceEvents") {
-    const traceEvents = args as any[];
-    if (!traceEvents || traceEvents.length === 0) return null;
-    return (
-      <details className="mt-4 border-t border-border/40 pt-3 text-[13px] text-text-secondary">
-        <summary className="cursor-pointer select-none font-medium text-text-primary outline-none">
-          思考流程信息 · {traceEvents.length} 个步骤
-        </summary>
-        <div className="mt-3 max-h-[300px] overflow-y-auto space-y-3 opacity-90 pr-2 scrollbar-thin">
-          {traceEvents.map((event: any, idx: number) => {
-            const confirmationId = typeof event?.metadata?.confirmation_id === 'string'
-              ? event.metadata.confirmation_id
-              : '';
-            const confirmationStatus = typeof event?.metadata?.confirmation_status === 'string'
-              ? event.metadata.confirmation_status
-              : '';
-            const confirmationResolved = ['confirmed', 'rejected', 'already_resolved'].includes(confirmationStatus);
-            const confirmationBusy = ['confirming', 'rejecting'].includes(confirmationStatus);
-            return (
-              <div key={idx} className="border-l-2 border-primary/25 pl-3">
-                <div className="font-medium text-text-primary">
-                  {idx + 1}. {traceLabels[event?.type] || event?.type || '事件'}
-                </div>
-                {event?.content && (
-                  <div className="mt-1.5 whitespace-pre-wrap text-text-secondary">
-                    {event.content}
-                  </div>
-                )}
-                {event?.type === 'approval_required' && event?.metadata?.confirmation_id && confirmationId && (
-                  <div className="mt-2 flex flex-wrap items-center gap-2">
-                    <button
-                      type="button"
-                      title="确认执行工具"
-                      aria-label="确认执行工具"
-                      disabled={!onConfirmTool || confirmationResolved || confirmationBusy}
-                      onClick={() => onConfirmTool?.(confirmationId, 'confirm')}
-                      className="inline-flex min-h-8 items-center gap-1.5 rounded-md bg-[#0b57d0] px-2.5 py-1.5 text-[12px] font-medium text-white transition-colors hover:bg-[#0842a0] disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      <Check className="size-3.5" aria-hidden="true" />
-                      <span>确认</span>
-                    </button>
-                    <button
-                      type="button"
-                      title="拒绝执行工具"
-                      aria-label="拒绝执行工具"
-                      disabled={!onConfirmTool || confirmationResolved || confirmationBusy}
-                      onClick={() => onConfirmTool?.(confirmationId, 'reject')}
-                      className="inline-flex min-h-8 items-center gap-1.5 rounded-md border border-border/70 bg-background px-2.5 py-1.5 text-[12px] font-medium text-text-primary transition-colors hover:border-red-500/60 hover:text-red-600 disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      <X className="size-3.5" aria-hidden="true" />
-                      <span>拒绝</span>
-                    </button>
-                    {confirmationStatus && (
-                      <span className="text-[12px] text-text-secondary">{confirmationStatus}</span>
-                    )}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      </details>
-    );
+    // The synthetic trace part is rendered by AgentActivityTrace above the
+    // answer; it must not also appear as an inline tool call.
+    return null;
   }
 
   if (toolName === "artifacts") {
@@ -576,18 +519,6 @@ function clampLifecyclePosition(position: LifecyclePosition): LifecyclePosition 
   };
 }
 
-function AiThinking({ text = '模型思考中' }: { text?: string }) {
-  return (
-    <div className="ai-thinking mt-1" role="status" aria-label="AI 正在思考">
-      <span className="ai-thinking-label">
-        <span key={text} className="font-medium bg-gradient-to-r from-[#a3a3a3] via-[#111] to-[#a3a3a3] dark:from-[#5f6368] dark:via-[#ffffff] dark:to-[#5f6368] bg-[length:200%_auto] bg-clip-text text-transparent animate-shimmer">
-          {text}
-        </span>
-      </span>
-    </div>
-  );
-}
-
 const LifecycleHoverPanel = ({
   content,
   isRunning,
@@ -769,20 +700,15 @@ const ChatMessage = () => {
   const lifecyclePositionRef = useRef(lifecyclePosition);
   const [lifecycleFlipBelow, setLifecycleFlipBelow] = useState(false);
   const messageContent = useMessage((state) => state.content) as any[] || [];
-  const messageRole = useMessage((state) => state.role);
   const messageStatusType = useMessage((state) => state.status?.type);
   const artifactArgs = getToolArgs(messageContent, "artifacts");
   const messageArtifacts = Array.isArray(artifactArgs) ? artifactArgs : [];
   const isMessageRunning = messageStatusType === 'running';
-  const isAssistantThinking = messageRole === 'assistant'
-    && isMessageRunning
-    && getMessageText(messageContent).trim().length === 0;
-
-  let thinkingText = '模型思考中';
-  if (isAssistantThinking) {
-    const lifecycle = buildLifecycle(messageContent, isMessageRunning);
-    // keep lifecycle evaluation if needed for other side effects, but text is fixed
-  }
+  const activityModel = buildAgentActivity({
+    events: readActivityEvents(messageContent),
+    isRunning: isMessageRunning,
+    hasText: getMessageText(messageContent).trim().length > 0,
+  });
 
   useEffect(() => {
     lifecyclePositionRef.current = lifecyclePosition;
@@ -935,9 +861,9 @@ const ChatMessage = () => {
         <AuiIf condition={(s) => s.message.role === "assistant"}>
           <div className="flex flex-col items-start w-full group">
             <div className="max-w-full text-[15px] text-[#1f1f1f] dark:text-[#e3e3e3] leading-relaxed break-words">
+              <AgentActivityTrace model={activityModel} className="mb-3" />
               <MessagePrimitive.Parts components={{ Text: MarkdownText, ToolCall: CustomToolCall } as any} />
               {messageArtifacts.length > 0 && <ArtifactList artifacts={messageArtifacts} />}
-              {isAssistantThinking && <AiThinking text={thinkingText} />}
             </div>
             
             {/* Action Bar — only show when not streaming */}

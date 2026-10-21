@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback, type ReactNode } from 'react'
+import { useState, useRef, useEffect, useCallback, type Dispatch, type ReactNode, type SetStateAction } from 'react'
 import { API } from '../api/config'
 import {
   createV2StreamConnection,
@@ -67,6 +67,40 @@ type AgentTraceEvent = {
   type: string
   content: string
   metadata?: Record<string, unknown>
+}
+type TraceAppendOptions = {
+  /** Replacement content; a function receives the current last message. */
+  content?: string | ((last: Message) => string)
+  /** Force the streaming flag. Omit to preserve the message's current value. */
+  isStreaming?: boolean
+}
+
+/**
+ * Appends a trace event to the last assistant message. All SSE branches use
+ * this helper; most force `isStreaming: true`, while a replayed
+ * `approval.resolved` omits it so a finished message stays finished.
+ */
+function appendTraceEvent(
+  setMessages: Dispatch<SetStateAction<Message[]>>,
+  traceEvent: AgentTraceEvent,
+  options: TraceAppendOptions = {},
+) {
+  const { content, isStreaming } = options
+  setMessages(prev => {
+    const updated = [...prev]
+    const last = updated[updated.length - 1]
+    if (!last || last.role !== 'assistant') return prev
+    const next: Message = {
+      ...last,
+      traceEvents: [...(last.traceEvents || []), traceEvent],
+    }
+    if (content !== undefined) {
+      next.content = typeof content === 'function' ? content(last) : content
+    }
+    if (isStreaming !== undefined) next.isStreaming = isStreaming
+    updated[updated.length - 1] = next
+    return updated
+  })
 }
 // A02: v2 artifact shape (payload of artifact.available). Download goes
 // through /api/v2/artifacts/{artifact_id} — no v1 download_url exists.
@@ -584,6 +618,16 @@ function SuperAgent() {
     if (event.type === 'approval.resolved') {
       setV2ApprovalState('resolved')
       setPendingApproval(null)
+
+      // Forward the resolution into the message's trace events so the inline
+      // activity trace settles its approval wait line. Preserve the current
+      // streaming flag: a replayed resolution must not reopen a finished run.
+      const traceEvent: AgentTraceEvent = {
+        type: 'approval_resolved',
+        content: '',
+        metadata: event.payload as Record<string, unknown>,
+      }
+      appendTraceEvent(setMessages, traceEvent)
     }
     if (event.type === 'memory.consent_required') {
       setPendingMemoryConsent(next.pendingMemoryConsent)
@@ -606,18 +650,7 @@ function SuperAgent() {
         content: typeof event.payload.content === 'string' ? event.payload.content : '',
         metadata: event.payload as Record<string, unknown>,
       }
-      setMessages(prev => {
-        const updated = [...prev]
-        const last = updated[updated.length - 1]
-        if (last && last.role === 'assistant') {
-          updated[updated.length - 1] = {
-            ...last,
-            traceEvents: [...(last.traceEvents || []), traceEvent],
-            isStreaming: true,
-          }
-        }
-        return updated
-      })
+      appendTraceEvent(setMessages, traceEvent, { isStreaming: true })
     } else if (event.type === 'artifact_candidate') {
       // A02: candidate artifact produced, host-side export pending.
       const traceEvent: AgentTraceEvent = {
@@ -628,18 +661,7 @@ function SuperAgent() {
             : '正在生成产物…',
         metadata: event.payload as Record<string, unknown>,
       }
-      setMessages(prev => {
-        const updated = [...prev]
-        const last = updated[updated.length - 1]
-        if (last && last.role === 'assistant') {
-          updated[updated.length - 1] = {
-            ...last,
-            traceEvents: [...(last.traceEvents || []), traceEvent],
-            isStreaming: true,
-          }
-        }
-        return updated
-      })
+      appendTraceEvent(setMessages, traceEvent, { isStreaming: true })
     } else if (event.type === 'artifact.available') {
       // A02: verified artifact ready — attach the download card to the
       // active assistant message. The payload is the public shape only.
@@ -671,19 +693,9 @@ function SuperAgent() {
         content: notice,
         metadata: event.payload as Record<string, unknown>,
       }
-      setMessages(prev => {
-        const updated = [...prev]
-        const last = updated[updated.length - 1]
-        if (last && last.role === 'assistant') {
-          const separator = last.content.trim() ? '\n\n' : ''
-          updated[updated.length - 1] = {
-            ...last,
-            content: `${last.content}${separator}[注意] ${notice}`,
-            traceEvents: [...(last.traceEvents || []), traceEvent],
-            isStreaming: true,
-          }
-        }
-        return updated
+      appendTraceEvent(setMessages, traceEvent, {
+        content: last => `${last.content}${last.content.trim() ? '\n\n' : ''}[注意] ${notice}`,
+        isStreaming: true,
       })
     } else if (event.type === 'approval.required') {
       // Surface the approval request as a trace event so the lifecycle
@@ -694,18 +706,7 @@ function SuperAgent() {
         content: '',
         metadata: event.payload as Record<string, unknown>,
       }
-      setMessages(prev => {
-        const updated = [...prev]
-        const last = updated[updated.length - 1]
-        if (last && last.role === 'assistant') {
-          updated[updated.length - 1] = {
-            ...last,
-            traceEvents: [...(last.traceEvents || []), traceEvent],
-            isStreaming: true,
-          }
-        }
-        return updated
-      })
+      appendTraceEvent(setMessages, traceEvent, { isStreaming: true })
     }
     // `progress` events update the v2 state (already done above) but do
     // not touch messages — the UI's thinking indicator reads from

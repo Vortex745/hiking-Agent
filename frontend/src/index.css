@@ -195,17 +195,6 @@
   }
 }
 
-@keyframes thinkingPulse {
-  0%, 100% {
-    opacity: 0.3;
-    transform: scale(0.8);
-  }
-  50% {
-    opacity: 1;
-    transform: scale(1.1);
-  }
-}
-
 .typing-indicator {
   animation: blink 1s step-end infinite;
 }
@@ -231,68 +220,6 @@
 
 .loading-dots span:nth-child(2) {
   animation-delay: -0.16s;
-}
-
-.ai-thinking {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  min-height: 24px;
-  color: var(--text-secondary);
-}
-
-.ai-thinking-core {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.ai-thinking-core span {
-  width: 5px;
-  height: 5px;
-  border-radius: 9999px;
-  background: currentColor;
-  animation: thinkingPulse 1.4s ease-in-out infinite;
-  will-change: transform, opacity;
-}
-
-.ai-thinking-core span:nth-child(2) {
-  animation-delay: 160ms;
-}
-
-.ai-thinking-core span:nth-child(3) {
-  animation-delay: 320ms;
-}
-
-.ai-thinking-line {
-  display: none;
-}
-
-.ai-thinking-label {
-  font-size: 13px;
-  font-weight: 400;
-  line-height: 1.2;
-  color: var(--text-secondary);
-  overflow: hidden;
-  display: inline-flex;
-  align-items: center;
-  height: 18px;
-}
-
-.ai-thinking-text-scroll {
-  display: inline-block;
-  animation: textScrollUp 0.4s cubic-bezier(0.22, 1, 0.36, 1) forwards;
-}
-
-@keyframes textScrollUp {
-  0% {
-    opacity: 0;
-    transform: translateY(100%);
-  }
-  100% {
-    opacity: 1;
-    transform: translateY(0);
-  }
 }
 
 .conversation-memory-meter {
@@ -528,5 +455,30 @@
   .t-panel-slide,
   .t-icon-swap .t-icon {
     transition: none !important;
+  }
+}
+
+/* Agent Activity Trace: scoped collapse animation driven by the Radix content height. */
+@keyframes trace-collapse-down {
+  from { height: 0; opacity: 0; }
+  to { height: var(--radix-collapsible-content-height); opacity: 1; }
+}
+
+@keyframes trace-collapse-up {
+  from { height: var(--radix-collapsible-content-height); opacity: 1; }
+  to { height: 0; opacity: 0; }
+}
+
+[data-slot="trace-collapsible"][data-animate="true"] [data-slot="trace-collapsible-content"][data-state="open"] {
+  animation: trace-collapse-down 240ms var(--ease-out);
+}
+
+[data-slot="trace-collapsible"][data-animate="true"] [data-slot="trace-collapsible-content"][data-state="closed"] {
+  animation: trace-collapse-up 160ms var(--ease-in-out);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-slot="trace-collapsible-content"] {
+    animation: none !important;
   }
 }
