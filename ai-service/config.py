@@ -444,3 +444,17 @@ def update_runtime_config(
             os.environ[key] = value
 
     return changed
+
+
+ENV_PATH = Path(__file__).with_name(".env")
+
+
+def env_file_updated_at() -> str | None:
+    """返回 .env 最后修改时间（UTC ISO8601）；文件不存在为 None。"""
+    from datetime import datetime, timezone
+
+    try:
+        mtime = ENV_PATH.stat().st_mtime
+    except OSError:
+        return None
+    return datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z")

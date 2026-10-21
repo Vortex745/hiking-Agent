@@ -147,6 +147,14 @@ try:
 except ImportError as e:
     logger.warning(f"✗ Models router unavailable: {e}")
 
+# LLM 配置路由: 仅本机可访问，读写 ai-service/.env
+try:
+    from api.llm_config_router import llm_config_router
+    app.include_router(llm_config_router, prefix="/api/v1")
+    logger.info("✓ LLM config router loaded")
+except ImportError as e:
+    logger.warning(f"✗ LLM config router unavailable: {e}")
+
 
 
 if __name__ == "__main__":
