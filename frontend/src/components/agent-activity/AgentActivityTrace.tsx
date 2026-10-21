@@ -39,13 +39,6 @@ const SUMMARY_ICONS = {
   pending: Clock,
 }
 
-function summaryStatus(model: AgentActivityModel): TraceStatus {
-  if (model.lines.some(line => line.status === 'error')) return 'error'
-  if (model.lines.some(line => line.status === 'pending')) return 'pending'
-  if (model.lines.some(line => line.status === 'running')) return 'running'
-  return 'done'
-}
-
 function lineIcon(line: ActivityLine) {
   if (line.status === 'error') return AlertTriangle
   if (line.status === 'pending') return Clock
@@ -80,19 +73,21 @@ export function AgentActivityTrace({
   className?: string
 }) {
   const [expanded, setExpanded] = useState(model.defaultExpanded)
-  const lastDefaultExpanded = useRef(model.defaultExpanded)
+  const lastStatus = useRef(model.status)
 
-  // A user toggle wins until the model asks for a different default (for
-  // example, a clean completion collapsing the trace).
+  // A user toggle wins until the summary status changes (for example, a
+  // clean completion or a failed step). Keying on the status, not the
+  // default-expanded boolean, lets a failed run re-expand even when the
+  // boolean was already true.
   useEffect(() => {
-    if (lastDefaultExpanded.current === model.defaultExpanded) return
-    lastDefaultExpanded.current = model.defaultExpanded
+    if (lastStatus.current === model.status) return
+    lastStatus.current = model.status
     setExpanded(model.defaultExpanded)
-  }, [model.defaultExpanded])
+  }, [model.status, model.defaultExpanded])
 
   if (!model.visible) return null
 
-  const status = summaryStatus(model)
+  const status = model.status
   const SummaryIcon = SUMMARY_ICONS[status]
   const summaryLineStatus = status === 'done' ? undefined : status
 
