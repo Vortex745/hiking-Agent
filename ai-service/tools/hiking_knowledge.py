@@ -15,6 +15,7 @@ from typing import Any
 
 from langchain_core.tools import tool
 
+from config import settings
 from rag.retriever import VectorStoreRetriever
 from rag.text_processing import clean_display_text
 
@@ -39,6 +40,7 @@ def _score_from_fields(doc: dict[str, Any]) -> float | None:
 _retrieval_stack_lock = threading.Lock()
 _retriever: VectorStoreRetriever | None = None
 _subgraph: Any = None
+_retrieval_stack_fingerprint: tuple[Any, ...] | None = None
 
 
 def _make_parent_retriever_fn(retriever: VectorStoreRetriever):
@@ -56,15 +58,51 @@ def _make_parent_retriever_fn(retriever: VectorStoreRetriever):
     return _fn
 
 
-def _get_retrieval_stack() -> tuple[VectorStoreRetriever, Any]:
-    """Lazily build, once per process, the retriever + compiled subgraph.
+def _embedding_fingerprint() -> tuple[Any, ...]:
+    """影响检索栈行为的配置指纹（embedding 客户端参数 + 索引文件路径）。"""
+    return (
+        settings.embedding_base_url,
+        settings.embedding_api_key,
+        settings.embedding_model,
+        settings.embedding_dimensions,
+        settings.rag_sqlite_db_path,
+    )
 
-    惰性构建保持 import 无副作用（不打开数据库文件）；构建加锁，竞态下
-    最坏情况是重复构建一次并整体替换，无正确性影响。
+
+def _close_retriever(retriever: VectorStoreRetriever) -> None:
+    """关闭被替换的检索栈，释放 SQLite 连接。
+
+    VectorStoreRetriever 自身暂无 close()（其 SQLite 适配器有），优先调用
+    公开 close，否则回退到公开 sqlite_store.close()。
     """
-    global _retriever, _subgraph
+    try:
+        closer = getattr(retriever, "close", None)
+        if callable(closer):
+            closer()
+            return
+        store = getattr(retriever, "sqlite_store", None)
+        store_closer = getattr(store, "close", None)
+        if callable(store_closer):
+            store_closer()
+    except Exception as exc:  # 关闭失败不应影响后续检索
+        logger.warning("closing stale retrieval stack failed: %s", exc)
+
+
+def _get_retrieval_stack() -> tuple[VectorStoreRetriever, Any]:
+    """Lazily build the retriever + compiled subgraph, keyed by config fingerprint.
+
+    惰性构建保持 import 无副作用（不打开数据库文件）；构建与替换持锁。
+    配置页保存 embedding 配置后指纹变化：先构建新栈，成功后再关闭并替换
+    旧栈（构建失败时保留旧栈可用）。
+    """
+    global _retriever, _subgraph, _retrieval_stack_fingerprint
     with _retrieval_stack_lock:
-        if _subgraph is None:
+        fingerprint = _embedding_fingerprint()
+        if (
+            _retriever is None
+            or _subgraph is None
+            or _retrieval_stack_fingerprint != fingerprint
+        ):
             from rag.retrieve_subgraph import build_retrieve_subgraph
 
             retriever = VectorStoreRetriever()
@@ -72,8 +110,12 @@ def _get_retrieval_stack() -> tuple[VectorStoreRetriever, Any]:
                 retriever=retriever,
                 parent_retriever_fn=_make_parent_retriever_fn(retriever),
             )
+            stale_retriever = _retriever
             _retriever = retriever
             _subgraph = subgraph
+            _retrieval_stack_fingerprint = fingerprint
+            if stale_retriever is not None:
+                _close_retriever(stale_retriever)
     return _retriever, _subgraph
 
 

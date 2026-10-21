@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 
@@ -142,6 +143,51 @@ def _verify_vec0_table_exists(conn: sqlite3.Connection) -> None:
         raise sqlite3.OperationalError("child_vec virtual table not created")
 
 
+_VEC0_DIMENSIONS_RE = re.compile(r"float\[(\d+)\]")
+
+
+def read_vec0_dimensions(db_path: Path | str | None) -> int | None:
+    """读取现有索引里 child_vec 声明的向量维度。
+
+    sqlite-vec 不暴露维度查询接口，只能从 sqlite_master 的建表 DDL
+    （`embedding float[N]`）解析。文件/表不存在、DDL 不含维度或解析失败
+    均返回 None，不抛异常、不创建数据库文件。
+    """
+    if not db_path:
+        return None
+    path = Path(db_path)
+    try:
+        if not path.is_file():
+            return None
+        conn: sqlite3.Connection | None = sqlite3.connect(
+            f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=1
+        )
+    except (OSError, ValueError, sqlite3.Error):
+        return None
+
+    try:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'child_vec'"
+        ).fetchone()
+    except (sqlite3.Error, OSError):
+        return None
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+
+    if not row or not row[0]:
+        return None
+    match = _VEC0_DIMENSIONS_RE.search(row[0])
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
 def connect(
     db_path: Path | str,
     embedding_dimensions: int = DEFAULT_EMBEDDING_DIMENSIONS,
@@ -176,4 +222,5 @@ __all__ = [
     "apply_pragmas",
     "connect",
     "init_schema",
+    "read_vec0_dimensions",
 ]
