@@ -530,3 +530,28 @@
     transition: none !important;
   }
 }
+
+/* Agent Activity Trace: scoped collapse animation driven by the Radix content height. */
+@keyframes trace-collapse-down {
+  from { height: 0; opacity: 0; }
+  to { height: var(--radix-collapsible-content-height); opacity: 1; }
+}
+
+@keyframes trace-collapse-up {
+  from { height: var(--radix-collapsible-content-height); opacity: 1; }
+  to { height: 0; opacity: 0; }
+}
+
+[data-slot="trace-collapsible-content"][data-state="open"] {
+  animation: trace-collapse-down 240ms var(--ease-out);
+}
+
+[data-slot="trace-collapsible-content"][data-state="closed"] {
+  animation: trace-collapse-up 160ms var(--ease-in-out);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-slot="trace-collapsible-content"] {
+    animation: none !important;
+  }
+}
