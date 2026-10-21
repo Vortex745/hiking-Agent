@@ -247,6 +247,32 @@ def test_update_runtime_config_creates_missing_env_file(tmp_path):
     assert settings.embedding_model == "fresh-embed"
 
 
+def test_update_runtime_config_retries_transient_replace_permission_error(
+    tmp_path, monkeypatch
+):
+    env_path = _write_env(tmp_path / ".env", "OPENAI_MODEL=old-model\n")
+    real_set_key = config.set_key
+    calls = {"count": 0}
+
+    def flaky_set_key(path, key, value):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            # Windows: freshly written temp files can be briefly locked.
+            raise PermissionError("transient lock")
+        return real_set_key(path, key, value)
+
+    monkeypatch.setattr(config, "set_key", flaky_set_key)
+
+    changed = config.update_runtime_config(
+        {"llm": {"model": "retried-model"}}, env_path=env_path
+    )
+
+    assert changed == ["OPENAI_MODEL"]
+    assert calls["count"] == 2
+    assert dotenv_values(env_path)["OPENAI_MODEL"] == "retried-model"
+    assert settings.openai_model == "retried-model"
+
+
 def test_read_vec0_dimensions_reads_temp_vec0_table(tmp_path):
     db_path = tmp_path / "rag.sqlite"
     conn = sqlite_schema.connect(db_path, embedding_dimensions=1024)

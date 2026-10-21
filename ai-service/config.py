@@ -4,6 +4,7 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -326,6 +327,24 @@ def _read_env_values(env_path: Path) -> dict[str, str]:
     return {key: value for key, value in values.items() if value is not None}
 
 
+def _set_env_key_with_retry(tmp_path: Path, key: str, value: str) -> None:
+    """dotenv.set_key 的 Windows 兼容包装。
+
+    Windows 上刚写出的临时文件可能被索引/杀毒进程短暂占用，set_key 内部的
+    os.replace 会抛 PermissionError。set_key 失败时目标文件保持不变，重试安全。
+    """
+    delay = 0.02
+    for attempt in range(6):
+        try:
+            set_key(str(tmp_path), key, value)
+            return
+        except PermissionError:
+            if attempt == 5:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.2)
+
+
 def _write_env_atomic(env_path: Path, updates: dict[str, str]) -> None:
     """同目录临时文件 + os.replace 原子替换，保留其他键与注释。
 
@@ -342,7 +361,7 @@ def _write_env_atomic(env_path: Path, updates: dict[str, str]) -> None:
         if env_path.is_file():
             shutil.copy2(env_path, tmp_path)
         for key, value in updates.items():
-            set_key(str(tmp_path), key, value)
+            _set_env_key_with_retry(tmp_path, key, value)
         os.replace(tmp_path, env_path)
     except BaseException:
         try:
