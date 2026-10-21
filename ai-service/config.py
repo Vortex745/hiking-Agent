@@ -1,9 +1,14 @@
 import os
 import json
 import re
+import shutil
+import tempfile
+import threading
+import time
 from pathlib import Path
+from typing import Any
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv, set_key
 
 
 if not os.getenv("VERCEL"):
@@ -239,3 +244,203 @@ class Settings:
 
 
 settings = Settings().load()
+
+
+# --- 运行时配置热更新 -------------------------------------------------------
+# 本模块是唯一知道 .env 键名与文件格式的地方；路由层只提交字段字典。
+
+_RUNTIME_CONFIG_LOCK = threading.Lock()
+
+_SECTION_FIELD_ENV_KEYS: dict[str, dict[str, str]] = {
+    "llm": {
+        "base_url": "OPENAI_BASE_URL",
+        "api_key": "OPENAI_API_KEY",
+        "model": "OPENAI_MODEL",
+    },
+    "embedding": {
+        "base_url": "EMBEDDING_BASE_URL",
+        "api_key": "EMBEDDING_API_KEY",
+        "model": "EMBEDDING_MODEL",
+        "dimensions": "EMBEDDING_DIMENSIONS",
+    },
+    "rerank": {
+        "base_url": "RERANK_BASE_URL",
+        "api_key": "RERANK_API_KEY",
+        "model": "RERANK_MODEL",
+    },
+}
+
+_SECTION_FIELD_SETTINGS_ATTRS: dict[str, dict[str, str]] = {
+    "llm": {
+        "base_url": "openai_base_url",
+        "api_key": "openai_api_key",
+        "model": "openai_model",
+    },
+    "embedding": {
+        "base_url": "embedding_base_url",
+        "api_key": "embedding_api_key",
+        "model": "embedding_model",
+        "dimensions": "embedding_dimensions",
+    },
+    "rerank": {
+        "base_url": "rerank_base_url",
+        "api_key": "rerank_api_key",
+        "model": "rerank_model",
+    },
+}
+
+
+def _parse_runtime_dimensions(value: Any) -> int:
+    """把 dimensions 解析为正整数；布尔/小数/非数字/非正数一律拒绝。"""
+    if isinstance(value, bool):
+        raise ValueError(f"dimensions must be a positive integer, got: {value!r}")
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError(f"dimensions must be a positive integer, got: {value!r}")
+        value = int(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not re.fullmatch(r"\d+", text):
+            raise ValueError(f"dimensions must be a positive integer, got: {value!r}")
+        value = int(text)
+    if not isinstance(value, int):
+        raise ValueError(f"dimensions must be a positive integer, got: {value!r}")
+    if value <= 0:
+        raise ValueError(f"dimensions must be a positive integer, got: {value!r}")
+    return value
+
+
+def _parse_runtime_text(section: str, field: str, value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{section}.{field} must be a non-empty string")
+    return value.strip()
+
+
+def _read_env_values(env_path: Path) -> dict[str, str]:
+    """读取现有 .env 的原始值（不做变量插值），用于判断实际变更的键。"""
+    if not env_path.is_file():
+        return {}
+    try:
+        values = dotenv_values(env_path, interpolate=False)
+    except (OSError, ValueError):
+        return {}
+    return {key: value for key, value in values.items() if value is not None}
+
+
+def _set_env_key_with_retry(tmp_path: Path, key: str, value: str) -> None:
+    """dotenv.set_key 的 Windows 兼容包装。
+
+    Windows 上刚写出的临时文件可能被索引/杀毒进程短暂占用，set_key 内部的
+    os.replace 会抛 PermissionError。set_key 失败时目标文件保持不变，重试安全。
+    """
+    delay = 0.02
+    for attempt in range(6):
+        try:
+            set_key(str(tmp_path), key, value)
+            return
+        except PermissionError:
+            if attempt == 5:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.2)
+
+
+def _write_env_atomic(env_path: Path, updates: dict[str, str]) -> None:
+    """同目录临时文件 + os.replace 原子替换，保留其他键与注释。
+
+    临时文件与目标同目录，避免跨盘 os.replace 失败；替换前对副本调用
+    dotenv.set_key，原文件在替换成功前保持不变。
+    """
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{env_path.name}.", suffix=".tmp", dir=str(env_path.parent)
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        if env_path.is_file():
+            shutil.copy2(env_path, tmp_path)
+        for key, value in updates.items():
+            _set_env_key_with_retry(tmp_path, key, value)
+        os.replace(tmp_path, env_path)
+    except BaseException:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def update_runtime_config(
+    sections: dict[str, dict[str, Any]],
+    env_path: str | Path | None = None,
+) -> list[str]:
+    """校验并持久化 LLM/embedding/rerank 配置，同时热更新进程内 settings。
+
+    Args:
+        sections: 形如 {"llm": {"base_url": ..., "model": ..., "api_key": ...}}；
+            api_key 为 None 或空串表示保持原值（不写文件、不改内存）。
+        env_path: 目标 .env；默认 ai-service/.env。
+
+    Returns:
+        实际发生变化的 env 键名（值未变化的键不计入）。
+
+    Raises:
+        ValueError: sections 结构、字段名或字段值非法（此时不落盘、不改内存）。
+        OSError: .env 不可写（此时 settings/os.environ 保持原值）。
+    """
+    if not isinstance(sections, dict):
+        raise ValueError("sections must be a mapping")
+
+    unknown_sections = set(sections) - set(_SECTION_FIELD_ENV_KEYS)
+    if unknown_sections:
+        raise ValueError(f"unknown config sections: {sorted(unknown_sections)}")
+
+    # 先完成全部解析与校验，校验失败不得留下半更新状态。
+    env_updates: dict[str, str] = {}
+    settings_updates: dict[str, Any] = {}
+    for section_name, section in sections.items():
+        if not isinstance(section, dict):
+            raise ValueError(f"section {section_name!r} must be a mapping")
+        field_env_keys = _SECTION_FIELD_ENV_KEYS[section_name]
+        unknown_fields = set(section) - set(field_env_keys)
+        if unknown_fields:
+            raise ValueError(
+                f"unknown fields in section {section_name!r}: {sorted(unknown_fields)}"
+            )
+        for field, env_key in field_env_keys.items():
+            if field not in section:
+                continue
+            raw_value = section[field]
+            if field == "api_key":
+                if raw_value is None:
+                    continue
+                if not isinstance(raw_value, str):
+                    raise ValueError(f"{section_name}.api_key must be a string")
+                value = raw_value.strip()
+                if not value:
+                    continue
+            elif field == "dimensions":
+                value = _parse_runtime_dimensions(raw_value)
+            else:
+                value = _parse_runtime_text(section_name, field, raw_value)
+            env_updates[env_key] = str(value)
+            settings_updates[_SECTION_FIELD_SETTINGS_ATTRS[section_name][field]] = value
+
+    if not env_updates:
+        return []
+
+    target = Path(env_path) if env_path is not None else Path(__file__).with_name(".env")
+
+    with _RUNTIME_CONFIG_LOCK:
+        current_values = _read_env_values(target)
+        changed = [key for key, value in env_updates.items() if current_values.get(key) != value]
+        if changed:
+            _write_env_atomic(target, {key: env_updates[key] for key in changed})
+        # 持久化成功后再应用，写盘失败时内存状态保持不变。
+        for attr, value in settings_updates.items():
+            setattr(settings, attr, value)
+        for key, value in env_updates.items():
+            os.environ[key] = value
+
+    return changed
