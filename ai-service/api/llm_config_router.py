@@ -1,0 +1,238 @@
+"""LLM/embedding/rerank 配置读写与连通性测试。
+
+路由只负责：本机来源校验、参数校验、调用 ``config``/``rag`` 助手、组装响应。
+它不知道 .env 键名，也不 import ``tools.hiking_knowledge``。
+"""
+
+import logging
+import os
+import time
+
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Request
+
+import config
+from api.models import (
+    LlmConfigEmbeddingSectionResponse,
+    LlmConfigResponse,
+    LlmConfigSectionResponse,
+    LlmConfigTestRequest,
+    LlmConfigTestResponse,
+    LlmConfigUpdateRequest,
+    LlmConfigUpdateResponse,
+)
+from config import settings
+from rag.sqlite_schema import read_vec0_dimensions
+
+logger = logging.getLogger("ai-service.llm_config")
+
+_ALLOWED_ORIGINS = frozenset(
+    {
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
+    }
+)
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})
+
+
+def require_local_request(request: Request) -> None:
+    """拒绝非本机来源、非白名单 Origin 与 Vercel 环境。"""
+    if os.getenv("VERCEL"):
+        raise HTTPException(status_code=403, detail="llm-config 在 Vercel 环境不可用")
+
+    client = request.client
+    if client is None or client.host not in _LOOPBACK_HOSTS:
+        raise HTTPException(status_code=403, detail="llm-config 仅允许本机访问")
+
+    origin = request.headers.get("origin")
+    if origin and origin not in _ALLOWED_ORIGINS:
+        raise HTTPException(status_code=403, detail="Origin 不在允许列表")
+
+
+llm_config_router = APIRouter(
+    prefix="/llm-config", dependencies=[Depends(require_local_request)]
+)
+
+
+def _mask_api_key(value: str) -> tuple[str, bool]:
+    """返回 (打码值, 是否已设置)；永不返回明文。"""
+    if not value:
+        return "", False
+    if len(value) < 10:
+        return "已设置", True
+    return f"{value[:4]}...{value[-4:]}", True
+
+
+def _build_snapshot() -> LlmConfigResponse:
+    llm_masked, llm_set = _mask_api_key(settings.openai_api_key)
+    embedding_masked, embedding_set = _mask_api_key(settings.embedding_api_key)
+    rerank_masked, rerank_set = _mask_api_key(settings.rerank_api_key)
+
+    return LlmConfigResponse(
+        llm=LlmConfigSectionResponse(
+            base_url=settings.openai_base_url,
+            model=settings.openai_model,
+            api_key_masked=llm_masked,
+            api_key_set=llm_set,
+        ),
+        embedding=LlmConfigEmbeddingSectionResponse(
+            base_url=settings.embedding_base_url,
+            model=settings.embedding_model,
+            dimensions=settings.embedding_dimensions,
+            api_key_masked=embedding_masked,
+            api_key_set=embedding_set,
+        ),
+        rerank=LlmConfigSectionResponse(
+            base_url=settings.rerank_base_url,
+            model=settings.rerank_model,
+            api_key_masked=rerank_masked,
+            api_key_set=rerank_set,
+        ),
+        updated_at=config.env_file_updated_at(),
+        index_dimensions=read_vec0_dimensions(settings.rag_sqlite_db_path),
+    )
+
+
+@llm_config_router.get("", response_model=LlmConfigResponse)
+async def get_llm_config() -> LlmConfigResponse:
+    return _build_snapshot()
+
+
+_REQUIRED_SECTIONS = ("llm", "embedding", "rerank")
+_DIMENSIONS_MIN = 64
+_DIMENSIONS_MAX = 4096
+
+
+def _require_non_empty(section_name: str, field: str, value: str | None) -> str:
+    if value is None or not value.strip():
+        raise HTTPException(
+            status_code=400, detail=f"{section_name}.{field} 不能为空"
+        )
+    return value.strip()
+
+
+def _validate_update(payload: LlmConfigUpdateRequest) -> dict[str, dict[str, object]]:
+    """把线上请求收敛成 config.update_runtime_config 接受的字段字典。"""
+    sections: dict[str, dict[str, object]] = {}
+    for section_name in _REQUIRED_SECTIONS:
+        section = getattr(payload, section_name)
+        if section is None:
+            raise HTTPException(
+                status_code=400, detail=f"缺少 {section_name} 配置"
+            )
+        validated: dict[str, object] = {
+            "base_url": _require_non_empty(section_name, "base_url", section.base_url),
+            "model": _require_non_empty(section_name, "model", section.model),
+            "api_key": section.api_key,
+        }
+        if section_name == "embedding":
+            dimensions = section.dimensions
+            if dimensions is None:
+                raise HTTPException(
+                    status_code=400, detail="embedding.dimensions 不能为空"
+                )
+            if not _DIMENSIONS_MIN <= dimensions <= _DIMENSIONS_MAX:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"embedding.dimensions 必须在 "
+                        f"{_DIMENSIONS_MIN}..{_DIMENSIONS_MAX} 之间"
+                    ),
+                )
+            validated["dimensions"] = dimensions
+        sections[section_name] = validated
+    return sections
+
+
+@llm_config_router.put("", response_model=LlmConfigUpdateResponse)
+async def update_llm_config(
+    payload: LlmConfigUpdateRequest,
+) -> LlmConfigUpdateResponse:
+    sections = _validate_update(payload)
+    requested_dimensions = sections["embedding"]["dimensions"]
+
+    # 维度冲突必须在任何写入之前拒绝，避免配置与索引永久不一致。
+    index_dimensions = read_vec0_dimensions(settings.rag_sqlite_db_path)
+    if index_dimensions is not None and index_dimensions != requested_dimensions:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"embedding.dimensions={requested_dimensions} 与索引实际维度 "
+                f"{index_dimensions} 不一致，需重建索引"
+            ),
+        )
+
+    previous_embedding_base_url = settings.embedding_base_url
+    previous_embedding_model = settings.embedding_model
+    try:
+        changed = config.update_runtime_config(
+            sections, env_path=config.ENV_PATH
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError:
+        logger.exception("llm-config write failed")
+        raise HTTPException(status_code=500, detail=".env 写入失败，配置未保存")
+
+    # 只记录变更字段名，绝不记录字段值。
+    logger.info("llm-config updated fields: %s", ", ".join(changed) or "(none)")
+
+    snapshot = _build_snapshot()
+    return LlmConfigUpdateResponse(
+        **snapshot.model_dump(),
+        reindex_recommended=(
+            settings.embedding_base_url != previous_embedding_base_url
+            or settings.embedding_model != previous_embedding_model
+        ),
+    )
+
+
+_SECTION_SETTINGS_ATTRS = {
+    "llm": ("openai_base_url", "openai_api_key"),
+    "embedding": ("embedding_base_url", "embedding_api_key"),
+    "rerank": ("rerank_base_url", "rerank_api_key"),
+}
+_PROBE_TIMEOUT_SECONDS = 15.0
+
+
+@llm_config_router.post("/test", response_model=LlmConfigTestResponse)
+async def test_llm_config(
+    payload: LlmConfigTestRequest,
+) -> LlmConfigTestResponse:
+    """探测上游 /models；空 base_url/api_key 回退已存配置，不落盘。"""
+    base_url_attr, api_key_attr = _SECTION_SETTINGS_ATTRS[payload.section]
+    base_url = (payload.base_url or "").strip() or getattr(settings, base_url_attr)
+    if not base_url.strip():
+        raise HTTPException(
+            status_code=400, detail=f"{payload.section}.base_url 未配置"
+        )
+    api_key = (payload.api_key or "").strip() or getattr(settings, api_key_attr)
+    url = f"{base_url.strip().rstrip('/')}/models"
+
+    started = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT_SECONDS) as upstream:
+            response = await upstream.get(
+                url, headers={"Authorization": f"Bearer {api_key}"}
+            )
+    except httpx.RequestError:
+        logger.warning("llm-config probe cannot connect section=%s", payload.section)
+        raise HTTPException(status_code=502, detail="无法连接上游模型服务")
+    latency_ms = int((time.perf_counter() - started) * 1000)
+
+    if response.status_code in (401, 403):
+        raise HTTPException(status_code=response.status_code, detail="上游拒绝访问")
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=502, detail=f"上游返回 {response.status_code}"
+        )
+
+    try:
+        data = response.json()
+    except ValueError:
+        raise HTTPException(status_code=502, detail="上游响应不是有效 JSON")
+    models = data.get("data") if isinstance(data, dict) else None
+    model_count = len(models) if isinstance(models, list) else 0
+    return LlmConfigTestResponse(latency_ms=latency_ms, model_count=model_count)
