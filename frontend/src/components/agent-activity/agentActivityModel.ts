@@ -171,6 +171,7 @@ export function buildAgentActivity(input: {
   const lines: ActivityLine[] = [];
   // Tracks whether the last meaningful event is an unresolved approval.
   let lastApprovalUnresolved = false;
+  let hasRejectedApproval = false;
 
   events.forEach((event, index) => {
     const metadata = event.metadata;
@@ -283,8 +284,59 @@ export function buildAgentActivity(input: {
           status: 'pending',
           title: tool ? `等待确认：${toolAction(tool)}` : '等待你的确认',
         };
+        if (tool) line.toolName = tool;
         if (message) line.description = message;
         lines.push(line);
+        return;
+      }
+
+      case 'approval_resolved': {
+        // The page forwards the approval.resolved SSE payload into the trace
+        // so the wait line can settle without the presenter knowing about
+        // approvals.
+        const tool = readMetadataText(metadata, 'tool');
+        const decision = readMetadataText(metadata, 'decision');
+        const status = readMetadataText(metadata, 'status');
+        const approved = decision === 'approve' || status === 'approved';
+        const rejected = decision === 'reject' || status === 'rejected';
+        if (!approved && !rejected) return;
+
+        lastApprovalUnresolved = false;
+        if (rejected) hasRejectedApproval = true;
+
+        let pendingIndex = -1;
+        for (let i = lines.length - 1; i >= 0; i -= 1) {
+          const candidate = lines[i];
+          if (
+            !candidate ||
+            candidate.kind !== 'approval' ||
+            candidate.status !== 'pending'
+          ) {
+            continue;
+          }
+          if (tool && candidate.toolName && candidate.toolName !== tool) continue;
+          pendingIndex = i;
+          break;
+        }
+        if (pendingIndex < 0) return;
+
+        const pending = lines[pendingIndex];
+        if (!pending) return;
+
+        const action = tool
+          ? toolAction(tool)
+          : pending.toolName
+            ? toolAction(pending.toolName)
+            : pending.title.replace(/^等待确认[:：]\s*/, '');
+        const settled: ActivityLine = {
+          ...pending,
+          status: approved ? 'done' : 'error',
+          title: `${approved ? '已确认' : '已拒绝'}：${action}`,
+        };
+        delete settled.description;
+        const resolvedMessage = readMetadataText(metadata, 'message');
+        if (resolvedMessage) settled.description = resolvedMessage;
+        lines[pendingIndex] = settled;
         return;
       }
 
@@ -313,7 +365,7 @@ export function buildAgentActivity(input: {
           id: 'state-answer',
           kind: 'answer',
           status: 'running',
-          title: '正在生成回答',
+          title: '正在整理答案',
         });
       }
     } else if (hasText) {
@@ -321,14 +373,14 @@ export function buildAgentActivity(input: {
         id: 'state-answer',
         kind: 'answer',
         status: 'running',
-        title: '正在生成回答',
+        title: '正在整理答案',
       });
     } else {
       lines.push({
         id: 'state-thinking',
         kind: 'thought',
         status: 'running',
-        title: '正在思考',
+        title: '正在理解你的问题与上下文',
       });
     }
   }
@@ -351,6 +403,8 @@ export function buildAgentActivity(input: {
   let summary: string;
   if (approvalWait) {
     summary = '等待你的确认';
+  } else if (hasRejectedApproval) {
+    summary = '操作已拒绝';
   } else if (hasError) {
     summary = '有步骤执行失败';
   } else if (isRunning) {
@@ -368,7 +422,7 @@ export function buildAgentActivity(input: {
   return {
     visible: true,
     summary,
-    defaultExpanded: isRunning || approvalWait || hasError,
+    defaultExpanded: isRunning || approvalWait || hasError || hasRejectedApproval,
     lines,
   };
 }
