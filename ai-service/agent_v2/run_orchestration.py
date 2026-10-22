@@ -229,6 +229,15 @@ def mark_terminal_safe(
             runs_repo.mark_run_error(run_id)
         # ``cancelled`` is set by the cancel API; the stream does not
         # call mark_run_cancelled because the DB row already reflects it.
+    except RunAlreadyTerminal:
+        # Ticket 03: the finalize fence CASes the status BEFORE the
+        # terminal frame is released, so this legacy best-effort stamp is
+        # normally a no-op now. Not a warning.
+        logger.debug(
+            "chat_v2: run_id=%s already terminal at mark_run_%s",
+            run_id,
+            terminal,
+        )
     except Exception as exc:
         logger.warning(
             "chat_v2: mark_run_%s failed for run_id=%s: %s",
