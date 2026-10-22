@@ -506,12 +506,14 @@ def test_resume_replay_after_refusal_does_not_reexecute(
 def test_disconnect_window_after_refusal_keeps_sandbox_unavailable_on_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """D1 regression: disconnect in the window AFTER the refusal ``error``
-    frame is emitted but BEFORE the run is marked terminal (generator
-    close). The effect row is already ``FAILED`` with the sandbox refusal
-    reason; the next resume must still surface the stable
-    ``sandbox_unavailable`` code with identical replayed payloads — never
-    ``artifact_generation_failed``."""
+    """D1 regression: a disconnect right after the refusal ``error`` frame.
+
+    Ticket 03 closes the old window: the terminal event and the run status
+    are durable BEFORE the frame leaves the server, so the interrupted
+    consumer already has the authoritative terminal. Replay must keep the
+    stable ``sandbox_unavailable`` code with identical payloads — never
+    ``artifact_generation_failed`` — and must not invent a second
+    terminal."""
     sentinels = _HostAccessSentinels(monkeypatch)
 
     repo = _repo(tmp_path)
@@ -532,9 +534,8 @@ def test_disconnect_window_after_refusal_keeps_sandbox_unavailable_on_resume(
         async for item in agen:
             items.append(item)
             if item.type == "error":
-                # Stop consuming exactly in the disconnect window: the
-                # error frame is persisted, ``mark_terminal_safe`` has not
-                # run yet.
+                # The terminal is durable before this frame arrives, so the
+                # disconnect can no longer strand the run mid-lifecycle.
                 break
         await agen.aclose()
         return items
@@ -544,29 +545,26 @@ def test_disconnect_window_after_refusal_keeps_sandbox_unavailable_on_resume(
     assert first_error.type == "error"
     assert first_error.payload["code"] == "sandbox_unavailable"
 
-    # The window state: the refusal is recorded as FAILED, and the run did
-    # NOT reach its terminal status (the disconnect cut the flow short).
     effects = repo.list_effects_for_run(run_id)
     assert effects and effects[0].status == EffectStatus.FAILED.value
     assert effects[0].failure_reason
     run = repo.get_run(run_id)
-    assert run is not None and not run.is_terminal
+    assert run is not None and run.is_terminal
+    assert run.status == "error"
 
-    # Reconnect where the client left off: the refusal must stay stable.
+    # Reconnect where the client left off: the already-delivered terminal
+    # is NOT re-emitted and no second terminal is invented.
     second = _stream_resume(orch, run_id, from_seq=first_error.sequence)
-    terminals = [e.type for e in second if e.type in TERMINALS]
-    assert terminals == ["error"], [e.type for e in second]
-    assert second[-1].payload["code"] == "sandbox_unavailable"
-    assert second[-1].payload == first_error.payload
-    first_tool_result = next(e for e in first if e.type == "tool_result")
-    resumed_tool_result = next(e for e in second if e.type == "tool_result")
-    assert resumed_tool_result.payload == first_tool_result.payload
+    assert [e.type for e in second if e.type in TERMINALS] == []
 
-    # Full replay of the whole log: every recorded refusal terminal keeps
-    # the stable code (no artifact_generation_failed drift).
+    # Full replay of the whole log: exactly one refusal terminal, with the
+    # stable code (no artifact_generation_failed drift).
     full = _stream_resume(orch, run_id, from_seq=0)
     error_codes = [e.payload["code"] for e in full if e.type == "error"]
-    assert error_codes == ["sandbox_unavailable", "sandbox_unavailable"]
+    assert error_codes == ["sandbox_unavailable"]
+    first_tool_result = next(e for e in first if e.type == "tool_result")
+    replayed_tool_result = next(e for e in full if e.type == "tool_result")
+    assert replayed_tool_result.payload == first_tool_result.payload
 
     sentinels.assert_no_host_access()
 

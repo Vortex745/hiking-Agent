@@ -257,6 +257,21 @@ class EventStream:
         if sequence + 1 > self._next_sequence:
             self._next_sequence = sequence + 1
 
+    def reopen_after_failed_persistence(self) -> None:
+        """Re-open the terminal slot for a terminal that never left the server.
+
+        BCDEF ticket 03: a terminal envelope is built BEFORE the assistant
+        + terminal durability fence runs. When that fence fails, the frame
+        was never published (the stream closes or replaces it), so one
+        replacement terminal — e.g. ``assistant_persist_failed`` — must be
+        buildable. The consumed sequence is NOT reused: the replacement
+        gets the next sequence, keeping monotonicity. This is not a
+        general-purpose reset; callers use it only inside the failed-fence
+        path.
+        """
+        self._terminal_emitted = False
+        self._terminal_type = None
+
     @property
     def terminal_emitted(self) -> bool:
         """True after a terminal event has been built."""
