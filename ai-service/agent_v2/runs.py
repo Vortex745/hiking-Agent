@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
@@ -107,6 +107,11 @@ class RunSnapshot:
     error_code: str | None = None
     recoverable: bool = False
     state_reconciled: bool = False
+    # BCDEF ticket 04: replay-visible effect metadata so status/result
+    # are reconstructible from the snapshot as well as the event log.
+    effects: list[dict[str, Any]] = field(default_factory=list)
+    # BCDEF ticket 06: lease status + fencing token for replay/audit.
+    sandbox_lease: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -739,7 +744,7 @@ class RunRepository:
             return run.run_id
         return None
 
-    # -- sandbox leases (Ticket 09) -----------------------------------
+    # -- sandbox leases (Ticket 09 + BCDEF ticket 06) ------------------
 
     def create_sandbox_lease(
         self,
@@ -747,6 +752,9 @@ class RunRepository:
         run_id: str,
         sandbox_type: str,
         workspace_path: str,
+        owner_id: str = "",
+        sandbox_identity: str = "",
+        ttl_seconds: float | None = None,
     ) -> str:
         """Persist a sandbox lease for ``run_id`` (spec AC1).
 
@@ -758,11 +766,74 @@ class RunRepository:
             run_id=run_id,
             sandbox_type=sandbox_type,
             workspace_path=workspace_path,
+            owner_id=owner_id,
+            sandbox_identity=sandbox_identity,
+            ttl_seconds=ttl_seconds,
+        )
+
+    def acquire_sandbox_lease(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        sandbox_type: str,
+        workspace_path: str,
+        sandbox_identity: str = "",
+        ttl_seconds: float | None = None,
+    ) -> tuple[SandboxLeaseRecord | None, bool]:
+        """Acquire the run's active lease (one generation, ticket 06)."""
+        return self.control.acquire_sandbox_lease(
+            run_id=run_id,
+            owner_id=owner_id,
+            sandbox_type=sandbox_type,
+            workspace_path=workspace_path,
+            sandbox_identity=sandbox_identity,
+            ttl_seconds=ttl_seconds,
         )
 
     def get_sandbox_lease(self, run_id: str) -> SandboxLeaseRecord | None:
         """Return the sandbox lease bound to ``run_id``, if any."""
         return self.control.get_sandbox_lease(run_id)
+
+    def renew_sandbox_lease(
+        self,
+        *,
+        run_id: str,
+        fencing_token: int,
+        owner_id: str = "",
+        ttl_seconds: float | None = None,
+        now: Any | None = None,
+    ) -> tuple[SandboxLeaseRecord | None, bool]:
+        """Heartbeat the lease under its fencing token (ticket 06)."""
+        return self.control.renew_sandbox_lease(
+            run_id=run_id,
+            fencing_token=fencing_token,
+            owner_id=owner_id,
+            ttl_seconds=ttl_seconds,
+            now=now,
+        )
+
+    def expire_sandbox_lease(
+        self, run_id: str, *, now: Any | None = None
+    ) -> SandboxLeaseRecord | None:
+        """Mark an overdue active lease expired (idempotent CAS)."""
+        return self.control.expire_sandbox_lease(run_id, now=now)
+
+    def release_sandbox_lease(
+        self,
+        *,
+        run_id: str,
+        fencing_token: int | None = None,
+        resource_usage: dict[str, Any] | None = None,
+        failure_reason: str | None = None,
+    ) -> tuple[SandboxLeaseRecord | None, bool]:
+        """Idempotent fenced release of the active lease (ticket 06)."""
+        return self.control.release_sandbox_lease(
+            run_id=run_id,
+            fencing_token=fencing_token,
+            resource_usage=resource_usage,
+            failure_reason=failure_reason,
+        )
 
     def destroy_sandbox_lease(
         self,
@@ -775,7 +846,8 @@ class RunRepository:
 
         Spec AC6: run completion or cancellation triggers sandbox cleanup.
         The lease records success/failure + resource usage so operators
-        can audit cost and investigate stale sandboxes.
+        can audit cost and investigate stale sandboxes. Idempotent —
+        repeated cleanup keeps the first release's evidence.
         """
         return self.control.destroy_sandbox_lease(
             run_id=run_id,
@@ -979,6 +1051,8 @@ class RunRepository:
         tool_name: str,
         args_canonical: str,
         external_idempotency_key: str,
+        effect_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> EffectRecord:
         """Persist a new effect row in ``authorized`` status (spec AC1).
 
@@ -994,6 +1068,8 @@ class RunRepository:
             tool_name=tool_name,
             args_canonical=args_canonical,
             external_idempotency_key=external_idempotency_key,
+            effect_id=effect_id,
+            idempotency_key=idempotency_key,
         )
 
     def get_effect(self, effect_key: str) -> EffectRecord | None:
@@ -1027,26 +1103,74 @@ class RunRepository:
         """
         return self.control.transition_effect_to_executing(effect_key)
 
+    def claim_effect(
+        self,
+        effect_key: str,
+        *,
+        owner: str,
+        claim_token: str,
+        ttl_seconds: float,
+        lease_id: str = "",
+        fencing_token: int = 0,
+    ) -> tuple[EffectRecord | None, bool]:
+        """CAS claim with a fenced claim token (BCDEF ticket 04).
+
+        Returns ``(record, won)``; the winner owns ``claim_token`` and is
+        the only caller allowed to execute the side effect and settle it.
+        """
+        return self.control.claim_effect(
+            effect_key,
+            owner=owner,
+            claim_token=claim_token,
+            ttl_seconds=ttl_seconds,
+            lease_id=lease_id,
+            fencing_token=fencing_token,
+        )
+
     def commit_effect(
         self,
         effect_key: str,
         result_json: str,
+        *,
+        claim_token: str | None = None,
     ) -> EffectRecord | None:
-        return self.control.commit_effect(effect_key, result_json)
+        return self.control.commit_effect(
+            effect_key, result_json, claim_token=claim_token
+        )
 
     def mark_effect_outcome_unknown(
         self,
         effect_key: str,
         reason: str = "",
+        *,
+        claim_token: str | None = None,
     ) -> EffectRecord | None:
-        return self.control.mark_effect_outcome_unknown(effect_key, reason)
+        return self.control.mark_effect_outcome_unknown(
+            effect_key, reason, claim_token=claim_token
+        )
 
     def mark_effect_failed(
         self,
         effect_key: str,
         reason: str = "",
+        *,
+        claim_token: str | None = None,
     ) -> EffectRecord | None:
-        return self.control.mark_effect_failed(effect_key, reason)
+        return self.control.mark_effect_failed(
+            effect_key, reason, claim_token=claim_token
+        )
+
+    def mark_effect_publication_failed(
+        self,
+        effect_key: str,
+        reason: str = "",
+        *,
+        claim_token: str | None = None,
+    ) -> EffectRecord | None:
+        """Fence a committed effect whose success event could not persist."""
+        return self.control.mark_effect_publication_failed(
+            effect_key, reason, claim_token=claim_token
+        )
 
     # -- events ---------------------------------------------------------
 
@@ -1536,6 +1660,8 @@ class RunRepository:
                 and terminal_payload.get("recoverable") is True
             )
         )
+        effects = self.control.list_effects_for_run(run_id)
+        lease = self.control.get_sandbox_lease(run_id)
 
         return RunSnapshot(
             run_id=run.run_id,
@@ -1587,6 +1713,38 @@ class RunRepository:
             error_code=error_code,
             recoverable=recoverable,
             state_reconciled=state_reconciled,
+            effects=[
+                {
+                    "effect_id": record.resolved_effect_id,
+                    "effect_key": record.effect_key,
+                    "tool": record.tool_name,
+                    "status": record.phase,
+                    "stored_status": record.status,
+                    "idempotency_key": record.resolved_idempotency_key,
+                    "claim_owner": record.claim_owner,
+                    "lease_id": record.lease_id,
+                    "fencing_token": record.fencing_token,
+                    "result": _effect_result_payload(record.result_json),
+                    "failure_reason": record.failure_reason,
+                    "committed_at": record.committed_at,
+                }
+                for record in effects
+            ],
+            sandbox_lease=(
+                {
+                    "lease_id": lease.lease_id,
+                    "status": lease.status,
+                    "owner_id": lease.owner_id,
+                    "fencing_token": lease.fencing_token,
+                    "sandbox_identity": lease.sandbox_identity,
+                    "expires_at": lease.expires_at,
+                    "heartbeat_at": lease.heartbeat_at,
+                    "destroyed_at": lease.destroyed_at,
+                    "failure_reason": lease.failure_reason,
+                }
+                if lease is not None
+                else None
+            ),
         )
 
     # -- cancel ---------------------------------------------------------
@@ -1623,6 +1781,21 @@ class RunRepository:
         if run is None:
             return False
         return run.status == "cancelled"
+
+
+def _effect_result_payload(result_json: str | None) -> dict[str, Any]:
+    """Parse a stored effect result for the snapshot.
+
+    A corrupt/absent result is surfaced as an empty dict — the status
+    (committed vs outcome_unknown) remains authoritative.
+    """
+    if not result_json:
+        return {}
+    try:
+        parsed = json.loads(result_json)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 __all__ = [

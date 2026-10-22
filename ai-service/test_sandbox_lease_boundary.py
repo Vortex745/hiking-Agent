@@ -1,0 +1,745 @@
+"""BCDEF ticket 06 — sandbox active lease, fencing token and resume gate.
+
+Seam: the ``sandbox_leases`` persistence CAS (through ``RunRepository``),
+the :class:`agent_v2.leases.SandboxLeaseGuard`, the sandbox execution
+bridge, and the orchestration resume path. Real SQLite under a tmp dir;
+the computer is a counting fake (no real sandbox, no network).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import sqlite3
+import threading
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from agent_v2.approvals import compute_approval_id, compute_expiry
+from agent_v2.leases import (
+    SandboxLeaseGuard,
+    SandboxLeaseLostError,
+    lease_is_expired,
+)
+from agent_v2.persistence import CheckpointsStore, ControlStore
+from agent_v2.run_orchestration import RunOrchestrator
+from agent_v2.runs import RunRepository
+
+
+def _repo(tmp_path) -> RunRepository:
+    return RunRepository(
+        control=ControlStore(str(tmp_path / "control.sqlite")),
+        checkpoints=CheckpointsStore(str(tmp_path / "ckpt.sqlite")),
+    )
+
+
+def _make_run(repo: RunRepository, request_id: str = "req-lease") -> str:
+    run_id, _ = repo.create_run_idempotent(
+        request_id=request_id,
+        conversation_id=f"conv-{request_id}",
+        profile_id="cowork",
+        user_message="m",
+    )
+    return run_id
+
+
+def _past_iso(seconds: int = 5) -> str:
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+
+
+def _expire_by_sql(repo: RunRepository, run_id: str) -> None:
+    repo.control._conn.execute(
+        "UPDATE sandbox_leases SET expires_at = ? WHERE run_id = ?",
+        (_past_iso(), run_id),
+    )
+
+
+# ---- acquire / renew / release / expire CAS ---------------------------------
+
+
+def test_acquire_creates_one_active_lease_with_fencing_metadata(tmp_path):
+    repo = _repo(tmp_path)
+    try:
+        run_id = _make_run(repo)
+        lease, acquired = repo.acquire_sandbox_lease(
+            run_id=run_id,
+            owner_id="worker-1",
+            sandbox_type="local_native",
+            workspace_path="/ws/run-lease",
+            sandbox_identity="local_native:/ws/run-lease",
+        )
+        assert acquired is True
+        assert lease is not None
+        assert lease.status == "active"
+        assert lease.owner_id == "worker-1"
+        assert lease.fencing_token == 1
+        assert lease.sandbox_identity == "local_native:/ws/run-lease"
+        assert lease.expires_at is not None
+        assert not lease_is_expired(lease.expires_at)
+        assert lease.heartbeat_at is not None
+
+        # Duplicate acquire: same generation, same row, no token bump.
+        again, acquired_again = repo.acquire_sandbox_lease(
+            run_id=run_id,
+            owner_id="worker-2",
+            sandbox_type="local_native",
+            workspace_path="/ws/other",
+        )
+        assert acquired_again is False
+        assert again is not None
+        assert again.lease_id == lease.lease_id
+        assert again.fencing_token == 1
+        assert again.workspace_path == "/ws/run-lease"
+        rows = repo.control._conn.execute(
+            "SELECT COUNT(*) FROM sandbox_leases WHERE run_id = ?", (run_id,)
+        ).fetchone()[0]
+        assert rows == 1
+    finally:
+        repo.close()
+
+
+def test_concurrent_acquire_yields_one_active_lease(tmp_path):
+    shared = tmp_path / "control.sqlite"
+    seeder = RunRepository(
+        control=ControlStore(str(shared)),
+        checkpoints=CheckpointsStore(str(tmp_path / "ckpt.sqlite")),
+    )
+    run_id = _make_run(seeder, "req-lease-race")
+    seeder.close()
+
+    stores = [ControlStore(str(shared)), ControlStore(str(shared))]
+    results: list[tuple[bool, str, int]] = []
+    barrier = threading.Barrier(2)
+
+    def _acquire(store: ControlStore, owner: str) -> None:
+        barrier.wait()
+        lease, acquired = store.acquire_sandbox_lease(
+            run_id=run_id,
+            owner_id=owner,
+            sandbox_type="local_native",
+            workspace_path=f"/ws/{owner}",
+        )
+        results.append((acquired, lease.lease_id if lease else "", lease.fencing_token if lease else -1))
+
+    threads = [
+        threading.Thread(target=_acquire, args=(stores[0], "worker-a")),
+        threading.Thread(target=_acquire, args=(stores[1], "worker-b")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+
+    assert len(results) == 2
+    assert sum(1 for acquired, _lid, _tok in results if acquired) == 1
+    lease_ids = {lease_id for _a, lease_id, _t in results}
+    assert len(lease_ids) == 1  # one active lease row/generation
+    conn = sqlite3.connect(str(shared))
+    try:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM sandbox_leases WHERE run_id = ?", (run_id,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert count == 1
+    for store in stores:
+        store.close()
+
+
+def test_renew_rejects_stale_token_and_expired_lease(tmp_path):
+    repo = _repo(tmp_path)
+    try:
+        run_id = _make_run(repo)
+        lease, _ = repo.acquire_sandbox_lease(
+            run_id=run_id,
+            owner_id="worker-1",
+            sandbox_type="local_native",
+            workspace_path="/ws",
+        )
+        assert lease is not None and lease.fencing_token == 1
+
+        renewed, ok = repo.renew_sandbox_lease(
+            run_id=run_id, fencing_token=1, owner_id="worker-1b"
+        )
+        assert ok is True and renewed is not None
+        assert renewed.owner_id == "worker-1b"
+
+        stale, stale_ok = repo.renew_sandbox_lease(
+            run_id=run_id, fencing_token=99, owner_id="stale"
+        )
+        assert stale_ok is False
+        assert stale is not None and stale.fencing_token == 1
+        assert stale.owner_id == "worker-1b"
+
+        # Expired leases cannot be renewed by the old worker.
+        _expire_by_sql(repo, run_id)
+        expired, expired_ok = repo.renew_sandbox_lease(
+            run_id=run_id, fencing_token=1, owner_id="worker-1"
+        )
+        assert expired_ok is False
+        assert expired is not None and expired.is_expired()
+
+        marked = repo.expire_sandbox_lease(run_id)
+        assert marked is not None and marked.status == "expired"
+        # A NEW sandbox may take over an explicitly expired/released row,
+        # but only with a higher fencing generation (old worker fenced).
+        takeover, acquired = repo.acquire_sandbox_lease(
+            run_id=run_id,
+            owner_id="worker-2",
+            sandbox_type="local_native",
+            workspace_path="/ws",
+        )
+        assert acquired is True
+        assert takeover is not None and takeover.status == "active"
+        assert takeover.fencing_token == 2
+    finally:
+        repo.close()
+
+
+def test_release_is_idempotent_and_fenced(tmp_path):
+    repo = _repo(tmp_path)
+    try:
+        run_id = _make_run(repo)
+        lease, _ = repo.acquire_sandbox_lease(
+            run_id=run_id,
+            owner_id="worker-1",
+            sandbox_type="local_native",
+            workspace_path="/ws",
+        )
+        assert lease is not None
+
+        released, ok = repo.release_sandbox_lease(
+            run_id=run_id, fencing_token=1, resource_usage={"files_deleted": 2}
+        )
+        assert ok is True and released is not None
+        assert released.status == "destroyed"
+        assert released.resource_usage == {"files_deleted": 2}
+        destroyed_at = released.destroyed_at
+
+        # Idempotent: a second release does not mutate the evidence row.
+        again, ok_again = repo.release_sandbox_lease(
+            run_id=run_id, failure_reason="late cleanup failure"
+        )
+        assert ok_again is False
+        assert again is not None
+        assert again.status == "destroyed"
+        assert again.destroyed_at == destroyed_at
+        assert again.failure_reason is None
+
+        # Re-acquire after release bumps the fencing token (monotonic).
+        gen2, acquired = repo.acquire_sandbox_lease(
+            run_id=run_id,
+            owner_id="worker-2",
+            sandbox_type="local_native",
+            workspace_path="/ws",
+        )
+        assert acquired is True
+        assert gen2 is not None and gen2.fencing_token == 2
+
+        # A stale worker cannot release the newer generation.
+        stale, stale_ok = repo.release_sandbox_lease(
+            run_id=run_id, fencing_token=1
+        )
+        assert stale_ok is False
+        assert stale is not None and stale.status == "active"
+        assert stale.fencing_token == 2
+    finally:
+        repo.close()
+
+
+def test_guard_blocks_expired_and_stale_fences(tmp_path):
+    repo = _repo(tmp_path)
+    try:
+        run_id = _make_run(repo)
+        lease, _ = repo.acquire_sandbox_lease(
+            run_id=run_id,
+            owner_id="worker-1",
+            sandbox_type="local_native",
+            workspace_path="/ws",
+        )
+        assert lease is not None and lease.fencing_token == 1
+
+        guard = SandboxLeaseGuard(
+            repo, run_id=run_id, fencing_token=1, lease_id=lease.lease_id
+        )
+        assert guard.assert_active() is not None
+        assert guard.renew() is not None
+
+        stale_guard = SandboxLeaseGuard(
+            repo, run_id=run_id, fencing_token=99, lease_id=lease.lease_id
+        )
+        with pytest.raises(SandboxLeaseLostError) as excinfo:
+            stale_guard.assert_active()
+        assert excinfo.value.code == "lease_fencing_rejected"
+
+        _expire_by_sql(repo, run_id)
+        with pytest.raises(SandboxLeaseLostError) as excinfo:
+            guard.assert_active()
+        assert excinfo.value.code == "lease_expired"
+
+        repo.release_sandbox_lease(run_id=run_id, fencing_token=1)
+        with pytest.raises(SandboxLeaseLostError) as excinfo:
+            guard.assert_active()
+        assert excinfo.value.code == "sandbox_lease_lost"
+    finally:
+        repo.close()
+
+
+def test_pre_ticket_schema_rows_stay_readable(tmp_path):
+    """Old effects/sandbox_leases tables get additive columns on open."""
+    db_path = tmp_path / "old-control.sqlite"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE runs (
+            run_id TEXT PRIMARY KEY,
+            request_id TEXT NOT NULL UNIQUE,
+            conversation_id TEXT NOT NULL,
+            profile_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            terminal_type TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            terminal_at TEXT
+        );
+        CREATE TABLE effects (
+            effect_key TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            conversation_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            args_canonical TEXT NOT NULL,
+            status TEXT NOT NULL,
+            external_idempotency_key TEXT NOT NULL,
+            result_json TEXT,
+            failure_reason TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            committed_at TEXT,
+            UNIQUE (run_id, tool_name, args_canonical)
+        );
+        CREATE TABLE sandbox_leases (
+            lease_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL UNIQUE,
+            sandbox_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            workspace_path TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            destroyed_at TEXT,
+            resource_usage_json TEXT,
+            failure_reason TEXT
+        );
+        """
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO runs VALUES (?, ?, ?, ?, 'running', NULL, ?, ?, NULL)",
+        ("run-old", "req-old", "conv-old", "cowork", now, now),
+    )
+    conn.execute(
+        "INSERT INTO effects VALUES (?, ?, ?, ?, ?, 'authorized', ?, NULL, "
+        "NULL, ?, ?, NULL)",
+        ("effect-old", "run-old", "conv-old", "sandbox_bash", '{"command":"x"}',
+         "ext-old", now, now),
+    )
+    conn.execute(
+        "INSERT INTO sandbox_leases VALUES (?, ?, ?, 'active', ?, ?, NULL, "
+        "NULL, NULL)",
+        ("lease-old", "run-old", "local_native", "/ws/old", now),
+    )
+    conn.commit()
+    conn.close()
+
+    store = ControlStore(str(db_path))
+    try:
+        effect = store.get_effect("effect-old")
+        assert effect is not None
+        assert effect.status == "authorized"
+        assert effect.phase == "pending"
+        assert effect.resolved_effect_id == "effect-old"
+        assert effect.resolved_idempotency_key == "ext-old"
+        assert effect.fencing_token == 0
+
+        lease = store.get_sandbox_lease("run-old")
+        assert lease is not None
+        assert lease.status == "active"
+        assert lease.fencing_token == 0
+        assert lease.expires_at is None
+        assert lease.is_expired() is False
+        # Legacy lease renews under generation 0 and gains an expiry.
+        renewed, ok = store.renew_sandbox_lease(
+            run_id="run-old", fencing_token=0, owner_id="worker"
+        )
+        assert ok is True and renewed is not None
+        assert renewed.expires_at is not None
+    finally:
+        store.close()
+
+
+# ---- sandbox execution bridge ------------------------------------------------
+
+
+def _bridge(computer: Any, guard: Any):
+    from agent_v2.kernel_tools import ProductSandboxBridge
+
+    return ProductSandboxBridge(computer, "/ws", lease_guard=guard)
+
+
+class _CountingComputer:
+    sandbox_type = "local_native"
+
+    def __init__(self) -> None:
+        self.commands: list[str] = []
+
+    def run_bash(self, workspace, command, **_kwargs):
+        self.commands.append(command)
+        return SimpleNamespace(
+            exit_code=0, stdout="ok", stderr="", duration_ms=1, truncated=False
+        )
+
+
+def test_bridge_refuses_execution_without_active_lease(tmp_path):
+    from uniharness.exceptions import CLIError
+
+    repo = _repo(tmp_path)
+    try:
+        run_id = _make_run(repo)
+        computer = _CountingComputer()
+        guard = SandboxLeaseGuard(repo, run_id=run_id, fencing_token=1)
+        bridge = _bridge(computer, guard)
+
+        async def scenario():
+            with pytest.raises(CLIError) as missing:
+                await bridge.run("echo hi")
+            assert "sandbox_lease_lost" in str(missing.value)
+            assert computer.commands == []
+
+            lease, _ = repo.acquire_sandbox_lease(
+                run_id=run_id,
+                owner_id="worker-1",
+                sandbox_type="local_native",
+                workspace_path="/ws",
+            )
+            assert lease is not None
+            await bridge.run("echo hi")
+            assert computer.commands == ["echo hi"]
+
+            stale = SandboxLeaseGuard(repo, run_id=run_id, fencing_token=99)
+            stale_bridge = _bridge(computer, stale)
+            with pytest.raises(CLIError) as fenced:
+                await stale_bridge.run("echo again")
+            assert "lease_fencing_rejected" in str(fenced.value)
+            assert computer.commands == ["echo hi"]
+
+        asyncio.run(scenario())
+    finally:
+        repo.close()
+
+
+# ---- cowork bash tool lease gate ----------------------------------------------
+
+
+def test_cowork_bash_tool_refuses_without_active_lease(tmp_path):
+    from agent_v2.effects import compute_effect_identity
+    from agent_v2.kernel_tools import CoworkBashTool
+
+    repo = _repo(tmp_path)
+    try:
+        run_id = _make_run(repo)
+        identity = compute_effect_identity(
+            run_id=run_id, tool_name="sandbox_bash", args={"command": "echo hi"}
+        )
+        repo.insert_effect(
+            effect_key=identity.effect_id,
+            run_id=run_id,
+            conversation_id="conv-lease",
+            tool_name="sandbox_bash",
+            args_canonical='{"command": "echo hi"}',
+            external_idempotency_key=identity.idempotency_key,
+        )
+        computer = _CountingComputer()
+
+        class _Bridge:
+            def __init__(self) -> None:
+                self.commands: list[str] = []
+
+            async def run(self, command: str, **_kwargs):
+                self.commands.append(command)
+                return SimpleNamespace(
+                    exit_code=0, stdout="hi", stderr="", duration_ms=1, truncated=False
+                )
+
+        bridge = _Bridge()
+        guard = SandboxLeaseGuard(repo, run_id=run_id, fencing_token=1)
+        tool = CoworkBashTool(
+            bridge=bridge,
+            run_id=run_id,
+            effects=repo,
+            audit_sink=lambda _entry: None,
+            lease_guard=guard,
+        )
+
+        result = asyncio.run(tool(command="echo hi"))
+
+        assert result.error and "lease" in result.error
+        assert bridge.commands == []  # no sandbox side effect
+        row = repo.get_effect(identity.effect_id)
+        assert row is not None and row.status == "authorized"  # never claimed
+    finally:
+        repo.close()
+
+
+# ---- orchestration first-stream lease gate ------------------------------------
+
+
+def test_cowork_first_stream_fails_closed_when_lease_cannot_be_acquired(
+    tmp_path, monkeypatch
+):
+    from agent_v2.run_orchestration import ChatFlowRequest
+
+    repo = _repo(tmp_path)
+
+    def boom(**_kwargs):
+        raise sqlite3.OperationalError("lease store unavailable")
+
+    monkeypatch.setattr(repo, "acquire_sandbox_lease", boom)
+    computer = _FakeComputer()
+    cleanups: list[Any] = []
+
+    async def fake_kernel(**_kwargs):
+        return ('{"command": "echo hi"}', [])
+
+    orch = RunOrchestrator(
+        settings=_settings(),
+        runs_repo=repo,
+        kernel_turn=fake_kernel,
+        computer_factory=lambda *a, **k: computer,
+        sandbox_cleanup=lambda *a, **k: cleanups.append(k),
+    )
+    try:
+        req = ChatFlowRequest(
+            message="在沙箱里创建一个文件",
+            request_id="req-lease-broken",
+            profile_id="cowork",
+        )
+
+        async def run() -> list[Any]:
+            return [event async for event in orch.stream_chat(req)]
+
+        items = asyncio.run(run())
+
+        types = [event.type for event in items]
+        assert types[-1] == "error"
+        assert items[-1].payload["code"] == "sandbox_lease_unavailable"
+        assert "approval.required" not in types  # never reached the gate
+        assert computer.bash_calls == []
+        assert len(cleanups) == 1  # workspace cleaned, no leaked sandbox
+        assert repo.get_sandbox_lease(repo.control.get_run_by_request("req-lease-broken").run_id) is None
+    finally:
+        repo.close()
+
+
+# ---- orchestration resume gate ------------------------------------------------
+class _FakeComputer:
+    sandbox_type = "local_native"
+
+    def __init__(self) -> None:
+        self.workspaces: list[str] = []
+        self.bash_calls: list[tuple[str, str]] = []
+        self.cleaned: list[str] = []
+
+    def create_workspace(self, run_id: str) -> str:
+        self.workspaces.append(run_id)
+        return f"/ws/{run_id}"
+
+    def run_bash(self, workspace_path, command, **_kwargs):
+        self.bash_calls.append((workspace_path, command))
+        return SimpleNamespace(
+            exit_code=0, stdout="hi", stderr="", duration_ms=1, truncated=False
+        )
+
+    def cleanup(self, workspace_path: str) -> dict[str, int]:
+        self.cleaned.append(workspace_path)
+        return {"files_deleted": 0}
+
+
+def _settings(**overrides: Any) -> Any:
+    base = {
+        "agent_v2_enabled": True,
+        "openai_api_key": "sk-test",
+        "openai_model": "m",
+        "agent_v2_cowork_policy": "trusted",
+    }
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def _paused_cowork_state(repo: RunRepository, request_id: str, command: str = "echo hi") -> tuple[str, str]:
+    run_id = _make_run(repo, request_id)
+    repo.acquire_sandbox_lease(
+        run_id=run_id,
+        owner_id="first-stream",
+        sandbox_type="local_native",
+        workspace_path=f"/ws/{run_id}",
+    )
+    approval_id = compute_approval_id(
+        run_id=run_id, tool_name="sandbox_bash", args={"command": command}
+    )
+    repo.insert_approval(
+        approval_id=approval_id,
+        run_id=run_id,
+        conversation_id=f"conv-{request_id}",
+        tool_name="sandbox_bash",
+        args_canonical=f'{{"command": "{command}"}}',
+        risk_level="high",
+        impact="sandbox bash",
+        created_at=datetime.now(timezone.utc).isoformat(),
+        expires_at=compute_expiry(datetime.now(timezone.utc).isoformat()),
+    )
+    repo.resolve_approval(
+        approval_id=approval_id, status="approved", decision_request_id="dec-1"
+    )
+    return run_id, approval_id
+
+
+def _resume_orchestrator(repo: RunRepository, computer: _FakeComputer):
+    def fake_export(**_kwargs: Any) -> dict[str, Any]:
+        return {"artifact_id": "art-lease", "public_filename": "out.txt"}
+
+    def cleanup(comp: Any, workspace_path: str, runs: Any, run_id: Any) -> None:
+        comp.cleanup(workspace_path)
+        if runs is not None and run_id is not None:
+            runs.destroy_sandbox_lease(run_id=run_id)
+
+    return RunOrchestrator(
+        settings=_settings(),
+        runs_repo=repo,
+        artifact_export=fake_export,
+        computer_factory=lambda *a, **k: computer,
+        sandbox_cleanup=cleanup,
+    )
+
+
+def _resume(orch: RunOrchestrator, run_id: str, from_seq: int = 0) -> list[Any]:
+    async def run() -> list[Any]:
+        return [event async for event in orch.stream_resume(run_id=run_id, from_seq=from_seq)]
+
+    return asyncio.run(run())
+
+
+def test_resume_with_expired_lease_fails_closed_without_execution(tmp_path):
+    repo = _repo(tmp_path)
+    try:
+        run_id, _approval = _paused_cowork_state(repo, "req-lease-expired")
+        _expire_by_sql(repo, run_id)
+        computer = _FakeComputer()
+        orch = _resume_orchestrator(repo, computer)
+
+        items = _resume(orch, run_id)
+
+        assert items[-1].type == "error"
+        assert items[-1].payload["code"] == "lease_expired"
+        assert computer.bash_calls == []  # no sandbox side effect
+        lease = repo.get_sandbox_lease(run_id)
+        assert lease is not None and lease.status != "active"
+        assert lease.fencing_token == 1  # no new generation created
+        run = repo.get_run(run_id)
+        assert run is not None and run.status == "error"
+    finally:
+        repo.close()
+
+
+def test_resume_rejects_non_continuable_run_status(tmp_path):
+    repo = _repo(tmp_path)
+    try:
+        run_id, _approval = _paused_cowork_state(repo, "req-lease-status")
+        repo.control.update_run_status(run_id=run_id, status="admitted")
+        computer = _FakeComputer()
+        orch = _resume_orchestrator(repo, computer)
+
+        items = _resume(orch, run_id)
+
+        assert items[-1].type == "error"
+        assert items[-1].payload["code"] == "run_not_resumable"
+        assert computer.bash_calls == []
+    finally:
+        repo.close()
+
+
+def test_resume_renews_lease_and_links_effect_claim_to_fencing_token(tmp_path):
+    repo = _repo(tmp_path)
+    try:
+        run_id, _approval = _paused_cowork_state(repo, "req-lease-link")
+        computer = _FakeComputer()
+        orch = _resume_orchestrator(repo, computer)
+
+        items = _resume(orch, run_id)
+
+        assert [event.type for event in items][-1] == "done"
+        assert computer.bash_calls == [(f"/ws/{run_id}", "echo hi")]
+        lease = repo.get_sandbox_lease(run_id)
+        assert lease is not None
+        # The lease is released by cleanup; its fencing generation and
+        # identity survive for replay/audit.
+        assert lease.fencing_token == 1
+        effect = repo.list_effects_for_run(run_id)[0]
+        assert effect.status == "committed"
+        assert effect.lease_id == lease.lease_id
+        assert effect.fencing_token == 1
+
+        snapshot = repo.get_snapshot(run_id)
+        assert snapshot is not None
+        assert snapshot.sandbox_lease is not None
+        assert snapshot.sandbox_lease["fencing_token"] == 1
+        assert snapshot.sandbox_lease["lease_id"] == lease.lease_id
+        assert snapshot.sandbox_lease["status"] == "destroyed"
+    finally:
+        repo.close()
+
+
+def test_duplicate_resume_does_not_create_second_sandbox_or_lease(tmp_path):
+    repo = _repo(tmp_path)
+    try:
+        run_id, _approval = _paused_cowork_state(repo, "req-lease-dup")
+        computer = _FakeComputer()
+        orch = _resume_orchestrator(repo, computer)
+
+        first = _resume(orch, run_id)
+        assert first[-1].type == "done"
+        second = _resume(orch, run_id, from_seq=1)
+
+        assert [event.type for event in second][-1] == "done"
+        assert computer.bash_calls == [(f"/ws/{run_id}", "echo hi")]  # once
+        assert computer.workspaces == []  # resume never creates a sandbox
+        rows = repo.control._conn.execute(
+            "SELECT COUNT(*) FROM sandbox_leases WHERE run_id = ?", (run_id,)
+        ).fetchone()[0]
+        assert rows == 1
+        lease = repo.get_sandbox_lease(run_id)
+        assert lease is not None and lease.fencing_token == 1
+    finally:
+        repo.close()
+
+
+def test_cleanup_release_is_idempotent_end_to_end(tmp_path):
+    repo = _repo(tmp_path)
+    try:
+        run_id, _approval = _paused_cowork_state(repo, "req-lease-clean")
+        computer = _FakeComputer()
+        orch = _resume_orchestrator(repo, computer)
+
+        _resume(orch, run_id)
+        first = repo.get_sandbox_lease(run_id)
+        assert first is not None and first.status == "destroyed"
+        destroyed_at = first.destroyed_at
+
+        # A second cleanup (retry after a crash) is a no-op.
+        repo.destroy_sandbox_lease(run_id=run_id, failure_reason="late retry")
+        again = repo.get_sandbox_lease(run_id)
+        assert again is not None
+        assert again.status == "destroyed"
+        assert again.destroyed_at == destroyed_at
+        assert again.failure_reason is None
+    finally:
+        repo.close()

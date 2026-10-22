@@ -27,7 +27,7 @@ import logging
 import sqlite3
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -37,6 +37,13 @@ logger = logging.getLogger("ai-service.agent_v2.persistence")
 def _now_iso() -> str:
     """UTC ISO 8601 timestamp with timezone suffix."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _now_plus_seconds(seconds: float) -> str:
+    """UTC ISO 8601 timestamp ``seconds`` in the future."""
+    return (
+        datetime.now(timezone.utc) + timedelta(seconds=float(seconds))
+    ).isoformat()
 
 
 def _connect(path: str) -> sqlite3.Connection:
@@ -177,6 +184,11 @@ CREATE TABLE IF NOT EXISTS sandbox_leases (
     sandbox_type TEXT NOT NULL,
     status TEXT NOT NULL,
     workspace_path TEXT NOT NULL,
+    owner_id TEXT,
+    expires_at TEXT,
+    heartbeat_at TEXT,
+    fencing_token INTEGER NOT NULL DEFAULT 0,
+    sandbox_identity TEXT,
     created_at TEXT NOT NULL,
     destroyed_at TEXT,
     resource_usage_json TEXT,
@@ -262,6 +274,8 @@ CREATE INDEX IF NOT EXISTS idx_approvals_decision_idem ON approvals(decision_req
 -- audit but the local FS does not deduplicate.
 CREATE TABLE IF NOT EXISTS effects (
     effect_key TEXT PRIMARY KEY,
+    effect_id TEXT,
+    idempotency_key TEXT,
     run_id TEXT NOT NULL,
     conversation_id TEXT NOT NULL,
     tool_name TEXT NOT NULL,
@@ -270,6 +284,12 @@ CREATE TABLE IF NOT EXISTS effects (
     external_idempotency_key TEXT NOT NULL,
     result_json TEXT,
     failure_reason TEXT,
+    claim_token TEXT,
+    claim_owner TEXT,
+    claimed_at TEXT,
+    claim_expires_at TEXT,
+    lease_id TEXT,
+    fencing_token INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     committed_at TEXT,
@@ -386,12 +406,18 @@ _VALID_SANDBOX_STATUSES: frozenset[str] = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class SandboxLeaseRecord:
-    """Snapshot of a sandbox_leases row (Ticket 09).
+    """Snapshot of a sandbox_leases row (Ticket 09 + BCDEF ticket 06).
 
     A lease binds a run to exactly one sandbox. ``status`` transitions:
-    ``active`` → ``destroyed`` (clean cleanup) or ``failed`` (cleanup
-    error or creation failure). ``resource_usage_json`` records cpu/memory
-    /duration metrics gathered at cleanup time so operators can audit cost.
+    ``active`` → ``destroyed`` (clean cleanup), ``failed`` (cleanup
+    error or creation failure), or ``expired`` (TTL elapsed).
+    ``resource_usage_json`` records cpu/memory/duration metrics gathered
+    at cleanup time so operators can audit cost.
+
+    Ticket 06 additions (all optional so pre-ticket rows stay readable):
+    ``owner_id`` (last worker that acquired/renewed), ``expires_at`` /
+    ``heartbeat_at`` (TTL), ``fencing_token`` (monotonic lease
+    generation; 0 = legacy row), and ``sandbox_identity``.
     """
 
     lease_id: str
@@ -403,6 +429,20 @@ class SandboxLeaseRecord:
     destroyed_at: str | None
     resource_usage: dict[str, Any] | None
     failure_reason: str | None
+    owner_id: str | None = None
+    expires_at: str | None = None
+    heartbeat_at: str | None = None
+    fencing_token: int = 0
+    sandbox_identity: str | None = None
+
+    @property
+    def is_active(self) -> bool:
+        return self.status == "active"
+
+    def is_expired(self, now: datetime | None = None) -> bool:
+        from agent_v2.leases import lease_is_expired
+
+        return lease_is_expired(self.expires_at, now=now)
 
 
 # ---- Artifact statuses (Ticket 10) ---------------------------------------
@@ -500,7 +540,15 @@ EffectStatus = Literal[
 ]
 
 _VALID_EFFECT_STATUSES: frozenset[str] = frozenset(
-    {"authorized", "executing", "committed", "outcome_unknown", "failed"}
+    {
+        "authorized",
+        "pending",
+        "executing",
+        "claimed",
+        "committed",
+        "outcome_unknown",
+        "failed",
+    }
 )
 _TERMINAL_EFFECT_STATUSES: frozenset[str] = frozenset(
     {"committed", "outcome_unknown", "failed"}
@@ -538,10 +586,37 @@ class EffectRecord:
     created_at: str
     updated_at: str
     committed_at: str | None
+    # BCDEF ticket 04 additive columns. Old rows read back with defaults;
+    # ``effect_id``/``idempotency_key`` fall back to the legacy key so
+    # every row has a stable identity and idempotency key.
+    effect_id: str = ""
+    idempotency_key: str = ""
+    claim_token: str | None = None
+    claim_owner: str | None = None
+    claimed_at: str | None = None
+    claim_expires_at: str | None = None
+    lease_id: str | None = None
+    fencing_token: int = 0
 
     @property
     def is_terminal(self) -> bool:
         return self.status in _TERMINAL_EFFECT_STATUSES
+
+    @property
+    def resolved_effect_id(self) -> str:
+        """Stable logical identity (legacy rows use ``effect_key``)."""
+        return self.effect_id or self.effect_key
+
+    @property
+    def resolved_idempotency_key(self) -> str:
+        return self.idempotency_key or self.external_idempotency_key
+
+    @property
+    def phase(self) -> str:
+        """Canonical ticket-04 status (authorized→pending, executing→claimed)."""
+        from agent_v2.effects import canonical_effect_status
+
+        return canonical_effect_status(self.status)
 
 
 class ControlStore:
@@ -552,6 +627,7 @@ class ControlStore:
         self._conn = _connect(db_path)
         self._conn.executescript(_CONTROL_SCHEMA)
         self._migrate_terminal_persist_failed()
+        self._migrate_additive_columns()
         logger.info("ControlStore ready at %s", db_path)
 
     def _migrate_terminal_persist_failed(self) -> None:
@@ -564,6 +640,44 @@ class ControlStore:
                 "ALTER TABLE runs ADD COLUMN terminal_persist_failed "
                 "INTEGER NOT NULL DEFAULT 0"
             )
+
+    def _migrate_additive_columns(self) -> None:
+        """Add BCDEF ticket 04/06 columns to pre-existing databases.
+
+        ``CREATE TABLE IF NOT EXISTS`` leaves an old table untouched, so
+        the additive columns are applied with ``ALTER TABLE`` after
+        checking ``PRAGMA table_info``. Old rows keep working because
+        every new column is nullable or has a default.
+        """
+        additions = {
+            "effects": {
+                "effect_id": "TEXT",
+                "idempotency_key": "TEXT",
+                "claim_token": "TEXT",
+                "claim_owner": "TEXT",
+                "claimed_at": "TEXT",
+                "claim_expires_at": "TEXT",
+                "lease_id": "TEXT",
+                "fencing_token": "INTEGER NOT NULL DEFAULT 0",
+            },
+            "sandbox_leases": {
+                "owner_id": "TEXT",
+                "expires_at": "TEXT",
+                "heartbeat_at": "TEXT",
+                "fencing_token": "INTEGER NOT NULL DEFAULT 0",
+                "sandbox_identity": "TEXT",
+            },
+        }
+        for table, columns in additions.items():
+            existing = {
+                row["name"]
+                for row in self._conn.execute(f"PRAGMA table_info({table})")
+            }
+            for name, ddl in columns.items():
+                if name not in existing:
+                    self._conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"
+                    )
 
     def close(self) -> None:
         self._conn.close()
@@ -1138,7 +1252,7 @@ class ControlStore:
         ).fetchone()
         return dict(row) if row is not None else None
 
-    # -- sandbox leases (Ticket 09) -----------------------------------
+    # -- sandbox leases (Ticket 09 + BCDEF ticket 06) -------------------
 
     def create_sandbox_lease(
         self,
@@ -1146,17 +1260,29 @@ class ControlStore:
         run_id: str,
         sandbox_type: str,
         workspace_path: str,
+        owner_id: str = "",
+        sandbox_identity: str = "",
+        ttl_seconds: float | None = None,
+        fencing_token: int = 1,
     ) -> str:
-        """Insert a new sandbox lease for ``run_id``.
+        """Insert a new active lease for ``run_id``.
 
         A run may have at most one lease (UNIQUE on run_id). Re-calling
         for an existing lease raises ``sqlite3.IntegrityError`` — callers
-        that want idempotent semantics check ``get_sandbox_lease`` first.
+        that want idempotent semantics check ``get_sandbox_lease`` or use
+        :meth:`acquire_sandbox_lease`.
 
         ``sandbox_type`` must be one of :data:`_VALID_SANDBOX_TYPES`.
+        Ticket 06 fields: ``owner_id``, ``sandbox_identity``, TTL
+        ``expires_at`` and the monotonic ``fencing_token`` (1 for a fresh
+        lease; only :meth:`acquire_sandbox_lease` may take over a newer
+        generation).
         """
         if sandbox_type not in _VALID_SANDBOX_TYPES:
             raise ValueError(f"invalid sandbox_type: {sandbox_type!r}")
+        from agent_v2.leases import SANDBOX_LEASE_TTL_SECONDS
+
+        ttl = SANDBOX_LEASE_TTL_SECONDS if ttl_seconds is None else ttl_seconds
         lease_id = str(uuid.uuid4())
         now = _now_iso()
         self._conn.execute("BEGIN")
@@ -1164,9 +1290,22 @@ class ControlStore:
             self._conn.execute(
                 "INSERT INTO sandbox_leases "
                 "(lease_id, run_id, sandbox_type, status, workspace_path, "
-                " created_at, destroyed_at, resource_usage_json, failure_reason) "
-                "VALUES (?, ?, ?, 'active', ?, ?, NULL, NULL, NULL)",
-                (lease_id, run_id, sandbox_type, workspace_path, now),
+                " owner_id, expires_at, heartbeat_at, fencing_token, "
+                " sandbox_identity, created_at, destroyed_at, "
+                " resource_usage_json, failure_reason) "
+                "VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)",
+                (
+                    lease_id,
+                    run_id,
+                    sandbox_type,
+                    workspace_path,
+                    owner_id or None,
+                    _now_plus_seconds(ttl),
+                    now,
+                    int(fencing_token),
+                    sandbox_identity or None,
+                    now,
+                ),
             )
             self._conn.execute("COMMIT")
         except Exception:
@@ -1174,12 +1313,232 @@ class ControlStore:
             raise
         return lease_id
 
+    def acquire_sandbox_lease(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        sandbox_type: str,
+        workspace_path: str,
+        sandbox_identity: str = "",
+        ttl_seconds: float | None = None,
+        now: datetime | None = None,
+    ) -> tuple[SandboxLeaseRecord | None, bool]:
+        """Acquire the active lease for a run (BCDEF ticket 06).
+
+        Returns ``(record, acquired)``.
+
+        * No row → insert generation 1 (``acquired=True``).
+        * Active, unexpired row → return it unchanged
+          (``acquired=False``). A duplicate resume/replay therefore
+          never creates a second active lease or bumps the fencing
+          token under a live worker.
+        * Active but expired → return the expired row unchanged
+          (``acquired=False``); the caller must fail closed instead of
+          silently continuing without a valid lease.
+        * Released/failed/expired row → CAS takeover: the SAME row is
+          reactivated with ``fencing_token + 1`` (the old generation is
+          fenced out). ``acquired=True`` only for the CAS winner.
+        """
+        from agent_v2.leases import SANDBOX_LEASE_TTL_SECONDS, lease_is_expired
+
+        if sandbox_type not in _VALID_SANDBOX_TYPES:
+            raise ValueError(f"invalid sandbox_type: {sandbox_type!r}")
+        ttl = SANDBOX_LEASE_TTL_SECONDS if ttl_seconds is None else ttl_seconds
+        current = now or datetime.now(timezone.utc)
+        existing = self.get_sandbox_lease(run_id)
+        if existing is None:
+            try:
+                lease_id = self.create_sandbox_lease(
+                    run_id=run_id,
+                    sandbox_type=sandbox_type,
+                    workspace_path=workspace_path,
+                    owner_id=owner_id,
+                    sandbox_identity=sandbox_identity,
+                    ttl_seconds=ttl,
+                    fencing_token=1,
+                )
+            except sqlite3.IntegrityError:
+                # Concurrent acquirer won the insert.
+                return self.get_sandbox_lease(run_id), False
+            return self.get_sandbox_lease(run_id), True
+        if existing.status == "active":
+            # One active lease per run — never a second generation while
+            # the current one is live (expired included: fail closed).
+            return existing, False
+
+        new_token = int(existing.fencing_token or 0) + 1
+        new_lease_id = str(uuid.uuid4())
+        now_iso = _now_iso()
+        self._conn.execute("BEGIN")
+        try:
+            cur = self._conn.execute(
+                "UPDATE sandbox_leases SET lease_id = ?, owner_id = ?, "
+                "status = 'active', workspace_path = ?, sandbox_type = ?, "
+                "sandbox_identity = ?, expires_at = ?, heartbeat_at = ?, "
+                "fencing_token = ?, created_at = ?, destroyed_at = NULL, "
+                "resource_usage_json = NULL, failure_reason = NULL "
+                "WHERE run_id = ? AND status = ? AND fencing_token = ?",
+                (
+                    new_lease_id,
+                    owner_id or None,
+                    workspace_path,
+                    sandbox_type,
+                    sandbox_identity or None,
+                    _now_plus_seconds(ttl),
+                    now_iso,
+                    new_token,
+                    now_iso,
+                    run_id,
+                    existing.status,
+                    int(existing.fencing_token or 0),
+                ),
+            )
+            acquired = cur.rowcount == 1
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return self.get_sandbox_lease(run_id), acquired
+
     def get_sandbox_lease(self, run_id: str) -> SandboxLeaseRecord | None:
         row = self._conn.execute(
             "SELECT * FROM sandbox_leases WHERE run_id = ?",
             (run_id,),
         ).fetchone()
         return self._row_to_lease(row) if row is not None else None
+
+    def renew_sandbox_lease(
+        self,
+        *,
+        run_id: str,
+        fencing_token: int,
+        owner_id: str = "",
+        ttl_seconds: float | None = None,
+        now: datetime | None = None,
+    ) -> tuple[SandboxLeaseRecord | None, bool]:
+        """Heartbeat the active lease under its current fencing token.
+
+        CAS: the UPDATE matches only ``status='active'``, the EXACT
+        ``fencing_token``, and an unexpired (or legacy null) expiry. An
+        expired lease cannot be renewed by the old worker; a stale
+        token cannot renew a newer generation. Returns
+        ``(record, renewed)``.
+        """
+        from agent_v2.leases import SANDBOX_LEASE_TTL_SECONDS
+
+        ttl = SANDBOX_LEASE_TTL_SECONDS if ttl_seconds is None else ttl_seconds
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        expires_at = (current + timedelta(seconds=ttl)).isoformat()
+        now_iso = _now_iso()
+        self._conn.execute("BEGIN")
+        try:
+            cur = self._conn.execute(
+                "UPDATE sandbox_leases SET expires_at = ?, heartbeat_at = ?, "
+                "owner_id = COALESCE(NULLIF(?, ''), owner_id) "
+                "WHERE run_id = ? AND status = 'active' AND fencing_token = ? "
+                "AND (expires_at IS NULL OR expires_at > ?)",
+                (
+                    expires_at,
+                    now_iso,
+                    owner_id or "",
+                    run_id,
+                    int(fencing_token),
+                    current.isoformat(),
+                ),
+            )
+            renewed = cur.rowcount == 1
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return self.get_sandbox_lease(run_id), renewed
+
+    def expire_sandbox_lease(
+        self,
+        run_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> SandboxLeaseRecord | None:
+        """Mark an overdue active lease ``expired`` (CAS, idempotent).
+
+        Only the row whose ``expires_at`` is in the past transitions; a
+        fresh lease is returned unchanged. An already-released row is
+        returned unchanged.
+        """
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute(
+                "UPDATE sandbox_leases SET status = 'expired' "
+                "WHERE run_id = ? AND status = 'active' "
+                "AND expires_at IS NOT NULL AND expires_at <= ?",
+                (run_id, current.isoformat()),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return self.get_sandbox_lease(run_id)
+
+    def release_sandbox_lease(
+        self,
+        *,
+        run_id: str,
+        fencing_token: int | None = None,
+        resource_usage: dict[str, Any] | None = None,
+        failure_reason: str | None = None,
+    ) -> tuple[SandboxLeaseRecord | None, bool]:
+        """Release the active lease (idempotent, BCDEF ticket 06).
+
+        Returns ``(record, released)``. Releasing an already released
+        lease is a no-op (``released=False``, row unchanged). When a
+        ``fencing_token`` is supplied, a stale worker cannot release a
+        NEWER generation: its token mismatch leaves the row untouched.
+        """
+        existing = self.get_sandbox_lease(run_id)
+        if existing is None:
+            return None, False
+        if existing.status not in ("active", "expired"):
+            return existing, False
+        if (
+            fencing_token is not None
+            and int(existing.fencing_token or 0) != int(fencing_token)
+        ):
+            return existing, False
+        now_iso = _now_iso()
+        status = "failed" if failure_reason else "destroyed"
+        usage_json = (
+            json.dumps(resource_usage, ensure_ascii=False)
+            if resource_usage is not None
+            else None
+        )
+        self._conn.execute("BEGIN")
+        try:
+            cur = self._conn.execute(
+                "UPDATE sandbox_leases SET status = ?, destroyed_at = ?, "
+                "resource_usage_json = ?, failure_reason = ? "
+                "WHERE run_id = ? AND status = ? AND fencing_token = ?",
+                (
+                    status,
+                    now_iso,
+                    usage_json,
+                    failure_reason,
+                    run_id,
+                    existing.status,
+                    int(existing.fencing_token or 0),
+                ),
+            )
+            released = cur.rowcount == 1
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return self.get_sandbox_lease(run_id), released
 
     def destroy_sandbox_lease(
         self,
@@ -1192,29 +1551,15 @@ class ControlStore:
 
         Returns the updated record, or ``None`` if no lease exists for
         ``run_id`` (e.g. creation failed before the row was inserted).
+        Idempotent: a lease already released is returned unchanged, so
+        repeated cleanup never mutates the first release's evidence.
         """
-        lease = self.get_sandbox_lease(run_id)
-        if lease is None:
-            return None
-        now = _now_iso()
-        status = "failed" if failure_reason else "destroyed"
-        usage_json = (
-            json.dumps(resource_usage, ensure_ascii=False)
-            if resource_usage is not None
-            else None
+        record, _released = self.release_sandbox_lease(
+            run_id=run_id,
+            resource_usage=resource_usage,
+            failure_reason=failure_reason,
         )
-        self._conn.execute("BEGIN")
-        try:
-            self._conn.execute(
-                "UPDATE sandbox_leases SET status = ?, destroyed_at = ?, "
-                "resource_usage_json = ?, failure_reason = ? WHERE run_id = ?",
-                (status, now, usage_json, failure_reason, run_id),
-            )
-            self._conn.execute("COMMIT")
-        except Exception:
-            self._conn.execute("ROLLBACK")
-            raise
-        return self.get_sandbox_lease(run_id)
+        return record
 
     def _row_to_lease(self, row: sqlite3.Row) -> SandboxLeaseRecord:
         usage_raw = row["resource_usage_json"]
@@ -1228,6 +1573,11 @@ class ControlStore:
             destroyed_at=row["destroyed_at"],
             resource_usage=json.loads(usage_raw) if usage_raw else None,
             failure_reason=row["failure_reason"],
+            owner_id=row["owner_id"],
+            expires_at=row["expires_at"],
+            heartbeat_at=row["heartbeat_at"],
+            fencing_token=int(row["fencing_token"] or 0),
+            sandbox_identity=row["sandbox_identity"],
         )
 
     # -- artifacts (Ticket 10) -----------------------------------------
@@ -1541,6 +1891,8 @@ class ControlStore:
         tool_name: str,
         args_canonical: str,
         external_idempotency_key: str,
+        effect_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> EffectRecord:
         """Insert a new effect row in ``authorized`` status (spec AC1).
 
@@ -1549,19 +1901,27 @@ class ControlStore:
         constraint catches duplicate inserts at the DB layer — callers
         that want idempotent semantics check :meth:`get_effect` first
         (spec AC5).
+
+        BCDEF ticket 04: ``effect_id``/``idempotency_key`` are the stable
+        logical identity columns; when omitted they default to the
+        deterministic ``effect_key`` / ``external_idempotency_key`` so
+        every row (including pre-ticket rows) has a stable identity.
         """
         now = _now_iso()
         self._conn.execute("BEGIN")
         try:
             self._conn.execute(
                 "INSERT INTO effects "
-                "(effect_key, run_id, conversation_id, tool_name, "
-                " args_canonical, status, external_idempotency_key, "
-                " result_json, failure_reason, created_at, updated_at, "
-                " committed_at) "
-                "VALUES (?, ?, ?, ?, ?, 'authorized', ?, NULL, NULL, ?, ?, NULL)",
+                "(effect_key, effect_id, idempotency_key, run_id, "
+                " conversation_id, tool_name, args_canonical, status, "
+                " external_idempotency_key, result_json, failure_reason, "
+                " created_at, updated_at, committed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'authorized', ?, NULL, NULL, "
+                " ?, ?, NULL)",
                 (
                     effect_key,
+                    effect_id or effect_key,
+                    idempotency_key or external_idempotency_key,
                     run_id,
                     conversation_id,
                     tool_name,
@@ -1611,36 +1971,49 @@ class ControlStore:
         ).fetchall()
         return [self._row_to_effect(r) for r in rows]
 
-    def transition_effect_to_executing(
+    def claim_effect(
         self,
         effect_key: str,
+        *,
+        owner: str,
+        claim_token: str,
+        ttl_seconds: float,
+        lease_id: str = "",
+        fencing_token: int = 0,
     ) -> tuple[EffectRecord | None, bool]:
-        """CAS transition ``authorized`` → ``executing`` (spec AC7).
+        """CAS claim of one effect (BCDEF ticket 04).
 
-        Returns ``(record, won)`` where ``won`` is True iff THIS caller
-        performed the transition. Under concurrent decisions or service
-        restart, only one caller sees ``won=True``; others see the
-        already-``executing`` row with ``won=False`` and must NOT
-        re-execute (spec AC7: "只有一个执行者获得执行权").
+        Returns ``(record, won)``. ``won`` is True iff THIS caller moved
+        the row from ``authorized``/``pending`` to ``executing`` and now
+        owns ``claim_token``. Exactly one concurrent claimer can win;
+        every other caller sees the current row with ``won=False`` and
+        must NOT execute — it either recovers the committed result or
+        returns a stable in-flight/conflict answer.
 
-        The CAS is implemented as ``UPDATE ... WHERE status='authorized'``
-        followed by a ``changes()`` check. SQLite's default isolation
-        makes this atomic within a single transaction; the writer_lock
-        serializes cross-process contention.
+        The claim token is the fencing credential checked by commit /
+        outcome transitions, so a stale worker cannot settle a row that
+        a newer claim generation owns.
         """
-        existing = self.get_effect(effect_key)
-        if existing is None:
-            return None, False
-        if existing.status != "authorized":
-            # Already past authorized — return current state, did not win.
-            return existing, False
         now = _now_iso()
+        claim_expires = _now_plus_seconds(ttl_seconds)
         self._conn.execute("BEGIN")
         try:
             cur = self._conn.execute(
-                "UPDATE effects SET status = 'executing', updated_at = ? "
-                "WHERE effect_key = ? AND status = 'authorized'",
-                (now, effect_key),
+                "UPDATE effects SET status = 'executing', "
+                "claim_token = ?, claim_owner = ?, claimed_at = ?, "
+                "claim_expires_at = ?, lease_id = ?, fencing_token = ?, "
+                "updated_at = ? "
+                "WHERE effect_key = ? AND status IN ('authorized', 'pending')",
+                (
+                    claim_token,
+                    owner,
+                    now,
+                    claim_expires,
+                    lease_id or None,
+                    int(fencing_token or 0),
+                    now,
+                    effect_key,
+                ),
             )
             won = cur.rowcount == 1
             self._conn.execute("COMMIT")
@@ -1649,10 +2022,35 @@ class ControlStore:
             raise
         return self.get_effect(effect_key), won
 
+    def transition_effect_to_executing(
+        self,
+        effect_key: str,
+    ) -> tuple[EffectRecord | None, bool]:
+        """Legacy CAS ``authorized`` → ``executing`` (spec AC7).
+
+        Kept as a thin wrapper over :meth:`claim_effect` for callers
+        that do not need the claim token. Ticket 04 paths use
+        :meth:`claim_effect` directly so commit/fail/unknown are fenced.
+        """
+        existing = self.get_effect(effect_key)
+        if existing is None:
+            return None, False
+        if existing.status not in ("authorized", "pending"):
+            # Already past authorized — return current state, did not win.
+            return existing, False
+        return self.claim_effect(
+            effect_key,
+            owner="legacy",
+            claim_token=str(uuid.uuid4()),
+            ttl_seconds=300.0,
+        )
+
     def commit_effect(
         self,
         effect_key: str,
         result_json: str,
+        *,
+        claim_token: str | None = None,
     ) -> EffectRecord | None:
         """Transition ``executing`` → ``committed`` with the durable result.
 
@@ -1666,16 +2064,25 @@ class ControlStore:
         affects 0 rows and we return the current record (not None) so
         the caller can detect the state mismatch. This prevents illegal
         transitions like ``outcome_unknown`` → ``committed``.
+
+        BCDEF ticket 04: when ``claim_token`` is supplied the UPDATE also
+        matches the claim generation. A worker whose claim was fenced
+        (or never existed) cannot commit; the caller observes the
+        unchanged row and must treat the outcome as unknown.
         """
         now = _now_iso()
+        sql = (
+            "UPDATE effects SET status = 'committed', result_json = ?, "
+            "committed_at = ?, updated_at = ? "
+            "WHERE effect_key = ? AND status IN ('executing', 'claimed')"
+        )
+        params: tuple[Any, ...] = (result_json, now, now, effect_key)
+        if claim_token is not None:
+            sql += " AND claim_token = ?"
+            params = params + (claim_token,)
         self._conn.execute("BEGIN")
         try:
-            self._conn.execute(
-                "UPDATE effects SET status = 'committed', result_json = ?, "
-                "committed_at = ?, updated_at = ? "
-                "WHERE effect_key = ? AND status = 'executing'",
-                (result_json, now, now, effect_key),
-            )
+            self._conn.execute(sql, params)
             self._conn.execute("COMMIT")
         except Exception:
             self._conn.execute("ROLLBACK")
@@ -1686,6 +2093,8 @@ class ControlStore:
         self,
         effect_key: str,
         reason: str = "",
+        *,
+        claim_token: str | None = None,
     ) -> EffectRecord | None:
         """Transition an ``executing`` effect to ``outcome_unknown`` (spec AC3).
 
@@ -1701,16 +2110,23 @@ class ControlStore:
         we return the current record so the caller can detect the
         mismatch. This prevents illegal transitions like
         ``committed`` → ``outcome_unknown``.
+
+        BCDEF ticket 04: an optional ``claim_token`` fences the
+        transition to the current claim generation.
         """
         now = _now_iso()
+        sql = (
+            "UPDATE effects SET status = 'outcome_unknown', "
+            "failure_reason = ?, updated_at = ? "
+            "WHERE effect_key = ? AND status IN ('executing', 'claimed')"
+        )
+        params: tuple[Any, ...] = (reason, now, effect_key)
+        if claim_token is not None:
+            sql += " AND claim_token = ?"
+            params = params + (claim_token,)
         self._conn.execute("BEGIN")
         try:
-            self._conn.execute(
-                "UPDATE effects SET status = 'outcome_unknown', "
-                "failure_reason = ?, updated_at = ? "
-                "WHERE effect_key = ? AND status = 'executing'",
-                (reason, now, effect_key),
-            )
+            self._conn.execute(sql, params)
             self._conn.execute("COMMIT")
         except Exception:
             self._conn.execute("ROLLBACK")
@@ -1721,6 +2137,8 @@ class ControlStore:
         self,
         effect_key: str,
         reason: str = "",
+        *,
+        claim_token: str | None = None,
     ) -> EffectRecord | None:
         """Transition an effect to ``failed`` (definitive error, terminal).
 
@@ -1735,16 +2153,59 @@ class ControlStore:
         rows and we return the current record so the caller can detect
         the mismatch. This prevents illegal transitions like
         ``committed`` → ``failed``.
+
+        BCDEF ticket 04: an optional ``claim_token`` fences the
+        transition to the current claim generation.
         """
         now = _now_iso()
+        sql = (
+            "UPDATE effects SET status = 'failed', "
+            "failure_reason = ?, updated_at = ? "
+            "WHERE effect_key = ? AND status IN ('executing', 'claimed')"
+        )
+        params: tuple[Any, ...] = (reason, now, effect_key)
+        if claim_token is not None:
+            sql += " AND claim_token = ?"
+            params = params + (claim_token,)
         self._conn.execute("BEGIN")
         try:
-            self._conn.execute(
-                "UPDATE effects SET status = 'failed', "
-                "failure_reason = ?, updated_at = ? "
-                "WHERE effect_key = ? AND status = 'executing'",
-                (reason, now, effect_key),
-            )
+            self._conn.execute(sql, params)
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return self.get_effect(effect_key)
+
+    def mark_effect_publication_failed(
+        self,
+        effect_key: str,
+        reason: str = "",
+        *,
+        claim_token: str | None = None,
+    ) -> EffectRecord | None:
+        """Fence a committed effect whose success event was not durable.
+
+        BCDEF ticket 04: the success publication gate is "external
+        returned AND ledger committed AND event replayable". When the
+        event write fails AFTER the ledger commit, the ledger row is moved
+        ``committed`` → ``outcome_unknown`` (a deliberate, narrow edge)
+        under the SAME claim token so no retry may publish a success for
+        evidence the replay cannot show. A different/fenced token matches
+        nothing and the row is returned unchanged.
+        """
+        now = _now_iso()
+        sql = (
+            "UPDATE effects SET status = 'outcome_unknown', "
+            "failure_reason = ?, updated_at = ? "
+            "WHERE effect_key = ? AND status = 'committed'"
+        )
+        params: tuple[Any, ...] = (reason, now, effect_key)
+        if claim_token is not None:
+            sql += " AND claim_token = ?"
+            params = params + (claim_token,)
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute(sql, params)
             self._conn.execute("COMMIT")
         except Exception:
             self._conn.execute("ROLLBACK")
@@ -1765,6 +2226,14 @@ class ControlStore:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             committed_at=row["committed_at"],
+            effect_id=row["effect_id"] or "",
+            idempotency_key=row["idempotency_key"] or "",
+            claim_token=row["claim_token"],
+            claim_owner=row["claim_owner"],
+            claimed_at=row["claimed_at"],
+            claim_expires_at=row["claim_expires_at"],
+            lease_id=row["lease_id"],
+            fencing_token=int(row["fencing_token"] or 0),
         )
 
     # -- redacted observability (Ticket 16) ---------------------------

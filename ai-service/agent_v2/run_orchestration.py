@@ -50,6 +50,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Callable
@@ -73,10 +74,14 @@ from agent_v2.computer import (
     SandboxUnavailableError,
 )
 from agent_v2.effects import (
+    DEFAULT_EFFECT_CLAIM_TTL_SECONDS,
+    EffectClaim,
     EffectStatus,
+    canonical_effect_status,
     compute_effect_key,
     compute_external_idempotency_key,
     deserialize_result,
+    execute_claimed,
     serialize_result,
 )
 from agent_v2.events import (
@@ -87,6 +92,11 @@ from agent_v2.events import (
 )
 from agent_v2.execution_contract import BoundaryError
 from agent_v2.execution_policy import build_execution_policy, freeze_settings
+from agent_v2.leases import (
+    SANDBOX_LEASE_TTL_SECONDS,
+    SandboxLeaseGuard,
+    SandboxLeaseLostError,
+)
 from agent_v2.memory_tools import extract_sensitive_memory
 from agent_v2.observability import CapacityExceeded
 from agent_v2.permissions import PermissionDecision, PermissionGate
@@ -617,8 +627,10 @@ def _failed_effect_public_error(copy: EffectCopy, reason: str) -> tuple[str, str
     """Map a recorded FAILED reason to the public ``error`` (code, message).
 
     Sandbox refusals keep the stable ``sandbox_unavailable`` code (and the
-    original message) on every resume/replay; all other failures keep the
-    per-tool ``copy.failure_code`` mapping.
+    original message) on every resume/replay; lease fence refusals keep
+    their stable ``lease_expired``/``lease_fencing_rejected``/
+    ``sandbox_lease_lost`` code; all other failures keep the per-tool
+    ``copy.failure_code`` mapping.
     """
     if reason.startswith(_SANDBOX_UNAVAILABLE_REASON_PREFIX):
         detail = reason[len(_SANDBOX_UNAVAILABLE_REASON_PREFIX):]
@@ -626,6 +638,9 @@ def _failed_effect_public_error(copy: EffectCopy, reason: str) -> tuple[str, str
             _SANDBOX_UNAVAILABLE_CODE,
             f"{_SANDBOX_UNAVAILABLE_MESSAGE_PREFIX}{detail}",
         )
+    if reason.startswith("lease:"):
+        code = reason[len("lease:"):] or "sandbox_lease_lost"
+        return code, f"{copy.error_failure_prefix}{code}"
     return copy.failure_code, f"{copy.error_failure_prefix}{reason}"
 
 
@@ -652,6 +667,7 @@ async def _kernel_plan_turn(
     workspace_path: str,
     message: str,
     run_id: str | None,
+    lease_guard: Any | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Run the plan-writing kernel turn over the run-scoped sandbox bridge.
 
@@ -659,6 +675,10 @@ async def _kernel_plan_turn(
     merges the kernel's own audits with the sandbox tools' audits, ready
     for :func:`_tool_result_payloads`. Kernel failures propagate as
     ``KernelModelFailure``; the caller maps them to its own terminal.
+
+    Ticket 06: when ``lease_guard`` is supplied every sandbox command
+    (read/write/run) revalidates the durable active lease + fencing token
+    before touching the sandbox.
     """
     from agent_v2.kernel_tools import (
         ProductSandboxBridge,
@@ -666,7 +686,9 @@ async def _kernel_plan_turn(
         SandboxWriteTool,
     )
 
-    bridge = ProductSandboxBridge(computer, workspace_path)
+    bridge = ProductSandboxBridge(
+        computer, workspace_path, lease_guard=lease_guard
+    )
     sandbox_audits: list[dict[str, Any]] = []
     sandbox_tools = (
         SandboxReadTool(bridge=bridge, run_id=run_id, audit_sink=sandbox_audits.append),
@@ -701,6 +723,16 @@ def _tool_result_payloads(entries: list[dict[str, Any]]) -> list[dict[str, Any]]
     return payloads
 
 
+def _effect_meta(
+    effect_key: str, external_idempotency_key: str
+) -> dict[str, Any]:
+    """Replay-visible effect identity merged into tool/effect events."""
+    return {
+        "effect_id": effect_key,
+        "idempotency_key": external_idempotency_key,
+    }
+
+
 async def drive_effect(
     *,
     runs_repo: RunRepository,
@@ -717,14 +749,19 @@ async def drive_effect(
     execute: Callable[[], dict[str, Any]],
     emit: EmitLike,
     outcome: EffectDriveResult,
+    emit_required: EmitLike | None = None,
+    post_execute_check: Callable[[], None] | None = None,
+    lease_id: str = "",
+    fencing_token: int = 0,
 ) -> AsyncGenerator[Any, None]:
-    """Drive ONE tool execution through the effect ledger (Ticket 39).
+    """Drive ONE tool execution through the effect ledger (Ticket 39/04).
 
     This is the single authority for the ledger transitions:
 
     * spec AC1 — insert the row in ``authorized`` BEFORE execution;
-    * spec AC7 — CAS ``authorized → executing``; exactly one executor
-      wins, the loser must not re-execute;
+    * ticket 04 — CAS ``authorized/pending → executing/claimed`` with a
+      fenced claim token; exactly one executor wins, the loser must not
+      re-execute;
     * spec AC2 — ``committed`` returns the stored result without
       re-execution (and re-emits the tool_call/tool_result pair when
       the event log is missing them);
@@ -735,17 +772,25 @@ async def drive_effect(
     * prior ``failed`` / ``outcome_unknown`` → terminal error, no
       re-execution;
     * commit failure after a successful side effect →
-      ``outcome_unknown`` so a retry cannot re-execute (spec AC4).
+      ``outcome_unknown`` so a retry cannot re-execute (spec AC4);
+    * ticket 04 publication gate — the success ``tool_result`` is
+      emitted ONLY after the external call returned, the ledger commit
+      held the claim token, and ``emit_required`` (when supplied)
+      durably persisted the event. Serialization / ledger / event
+      failures all become ``outcome_unknown`` with NO success result.
 
     Yields whatever ``emit`` returns (envelopes or rendered frames).
     The caller decides, from ``outcome.status`` / ``outcome
     .preserve_sandbox``, whether to continue its flow (export, text,
     done) or stop.
     """
+    publish = emit_required or emit
     existing_effect = runs_repo.get_effect(effect_key)
 
     # Executing: distinguish a live concurrent executor from a crashed one.
-    if existing_effect is not None and existing_effect.status == EffectStatus.EXECUTING.value:
+    if existing_effect is not None and canonical_effect_status(
+        existing_effect.status
+    ) == EffectStatus.CLAIMED.value:
         if _effect_executor_is_live(all_events, copy.tool_name):
             outcome.status = "in_flight"
             outcome.preserve_sandbox = True
@@ -781,6 +826,7 @@ async def drive_effect(
             yield emit("tool_call", {
                 "tool": copy.tool_name,
                 "args": tool_args,
+                **_effect_meta(effect_key, external_idempotency_key),
             })
         err_code, err_message = _failed_effect_public_error(copy, reason)
         yield emit("tool_result", {
@@ -820,8 +866,27 @@ async def drive_effect(
                 yield emit("tool_call", {
                     "tool": copy.tool_name,
                     "args": tool_args,
+                    **_effect_meta(effect_key, external_idempotency_key),
                 })
-            yield emit("tool_result", copy.ok_tool_result(stored, tool_args))
+            try:
+                yield publish(
+                    "tool_result",
+                    copy.ok_tool_result(stored, tool_args)
+                    | {"effect_id": effect_key},
+                )
+            except Exception:
+                logger.exception(
+                    "run_orchestration: effect tool_result publish failed for "
+                    "%s run_id=%s (recovered committed result)",
+                    copy.tool_name, run_id,
+                )
+                outcome.status = "outcome_unknown"
+                yield emit("error", {
+                    "code": "effect_event_persist_failed",
+                    "message": copy.commit_unknown_message,
+                })
+                mark_terminal_safe(runs_repo, run_id, "error")
+                return
             has_tool_result_ok = True
 
     if not has_tool_result_ok:
@@ -840,8 +905,19 @@ async def drive_effect(
             except Exception:
                 existing_effect = runs_repo.get_effect(effect_key)
 
-        # CAS transition ``authorized → executing`` (spec AC7).
-        _, won = runs_repo.transition_effect_to_executing(effect_key)
+        # CAS claim ``authorized/pending → executing/claimed`` with a
+        # fenced claim token (BCDEF ticket 04). Exactly one caller wins;
+        # only the winner may reach the external side effect.
+        claim_token = uuid.uuid4().hex
+        claim_owner = f"effect-worker:{uuid.uuid4().hex}"
+        _record, won = runs_repo.claim_effect(
+            effect_key,
+            owner=claim_owner,
+            claim_token=claim_token,
+            ttl_seconds=DEFAULT_EFFECT_CLAIM_TTL_SECONDS,
+            lease_id=lease_id,
+            fencing_token=fencing_token,
+        )
         if not won:
             current = runs_repo.get_effect(effect_key)
             if current is not None and current.status == EffectStatus.COMMITTED.value:
@@ -849,7 +925,24 @@ async def drive_effect(
                 outcome.status = "recovered"
                 outcome.stored_result = stored
                 outcome.has_tool_result_ok = True
-                yield emit("tool_result", copy.ok_tool_result(stored, tool_args))
+                try:
+                    yield publish(
+                        "tool_result",
+                        copy.ok_tool_result(stored, tool_args)
+                        | {"effect_id": effect_key},
+                    )
+                except Exception:
+                    logger.exception(
+                        "run_orchestration: effect tool_result publish failed "
+                        "for %s run_id=%s (CAS-loser recovered result)",
+                        copy.tool_name, run_id,
+                    )
+                    outcome.status = "outcome_unknown"
+                    yield emit("error", {
+                        "code": "effect_event_persist_failed",
+                        "message": copy.commit_unknown_message,
+                    })
+                    mark_terminal_safe(runs_repo, run_id, "error")
             elif current is not None and current.status in (
                 EffectStatus.OUTCOME_UNKNOWN.value,
                 EffectStatus.FAILED.value,
@@ -858,6 +951,8 @@ async def drive_effect(
                     outcome.status = "outcome_unknown"
                     yield emit("effect.outcome_unknown", {
                         "effect_key": effect_key,
+                        "effect_id": effect_key,
+                        "idempotency_key": external_idempotency_key,
                         "tool": copy.tool_name,
                         "message": copy.unknown_message,
                     })
@@ -870,6 +965,7 @@ async def drive_effect(
                         "tool": copy.tool_name,
                         "status": "error",
                         "content": f"{copy.tool_result_failure_prefix}{_failed_effect_reason_text(reason)}",
+                        "effect_id": effect_key,
                     })
                     # Same mapping as the direct FAILED branch — a recorded
                     # sandbox refusal keeps ``sandbox_unavailable`` (D1).
@@ -887,16 +983,48 @@ async def drive_effect(
                 })
             return
 
-        # We won the CAS — emit tool_call and execute the tool.
+        # We won the CAS — emit tool_call and execute the tool. The
+        # executor is reachable ONLY through ``execute_claimed``: the
+        # claim object is the structural "claim before side effect" guard.
+        claim = EffectClaim(
+            effect_id=effect_key,
+            claim_token=claim_token,
+            owner=claim_owner,
+            lease_id=lease_id,
+            fencing_token=fencing_token,
+        )
         outcome.status = "executed"
         yield emit("tool_call", {
             "tool": copy.tool_name,
             "args": tool_args,
+            **_effect_meta(effect_key, external_idempotency_key),
         })
         try:
-            result = execute()
+            result = execute_claimed(claim, execute)
+        except SandboxLeaseLostError as exc:
+            # The lease fence refused BEFORE any sandbox command ran:
+            # nothing executed, so the effect is definitively failed and
+            # the public code stays stable on every replay.
+            runs_repo.mark_effect_failed(
+                effect_key,
+                reason=f"lease:{exc.code}",
+                claim_token=claim_token,
+            )
+            outcome.status = "failed"
+            yield emit("tool_result", {
+                "tool": copy.tool_name,
+                "status": "error",
+                "content": f"{copy.tool_result_failure_prefix}{exc.message}",
+                "effect_id": effect_key,
+            })
+            yield emit("error", {
+                "code": exc.code,
+                "message": f"{copy.error_failure_prefix}{exc.message}",
+            })
+            mark_terminal_safe(runs_repo, run_id, "error")
+            return
         except SandboxTimeoutError as exc:
-            runs_repo.mark_effect_failed(effect_key, reason=str(exc))
+            runs_repo.mark_effect_failed(effect_key, reason=str(exc), claim_token=claim_token)
             outcome.status = "failed"
             yield emit("tool_result", {
                 "tool": copy.tool_name,
@@ -932,7 +1060,7 @@ async def drive_effect(
             mark_terminal_safe(runs_repo, run_id, "error")
             return
         except ComputerError as exc:
-            runs_repo.mark_effect_failed(effect_key, reason=str(exc))
+            runs_repo.mark_effect_failed(effect_key, reason=str(exc), claim_token=claim_token)
             outcome.status = "failed"
             yield emit("tool_result", {
                 "tool": copy.tool_name,
@@ -946,24 +1074,62 @@ async def drive_effect(
             mark_terminal_safe(runs_repo, run_id, "error")
             return
 
-        # Success — commit the effect with the result (spec AC2).
-        # Spec AC4: a bookkeeping failure after the side effect completed
-        # must become outcome_unknown so a retry cannot re-execute.
+        # The external operation returned. Before publishing ANY success,
+        # re-check the lease fence (a takeover during execution makes the
+        # outcome indeterminate) and commit the ledger under the claim.
+        if post_execute_check is not None:
+            try:
+                post_execute_check()
+            except SandboxLeaseLostError as exc:
+                runs_repo.mark_effect_outcome_unknown(
+                    effect_key,
+                    reason=f"lease:{exc.code}",
+                    claim_token=claim_token,
+                )
+                outcome.status = "outcome_unknown"
+                yield emit("effect.outcome_unknown", {
+                    "effect_key": effect_key,
+                    "effect_id": effect_key,
+                    "idempotency_key": external_idempotency_key,
+                    "tool": copy.tool_name,
+                    "message": copy.commit_unknown_message,
+                })
+                yield emit("error", {
+                    "code": exc.code,
+                    "message": copy.commit_unknown_message,
+                })
+                mark_terminal_safe(runs_repo, run_id, "error")
+                return
+
+        # Success — serialize + commit the effect under the claim token
+        # (spec AC2). Any bookkeeping failure after the side effect
+        # completed must become outcome_unknown so a retry cannot
+        # re-execute (spec AC4, ticket 04).
+        committed = None
         try:
-            runs_repo.commit_effect(effect_key, serialize_result(result))
+            serialized = serialize_result(result)
+            committed = runs_repo.commit_effect(
+                effect_key, serialized, claim_token=claim_token
+            )
         except Exception:
             logger.exception(
-                "run_orchestration: commit_effect failed for %s run_id=%s; "
+                "run_orchestration: effect commit failed for %s run_id=%s; "
                 "marking outcome_unknown",
                 copy.tool_name, run_id,
             )
+        if committed is None or canonical_effect_status(committed.status) != (
+            EffectStatus.COMMITTED.value
+        ):
             runs_repo.mark_effect_outcome_unknown(
                 effect_key,
                 reason=copy.commit_unknown_reason,
+                claim_token=claim_token,
             )
             outcome.status = "outcome_unknown"
             yield emit("effect.outcome_unknown", {
                 "effect_key": effect_key,
+                "effect_id": effect_key,
+                "idempotency_key": external_idempotency_key,
                 "tool": copy.tool_name,
                 "message": copy.commit_unknown_message,
             })
@@ -976,7 +1142,40 @@ async def drive_effect(
 
         outcome.stored_result = result
         outcome.has_tool_result_ok = True
-        yield emit("tool_result", copy.ok_tool_result(result, tool_args))
+        try:
+            yield publish(
+                "tool_result",
+                copy.ok_tool_result(result, tool_args) | {"effect_id": effect_key},
+            )
+        except Exception:
+            # External op + ledger committed, but the success event is
+            # not replayable. Fence the committed row to outcome_unknown
+            # (same claim) and publish an error instead of a success.
+            logger.exception(
+                "run_orchestration: effect success event not durable for "
+                "%s run_id=%s; fencing to outcome_unknown",
+                copy.tool_name, run_id,
+            )
+            runs_repo.mark_effect_publication_failed(
+                effect_key,
+                reason="success_event_not_durable",
+                claim_token=claim_token,
+            )
+            outcome.status = "outcome_unknown"
+            outcome.has_tool_result_ok = False
+            yield emit("effect.outcome_unknown", {
+                "effect_key": effect_key,
+                "effect_id": effect_key,
+                "idempotency_key": external_idempotency_key,
+                "tool": copy.tool_name,
+                "message": copy.commit_unknown_message,
+            })
+            yield emit("error", {
+                "code": "effect_outcome_unknown",
+                "message": copy.commit_unknown_message,
+            })
+            mark_terminal_safe(runs_repo, run_id, "error")
+            return
     else:
         # Tool already executed in a prior resume — the event log is the
         # source of truth; no ledger transition may re-run it (spec AC5).
@@ -1388,6 +1587,65 @@ class RunOrchestrator:
         self._computer_factory = computer_factory
         self._sandbox_cleanup = sandbox_cleanup
         self._gate_factory = gate_factory
+
+    def _acquire_sandbox_lease(
+        self,
+        *,
+        run_id: str | None,
+        computer: Computer,
+        workspace_path: str,
+    ) -> tuple[SandboxLeaseGuard | None, str | None, str]:
+        """Acquire the durable active sandbox lease (BCDEF ticket 06).
+
+        Returns ``(guard, error_code, error_message)``. A persistence
+        failure, a non-active lease, or an expired lease fails closed:
+        the caller emits the stable error, cleans the workspace, and
+        terminates instead of executing unleased.
+
+        With persistence disabled (``runs_repo is None``) no durable
+        lease exists, so the legacy non-persistent mode returns
+        ``(None, None, "")``.
+        """
+        runs_repo = self._runs_repo
+        if runs_repo is None or run_id is None:
+            return None, None, ""
+        owner_id = f"sandbox-owner:{uuid.uuid4().hex}"
+        try:
+            lease, _acquired = runs_repo.acquire_sandbox_lease(
+                run_id=run_id,
+                owner_id=owner_id,
+                sandbox_type=computer.sandbox_type,
+                workspace_path=workspace_path,
+                sandbox_identity=f"{computer.sandbox_type}:{workspace_path}",
+                ttl_seconds=SANDBOX_LEASE_TTL_SECONDS,
+            )
+        except Exception:
+            logger.exception(
+                "run_orchestration: acquire_sandbox_lease failed for "
+                "run_id=%s; refusing to execute unleased (workspace=%s)",
+                run_id, workspace_path,
+            )
+            return None, "sandbox_lease_unavailable", (
+                "无法获得持久沙箱租约，已停止执行。"
+            )
+        if lease is None or lease.status != "active":
+            return None, "sandbox_lease_unavailable", (
+                "沙箱租约不可用（未激活），已停止执行。"
+            )
+        if lease.is_expired():
+            runs_repo.expire_sandbox_lease(run_id)
+            return None, "lease_expired", (
+                "沙箱租约已过期，无法继续执行。"
+            )
+        guard = SandboxLeaseGuard(
+            runs_repo,
+            run_id=run_id,
+            fencing_token=lease.fencing_token,
+            lease_id=lease.lease_id,
+            owner_id=owner_id,
+            ttl_seconds=SANDBOX_LEASE_TTL_SECONDS,
+        )
+        return guard, None, ""
 
     def _export_artifact(
         self,
@@ -2083,20 +2341,17 @@ class RunOrchestrator:
             mark_terminal_safe(runs_repo, run_id, "error")
             return
 
-        # Persist the lease (best-effort).
-        if runs_repo is not None and run_id is not None:
-            try:
-                runs_repo.create_sandbox_lease(
-                    run_id=run_id,
-                    sandbox_type=computer.sandbox_type,
-                    workspace_path=workspace_path,
-                )
-            except Exception:
-                logger.exception(
-                    "run_orchestration: create_sandbox_lease failed for "
-                    "run_id=%s; continuing without lease record (workspace=%s)",
-                    run_id, workspace_path,
-                )
+        # BCDEF ticket 06: acquire the durable active lease BEFORE the
+        # planner/pause flow. Failure is terminal — never hold an
+        # unleased sandbox.
+        lease_guard, lease_error, lease_message = self._acquire_sandbox_lease(
+            run_id=run_id, computer=computer, workspace_path=workspace_path
+        )
+        if lease_error is not None:
+            self._sandbox_cleanup(computer, workspace_path, runs_repo, run_id)
+            yield emit("error", {"code": lease_error, "message": lease_message})
+            mark_terminal_safe(runs_repo, run_id, "error")
+            return
 
         # Ticket 31: the bash command is planned by the real UniHarness
         # model loop (a non-executing turn — the planner has no shell
@@ -2331,22 +2586,16 @@ class RunOrchestrator:
             mark_terminal_safe(runs_repo, run_id, "error")
             return
 
-        # Persist the lease (best-effort). Lease persistence failure does not
-        # block the run — the workspace path is logged so operators can find
-        # the sandbox manually if the lease row is missing.
-        if runs_repo is not None and run_id is not None:
-            try:
-                runs_repo.create_sandbox_lease(
-                    run_id=run_id,
-                    sandbox_type=computer.sandbox_type,
-                    workspace_path=workspace_path,
-                )
-            except Exception:
-                logger.exception(
-                    "run_orchestration: create_sandbox_lease failed for "
-                    "run_id=%s; continuing without lease record (workspace=%s)",
-                    run_id, workspace_path,
-                )
+        # BCDEF ticket 06: acquire the durable active lease BEFORE any
+        # sandbox work. Failure is terminal — never execute unleased.
+        lease_guard, lease_error, lease_message = self._acquire_sandbox_lease(
+            run_id=run_id, computer=computer, workspace_path=workspace_path
+        )
+        if lease_error is not None:
+            self._sandbox_cleanup(computer, workspace_path, runs_repo, run_id)
+            yield emit("error", {"code": lease_error, "message": lease_message})
+            mark_terminal_safe(runs_repo, run_id, "error")
+            return
 
         try:
             # Cancel check before tool_call.
@@ -2462,6 +2711,7 @@ class RunOrchestrator:
                     workspace_path=workspace_path,
                     message=req.message,
                     run_id=run_id,
+                    lease_guard=lease_guard,
                 )
             except KernelModelFailure as exc:
                 yield emit("error", {"code": exc.code, "message": exc.message})
@@ -2479,9 +2729,23 @@ class RunOrchestrator:
 
             # Generate PDF inside sandbox. Fail-closed: timeout/error → terminal.
             try:
+                if lease_guard is not None:
+                    lease_guard.assert_active()
                 relative_path = computer.generate_pdf(
                     workspace_path, plan_content, _ARTIFACT_FILENAME
                 )
+            except SandboxLeaseLostError as exc:
+                yield emit("tool_result", {
+                    "tool": "generate_pdf",
+                    "status": "error",
+                    "content": f"沙箱租约无效：{exc.message}",
+                })
+                yield emit("error", {
+                    "code": exc.code,
+                    "message": f"沙箱租约无效，已停止执行：{exc.message}",
+                })
+                mark_terminal_safe(runs_repo, run_id, "error")
+                return
             except SandboxTimeoutError as exc:
                 yield emit("tool_result", {
                     "tool": "generate_pdf",
@@ -2813,7 +3077,9 @@ class RunOrchestrator:
             and isinstance(evt["payload"].get("content"), str)
         ]
 
-        def emit(event_type: str, payload: dict[str, Any]) -> EventEnvelope:
+        def _emit_impl(
+            event_type: str, payload: dict[str, Any], *, strict: bool
+        ) -> EventEnvelope:
             if event_type == "text":
                 content = payload.get("content")
                 if isinstance(content, str) and content:
@@ -2841,6 +3107,11 @@ class RunOrchestrator:
                         timestamp=envelope.timestamp,
                     )
                 except Exception:
+                    if strict:
+                        # BCDEF ticket 04: a success tool_result may only be
+                        # published once the effect event is replayable; the
+                        # driver turns this raise into outcome_unknown.
+                        raise
                     logger.exception(
                         "run_orchestration: persist_event failed during resume "
                         "for run_id=%s seq=%d",
@@ -2875,6 +3146,13 @@ class RunOrchestrator:
                     )
             return envelope
 
+        def emit(event_type: str, payload: dict[str, Any]) -> EventEnvelope:
+            return _emit_impl(event_type, payload, strict=False)
+
+        def emit_required(event_type: str, payload: dict[str, Any]) -> EventEnvelope:
+            """Durable publish gate: raises when the event cannot persist."""
+            return _emit_impl(event_type, payload, strict=True)
+
         # Look up the resolved approval that authorized this resume.
         approvals = runs_repo.list_approvals_for_run(run_id)
         resolved = next((a for a in approvals if a.is_terminal), None)
@@ -2882,6 +3160,17 @@ class RunOrchestrator:
             yield emit("error", {
                 "code": "no_resolved_approval",
                 "message": "运行已恢复但未找到已解决的审批。",
+            })
+            mark_terminal_safe(runs_repo, run_id, "error")
+            return
+
+        # BCDEF ticket 06: revalidate the run status BEFORE continuing.
+        # Only a paused run (awaiting the decision) or a running run
+        # (decision recorded) may start sandbox work again.
+        if run.status not in ("paused", "running"):
+            yield emit("error", {
+                "code": "run_not_resumable",
+                "message": f"运行状态 {run.status} 不允许继续执行。",
             })
             mark_terminal_safe(runs_repo, run_id, "error")
             return
@@ -2950,6 +3239,63 @@ class RunOrchestrator:
             mark_terminal_safe(runs_repo, run_id, "error")
             return
 
+        # BCDEF ticket 06: an expired lease cannot be renewed by the old
+        # worker and must NOT be silently bypassed with a new sandbox.
+        if lease.is_expired():
+            runs_repo.expire_sandbox_lease(run_id)
+            if not has_approval_resolved:
+                yield emit("approval.resolved", {
+                    "approval_id": resolved.approval_id,
+                    "tool": resolved.tool_name,
+                    "decision": "approve",
+                    "status": resolved.status,
+                    "message": "用户已批准操作，继续执行。",
+                })
+            yield emit("error", {
+                "code": "lease_expired",
+                "message": (
+                    "沙箱租约已过期，无法安全恢复运行；请重新发起请求。"
+                ),
+            })
+            mark_terminal_safe(runs_repo, run_id, "error")
+            return
+
+        # Revalidate the lease generation (heartbeat under the CURRENT
+        # fencing token). A stale token or a lost row fails closed.
+        lease_owner = f"resume:{uuid.uuid4().hex}"
+        renewed_lease, lease_renewed = runs_repo.renew_sandbox_lease(
+            run_id=run_id,
+            fencing_token=lease.fencing_token,
+            owner_id=lease_owner,
+            ttl_seconds=SANDBOX_LEASE_TTL_SECONDS,
+        )
+        if not lease_renewed or renewed_lease is None:
+            if not has_approval_resolved:
+                yield emit("approval.resolved", {
+                    "approval_id": resolved.approval_id,
+                    "tool": resolved.tool_name,
+                    "decision": "approve",
+                    "status": resolved.status,
+                    "message": "用户已批准操作，继续执行。",
+                })
+            yield emit("error", {
+                "code": "sandbox_lease_lost",
+                "message": (
+                    "沙箱租约已被其他执行者接管或失效，无法安全恢复运行。"
+                ),
+            })
+            mark_terminal_safe(runs_repo, run_id, "error")
+            return
+        lease = renewed_lease
+        lease_guard = SandboxLeaseGuard(
+            runs_repo,
+            run_id=run_id,
+            fencing_token=lease.fencing_token,
+            lease_id=lease.lease_id,
+            owner_id=lease_owner,
+            ttl_seconds=SANDBOX_LEASE_TTL_SECONDS,
+        )
+
         # Reconstruct the Computer bound to the leased workspace through
         # the injected factory (the adapter hook resolves the adapter
         # global lazily so contract-test monkeypatch points keep working).
@@ -2995,10 +3341,13 @@ class RunOrchestrator:
             if resolved.tool_name == "sandbox_bash":
                 async for envelope in self._resume_cowork_bash_steps(
                     emit=emit,
+                    emit_required=emit_required,
                     runs_repo=runs_repo,
                     run_id=run_id,
                     computer=computer,
                     workspace_path=workspace_path,
+                    lease=lease,
+                    lease_guard=lease_guard,
                     resolved=resolved,
                     approved_args=approved_args,
                     has_tool_call=has_tool_call,
@@ -3065,6 +3414,7 @@ class RunOrchestrator:
                         workspace_path=workspace_path,
                         message=user_message,
                         run_id=run_id,
+                        lease_guard=lease_guard,
                     )
                 except KernelModelFailure as exc:
                     yield emit("error", {"code": exc.code, "message": exc.message})
@@ -3077,6 +3427,10 @@ class RunOrchestrator:
                 plan_content = plan_text
 
             def _execute_pdf() -> dict[str, Any]:
+                # Ticket 06: heartbeat + revalidate the fenced lease right
+                # before the sandbox side effect.
+                lease_guard.renew()
+                lease_guard.assert_active()
                 generated = computer.generate_pdf(
                     workspace_path, plan_content, artifact_filename
                 )
@@ -3097,6 +3451,10 @@ class RunOrchestrator:
                 execute=_execute_pdf,
                 emit=emit,
                 outcome=outcome,
+                emit_required=emit_required,
+                post_execute_check=lease_guard.assert_active,
+                lease_id=lease.lease_id,
+                fencing_token=lease.fencing_token,
             ):
                 yield envelope
             if outcome.status in ("failed", "outcome_unknown", "in_flight"):
@@ -3245,10 +3603,13 @@ class RunOrchestrator:
         self,
         *,
         emit: EmitEnvelope,
+        emit_required: EmitEnvelope,
         runs_repo: RunRepository,
         run_id: str,
         computer: Computer,
         workspace_path: str,
+        lease: Any,
+        lease_guard: SandboxLeaseGuard,
         resolved: ApprovalRecord,
         approved_args: dict[str, Any],
         has_tool_call: bool,
@@ -3292,6 +3653,10 @@ class RunOrchestrator:
         outcome = EffectDriveResult()
 
         def _execute_bash() -> dict[str, Any]:
+            # Ticket 06: heartbeat + revalidate the fenced lease right
+            # before the sandbox side effect.
+            lease_guard.renew()
+            lease_guard.assert_active()
             bash_result = computer.run_bash(
                 workspace_path,
                 bash_command,
@@ -3321,6 +3686,10 @@ class RunOrchestrator:
             execute=_execute_bash,
             emit=emit,
             outcome=outcome,
+            emit_required=emit_required,
+            post_execute_check=lease_guard.assert_active,
+            lease_id=lease.lease_id,
+            fencing_token=lease.fencing_token,
         ):
             yield envelope
         if outcome.status in ("failed", "outcome_unknown", "in_flight"):
@@ -3552,6 +3921,21 @@ class RunOrchestrator:
                     "message": (
                         "沙箱租赁已丢失或销毁，无法安全恢复运行（spec AC7）。"
                         "请重新发起请求。"
+                    ),
+                },
+            )
+        # BCDEF ticket 06: an expired lease cannot authorize a resume;
+        # surface a stable lease_expired reason and leave the decision
+        # unrecorded (the run stays paused for reconciliation).
+        if lease.is_expired():
+            runs_repo.expire_sandbox_lease(approval.run_id)
+            return ApprovalDecisionOutcome(
+                status="sandbox_lease_lost",
+                payload={
+                    "approval_id": approval_id,
+                    "reason": "lease_expired",
+                    "message": (
+                        "沙箱租约已过期，无法安全恢复运行；请重新发起请求。"
                     ),
                 },
             )
