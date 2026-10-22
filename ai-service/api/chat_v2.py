@@ -569,6 +569,10 @@ async def chat_v2_snapshot(
         "sequence_cursor": snapshot.sequence_cursor,
         "messages": snapshot.messages,
         "pending_actions": snapshot.pending_actions,
+        # BCDEF ticket 08: frozen execution policy identity (snapshot /
+        # replay explain which policy this run executed under).
+        "policy_hash": snapshot.policy_hash,
+        "policy_schema_version": snapshot.policy_schema_version,
     }
 
 

@@ -23,19 +23,35 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Mapping
 
+from agent_v2.execution_contract import (
+    EXECUTION_SCHEMA_VERSION,
+    SUPPORTED_SCHEMA_VERSIONS,
+    BoundaryError,
+    ExecutionErrorCode,
+    policy_hash,
+)
+from agent_v2.execution_policy import (
+    ResolvedPolicySnapshot,
+    profile_from_policy,
+    serialize_policy,
+)
 from agent_v2.persistence import (
     ApprovalRecord,
     ArtifactRecord,
     CheckpointsStore,
     ControlStore,
     EffectRecord,
+    PolicySnapshotRecord,
+    PolicySnapshotWrite,
     RunAlreadyTerminal,
     RunNotFound,
     RunRecord,
     SandboxLeaseRecord,
 )
+from agent_v2.profiles import CapabilityProfile
 
 logger = logging.getLogger("ai-service.agent_v2.runs")
 
@@ -72,6 +88,10 @@ class RunSnapshot:
     sequence_cursor: int
     messages: list[dict[str, Any]]
     pending_actions: list[dict[str, Any]]
+    # BCDEF ticket 08: the frozen execution policy identity, so snapshot
+    # readers can explain which policy a run executed under.
+    policy_hash: str = ""
+    policy_schema_version: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +101,65 @@ class CancelOutcome:
     accepted: bool
     reason: str
     run_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class AdmissionResult:
+    """Outcome of the admission fence (BCDEF ticket 02).
+
+    ``execute`` is True for exactly one caller per request_id: the CAS
+    winner of ``admission_pending``/``admission_failed`` → ``admitted``.
+    Duplicates and terminal replays therefore never start a second model
+    turn. ``admission_event`` is the persisted ``run_started`` envelope
+    data so orchestration can emit the exact durable frame (same
+    event_id/sequence/payload as replay).
+    """
+
+    run_id: str
+    conversation_id: str
+    status: str
+    created: bool = False
+    replayed: bool = False
+    repaired: bool = False
+    execute: bool = False
+    error_code: str | None = None
+    recoverable: bool = False
+    admission_event: dict[str, Any] | None = None
+    policy_hash: str = ""
+    policy_schema_version: int = 0
+    policy: Mapping[str, Any] | None = None
+    profile: CapabilityProfile | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error_code is None
+
+
+# Statuses that a retry must replay, never repair or execute again.
+_NON_REPAIRABLE_STATUSES = frozenset(
+    {"done", "error", "cancelled", "outcome_unknown"}
+)
+
+
+def _admission_payload(
+    *,
+    status: str,
+    created: bool,
+    replayed: bool,
+    repaired: bool,
+    policy_hash_value: str = "",
+    schema_version: int = 0,
+) -> dict[str, Any]:
+    admission: dict[str, Any] = {
+        "status": status,
+        "created": created,
+        "replayed": replayed,
+        "repaired": repaired,
+    }
+    if policy_hash_value:
+        admission["policy_hash"] = policy_hash_value
+        admission["schema_version"] = schema_version
+    return {"admission": admission}
 
 
 class RunRepository:
@@ -144,6 +223,427 @@ class RunRepository:
                 sequence=0,
             )
         return run_id, created
+
+    # -- admission fence (BCDEF ticket 02) ------------------------------
+
+    def admit(
+        self,
+        *,
+        request_id: str,
+        conversation_id: str | None,
+        profile_id: str,
+        user_message: str,
+        policy: Mapping[str, Any] | None = None,
+    ) -> AdmissionResult:
+        """Durably admit one request before any model or sandbox work.
+
+        The fence is: run row + frozen policy snapshot → canonical
+        conversation → user message → admission (``run_started``) event →
+        ``admitted`` CAS. Any required write failure returns
+        ``admission_failed`` (recoverable) without a model turn. A
+        same-request retry keeps the original run_id and only backfills
+        the missing records; at most one durable run, one user message and
+        one admission event exist per request_id.
+
+        ``policy`` is the complete execution policy built at THIS
+        admission from current config. It is hashed and stored atomically
+        with the run, and the returned ``profile`` is reconstructed from
+        the stored snapshot so execution never re-reads config.
+        """
+        supplied = (conversation_id or "").strip()
+        canonical = supplied or f"conv-{request_id}"
+
+        policy_write: PolicySnapshotWrite | None = None
+        expected_hash = ""
+        expected_schema = 0
+        if policy is not None:
+            try:
+                expected_schema = int(
+                    policy.get("schema_version", EXECUTION_SCHEMA_VERSION)
+                )
+                if expected_schema not in SUPPORTED_SCHEMA_VERSIONS:
+                    raise ValueError(
+                        f"unsupported policy schema {expected_schema}"
+                    )
+                expected_hash = policy_hash(policy)
+                policy_write = PolicySnapshotWrite(
+                    policy_json=serialize_policy(policy),
+                    policy_hash=expected_hash,
+                    schema_version=expected_schema,
+                    source_version=str(policy.get("source_version", "")),
+                    compatibility_json=json.dumps(
+                        dict(policy.get("compatibility", {})),
+                        sort_keys=True,
+                        ensure_ascii=False,
+                    ),
+                    created_at=datetime.now(timezone.utc).isoformat(),
+                )
+            except Exception:
+                logger.exception(
+                    "admission: policy snapshot build failed for request_id=%s",
+                    request_id,
+                )
+                return AdmissionResult(
+                    run_id="",
+                    conversation_id=canonical,
+                    status="admission_failed",
+                    error_code=ExecutionErrorCode.POLICY_INCOMPATIBLE.value,
+                    recoverable=False,
+                )
+
+        try:
+            run, created = self.control.admit_run(
+                request_id=request_id,
+                conversation_id=canonical,
+                profile_id=profile_id,
+                policy=policy_write,
+            )
+        except Exception:
+            logger.exception(
+                "admission: run write failed for request_id=%s", request_id
+            )
+            return AdmissionResult(
+                run_id="",
+                conversation_id=canonical,
+                status="admission_failed",
+                error_code="admission_failed",
+                recoverable=True,
+            )
+
+        run_id = run.run_id
+        canonical = run.conversation_id
+        prior_status = run.status
+        replayed = not created
+
+        if prior_status in _NON_REPAIRABLE_STATUSES:
+            stored = self.control.get_policy_snapshot(run_id)
+            return AdmissionResult(
+                run_id=run_id,
+                conversation_id=canonical,
+                status=prior_status,
+                created=created,
+                replayed=True,
+                execute=False,
+                admission_event=self._admission_event_dict(run_id),
+                policy_hash=stored.policy_hash if stored is not None else "",
+                policy_schema_version=(
+                    stored.schema_version if stored is not None else 0
+                ),
+            )
+
+        # Ticket 08: a run without a frozen snapshot may not execute. A
+        # legacy/pre-policy run gets its snapshot on the first admission
+        # attempt; failure here keeps the run repairable and refuses
+        # execution.
+        if policy_write is not None:
+            try:
+                if self.control.get_policy_snapshot(run_id) is None:
+                    self.control.insert_policy_snapshot(
+                        run_id=run_id, policy=policy_write
+                    )
+            except Exception:
+                logger.exception(
+                    "admission: policy snapshot write failed for run_id=%s",
+                    run_id,
+                )
+                if prior_status in ("admission_pending", "admission_failed"):
+                    self._mark_admission_failed(run_id)
+                return AdmissionResult(
+                    run_id=run_id,
+                    conversation_id=canonical,
+                    status="admission_failed",
+                    created=created,
+                    replayed=replayed,
+                    execute=False,
+                    error_code=ExecutionErrorCode.POLICY_INCOMPATIBLE.value,
+                    recoverable=False,
+                    admission_event=self._admission_event_dict(run_id),
+                )
+
+        repaired = False
+        try:
+            conversation_created = self.checkpoints.ensure_conversation(
+                conversation_id=canonical,
+                profile_id=profile_id,
+            )
+            _message_id, message_created = self.checkpoints.ensure_user_message(
+                conversation_id=canonical,
+                run_id=run_id,
+                content=user_message,
+            )
+            repaired = replayed and (conversation_created or message_created)
+            if prior_status == "admission_failed":
+                repaired = True
+            outcome = "repaired" if repaired else "admitted"
+            _event, event_created = self.checkpoints.ensure_admission_event(
+                run_id=run_id,
+                conversation_id=canonical,
+                request_id=request_id,
+                payload=_admission_payload(
+                    status=outcome,
+                    created=created,
+                    replayed=replayed,
+                    repaired=repaired,
+                    policy_hash_value=expected_hash,
+                    schema_version=expected_schema,
+                ),
+            )
+            if replayed and event_created:
+                repaired = True
+                self.checkpoints.ensure_admission_event(
+                    run_id=run_id,
+                    conversation_id=canonical,
+                    request_id=request_id,
+                    payload=_admission_payload(
+                        status="repaired",
+                        created=created,
+                        replayed=True,
+                        repaired=True,
+                        policy_hash_value=expected_hash,
+                        schema_version=expected_schema,
+                    ),
+                )
+        except Exception:
+            logger.exception(
+                "admission: checkpoint fence failed for request_id=%s run_id=%s",
+                request_id,
+                run_id,
+            )
+            self._mark_admission_failed(run_id)
+            return AdmissionResult(
+                run_id=run_id,
+                conversation_id=canonical,
+                status="admission_failed",
+                created=created,
+                replayed=replayed,
+                repaired=repaired,
+                execute=False,
+                error_code="admission_failed",
+                recoverable=True,
+                admission_event=self._admission_event_dict(run_id),
+                policy_hash=expected_hash,
+                policy_schema_version=expected_schema,
+            )
+
+        # Validate the stored snapshot BEFORE claiming the run for
+        # execution: a missing/corrupt snapshot fails the admission fence
+        # instead of reaching the model.
+        resolved: ResolvedPolicySnapshot | None = None
+        frozen_profile: CapabilityProfile | None = None
+        if policy_write is not None:
+            try:
+                resolved = self.resolve_policy_snapshot(run_id)
+                frozen_profile = resolved.profile()
+            except BoundaryError as exc:
+                logger.warning(
+                    "admission: policy snapshot unusable for run_id=%s: %s",
+                    run_id,
+                    exc,
+                )
+                if prior_status in ("admission_pending", "admission_failed"):
+                    self._mark_admission_failed(run_id)
+                return AdmissionResult(
+                    run_id=run_id,
+                    conversation_id=canonical,
+                    status="admission_failed",
+                    created=created,
+                    replayed=replayed,
+                    repaired=repaired,
+                    execute=False,
+                    error_code=exc.code.value,
+                    recoverable=exc.recoverable,
+                    admission_event=self._admission_event_dict(run_id),
+                    policy_hash=expected_hash,
+                    policy_schema_version=expected_schema,
+                )
+
+        try:
+            repair_edge = prior_status == "admission_failed"
+            won = self.control.mark_run_admitted(run_id=run_id, repair=repair_edge)
+            if not won:
+                current = self.control.get_run(run_id)
+                if current is not None and current.status == "admission_failed":
+                    won = self.control.mark_run_admitted(run_id=run_id, repair=True)
+                    if won:
+                        repair_edge = True
+                        repaired = True
+                elif current is not None:
+                    return AdmissionResult(
+                        run_id=run_id,
+                        conversation_id=canonical,
+                        status=current.status,
+                        created=created,
+                        replayed=True,
+                        repaired=repaired,
+                        execute=False,
+                        admission_event=self._admission_event_dict(run_id),
+                        policy_hash=expected_hash,
+                        policy_schema_version=expected_schema,
+                    )
+            if won and repair_edge:
+                # Supersede the failed attempt: drop its stale error
+                # terminal and record the repaired admission outcome.
+                self.checkpoints.clear_admission_failure_events(run_id)
+                self.checkpoints.ensure_admission_event(
+                    run_id=run_id,
+                    conversation_id=canonical,
+                    request_id=request_id,
+                    payload=_admission_payload(
+                        status="repaired",
+                        created=created,
+                        replayed=True,
+                        repaired=True,
+                        policy_hash_value=expected_hash,
+                        schema_version=expected_schema,
+                    ),
+                )
+                repaired = True
+        except Exception:
+            logger.exception(
+                "admission: admitted transition failed for request_id=%s run_id=%s",
+                request_id,
+                run_id,
+            )
+            self._mark_admission_failed(run_id)
+            return AdmissionResult(
+                run_id=run_id,
+                conversation_id=canonical,
+                status="admission_failed",
+                created=created,
+                replayed=replayed,
+                repaired=repaired,
+                execute=False,
+                error_code="admission_failed",
+                recoverable=True,
+                admission_event=self._admission_event_dict(run_id),
+                policy_hash=expected_hash,
+                policy_schema_version=expected_schema,
+            )
+
+        if not won:
+            return AdmissionResult(
+                run_id=run_id,
+                conversation_id=canonical,
+                status="admitted",
+                created=created,
+                replayed=True,
+                repaired=repaired,
+                execute=False,
+                admission_event=self._admission_event_dict(run_id),
+                policy_hash=expected_hash,
+                policy_schema_version=expected_schema,
+            )
+
+        return AdmissionResult(
+            run_id=run_id,
+            conversation_id=canonical,
+            status="admitted",
+            created=created,
+            replayed=replayed,
+            repaired=repaired,
+            execute=True,
+            admission_event=self._admission_event_dict(run_id),
+            policy_hash=expected_hash,
+            policy_schema_version=expected_schema,
+            policy=(dict(resolved.policy) if resolved is not None else None),
+            profile=frozen_profile,
+        )
+
+    def resolve_policy_snapshot(self, run_id: str) -> ResolvedPolicySnapshot:
+        """Return the validated frozen policy of ``run_id``.
+
+        Fails closed with ``policy_snapshot_missing`` when no snapshot was
+        written, and with ``policy_incompatible`` when the stored content
+        does not match its recorded hash, targets an unsupported schema,
+        or cannot be interpreted. Ticket 09 adapters and ticket 10
+        projection consume this API.
+        """
+        record = self.control.get_policy_snapshot(run_id)
+        if record is None:
+            raise BoundaryError(
+                ExecutionErrorCode.POLICY_SNAPSHOT_MISSING,
+                f"run {run_id} has no frozen execution policy snapshot",
+            )
+        try:
+            policy = json.loads(record.policy_json)
+        except (TypeError, ValueError) as exc:
+            raise BoundaryError(
+                ExecutionErrorCode.POLICY_INCOMPATIBLE,
+                f"run {run_id} policy snapshot is not valid JSON",
+            ) from exc
+        if not isinstance(policy, dict):
+            raise BoundaryError(
+                ExecutionErrorCode.POLICY_INCOMPATIBLE,
+                f"run {run_id} policy snapshot is not a mapping",
+            )
+        if policy_hash(policy) != record.policy_hash:
+            raise BoundaryError(
+                ExecutionErrorCode.POLICY_INCOMPATIBLE,
+                f"run {run_id} policy hash mismatch",
+            )
+        if record.schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+            raise BoundaryError(
+                ExecutionErrorCode.POLICY_INCOMPATIBLE,
+                f"run {run_id} policy schema {record.schema_version} "
+                f"is not supported",
+            )
+        if int(policy.get("schema_version", -1)) != record.schema_version:
+            raise BoundaryError(
+                ExecutionErrorCode.POLICY_INCOMPATIBLE,
+                f"run {run_id} policy schema does not match its hash content",
+            )
+        try:
+            compatibility = json.loads(record.compatibility_json or "{}")
+        except (TypeError, ValueError):
+            compatibility = {}
+        if not isinstance(compatibility, dict):
+            compatibility = {}
+        return ResolvedPolicySnapshot(
+            run_id=run_id,
+            policy=policy,
+            policy_hash=record.policy_hash,
+            schema_version=record.schema_version,
+            source_version=record.source_version,
+            created_at=record.created_at,
+            compatibility=compatibility,
+        )
+
+    def get_policy_snapshot(self, run_id: str) -> PolicySnapshotRecord | None:
+        """Raw persisted snapshot row (no validation), or None."""
+        return self.control.get_policy_snapshot(run_id)
+
+    def _admission_event_dict(self, run_id: str) -> dict[str, Any] | None:
+        event = self.checkpoints.get_admission_event(run_id)
+        if event is None:
+            return None
+        return {
+            "version": "2",
+            "event_id": event.event_id,
+            "sequence": event.sequence,
+            "run_id": event.run_id,
+            "conversation_id": event.conversation_id,
+            "timestamp": event.created_at,
+            "type": event.event_type,
+            "request_id": event.request_id,
+            "payload": json.loads(event.payload_json),
+        }
+
+    def _mark_admission_failed(self, run_id: str) -> None:
+        try:
+            self.control.mark_admission_failed(run_id)
+        except Exception:
+            logger.exception(
+                "admission: could not persist admission_failed for run_id=%s",
+                run_id,
+            )
+
+    def mark_run_running(self, run_id: str) -> bool:
+        """Idempotently enter execution after the admission fence."""
+        return self.control.mark_run_running(run_id)
+
+    def get_admission_event(self, run_id: str) -> dict[str, Any] | None:
+        """The persisted admission envelope data, or None."""
+        return self._admission_event_dict(run_id)
 
     def get_run(self, run_id: str) -> RunRecord | None:
         return self.control.get_run(run_id)
@@ -708,6 +1208,7 @@ class RunRepository:
         )
         sequence_cursor = self.checkpoints.get_last_sequence(run_id)
         pending = self.checkpoints.get_pending_actions(run_id)
+        policy_snapshot = self.control.get_policy_snapshot(run_id)
 
         return RunSnapshot(
             run_id=run.run_id,
@@ -731,6 +1232,14 @@ class RunRepository:
                 for m in messages
             ],
             pending_actions=pending,
+            policy_hash=(
+                policy_snapshot.policy_hash if policy_snapshot is not None else ""
+            ),
+            policy_schema_version=(
+                policy_snapshot.schema_version
+                if policy_snapshot is not None
+                else 0
+            ),
         )
 
     # -- cancel ---------------------------------------------------------

@@ -85,6 +85,8 @@ from agent_v2.events import (
     EventStream,
     TerminalEventAlreadyEmitted,
 )
+from agent_v2.execution_contract import BoundaryError
+from agent_v2.execution_policy import build_execution_policy, freeze_settings
 from agent_v2.memory_tools import extract_sensitive_memory
 from agent_v2.observability import CapacityExceeded
 from agent_v2.permissions import PermissionDecision, PermissionGate
@@ -1330,9 +1332,10 @@ class RunOrchestrator:
         telemetry = self._telemetry
         telemetry_started = time.perf_counter()
 
-        # Idempotent run creation. ``conversation_id`` defaults to a
-        # derived value so single-shot runs without a client-supplied id
-        # still persist.
+        # The canonical conversation identity is the one durably stored in
+        # the run row. A client-supplied id wins; otherwise the derived
+        # ``conv-{request_id}`` is persisted and used by every envelope
+        # (fixes the empty conversation_id on derived conversations).
         run_id: str | None = None
         conversation_id = req.conversation_id or f"conv-{req.request_id}"
         conversation_forbidden = bool(
@@ -1340,61 +1343,6 @@ class RunOrchestrator:
             and subject_id
             and not memory.claim_conversation(subject_id, conversation_id)
         )
-        if runs_repo is not None and not conversation_forbidden:
-            try:
-                run_id, created = runs_repo.create_run_idempotent(
-                    request_id=req.request_id,
-                    conversation_id=conversation_id,
-                    profile_id=req.profile_id,
-                    user_message=req.message,
-                )
-            except Exception:
-                # Persistence failure must not break the in-memory stream.
-                # Log and continue without persistence; the client still
-                # gets the SSE contract, just without durable replay for
-                # this run.
-                logger.exception(
-                    "chat_v2: create_run_idempotent failed for request_id=%s; "
-                    "continuing without persistence",
-                    req.request_id,
-                )
-                run_id = None
-                created = True  # proceed as if fresh
-            else:
-                persisted_run = runs_repo.get_run(run_id)
-                if (
-                    memory is not None
-                    and subject_id
-                    and persisted_run is not None
-                    and not memory.owns_conversation(
-                        subject_id, persisted_run.conversation_id
-                    )
-                ):
-                    conversation_forbidden = True
-                    run_id = None
-                    created = True
-                # Propagate the server-generated run_id to every built
-                # envelope (spec decision #26). The frontend reads this
-                # from the first event to call /snapshot, /cancel, and
-                # /events.
-                if run_id:
-                    stream.run_id = run_id
-                    if created and telemetry is not None:
-                        telemetry.record(
-                            run_id,
-                            profile_name=req.profile_id,
-                            status="running",
-                            model_name=getattr(self._settings, "openai_model", ""),
-                        )
-                if not created:
-                    # Spec AC2: duplicate request_id — replay stored
-                    # events and stop. No model call, no tool
-                    # re-execution.
-                    async for envelope in self._replay_stored_events(
-                        stream, runs_repo, run_id, req
-                    ):
-                        yield envelope
-                    return
 
         # Build the emit closures. They wrap build + persist (+ render
         # for the legacy hooks) so the flow generators below stay linear
@@ -1409,7 +1357,7 @@ class RunOrchestrator:
                         event_type=envelope.type,
                         payload=envelope.payload,
                         request_id=req.request_id,
-                        conversation_id=req.conversation_id or "",
+                        conversation_id=conversation_id,
                         event_id=envelope.event_id,
                         timestamp=envelope.timestamp,
                     )
@@ -1441,6 +1389,21 @@ class RunOrchestrator:
                     )
             return envelope
 
+        def _admission_envelope(event: dict[str, Any]) -> EventEnvelope:
+            return EventEnvelope(
+                version=event.get("version", "2"),
+                sequence=event["sequence"],
+                type=event["type"],
+                payload=event["payload"],
+                request_id=event.get("request_id", req.request_id),
+                conversation_id=event.get("conversation_id", conversation_id),
+                run_id=event.get("run_id", run_id or ""),
+                event_id=event.get("event_id", ""),
+                timestamp=event.get("timestamp", ""),
+            )
+
+        admission = None
+        run_started_emitted = False
         try:
             if conversation_forbidden:
                 yield _emit("error", {
@@ -1451,17 +1414,18 @@ class RunOrchestrator:
 
             # v2 disabled → terminal error. The Gateway should not route
             # here when v2 is off, but the endpoint defends in depth. No
-            # internal events have been processed, so unknown_dropped
-            # stays 0.
+            # admission happens: a request that can never execute must
+            # not leave a durable run behind.
             if not self._settings.agent_v2_enabled:
                 yield _emit("error", {
                     "code": "v2_disabled",
                     "message": "Chat v2 is disabled (AGENT_V2_ENABLED=false).",
                 })
-                mark_terminal_safe(runs_repo, run_id, "error")
                 return
 
             # Resolve profile (server-defined; client cannot override).
+            # Resolution happens BEFORE admission so an unknown profile
+            # never creates a durable run.
             try:
                 profile = resolve_profile(req.profile_id)
             except UnknownProfileError as exc:
@@ -1469,17 +1433,11 @@ class RunOrchestrator:
                     "code": "unknown_profile",
                     "message": str(exc),
                 })
-                mark_terminal_safe(runs_repo, run_id, "error")
                 return
 
-            # Ticket 13 AC2 — cowork authorization gate. The cowork
-            # profile is registered but NOT callable by default. Only an
-            # explicit operator-set policy of ``trusted`` or ``staging``
-            # authorizes the request. Clients cannot upgrade to cowork
-            # by sending the profile id — this server-side gate is the
-            # authority. The check runs AFTER profile resolution so an
-            # unknown profile still returns ``unknown_profile`` (not
-            # ``cowork_unauthorized``).
+            # Ticket 13 AC2 — cowork authorization gate (unchanged): the
+            # server policy, not the client, authorizes cowork. Runs
+            # before admission so an unauthorized request creates no run.
             if profile.profile_id == ProfileId.COWORK and not is_cowork_authorized(
                 self._settings
             ):
@@ -1490,16 +1448,168 @@ class RunOrchestrator:
                         "请联系运维启用 trusted/staging 策略。"
                     ),
                 })
-                mark_terminal_safe(runs_repo, run_id, "error")
                 return
+
+            # BCDEF ticket 08: freeze the COMPLETE execution policy from
+            # current config exactly once, before admission. It is stored
+            # with the run and every later execution step reads the frozen
+            # snapshot, never the live config.
+            try:
+                execution_policy = build_execution_policy(profile, self._settings)
+            except Exception:
+                logger.exception(
+                    "chat_v2: execution policy build failed for request_id=%s",
+                    req.request_id,
+                )
+                yield _emit("error", {
+                    "code": "policy_incompatible",
+                    "message": "运行策略无法冻结，已停止执行。",
+                    "recoverable": False,
+                })
+                return
+
+            # BCDEF ticket 02: the admission fence. Runs BEFORE any model
+            # call or sandbox creation. A failure here is terminal and
+            # never reaches execution; the same request_id retry repairs
+            # only the missing durable records.
+            policy_settings: Any = self._settings
+            if runs_repo is not None:
+                try:
+                    admission = runs_repo.admit(
+                        request_id=req.request_id,
+                        conversation_id=req.conversation_id,
+                        profile_id=req.profile_id,
+                        user_message=req.message,
+                        policy=execution_policy,
+                    )
+                except Exception:
+                    logger.exception(
+                        "chat_v2: admission crashed for request_id=%s",
+                        req.request_id,
+                    )
+                    yield _emit("error", {
+                        "code": "admission_failed",
+                        "message": "请求未被接纳，未执行模型调用。",
+                        "recoverable": True,
+                    })
+                    return
+
+                run_id = admission.run_id or None
+                conversation_id = admission.conversation_id or conversation_id
+                stream.run_id = run_id or ""
+                stream.conversation_id = conversation_id
+
+                if (
+                    run_id
+                    and memory is not None
+                    and subject_id
+                    and not memory.owns_conversation(subject_id, conversation_id)
+                ):
+                    conversation_forbidden = True
+                    run_id = None
+                    stream.run_id = ""
+
+                if not admission.ok:
+                    error_payload = {
+                        "code": admission.error_code or "admission_failed",
+                        "message": "请求未被接纳，未执行模型调用。",
+                        "recoverable": admission.recoverable,
+                    }
+                    if admission.admission_event is not None:
+                        envelope = _admission_envelope(admission.admission_event)
+                        stream.advance_to(envelope.sequence)
+                        yield envelope
+                        yield _emit("error", error_payload)
+                    else:
+                        # No admission fact is durable yet: the failed
+                        # attempt must not write an error row before the
+                        # admission event, or a repair would replay an
+                        # error terminal ahead of the run's admission.
+                        # The run status (admission_failed) is the durable
+                        # explanation until repair.
+                        yield stream.build("error", error_payload)
+                    return
+
+                if admission.created and telemetry is not None and run_id:
+                    telemetry.record(
+                        run_id,
+                        profile_name=req.profile_id,
+                        status="running",
+                        model_name=getattr(self._settings, "openai_model", ""),
+                    )
+
+                if conversation_forbidden:
+                    yield _emit("error", {
+                        "code": "conversation_forbidden",
+                        "message": "Conversation not accessible",
+                    })
+                    return
+
+                if not admission.execute:
+                    # Duplicate request_id or terminal replay — replay the
+                    # stored stream. No model call, no tool re-execution.
+                    async for envelope in self._replay_stored_events(
+                        stream, runs_repo, run_id, req
+                    ):
+                        yield envelope
+                    return
+
+                # The persisted admission event IS the first frame. Emit
+                # the exact durable envelope (same id/sequence/payload) so
+                # first stream and replay agree.
+                if admission.admission_event is not None:
+                    envelope = _admission_envelope(admission.admission_event)
+                    stream.advance_to(envelope.sequence)
+                    run_started_emitted = True
+                    yield envelope
+
+                # Ticket 08: execution uses the FROZEN snapshot. A run
+                # without a valid snapshot fails closed before any model,
+                # tool or sandbox work.
+                try:
+                    resolved_policy = runs_repo.resolve_policy_snapshot(run_id)
+                    profile = resolved_policy.profile()
+                    policy_settings = freeze_settings(
+                        self._settings, resolved_policy.policy
+                    )
+                except BoundaryError as exc:
+                    logger.error(
+                        "chat_v2: policy snapshot unusable for run_id=%s: %s",
+                        run_id,
+                        exc,
+                    )
+                    yield _emit("error", {
+                        "code": exc.code.value,
+                        "message": "运行策略快照不可用，已停止执行。",
+                        "recoverable": exc.recoverable,
+                    })
+                    mark_terminal_safe(runs_repo, run_id, "error")
+                    return
+
+                try:
+                    runs_repo.mark_run_running(run_id)
+                except Exception:
+                    logger.exception(
+                        "chat_v2: mark_run_running failed for run_id=%s", run_id
+                    )
+                    yield _emit("error", {
+                        "code": "admission_failed",
+                        "message": "请求未被接纳，未执行模型调用。",
+                        "recoverable": True,
+                    })
+                    mark_terminal_safe(runs_repo, run_id, "error")
+                    return
+            else:
+                stream.conversation_id = conversation_id
 
             # Model failure scenario: no API key configured. The contract
             # requires this to be a terminal ``error`` event, not an HTTP
-            # 500. ``run_started`` is emitted first so the client sees the
-            # run begin before the model-unavailable terminal (spec
-            # decision #27).
+            # 500. The admission ``run_started`` frame (if persistence is
+            # on) already told the client the run began.
             if not self._settings.openai_api_key:
-                yield _emit("run_started", {})
+                if not run_started_emitted:
+                    yield _emit("run_started", {})
+                    run_started_emitted = True
                 yield _emit("error", {
                     "code": "model_unavailable",
                     "message": "主模型未配置 API Key (OPENAI_API_KEY 为空)。",
@@ -1516,10 +1626,12 @@ class RunOrchestrator:
             stream.drop_unknown("uniharness_llm_token")
 
             # Spec decision #27 + AC2: ``run_started`` is a distinct
-            # event type signaling the run has begun. It is the first
-            # user-visible event in a successful flow; ``progress``
-            # follows for ongoing status updates.
-            yield _emit("run_started", {})
+            # event type signaling the run has begun. Without persistence
+            # it is built here; with persistence the durable admission
+            # event was already yielded above.
+            if not run_started_emitted:
+                yield _emit("run_started", {})
+                run_started_emitted = True
 
             yield _emit("progress", {
                 "stage": "processing",
@@ -1552,6 +1664,7 @@ class RunOrchestrator:
                 # route flow exists anymore.
                 async for envelope in self._stream_kernel_turn(
                     req, profile, run_id=run_id, emit=_emit,
+                    settings=policy_settings,
                 ):
                     if is_cancelled(runs_repo, run_id) and not stream.terminal_emitted:
                         yield _emit("cancelled", {
@@ -1571,6 +1684,7 @@ class RunOrchestrator:
                 # chat exactly: one `done` terminal after `text`.
                 async for envelope in self._stream_kernel_turn(
                     req, profile, run_id=run_id, emit=_emit,
+                    settings=policy_settings,
                 ):
                     if is_cancelled(runs_repo, run_id) and not stream.terminal_emitted:
                         yield _emit("cancelled", {
@@ -1597,6 +1711,7 @@ class RunOrchestrator:
                 # ``finally`` block so the sandbox is never leaked.
                 async for envelope in self._stream_artifact_flow(
                     req, profile, run_id=run_id, emit=_emit,
+                    settings=policy_settings,
                 ):
                     yield envelope
                 return
@@ -1611,6 +1726,7 @@ class RunOrchestrator:
                 # module.)
                 async for envelope in self._stream_cowork_flow(
                     req, profile, run_id=run_id, emit=_emit,
+                    settings=policy_settings,
                 ):
                     yield envelope
                 return
@@ -1638,6 +1754,7 @@ class RunOrchestrator:
                 async for envelope in self._stream_kernel_turn(
                     req, profile, run_id=run_id, emit=_emit,
                     memory=memory, subject_id=subject_id,
+                    settings=policy_settings,
                 ):
                     yield envelope
             else:
@@ -1685,6 +1802,7 @@ class RunOrchestrator:
         *,
         run_id: str | None,
         emit: EmitEnvelope,
+        settings: Any | None = None,
     ) -> AsyncGenerator[EventEnvelope, None]:
         """cowork profile flow.
 
@@ -1778,7 +1896,7 @@ class RunOrchestrator:
             command_plan, _ = await self._kernel_turn(
                 system_prompt=compose_cowork_planner_prompt(),
                 message=req.message,
-                settings=self._settings,
+                settings=settings if settings is not None else self._settings,
                 run_id=run_id,
                 checkpoint_store=self._kernel_checkpoints,
                 extra_tools=(),
@@ -1928,6 +2046,7 @@ class RunOrchestrator:
         *,
         run_id: str | None,
         emit: EmitEnvelope,
+        settings: Any | None = None,
     ) -> AsyncGenerator[EventEnvelope, None]:
         """artifact profile flow.
 
@@ -2125,7 +2244,7 @@ class RunOrchestrator:
             try:
                 plan_text, plan_audit_entries = await _kernel_plan_turn(
                     kernel_turn=self._kernel_turn,
-                    settings=self._settings,
+                    settings=settings if settings is not None else self._settings,
                     checkpoint_store=self._kernel_checkpoints,
                     computer=computer,
                     workspace_path=workspace_path,
@@ -3275,7 +3394,7 @@ class RunOrchestrator:
                     event_type=terminal_envelope.type,
                     payload=terminal_envelope.payload,
                     request_id=req.request_id,
-                    conversation_id=req.conversation_id or "",
+                    conversation_id=stream.conversation_id,
                 )
             except Exception:
                 logger.exception(
@@ -3294,8 +3413,10 @@ class RunOrchestrator:
         emit: EmitEnvelope,
         memory: Any | None = None,
         subject_id: str | None = None,
+        settings: Any | None = None,
     ) -> AsyncGenerator[EventEnvelope, None]:
         """Shared T26/T28/T29 kernel turn used by chat and route_plan profiles."""
+        kernel_settings = settings if settings is not None else self._settings
         from agent_v2.kernel import KernelModelFailure
         from agent_v2.kernel_tools import (
             build_chat_extra_tools,
@@ -3308,7 +3429,7 @@ class RunOrchestrator:
         mcp_servers: dict[str, Any] = {}
         mcp_required = getattr(profile, "allowed_mcp_servers", None)
         if mcp_required:
-            mcp_servers, mcp_audits = build_profile_mcp_servers(profile, self._settings)
+            mcp_servers, mcp_audits = build_profile_mcp_servers(profile, kernel_settings)
             if not mcp_servers:
                 # Every allowlisted evidence source is unavailable → fail
                 # closed instead of fabricating a plan (Ticket 29 AC5).
@@ -3339,7 +3460,7 @@ class RunOrchestrator:
             # kernel turn.
             sub_defs, sub_audits = build_subagent_definitions(
                 profile,
-                self._settings,
+                kernel_settings,
                 extra_tool_names={t.name for t in extra_tools},
                 available_mcp_servers=set(mcp_servers),
             )
@@ -3393,7 +3514,7 @@ class RunOrchestrator:
             deltas: asyncio.Queue[tuple[str, str]] = asyncio.Queue(maxsize=1)
             streamed_text = ""
             thoughts_enabled = bool(
-                getattr(self._settings, "agent_v2_thoughts_enabled", True)
+                getattr(kernel_settings, "agent_v2_thoughts_enabled", True)
             )
 
             async def on_text(delta: str, kernel_audits: list[dict[str, Any]]) -> None:
@@ -3413,7 +3534,7 @@ class RunOrchestrator:
             task = asyncio.create_task(self._kernel_turn(
                 system_prompt=system_prompt,
                 message=req.message,
-                settings=self._settings,
+                settings=kernel_settings,
                 run_id=run_id,
                 checkpoint_store=self._kernel_checkpoints,
                 extra_tools=tuple(extra_tools),
@@ -3421,6 +3542,7 @@ class RunOrchestrator:
                 mcp_servers=mcp_servers or None,
                 subagent_definitions=sub_defs or None,
                 history=history,
+                compaction_threshold=profile.model.compaction_threshold,
                 on_text=on_text,
                 on_thought=on_thought if thoughts_enabled else None,
             ))

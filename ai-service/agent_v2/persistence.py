@@ -69,24 +69,42 @@ def _connect(path: str) -> sqlite3.Connection:
 
 
 RunStatus = Literal[
-    "running",      # actively streaming
-    "done",         # natural terminal (done event emitted)
-    "error",        # failure terminal (error event emitted)
-    "cancelled",    # cancel requested + accepted
-    "paused",       # Ticket 11: awaiting user approval; NOT terminal
+    "admission_pending",  # durable run exists, admission fence not yet complete
+    "admitted",           # admission fence complete; execution may start
+    "running",            # actively streaming
+    "done",               # natural terminal (done event emitted)
+    "error",              # failure terminal (error event emitted)
+    "cancelled",          # cancel requested + accepted
+    "paused",             # Ticket 11: awaiting user approval; NOT terminal
+    "admission_failed",   # fence failed; repairable by admission repair only
 ]
 
-TerminalType = Literal["done", "error", "cancelled"]
+TerminalType = Literal["done", "error", "cancelled", "admission_failed"]
 
 _VALID_STATUSES: frozenset[str] = frozenset(
-    {"running", "done", "error", "cancelled", "paused"}
+    {
+        "admission_pending",
+        "admitted",
+        "running",
+        "done",
+        "error",
+        "cancelled",
+        "paused",
+        "admission_failed",
+    }
 )
 # ``paused`` is NOT terminal — the run is awaiting a user decision and
 # will resume on ``POST /approvals/{approval_id}/decision``. The
 # RunAlreadyTerminal guard therefore allows ``running`` → ``paused`` and
 # ``paused`` → ``running`` transitions.
+#
+# ``admission_failed`` is terminal for execution: it has no outgoing
+# lifecycle edge. BCDEF ticket 02 adds one dedicated repair transition
+# (``admission_failed`` → ``admitted``) used only by admission repair; it
+# is not a resume and can never start a second model call for a run that
+# already executed.
 _TERMINAL_STATUSES: frozenset[str] = frozenset(
-    {"done", "error", "cancelled"}
+    {"done", "error", "cancelled", "admission_failed"}
 )
 
 
@@ -108,6 +126,25 @@ CREATE TABLE IF NOT EXISTS runs (
 
 CREATE INDEX IF NOT EXISTS idx_runs_conversation ON runs(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
+
+-- BCDEF ticket 08: the execution policy frozen at admission. One row per
+-- run (run_id is UNIQUE/PRIMARY KEY). ``policy_json`` is the canonical
+-- policy content; ``policy_hash`` is its SHA-256 from
+-- ``execution_contract.policy_hash``. Snapshot insertion shares the
+-- admission commit gate with the run row (same transaction).
+CREATE TABLE IF NOT EXISTS policy_snapshots (
+    run_id TEXT PRIMARY KEY,
+    policy_hash TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    source_version TEXT NOT NULL,
+    policy_json TEXT NOT NULL,
+    compatibility_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_policy_snapshots_hash
+ON policy_snapshots(policy_hash);
 
 CREATE TABLE IF NOT EXISTS cancel_requests (
     cancel_id TEXT PRIMARY KEY,
@@ -296,6 +333,35 @@ class RunRecord:
     @property
     def is_terminal(self) -> bool:
         return self.status in _TERMINAL_STATUSES
+
+
+@dataclass(frozen=True, slots=True)
+class PolicySnapshotWrite:
+    """Primitive values of a snapshot insert (BCDEF ticket 08).
+
+    Kept storage-local so :mod:`agent_v2.persistence` does not import the
+    policy builder; hash/serialization happen in :mod:`agent_v2.runs`.
+    """
+
+    policy_json: str
+    policy_hash: str
+    schema_version: int
+    source_version: str
+    compatibility_json: str
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class PolicySnapshotRecord:
+    """Snapshot of a policy_snapshots row."""
+
+    run_id: str
+    policy_hash: str
+    schema_version: int
+    source_version: str
+    policy_json: str
+    compatibility_json: str
+    created_at: str
 
 
 # ---- Sandbox lease statuses -----------------------------------------------
@@ -545,6 +611,168 @@ class ControlStore:
             updated_at=row["updated_at"],
             terminal_at=row["terminal_at"],
         )
+
+    # -- admission fence (BCDEF ticket 02) ------------------------------
+
+    def admit_run(
+        self,
+        *,
+        request_id: str,
+        conversation_id: str,
+        profile_id: str,
+        policy: PolicySnapshotWrite | None = None,
+    ) -> tuple[RunRecord, bool]:
+        """Insert a run in ``admission_pending`` or return the existing row.
+
+        Unlike :meth:`create_run_idempotent` (legacy callers that start in
+        ``running``), admission runs start pending: the orchestrator may
+        not start a model turn until the repository marks the fence
+        complete. The request_id UNIQUE constraint makes concurrent
+        admissions converge on one durable run.
+
+        When ``policy`` is supplied, the run row and its policy snapshot
+        are inserted in ONE transaction: a run without a snapshot can
+        never be observed, so execution cannot start without frozen policy.
+        """
+        existing = self.get_run_by_request(request_id)
+        if existing is not None:
+            return existing, False
+
+        run_id = str(uuid.uuid4())
+        now = _now_iso()
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute(
+                "INSERT INTO runs "
+                "(run_id, request_id, conversation_id, profile_id, "
+                " status, terminal_type, created_at, updated_at, terminal_at) "
+                "VALUES (?, ?, ?, ?, 'admission_pending', NULL, ?, ?, NULL)",
+                (run_id, request_id, conversation_id, profile_id, now, now),
+            )
+            if policy is not None:
+                self._conn.execute(
+                    "INSERT INTO policy_snapshots "
+                    "(run_id, policy_hash, schema_version, source_version, "
+                    " policy_json, compatibility_json, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        run_id,
+                        policy.policy_hash,
+                        policy.schema_version,
+                        policy.source_version,
+                        policy.policy_json,
+                        policy.compatibility_json,
+                        policy.created_at,
+                    ),
+                )
+            self._conn.execute("COMMIT")
+        except sqlite3.IntegrityError:
+            self._conn.execute("ROLLBACK")
+            existing = self.get_run_by_request(request_id)
+            if existing is not None:
+                return existing, False
+            raise
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+
+        record = self.get_run(run_id)
+        if record is None:  # pragma: no cover - defensive
+            raise RuntimeError(f"admitted run {run_id} disappeared")
+        return record, True
+
+    # -- policy snapshots (BCDEF ticket 08) -----------------------------
+
+    @staticmethod
+    def _row_to_policy_snapshot(row: sqlite3.Row) -> PolicySnapshotRecord:
+        return PolicySnapshotRecord(
+            run_id=row["run_id"],
+            policy_hash=row["policy_hash"],
+            schema_version=row["schema_version"],
+            source_version=row["source_version"],
+            policy_json=row["policy_json"],
+            compatibility_json=row["compatibility_json"],
+            created_at=row["created_at"],
+        )
+
+    def get_policy_snapshot(self, run_id: str) -> PolicySnapshotRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM policy_snapshots WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        return self._row_to_policy_snapshot(row) if row is not None else None
+
+    def insert_policy_snapshot(
+        self,
+        *,
+        run_id: str,
+        policy: PolicySnapshotWrite,
+    ) -> tuple[PolicySnapshotRecord, bool]:
+        """Idempotently insert the run's snapshot; duplicate returns existing.
+
+        The first write wins: an existing snapshot is never overwritten,
+        so a config change between attempts cannot rewrite an admitted
+        run's policy. Returns ``(record, created)``.
+        """
+        cursor = self._conn.execute(
+            "INSERT OR IGNORE INTO policy_snapshots "
+            "(run_id, policy_hash, schema_version, source_version, "
+            " policy_json, compatibility_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                policy.policy_hash,
+                policy.schema_version,
+                policy.source_version,
+                policy.policy_json,
+                policy.compatibility_json,
+                policy.created_at,
+            ),
+        )
+        record = self.get_policy_snapshot(run_id)
+        if record is None:  # pragma: no cover - defensive
+            raise RuntimeError(f"policy snapshot for run {run_id} disappeared")
+        return record, cursor.rowcount == 1
+
+    def mark_run_admitted(self, *, run_id: str, repair: bool = False) -> bool:
+        """CAS the admission fence to ``admitted``; True iff this caller won.
+
+        Exactly one concurrent admission may win the CAS, so at most one
+        orchestration continues into execution. ``repair=True`` is the
+        dedicated admission repair edge (``admission_failed`` → ``admitted``);
+        it is not a lifecycle resume and never follows an executed model turn.
+        """
+        allowed = ("admission_failed",) if repair else ("admission_pending",)
+        placeholders = ", ".join("?" for _ in allowed)
+        now = _now_iso()
+        cursor = self._conn.execute(
+            f"UPDATE runs SET status = 'admitted', terminal_type = NULL, "
+            f"updated_at = ?, terminal_at = NULL "
+            f"WHERE run_id = ? AND status IN ({placeholders})",
+            (now, run_id, *allowed),
+        )
+        return cursor.rowcount == 1
+
+    def mark_admission_failed(self, run_id: str) -> bool:
+        """Record a repairable admission failure (never from an executed run)."""
+        now = _now_iso()
+        cursor = self._conn.execute(
+            "UPDATE runs SET status = 'admission_failed', "
+            "terminal_type = 'admission_failed', updated_at = ?, terminal_at = ? "
+            "WHERE run_id = ? AND status IN ('admission_pending', 'admission_failed')",
+            (now, now, run_id),
+        )
+        return cursor.rowcount == 1
+
+    def mark_run_running(self, run_id: str) -> bool:
+        """Idempotently move an admitted run into execution."""
+        now = _now_iso()
+        cursor = self._conn.execute(
+            "UPDATE runs SET status = 'running', updated_at = ? "
+            "WHERE run_id = ? AND status IN ('admitted', 'running')",
+            (now, run_id),
+        )
+        return cursor.rowcount == 1
 
     def get_run_by_request(self, request_id: str) -> RunRecord | None:
         row = self._conn.execute(
@@ -1590,6 +1818,12 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_messages_run ON messages(run_id);
 CREATE INDEX IF NOT EXISTS idx_messages_seq ON messages(run_id, sequence);
+-- BCDEF ticket 02: one request_id may produce at most one user message.
+-- The admission fence relies on this UNIQUE constraint for concurrent
+-- duplicates; a racing loser re-reads the winner's row instead of
+-- appending a second copy.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_run_user
+    ON messages(run_id) WHERE role = 'user';
 
 CREATE TABLE IF NOT EXISTS run_events (
     event_id TEXT PRIMARY KEY,
@@ -1664,8 +1898,12 @@ class CheckpointsStore:
         *,
         conversation_id: str,
         profile_id: str,
-    ) -> None:
-        """Insert the conversation row if missing; touch last_active_at."""
+    ) -> bool:
+        """Insert the conversation row if missing; touch last_active_at.
+
+        Returns True iff a new conversation row was created. Admission
+        repair uses the flag to report what it backfilled.
+        """
         now = _now_iso()
         self._conn.execute("BEGIN")
         try:
@@ -1673,7 +1911,8 @@ class CheckpointsStore:
                 "SELECT conversation_id FROM conversations WHERE conversation_id = ?",
                 (conversation_id,),
             ).fetchone()
-            if existing is None:
+            created = existing is None
+            if created:
                 self._conn.execute(
                     "INSERT INTO conversations "
                     "(conversation_id, profile_id, created_at, last_active_at) "
@@ -1690,6 +1929,7 @@ class CheckpointsStore:
         except Exception:
             self._conn.execute("ROLLBACK")
             raise
+        return created
 
     def get_conversation(self, conversation_id: str) -> dict[str, Any] | None:
         row = self._conn.execute(
@@ -1735,6 +1975,47 @@ class CheckpointsStore:
             self._conn.execute("ROLLBACK")
             raise
         return message_id
+
+    def ensure_user_message(
+        self,
+        *,
+        conversation_id: str,
+        run_id: str,
+        content: str,
+        sequence: int = 0,
+    ) -> tuple[str, bool]:
+        """Idempotently persist the ONE user message of ``run_id``.
+
+        Returns ``(message_id, created)``. Concurrent admissions race on
+        the partial UNIQUE(run_id) WHERE role='user' index; the loser
+        re-reads the winner's row, so a request_id can never accumulate a
+        second user message.
+        """
+        row = self._conn.execute(
+            "SELECT message_id FROM messages WHERE run_id = ? AND role = 'user' "
+            "ORDER BY rowid ASC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        if row is not None:
+            return row["message_id"], False
+        try:
+            message_id = self.append_message(
+                conversation_id=conversation_id,
+                run_id=run_id,
+                role="user",
+                content=content,
+                sequence=sequence,
+            )
+        except sqlite3.IntegrityError:
+            row = self._conn.execute(
+                "SELECT message_id FROM messages WHERE run_id = ? AND role = 'user' "
+                "ORDER BY rowid ASC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise
+            return row["message_id"], False
+        return message_id, True
 
     def clear_conversation(self, conversation_id: str) -> int:
         """Delete all messages of a conversation; return the removed count.
@@ -1891,6 +2172,118 @@ class CheckpointsStore:
         if row is None or row["max_seq"] is None:
             return 0
         return int(row["max_seq"])
+
+    # -- admission event (BCDEF ticket 02) ------------------------------
+
+    @staticmethod
+    def _row_to_stored_event(r: sqlite3.Row) -> StoredEvent:
+        return StoredEvent(
+            event_id=r["event_id"],
+            run_id=r["run_id"],
+            sequence=r["sequence"],
+            event_type=r["event_type"],
+            payload_json=r["payload_json"],
+            request_id=r["request_id"],
+            conversation_id=r["conversation_id"],
+            created_at=r["created_at"],
+        )
+
+    def get_admission_event(self, run_id: str) -> StoredEvent | None:
+        """Return the durable ``run_started`` admission event of ``run_id``."""
+        row = self._conn.execute(
+            "SELECT * FROM run_events WHERE run_id = ? "
+            "AND event_type = 'run_started' ORDER BY sequence ASC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        return self._row_to_stored_event(row) if row is not None else None
+
+    def ensure_admission_event(
+        self,
+        *,
+        run_id: str,
+        conversation_id: str,
+        request_id: str,
+        payload: dict[str, Any],
+        event_id: str | None = None,
+        timestamp: str | None = None,
+    ) -> tuple[StoredEvent, bool]:
+        """Idempotently persist the ONE admission event of ``run_id``.
+
+        Returns ``(event, created)``. A duplicate admission refreshes the
+        payload (admitted/repaired/replayed outcome) without adding a
+        second ``run_started`` row, so replay always has exactly one
+        admission fact. Concurrent inserts converge via the
+        UNIQUE(run_id, sequence) constraint.
+        """
+        eid = event_id or str(uuid.uuid4())
+        now = timestamp or _now_iso()
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        for _attempt in range(3):
+            existing = self.get_admission_event(run_id)
+            if existing is not None:
+                if existing.payload_json != payload_json:
+                    self._conn.execute(
+                        "UPDATE run_events SET payload_json = ? WHERE event_id = ?",
+                        (payload_json, existing.event_id),
+                    )
+                refreshed = self._conn.execute(
+                    "SELECT * FROM run_events WHERE event_id = ?",
+                    (existing.event_id,),
+                ).fetchone()
+                return self._row_to_stored_event(refreshed), False
+            sequence = self.get_last_sequence(run_id) + 1
+            try:
+                self.append_event(
+                    run_id=run_id,
+                    sequence=sequence,
+                    event_type="run_started",
+                    payload=payload,
+                    request_id=request_id,
+                    conversation_id=conversation_id,
+                    event_id=eid,
+                    timestamp=now,
+                )
+            except sqlite3.IntegrityError:
+                continue
+            row = self._conn.execute(
+                "SELECT * FROM run_events WHERE event_id = ?",
+                (eid,),
+            ).fetchone()
+            if row is not None:
+                return self._row_to_stored_event(row), True
+        raise RuntimeError(
+            f"could not persist admission event for run_id={run_id}"
+        )
+
+    def clear_admission_failure_events(self, run_id: str) -> int:
+        """Delete stale ``admission_failed`` error terminals of ``run_id``.
+
+        A failed admission attempt may have persisted an ``error`` terminal
+        before the repair retry succeeded. That frame belonged to the
+        failed attempt, not to the run: keeping it would give the repaired
+        run two terminals and put an error before its admission event.
+        The durable admission event carries the repaired outcome, so the
+        stale terminal is removed in the same repair operation.
+        """
+        rows = self._conn.execute(
+            "SELECT event_id, payload_json FROM run_events "
+            "WHERE run_id = ? AND event_type = 'error'",
+            (run_id,),
+        ).fetchall()
+        removed = 0
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, ValueError):
+                continue
+            if payload.get("code") != "admission_failed":
+                continue
+            self._conn.execute(
+                "DELETE FROM run_events WHERE event_id = ?",
+                (row["event_id"],),
+            )
+            removed += 1
+        return removed
 
     def get_pending_actions(self, run_id: str) -> list[dict[str, Any]]:
         """Return tool_call events that have no matching tool_result yet.

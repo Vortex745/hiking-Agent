@@ -117,6 +117,21 @@ _RISK_ORDER: dict[RiskLevel, int] = {
 }
 
 
+def approval_risk_threshold() -> str:
+    """The server-owned risk level at which approval is required.
+
+    Exposed for the admission-time execution policy snapshot (BCDEF
+    ticket 08) so the frozen effect/approval policy stays honest when the
+    threshold is tuned.
+    """
+    return _APPROVAL_RISK_THRESHOLD.value
+
+
+def tool_risk_policy() -> dict[str, str]:
+    """Stable ``{tool_name: risk_level}`` view of the server risk table."""
+    return {tool: risk.value for tool, risk in _TOOL_RISK.items()}
+
+
 @dataclass(frozen=True, slots=True)
 class PermissionVerdict:
     """The gate's verdict for a single tool call.
