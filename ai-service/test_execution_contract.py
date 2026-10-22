@@ -162,6 +162,28 @@ def test_only_terminal_statuses_have_no_outgoing_edges() -> None:
             assert status not in contract.RESUMABLE_STATUSES
 
 
+def test_admission_repair_edge_is_separate_from_lifecycle_resume() -> None:
+    assert contract.ADMISSION_REPAIR_TRANSITIONS == {
+        contract.RunStatus.ADMISSION_FAILED: frozenset(
+            {contract.RunStatus.ADMITTED}
+        )
+    }
+    contract.assert_admission_repair("admission_failed", "admitted")
+    # Every other pair — including the same edge through the lifecycle
+    # table — stays invalid: repair is not a resume.
+    for current in contract.RunStatus:
+        for target in contract.RunStatus:
+            if current is contract.RunStatus.ADMISSION_FAILED and (
+                target is contract.RunStatus.ADMITTED
+            ):
+                continue
+            with pytest.raises(contract.ContractViolation) as excinfo:
+                contract.assert_admission_repair(current, target)
+            assert excinfo.value.code == contract.ReasonCode.INVALID_TRANSITION
+    with pytest.raises(contract.ContractViolation):
+        contract.assert_transition("admission_failed", "admitted")
+
+
 def test_terminal_uniqueness_is_idempotent_for_same_event() -> None:
     contract.assert_terminal_unique(None, "evt-1")
     contract.assert_terminal_unique("evt-1", "evt-1")

@@ -178,6 +178,35 @@ ALLOWED_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
 }
 
 
+# Admission repair edge (BCDEF ticket 02). Kept OUT of
+# ``ALLOWED_TRANSITIONS`` on purpose: ``admission_failed`` is execution
+# terminal (no lifecycle continuation), and this edge exists only so a
+# same-request retry can backfill the missing admission records and start
+# the FIRST execution. It is never a resume: a run that already executed
+# can never enter this transition.
+ADMISSION_REPAIR_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
+    RunStatus.ADMISSION_FAILED: frozenset({RunStatus.ADMITTED}),
+}
+
+
+def assert_admission_repair(current: RunStatus | str, target: RunStatus | str) -> None:
+    """Raise unless ``current -> target`` is the admission repair edge.
+
+    Only ``admission_failed -> admitted`` qualifies. Callers must not use
+    this for execution resume or for any other terminal status.
+    """
+    current_status = coerce_run_status(current)
+    target_status = coerce_run_status(target)
+    if target_status not in ADMISSION_REPAIR_TRANSITIONS.get(
+        current_status, frozenset()
+    ):
+        raise ContractViolation(
+            ReasonCode.INVALID_TRANSITION,
+            f"admission repair does not allow {current_status.value!r} -> "
+            f"{target_status.value!r}",
+        )
+
+
 def coerce_run_status(value: RunStatus | str) -> RunStatus:
     """Convert a stored/string status to :class:`RunStatus`.
 

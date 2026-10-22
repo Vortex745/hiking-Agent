@@ -1330,9 +1330,10 @@ class RunOrchestrator:
         telemetry = self._telemetry
         telemetry_started = time.perf_counter()
 
-        # Idempotent run creation. ``conversation_id`` defaults to a
-        # derived value so single-shot runs without a client-supplied id
-        # still persist.
+        # The canonical conversation identity is the one durably stored in
+        # the run row. A client-supplied id wins; otherwise the derived
+        # ``conv-{request_id}`` is persisted and used by every envelope
+        # (fixes the empty conversation_id on derived conversations).
         run_id: str | None = None
         conversation_id = req.conversation_id or f"conv-{req.request_id}"
         conversation_forbidden = bool(
@@ -1340,61 +1341,6 @@ class RunOrchestrator:
             and subject_id
             and not memory.claim_conversation(subject_id, conversation_id)
         )
-        if runs_repo is not None and not conversation_forbidden:
-            try:
-                run_id, created = runs_repo.create_run_idempotent(
-                    request_id=req.request_id,
-                    conversation_id=conversation_id,
-                    profile_id=req.profile_id,
-                    user_message=req.message,
-                )
-            except Exception:
-                # Persistence failure must not break the in-memory stream.
-                # Log and continue without persistence; the client still
-                # gets the SSE contract, just without durable replay for
-                # this run.
-                logger.exception(
-                    "chat_v2: create_run_idempotent failed for request_id=%s; "
-                    "continuing without persistence",
-                    req.request_id,
-                )
-                run_id = None
-                created = True  # proceed as if fresh
-            else:
-                persisted_run = runs_repo.get_run(run_id)
-                if (
-                    memory is not None
-                    and subject_id
-                    and persisted_run is not None
-                    and not memory.owns_conversation(
-                        subject_id, persisted_run.conversation_id
-                    )
-                ):
-                    conversation_forbidden = True
-                    run_id = None
-                    created = True
-                # Propagate the server-generated run_id to every built
-                # envelope (spec decision #26). The frontend reads this
-                # from the first event to call /snapshot, /cancel, and
-                # /events.
-                if run_id:
-                    stream.run_id = run_id
-                    if created and telemetry is not None:
-                        telemetry.record(
-                            run_id,
-                            profile_name=req.profile_id,
-                            status="running",
-                            model_name=getattr(self._settings, "openai_model", ""),
-                        )
-                if not created:
-                    # Spec AC2: duplicate request_id — replay stored
-                    # events and stop. No model call, no tool
-                    # re-execution.
-                    async for envelope in self._replay_stored_events(
-                        stream, runs_repo, run_id, req
-                    ):
-                        yield envelope
-                    return
 
         # Build the emit closures. They wrap build + persist (+ render
         # for the legacy hooks) so the flow generators below stay linear
@@ -1409,7 +1355,7 @@ class RunOrchestrator:
                         event_type=envelope.type,
                         payload=envelope.payload,
                         request_id=req.request_id,
-                        conversation_id=req.conversation_id or "",
+                        conversation_id=conversation_id,
                         event_id=envelope.event_id,
                         timestamp=envelope.timestamp,
                     )
@@ -1441,6 +1387,21 @@ class RunOrchestrator:
                     )
             return envelope
 
+        def _admission_envelope(event: dict[str, Any]) -> EventEnvelope:
+            return EventEnvelope(
+                version=event.get("version", "2"),
+                sequence=event["sequence"],
+                type=event["type"],
+                payload=event["payload"],
+                request_id=event.get("request_id", req.request_id),
+                conversation_id=event.get("conversation_id", conversation_id),
+                run_id=event.get("run_id", run_id or ""),
+                event_id=event.get("event_id", ""),
+                timestamp=event.get("timestamp", ""),
+            )
+
+        admission = None
+        run_started_emitted = False
         try:
             if conversation_forbidden:
                 yield _emit("error", {
@@ -1451,17 +1412,18 @@ class RunOrchestrator:
 
             # v2 disabled → terminal error. The Gateway should not route
             # here when v2 is off, but the endpoint defends in depth. No
-            # internal events have been processed, so unknown_dropped
-            # stays 0.
+            # admission happens: a request that can never execute must
+            # not leave a durable run behind.
             if not self._settings.agent_v2_enabled:
                 yield _emit("error", {
                     "code": "v2_disabled",
                     "message": "Chat v2 is disabled (AGENT_V2_ENABLED=false).",
                 })
-                mark_terminal_safe(runs_repo, run_id, "error")
                 return
 
             # Resolve profile (server-defined; client cannot override).
+            # Resolution happens BEFORE admission so an unknown profile
+            # never creates a durable run.
             try:
                 profile = resolve_profile(req.profile_id)
             except UnknownProfileError as exc:
@@ -1469,17 +1431,11 @@ class RunOrchestrator:
                     "code": "unknown_profile",
                     "message": str(exc),
                 })
-                mark_terminal_safe(runs_repo, run_id, "error")
                 return
 
-            # Ticket 13 AC2 — cowork authorization gate. The cowork
-            # profile is registered but NOT callable by default. Only an
-            # explicit operator-set policy of ``trusted`` or ``staging``
-            # authorizes the request. Clients cannot upgrade to cowork
-            # by sending the profile id — this server-side gate is the
-            # authority. The check runs AFTER profile resolution so an
-            # unknown profile still returns ``unknown_profile`` (not
-            # ``cowork_unauthorized``).
+            # Ticket 13 AC2 — cowork authorization gate (unchanged): the
+            # server policy, not the client, authorizes cowork. Runs
+            # before admission so an unauthorized request creates no run.
             if profile.profile_id == ProfileId.COWORK and not is_cowork_authorized(
                 self._settings
             ):
@@ -1490,16 +1446,125 @@ class RunOrchestrator:
                         "请联系运维启用 trusted/staging 策略。"
                     ),
                 })
-                mark_terminal_safe(runs_repo, run_id, "error")
                 return
+
+            # BCDEF ticket 02: the admission fence. Runs BEFORE any model
+            # call or sandbox creation. A failure here is terminal and
+            # never reaches execution; the same request_id retry repairs
+            # only the missing durable records.
+            if runs_repo is not None:
+                try:
+                    admission = runs_repo.admit(
+                        request_id=req.request_id,
+                        conversation_id=req.conversation_id,
+                        profile_id=req.profile_id,
+                        user_message=req.message,
+                    )
+                except Exception:
+                    logger.exception(
+                        "chat_v2: admission crashed for request_id=%s",
+                        req.request_id,
+                    )
+                    yield _emit("error", {
+                        "code": "admission_failed",
+                        "message": "请求未被接纳，未执行模型调用。",
+                        "recoverable": True,
+                    })
+                    return
+
+                run_id = admission.run_id or None
+                conversation_id = admission.conversation_id or conversation_id
+                stream.run_id = run_id or ""
+                stream.conversation_id = conversation_id
+
+                if (
+                    run_id
+                    and memory is not None
+                    and subject_id
+                    and not memory.owns_conversation(subject_id, conversation_id)
+                ):
+                    conversation_forbidden = True
+                    run_id = None
+                    stream.run_id = ""
+
+                if not admission.ok:
+                    error_payload = {
+                        "code": admission.error_code or "admission_failed",
+                        "message": "请求未被接纳，未执行模型调用。",
+                        "recoverable": admission.recoverable,
+                    }
+                    if admission.admission_event is not None:
+                        envelope = _admission_envelope(admission.admission_event)
+                        stream.advance_to(envelope.sequence)
+                        yield envelope
+                        yield _emit("error", error_payload)
+                    else:
+                        # No admission fact is durable yet: the failed
+                        # attempt must not write an error row before the
+                        # admission event, or a repair would replay an
+                        # error terminal ahead of the run's admission.
+                        # The run status (admission_failed) is the durable
+                        # explanation until repair.
+                        yield stream.build("error", error_payload)
+                    return
+
+                if admission.created and telemetry is not None and run_id:
+                    telemetry.record(
+                        run_id,
+                        profile_name=req.profile_id,
+                        status="running",
+                        model_name=getattr(self._settings, "openai_model", ""),
+                    )
+
+                if conversation_forbidden:
+                    yield _emit("error", {
+                        "code": "conversation_forbidden",
+                        "message": "Conversation not accessible",
+                    })
+                    return
+
+                if not admission.execute:
+                    # Duplicate request_id or terminal replay — replay the
+                    # stored stream. No model call, no tool re-execution.
+                    async for envelope in self._replay_stored_events(
+                        stream, runs_repo, run_id, req
+                    ):
+                        yield envelope
+                    return
+
+                # The persisted admission event IS the first frame. Emit
+                # the exact durable envelope (same id/sequence/payload) so
+                # first stream and replay agree.
+                if admission.admission_event is not None:
+                    envelope = _admission_envelope(admission.admission_event)
+                    stream.advance_to(envelope.sequence)
+                    run_started_emitted = True
+                    yield envelope
+
+                try:
+                    runs_repo.mark_run_running(run_id)
+                except Exception:
+                    logger.exception(
+                        "chat_v2: mark_run_running failed for run_id=%s", run_id
+                    )
+                    yield _emit("error", {
+                        "code": "admission_failed",
+                        "message": "请求未被接纳，未执行模型调用。",
+                        "recoverable": True,
+                    })
+                    mark_terminal_safe(runs_repo, run_id, "error")
+                    return
+            else:
+                stream.conversation_id = conversation_id
 
             # Model failure scenario: no API key configured. The contract
             # requires this to be a terminal ``error`` event, not an HTTP
-            # 500. ``run_started`` is emitted first so the client sees the
-            # run begin before the model-unavailable terminal (spec
-            # decision #27).
+            # 500. The admission ``run_started`` frame (if persistence is
+            # on) already told the client the run began.
             if not self._settings.openai_api_key:
-                yield _emit("run_started", {})
+                if not run_started_emitted:
+                    yield _emit("run_started", {})
+                    run_started_emitted = True
                 yield _emit("error", {
                     "code": "model_unavailable",
                     "message": "主模型未配置 API Key (OPENAI_API_KEY 为空)。",
@@ -1516,10 +1581,12 @@ class RunOrchestrator:
             stream.drop_unknown("uniharness_llm_token")
 
             # Spec decision #27 + AC2: ``run_started`` is a distinct
-            # event type signaling the run has begun. It is the first
-            # user-visible event in a successful flow; ``progress``
-            # follows for ongoing status updates.
-            yield _emit("run_started", {})
+            # event type signaling the run has begun. Without persistence
+            # it is built here; with persistence the durable admission
+            # event was already yielded above.
+            if not run_started_emitted:
+                yield _emit("run_started", {})
+                run_started_emitted = True
 
             yield _emit("progress", {
                 "stage": "processing",
@@ -3275,7 +3342,7 @@ class RunOrchestrator:
                     event_type=terminal_envelope.type,
                     payload=terminal_envelope.payload,
                     request_id=req.request_id,
-                    conversation_id=req.conversation_id or "",
+                    conversation_id=stream.conversation_id,
                 )
             except Exception:
                 logger.exception(

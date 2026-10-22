@@ -83,6 +83,57 @@ class CancelOutcome:
     run_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class AdmissionResult:
+    """Outcome of the admission fence (BCDEF ticket 02).
+
+    ``execute`` is True for exactly one caller per request_id: the CAS
+    winner of ``admission_pending``/``admission_failed`` → ``admitted``.
+    Duplicates and terminal replays therefore never start a second model
+    turn. ``admission_event`` is the persisted ``run_started`` envelope
+    data so orchestration can emit the exact durable frame (same
+    event_id/sequence/payload as replay).
+    """
+
+    run_id: str
+    conversation_id: str
+    status: str
+    created: bool = False
+    replayed: bool = False
+    repaired: bool = False
+    execute: bool = False
+    error_code: str | None = None
+    recoverable: bool = False
+    admission_event: dict[str, Any] | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error_code is None
+
+
+# Statuses that a retry must replay, never repair or execute again.
+_NON_REPAIRABLE_STATUSES = frozenset(
+    {"done", "error", "cancelled", "outcome_unknown"}
+)
+
+
+def _admission_payload(
+    *,
+    status: str,
+    created: bool,
+    replayed: bool,
+    repaired: bool,
+) -> dict[str, Any]:
+    return {
+        "admission": {
+            "status": status,
+            "created": created,
+            "replayed": replayed,
+            "repaired": repaired,
+        }
+    }
+
+
 class RunRepository:
     """Facade over ControlStore + CheckpointsStore.
 
@@ -144,6 +195,233 @@ class RunRepository:
                 sequence=0,
             )
         return run_id, created
+
+    # -- admission fence (BCDEF ticket 02) ------------------------------
+
+    def admit(
+        self,
+        *,
+        request_id: str,
+        conversation_id: str | None,
+        profile_id: str,
+        user_message: str,
+    ) -> AdmissionResult:
+        """Durably admit one request before any model or sandbox work.
+
+        The fence is: canonical run row → conversation → user message →
+        admission (``run_started``) event → ``admitted`` CAS. Any required
+        write failure returns ``admission_failed`` (recoverable) without a
+        model turn. A same-request retry keeps the original run_id and only
+        backfills the missing records; at most one durable run, one user
+        message and one admission event exist per request_id.
+        """
+        supplied = (conversation_id or "").strip()
+        canonical = supplied or f"conv-{request_id}"
+        try:
+            run, created = self.control.admit_run(
+                request_id=request_id,
+                conversation_id=canonical,
+                profile_id=profile_id,
+            )
+        except Exception:
+            logger.exception(
+                "admission: run write failed for request_id=%s", request_id
+            )
+            return AdmissionResult(
+                run_id="",
+                conversation_id=canonical,
+                status="admission_failed",
+                error_code="admission_failed",
+                recoverable=True,
+            )
+
+        run_id = run.run_id
+        canonical = run.conversation_id
+        prior_status = run.status
+        replayed = not created
+
+        if prior_status in _NON_REPAIRABLE_STATUSES:
+            return AdmissionResult(
+                run_id=run_id,
+                conversation_id=canonical,
+                status=prior_status,
+                created=created,
+                replayed=True,
+                execute=False,
+                admission_event=self._admission_event_dict(run_id),
+            )
+
+        repaired = False
+        try:
+            conversation_created = self.checkpoints.ensure_conversation(
+                conversation_id=canonical,
+                profile_id=profile_id,
+            )
+            _message_id, message_created = self.checkpoints.ensure_user_message(
+                conversation_id=canonical,
+                run_id=run_id,
+                content=user_message,
+            )
+            repaired = replayed and (conversation_created or message_created)
+            if prior_status == "admission_failed":
+                repaired = True
+            outcome = "repaired" if repaired else "admitted"
+            _event, event_created = self.checkpoints.ensure_admission_event(
+                run_id=run_id,
+                conversation_id=canonical,
+                request_id=request_id,
+                payload=_admission_payload(
+                    status=outcome,
+                    created=created,
+                    replayed=replayed,
+                    repaired=repaired,
+                ),
+            )
+            if replayed and event_created:
+                repaired = True
+                self.checkpoints.ensure_admission_event(
+                    run_id=run_id,
+                    conversation_id=canonical,
+                    request_id=request_id,
+                    payload=_admission_payload(
+                        status="repaired",
+                        created=created,
+                        replayed=True,
+                        repaired=True,
+                    ),
+                )
+        except Exception:
+            logger.exception(
+                "admission: checkpoint fence failed for request_id=%s run_id=%s",
+                request_id,
+                run_id,
+            )
+            self._mark_admission_failed(run_id)
+            return AdmissionResult(
+                run_id=run_id,
+                conversation_id=canonical,
+                status="admission_failed",
+                created=created,
+                replayed=replayed,
+                repaired=repaired,
+                execute=False,
+                error_code="admission_failed",
+                recoverable=True,
+                admission_event=self._admission_event_dict(run_id),
+            )
+
+        try:
+            repair_edge = prior_status == "admission_failed"
+            won = self.control.mark_run_admitted(run_id=run_id, repair=repair_edge)
+            if not won:
+                current = self.control.get_run(run_id)
+                if current is not None and current.status == "admission_failed":
+                    won = self.control.mark_run_admitted(run_id=run_id, repair=True)
+                    if won:
+                        repair_edge = True
+                        repaired = True
+                elif current is not None:
+                    return AdmissionResult(
+                        run_id=run_id,
+                        conversation_id=canonical,
+                        status=current.status,
+                        created=created,
+                        replayed=True,
+                        repaired=repaired,
+                        execute=False,
+                        admission_event=self._admission_event_dict(run_id),
+                    )
+            if won and repair_edge:
+                # Supersede the failed attempt: drop its stale error
+                # terminal and record the repaired admission outcome.
+                self.checkpoints.clear_admission_failure_events(run_id)
+                self.checkpoints.ensure_admission_event(
+                    run_id=run_id,
+                    conversation_id=canonical,
+                    request_id=request_id,
+                    payload=_admission_payload(
+                        status="repaired",
+                        created=created,
+                        replayed=True,
+                        repaired=True,
+                    ),
+                )
+                repaired = True
+        except Exception:
+            logger.exception(
+                "admission: admitted transition failed for request_id=%s run_id=%s",
+                request_id,
+                run_id,
+            )
+            self._mark_admission_failed(run_id)
+            return AdmissionResult(
+                run_id=run_id,
+                conversation_id=canonical,
+                status="admission_failed",
+                created=created,
+                replayed=replayed,
+                repaired=repaired,
+                execute=False,
+                error_code="admission_failed",
+                recoverable=True,
+                admission_event=self._admission_event_dict(run_id),
+            )
+
+        if not won:
+            return AdmissionResult(
+                run_id=run_id,
+                conversation_id=canonical,
+                status="admitted",
+                created=created,
+                replayed=True,
+                repaired=repaired,
+                execute=False,
+                admission_event=self._admission_event_dict(run_id),
+            )
+
+        return AdmissionResult(
+            run_id=run_id,
+            conversation_id=canonical,
+            status="admitted",
+            created=created,
+            replayed=replayed,
+            repaired=repaired,
+            execute=True,
+            admission_event=self._admission_event_dict(run_id),
+        )
+
+    def _admission_event_dict(self, run_id: str) -> dict[str, Any] | None:
+        event = self.checkpoints.get_admission_event(run_id)
+        if event is None:
+            return None
+        return {
+            "version": "2",
+            "event_id": event.event_id,
+            "sequence": event.sequence,
+            "run_id": event.run_id,
+            "conversation_id": event.conversation_id,
+            "timestamp": event.created_at,
+            "type": event.event_type,
+            "request_id": event.request_id,
+            "payload": json.loads(event.payload_json),
+        }
+
+    def _mark_admission_failed(self, run_id: str) -> None:
+        try:
+            self.control.mark_admission_failed(run_id)
+        except Exception:
+            logger.exception(
+                "admission: could not persist admission_failed for run_id=%s",
+                run_id,
+            )
+
+    def mark_run_running(self, run_id: str) -> bool:
+        """Idempotently enter execution after the admission fence."""
+        return self.control.mark_run_running(run_id)
+
+    def get_admission_event(self, run_id: str) -> dict[str, Any] | None:
+        """The persisted admission envelope data, or None."""
+        return self._admission_event_dict(run_id)
 
     def get_run(self, run_id: str) -> RunRecord | None:
         return self.control.get_run(run_id)
