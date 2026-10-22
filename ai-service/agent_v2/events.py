@@ -66,9 +66,15 @@ EventVersion = Literal["2"]
 # ``thought`` carries model reasoning the public text filter removed
 # (``<think>`` blocks or a provider reasoning delta). It is optional: a
 # provider that emits no reasoning simply produces no such event.
+# ``progress.gap`` (BCDEF ticket 01) is a progress-class projection emitted
+# when one or more droppable progress events were not persisted. The payload
+# carries ``from_sequence``, ``to_sequence`` and ``dropped`` so replay can
+# surface the hole instead of treating it as completion. It is additive: the
+# envelope shape and the terminal sets are unchanged.
 EventType = Literal[
     "run_started",
     "progress",
+    "progress.gap",
     "text",
     "thought",
     "tool_call",
