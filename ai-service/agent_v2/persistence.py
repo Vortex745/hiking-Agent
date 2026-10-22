@@ -127,6 +127,25 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE INDEX IF NOT EXISTS idx_runs_conversation ON runs(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
 
+-- BCDEF ticket 08: the execution policy frozen at admission. One row per
+-- run (run_id is UNIQUE/PRIMARY KEY). ``policy_json`` is the canonical
+-- policy content; ``policy_hash`` is its SHA-256 from
+-- ``execution_contract.policy_hash``. Snapshot insertion shares the
+-- admission commit gate with the run row (same transaction).
+CREATE TABLE IF NOT EXISTS policy_snapshots (
+    run_id TEXT PRIMARY KEY,
+    policy_hash TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    source_version TEXT NOT NULL,
+    policy_json TEXT NOT NULL,
+    compatibility_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_policy_snapshots_hash
+ON policy_snapshots(policy_hash);
+
 CREATE TABLE IF NOT EXISTS cancel_requests (
     cancel_id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL,
@@ -314,6 +333,35 @@ class RunRecord:
     @property
     def is_terminal(self) -> bool:
         return self.status in _TERMINAL_STATUSES
+
+
+@dataclass(frozen=True, slots=True)
+class PolicySnapshotWrite:
+    """Primitive values of a snapshot insert (BCDEF ticket 08).
+
+    Kept storage-local so :mod:`agent_v2.persistence` does not import the
+    policy builder; hash/serialization happen in :mod:`agent_v2.runs`.
+    """
+
+    policy_json: str
+    policy_hash: str
+    schema_version: int
+    source_version: str
+    compatibility_json: str
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class PolicySnapshotRecord:
+    """Snapshot of a policy_snapshots row."""
+
+    run_id: str
+    policy_hash: str
+    schema_version: int
+    source_version: str
+    policy_json: str
+    compatibility_json: str
+    created_at: str
 
 
 # ---- Sandbox lease statuses -----------------------------------------------
@@ -572,6 +620,7 @@ class ControlStore:
         request_id: str,
         conversation_id: str,
         profile_id: str,
+        policy: PolicySnapshotWrite | None = None,
     ) -> tuple[RunRecord, bool]:
         """Insert a run in ``admission_pending`` or return the existing row.
 
@@ -580,6 +629,10 @@ class ControlStore:
         not start a model turn until the repository marks the fence
         complete. The request_id UNIQUE constraint makes concurrent
         admissions converge on one durable run.
+
+        When ``policy`` is supplied, the run row and its policy snapshot
+        are inserted in ONE transaction: a run without a snapshot can
+        never be observed, so execution cannot start without frozen policy.
         """
         existing = self.get_run_by_request(request_id)
         if existing is not None:
@@ -596,6 +649,22 @@ class ControlStore:
                 "VALUES (?, ?, ?, ?, 'admission_pending', NULL, ?, ?, NULL)",
                 (run_id, request_id, conversation_id, profile_id, now, now),
             )
+            if policy is not None:
+                self._conn.execute(
+                    "INSERT INTO policy_snapshots "
+                    "(run_id, policy_hash, schema_version, source_version, "
+                    " policy_json, compatibility_json, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        run_id,
+                        policy.policy_hash,
+                        policy.schema_version,
+                        policy.source_version,
+                        policy.policy_json,
+                        policy.compatibility_json,
+                        policy.created_at,
+                    ),
+                )
             self._conn.execute("COMMIT")
         except sqlite3.IntegrityError:
             self._conn.execute("ROLLBACK")
@@ -611,6 +680,59 @@ class ControlStore:
         if record is None:  # pragma: no cover - defensive
             raise RuntimeError(f"admitted run {run_id} disappeared")
         return record, True
+
+    # -- policy snapshots (BCDEF ticket 08) -----------------------------
+
+    @staticmethod
+    def _row_to_policy_snapshot(row: sqlite3.Row) -> PolicySnapshotRecord:
+        return PolicySnapshotRecord(
+            run_id=row["run_id"],
+            policy_hash=row["policy_hash"],
+            schema_version=row["schema_version"],
+            source_version=row["source_version"],
+            policy_json=row["policy_json"],
+            compatibility_json=row["compatibility_json"],
+            created_at=row["created_at"],
+        )
+
+    def get_policy_snapshot(self, run_id: str) -> PolicySnapshotRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM policy_snapshots WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        return self._row_to_policy_snapshot(row) if row is not None else None
+
+    def insert_policy_snapshot(
+        self,
+        *,
+        run_id: str,
+        policy: PolicySnapshotWrite,
+    ) -> tuple[PolicySnapshotRecord, bool]:
+        """Idempotently insert the run's snapshot; duplicate returns existing.
+
+        The first write wins: an existing snapshot is never overwritten,
+        so a config change between attempts cannot rewrite an admitted
+        run's policy. Returns ``(record, created)``.
+        """
+        cursor = self._conn.execute(
+            "INSERT OR IGNORE INTO policy_snapshots "
+            "(run_id, policy_hash, schema_version, source_version, "
+            " policy_json, compatibility_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                policy.policy_hash,
+                policy.schema_version,
+                policy.source_version,
+                policy.policy_json,
+                policy.compatibility_json,
+                policy.created_at,
+            ),
+        )
+        record = self.get_policy_snapshot(run_id)
+        if record is None:  # pragma: no cover - defensive
+            raise RuntimeError(f"policy snapshot for run {run_id} disappeared")
+        return record, cursor.rowcount == 1
 
     def mark_run_admitted(self, *, run_id: str, repair: bool = False) -> bool:
         """CAS the admission fence to ``admitted``; True iff this caller won.

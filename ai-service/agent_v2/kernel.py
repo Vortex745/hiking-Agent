@@ -449,6 +449,7 @@ async def run_chat_turn(
     on_text: Callable[[str, list[dict[str, Any]]], Awaitable[None]] | None = None,
     on_thought: Callable[[str], Awaitable[None]] | None = None,
     history: list[dict[str, str]] | None = None,
+    compaction_threshold: int | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Run ONE chat turn through the real UniHarness model loop (T28 entry).
 
@@ -505,6 +506,7 @@ async def run_chat_turn(
         mcp_servers=dict(mcp_servers) if mcp_servers else {},
         approval_callback=approval_callback,
         subagent_definitions=dict(subagent_definitions) if subagent_definitions else {},
+        compaction_threshold=compaction_threshold,
     )
     with tracing.start_span(
         "agent.turn",

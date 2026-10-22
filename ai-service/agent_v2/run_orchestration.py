@@ -85,6 +85,8 @@ from agent_v2.events import (
     EventStream,
     TerminalEventAlreadyEmitted,
 )
+from agent_v2.execution_contract import BoundaryError
+from agent_v2.execution_policy import build_execution_policy, freeze_settings
 from agent_v2.memory_tools import extract_sensitive_memory
 from agent_v2.observability import CapacityExceeded
 from agent_v2.permissions import PermissionDecision, PermissionGate
@@ -1448,10 +1450,29 @@ class RunOrchestrator:
                 })
                 return
 
+            # BCDEF ticket 08: freeze the COMPLETE execution policy from
+            # current config exactly once, before admission. It is stored
+            # with the run and every later execution step reads the frozen
+            # snapshot, never the live config.
+            try:
+                execution_policy = build_execution_policy(profile, self._settings)
+            except Exception:
+                logger.exception(
+                    "chat_v2: execution policy build failed for request_id=%s",
+                    req.request_id,
+                )
+                yield _emit("error", {
+                    "code": "policy_incompatible",
+                    "message": "运行策略无法冻结，已停止执行。",
+                    "recoverable": False,
+                })
+                return
+
             # BCDEF ticket 02: the admission fence. Runs BEFORE any model
             # call or sandbox creation. A failure here is terminal and
             # never reaches execution; the same request_id retry repairs
             # only the missing durable records.
+            policy_settings: Any = self._settings
             if runs_repo is not None:
                 try:
                     admission = runs_repo.admit(
@@ -1459,6 +1480,7 @@ class RunOrchestrator:
                         conversation_id=req.conversation_id,
                         profile_id=req.profile_id,
                         user_message=req.message,
+                        policy=execution_policy,
                     )
                 except Exception:
                     logger.exception(
@@ -1541,6 +1563,29 @@ class RunOrchestrator:
                     run_started_emitted = True
                     yield envelope
 
+                # Ticket 08: execution uses the FROZEN snapshot. A run
+                # without a valid snapshot fails closed before any model,
+                # tool or sandbox work.
+                try:
+                    resolved_policy = runs_repo.resolve_policy_snapshot(run_id)
+                    profile = resolved_policy.profile()
+                    policy_settings = freeze_settings(
+                        self._settings, resolved_policy.policy
+                    )
+                except BoundaryError as exc:
+                    logger.error(
+                        "chat_v2: policy snapshot unusable for run_id=%s: %s",
+                        run_id,
+                        exc,
+                    )
+                    yield _emit("error", {
+                        "code": exc.code.value,
+                        "message": "运行策略快照不可用，已停止执行。",
+                        "recoverable": exc.recoverable,
+                    })
+                    mark_terminal_safe(runs_repo, run_id, "error")
+                    return
+
                 try:
                     runs_repo.mark_run_running(run_id)
                 except Exception:
@@ -1619,6 +1664,7 @@ class RunOrchestrator:
                 # route flow exists anymore.
                 async for envelope in self._stream_kernel_turn(
                     req, profile, run_id=run_id, emit=_emit,
+                    settings=policy_settings,
                 ):
                     if is_cancelled(runs_repo, run_id) and not stream.terminal_emitted:
                         yield _emit("cancelled", {
@@ -1638,6 +1684,7 @@ class RunOrchestrator:
                 # chat exactly: one `done` terminal after `text`.
                 async for envelope in self._stream_kernel_turn(
                     req, profile, run_id=run_id, emit=_emit,
+                    settings=policy_settings,
                 ):
                     if is_cancelled(runs_repo, run_id) and not stream.terminal_emitted:
                         yield _emit("cancelled", {
@@ -1664,6 +1711,7 @@ class RunOrchestrator:
                 # ``finally`` block so the sandbox is never leaked.
                 async for envelope in self._stream_artifact_flow(
                     req, profile, run_id=run_id, emit=_emit,
+                    settings=policy_settings,
                 ):
                     yield envelope
                 return
@@ -1678,6 +1726,7 @@ class RunOrchestrator:
                 # module.)
                 async for envelope in self._stream_cowork_flow(
                     req, profile, run_id=run_id, emit=_emit,
+                    settings=policy_settings,
                 ):
                     yield envelope
                 return
@@ -1705,6 +1754,7 @@ class RunOrchestrator:
                 async for envelope in self._stream_kernel_turn(
                     req, profile, run_id=run_id, emit=_emit,
                     memory=memory, subject_id=subject_id,
+                    settings=policy_settings,
                 ):
                     yield envelope
             else:
@@ -1752,6 +1802,7 @@ class RunOrchestrator:
         *,
         run_id: str | None,
         emit: EmitEnvelope,
+        settings: Any | None = None,
     ) -> AsyncGenerator[EventEnvelope, None]:
         """cowork profile flow.
 
@@ -1845,7 +1896,7 @@ class RunOrchestrator:
             command_plan, _ = await self._kernel_turn(
                 system_prompt=compose_cowork_planner_prompt(),
                 message=req.message,
-                settings=self._settings,
+                settings=settings if settings is not None else self._settings,
                 run_id=run_id,
                 checkpoint_store=self._kernel_checkpoints,
                 extra_tools=(),
@@ -1995,6 +2046,7 @@ class RunOrchestrator:
         *,
         run_id: str | None,
         emit: EmitEnvelope,
+        settings: Any | None = None,
     ) -> AsyncGenerator[EventEnvelope, None]:
         """artifact profile flow.
 
@@ -2192,7 +2244,7 @@ class RunOrchestrator:
             try:
                 plan_text, plan_audit_entries = await _kernel_plan_turn(
                     kernel_turn=self._kernel_turn,
-                    settings=self._settings,
+                    settings=settings if settings is not None else self._settings,
                     checkpoint_store=self._kernel_checkpoints,
                     computer=computer,
                     workspace_path=workspace_path,
@@ -3361,8 +3413,10 @@ class RunOrchestrator:
         emit: EmitEnvelope,
         memory: Any | None = None,
         subject_id: str | None = None,
+        settings: Any | None = None,
     ) -> AsyncGenerator[EventEnvelope, None]:
         """Shared T26/T28/T29 kernel turn used by chat and route_plan profiles."""
+        kernel_settings = settings if settings is not None else self._settings
         from agent_v2.kernel import KernelModelFailure
         from agent_v2.kernel_tools import (
             build_chat_extra_tools,
@@ -3375,7 +3429,7 @@ class RunOrchestrator:
         mcp_servers: dict[str, Any] = {}
         mcp_required = getattr(profile, "allowed_mcp_servers", None)
         if mcp_required:
-            mcp_servers, mcp_audits = build_profile_mcp_servers(profile, self._settings)
+            mcp_servers, mcp_audits = build_profile_mcp_servers(profile, kernel_settings)
             if not mcp_servers:
                 # Every allowlisted evidence source is unavailable → fail
                 # closed instead of fabricating a plan (Ticket 29 AC5).
@@ -3406,7 +3460,7 @@ class RunOrchestrator:
             # kernel turn.
             sub_defs, sub_audits = build_subagent_definitions(
                 profile,
-                self._settings,
+                kernel_settings,
                 extra_tool_names={t.name for t in extra_tools},
                 available_mcp_servers=set(mcp_servers),
             )
@@ -3460,7 +3514,7 @@ class RunOrchestrator:
             deltas: asyncio.Queue[tuple[str, str]] = asyncio.Queue(maxsize=1)
             streamed_text = ""
             thoughts_enabled = bool(
-                getattr(self._settings, "agent_v2_thoughts_enabled", True)
+                getattr(kernel_settings, "agent_v2_thoughts_enabled", True)
             )
 
             async def on_text(delta: str, kernel_audits: list[dict[str, Any]]) -> None:
@@ -3480,7 +3534,7 @@ class RunOrchestrator:
             task = asyncio.create_task(self._kernel_turn(
                 system_prompt=system_prompt,
                 message=req.message,
-                settings=self._settings,
+                settings=kernel_settings,
                 run_id=run_id,
                 checkpoint_store=self._kernel_checkpoints,
                 extra_tools=tuple(extra_tools),
@@ -3488,6 +3542,7 @@ class RunOrchestrator:
                 mcp_servers=mcp_servers or None,
                 subagent_definitions=sub_defs or None,
                 history=history,
+                compaction_threshold=profile.model.compaction_threshold,
                 on_text=on_text,
                 on_thought=on_thought if thoughts_enabled else None,
             ))

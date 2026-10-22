@@ -779,6 +779,7 @@ class ExecutionErrorCode(str, Enum):
     CLEANUP_PENDING = "cleanup_pending"
     REPLAY_GAP = "replay_gap"
     POLICY_INCOMPATIBLE = "policy_incompatible"
+    POLICY_SNAPSHOT_MISSING = "policy_snapshot_missing"
     DUPLICATE_TERMINAL = "duplicate_terminal"
     REPAIR_PENDING = "repair_pending"
 
@@ -795,6 +796,7 @@ ERROR_RECOVERABLE: dict[ExecutionErrorCode, bool] = {
     ExecutionErrorCode.CLEANUP_PENDING: True,
     ExecutionErrorCode.REPLAY_GAP: True,
     ExecutionErrorCode.POLICY_INCOMPATIBLE: False,
+    ExecutionErrorCode.POLICY_SNAPSHOT_MISSING: False,
     ExecutionErrorCode.DUPLICATE_TERMINAL: False,
     ExecutionErrorCode.REPAIR_PENDING: True,
 }
