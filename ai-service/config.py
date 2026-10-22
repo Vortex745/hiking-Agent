@@ -74,6 +74,9 @@ class Settings:
     # 稳定观察期已过。代码组件就绪后此 flag 仍是权威 gate；运营可随时
     # 通过此配置立即关闭 subagent（AC7）。
     agent_v2_subagent_enabled: bool = False
+    # 模型推理透出：默认开启（有推理就发 ``thought`` 事件，没有就不发）。
+    # 关闭后 kernel 不接收 on_thought，SSE 也不会出现该事件类型。
+    agent_v2_thoughts_enabled: bool = True
     # Langfuse LLM 可观测性（可选）：未配置 key 时自动禁用，零回归。
     langfuse_enabled: bool = True
     langfuse_public_key: str = ""
@@ -84,6 +87,9 @@ class Settings:
     # stdout 日志配置：level 为 Python 日志级别，format 支持 json/text。
     log_level: str = "INFO"
     log_format: str = "json"
+    # 本地 Agent 执行日志（LLM_LOG）：默认关闭，仅本地调试开启。
+    llm_log_enabled: bool = False
+    llm_log_path: str = "./logs/llm.log"
 
     def _default_runtime_dir(self, name: str) -> str:
         if os.getenv("VERCEL"):
@@ -198,6 +204,10 @@ class Settings:
         self.agent_v2_subagent_enabled = (
             os.getenv("AGENT_V2_SUBAGENT_ENABLED", "false").lower() == "true"
         )
+        # 推理透出默认开启；运营可用 AGENT_V2_THOUGHTS_ENABLED=false 立即关闭。
+        self.agent_v2_thoughts_enabled = (
+            os.getenv("AGENT_V2_THOUGHTS_ENABLED", "true").lower() == "true"
+        )
         # Langfuse：未配置 key 时 observability 模块返回空 callbacks，零回归。
         self.langfuse_enabled = os.getenv("LANGFUSE_ENABLED", "true").lower() == "true"
         self.langfuse_public_key = os.getenv("LANGFUSE_PUBLIC_KEY", "")
@@ -213,6 +223,12 @@ class Settings:
             self.observability_sample_ratio = 1.0
         self.log_level = os.getenv("LOG_LEVEL", "INFO").upper()
         self.log_format = os.getenv("LOG_FORMAT", "json").lower()
+        self.llm_log_enabled = (
+            os.getenv("LLM_LOG_ENABLED", "false").lower() == "true"
+        )
+        self.llm_log_path = os.getenv(
+            "LLM_LOG_PATH", self._default_runtime_dir("logs/llm.log")
+        )
 
         return self
 

@@ -11,6 +11,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
 
 import api.chat_v2 as chat_v2
+from agent_v2.events import EventEnvelope
 from observability import tracing
 from observability.logging_setup import (
     JsonFormatter,
@@ -26,6 +27,25 @@ from observability.request_context import (
 
 VALID_TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{8,128}$")
+
+
+@pytest.fixture(autouse=True)
+def isolate_llm_log_sink(monkeypatch):
+    """Stop ``configure_logging`` from attaching the ambient LLM_LOG file sink.
+
+    ``ai-service/.env`` ships ``LLM_LOG_ENABLED=true``, so a test that calls
+    ``configure_logging`` leaves a live handler on ``ai-service.llm_log``. Files
+    scheduled afterwards then see ``llm_log.enabled()`` and the kernel adds a
+    tool-log callback they never asked for, while fake-model records land in
+    the developer's real ``./logs/llm.log``.
+    """
+    from config import settings
+    from observability import llm_log
+
+    saved = (llm_log._handler, llm_log._setup_done, llm_log._broken)
+    monkeypatch.setattr(settings, "llm_log_enabled", False, raising=False)
+    yield
+    llm_log._handler, llm_log._setup_done, llm_log._broken = saved
 
 
 def build_app(*, spanned: bool = False) -> FastAPI:
@@ -230,7 +250,15 @@ def test_streaming_response_is_not_buffered():
     assert received == ["first"]
 
 
-def test_json_formatter_emits_pinned_keys():
+def test_json_formatter_envelope_is_pinned_but_event_fields_are_conditional():
+    """Envelope keys always exist; request fields appear only when they have a value.
+
+    Forcing ``method/route/status/duration_ms`` onto every line as ``""`` made
+    ``duration_ms`` a string on business logs and a number on access logs —
+    consumers aggregating it would break.
+    """
+    import json
+
     formatter = JsonFormatter()
     record = logging.LogRecord(
         "ai-service.http", logging.INFO, __file__, 1, "hello", None, None
@@ -242,22 +270,42 @@ def test_json_formatter_emits_pinned_keys():
     record.duration_ms = 1.5
     token = request_id_var.set("req-12345678")
     try:
-        payload = __import__("json").loads(formatter.format(record))
+        payload = json.loads(formatter.format(record))
+        bare = json.loads(
+            formatter.format(
+                logging.LogRecord(
+                    "ai-service.demo", logging.INFO, __file__, 2, "tick", None, None
+                )
+            )
+        )
     finally:
         request_id_var.reset(token)
+
     for key in (
         "ts",
         "level",
         "event",
+        "logger",
+        "service",
+        "schema",
+        "caller",
         "msg",
         "request_id",
         "trace_id",
-        "route",
-        "status",
-        "duration_ms",
     ):
         assert key in payload
-    assert set(payload).issuperset({"ts", "level", "event", "msg"})
+    assert payload["service"] == "ai-service"
+    assert payload["schema"] == 1
+    assert payload["logger"] == record.name
+    assert payload["caller"] == "test_request_logging.py:1[None]"
+    assert (payload["route"], payload["status"], payload["duration_ms"]) == (
+        "/x",
+        200,
+        1.5,
+    )
+
+    for key in ("method", "route", "status", "duration_ms"):
+        assert key not in bare, f"{key} must not be pinned as an empty string"
 
 
 def test_json_formatter_normalizes_missing_correlation_ids():
@@ -448,3 +496,162 @@ def test_chat_v2_resume_span_uses_gateway_request_id(span_exporter, monkeypatch)
     span = [s for s in span_exporter.get_finished_spans() if s.name == "chat.resume"][0]
     assert span.attributes["request.id"] == "20261020T220000000-32"
     assert span.attributes["client.request.id"] == "client-body-id"
+
+
+def _event_stream_client(monkeypatch, events):
+    class Orchestrator(_StreamingOrchestrator):
+        async def stream_chat(self, *_args, **_kwargs):
+            for event in events:
+                yield event
+
+        async def stream_resume(self, **_kwargs):
+            for event in events:
+                yield event
+
+    monkeypatch.setattr(chat_v2, "_build_run_orchestrator", lambda _runtime: Orchestrator())
+    monkeypatch.setattr(
+        chat_v2,
+        "_get_runs_repo",
+        lambda _request: SimpleNamespace(
+            get_run=lambda _run_id: SimpleNamespace(
+                request_id="client-body-id", conversation_id="conv-1", status="running"
+            )
+        ),
+    )
+    monkeypatch.setattr(chat_v2, "_require_conversation_owner", lambda *a, **k: None)
+    app = FastAPI()
+    app.add_middleware(RequestContextMiddleware)
+    app.include_router(chat_v2.chat_v2_router, prefix="/api/v2")
+    return TestClient(app)
+
+
+def _post_event_stream(client, endpoint):
+    if endpoint == "sse":
+        return client.post(
+            "/api/v2/chat/sse",
+            json={"message": "hi", "request_id": "client-body-id"},
+        )
+    return client.post("/api/v2/chat/resume/run-1")
+
+
+@pytest.mark.parametrize("endpoint", ["sse", "resume"])
+@pytest.mark.parametrize(
+    "event_type,outcome,status",
+    [
+        ("error", "error", "ERROR"),
+        ("done", "done", "OK"),
+        ("cancelled", "cancelled", "UNSET"),
+        ("run.paused", "paused", "UNSET"),
+        ("text", "unknown", "UNSET"),
+    ],
+)
+def test_stream_outcome_reaches_logs_and_root_span(
+    span_exporter, monkeypatch, caplog, endpoint, event_type, outcome, status
+):
+    payload = {"code": "v2_disabled", "message": "private-error-fixture"}
+    event = EventEnvelope(version="2", sequence=1, type=event_type, payload=payload)
+    client = _event_stream_client(monkeypatch, [event])
+
+    with caplog.at_level(logging.INFO, logger="ai-service.http"):
+        response = _post_event_stream(client, endpoint)
+
+    assert response.status_code == 200
+    assert "private-error-fixture" in response.text
+    summaries = [r for r in caplog.records if getattr(r, "event", None) == "request.completed"]
+    failures = [r for r in caplog.records if getattr(r, "event", None) == "request.failed"]
+    assert len(summaries) == 1
+    assert summaries[0].status == 200
+    assert summaries[0].outcome == outcome
+    assert len(failures) == (1 if event_type == "error" else 0)
+    span_name = "chat.request" if endpoint == "sse" else "chat.resume"
+    span = next(s for s in span_exporter.get_finished_spans() if s.name == span_name)
+    assert span.status.status_code.name == status
+    assert span.attributes["chat.outcome"] == outcome
+    assert summaries[0].trace_id == format(span.context.trace_id, "032x")
+    if event_type == "error":
+        assert summaries[0].error_code == "v2_disabled"
+        assert failures[0].error_code == "v2_disabled"
+        assert failures[0].error_type == "StreamError"
+        assert span.attributes["error.code"] == "v2_disabled"
+    for record in summaries + failures:
+        assert "private-error-fixture" not in JsonFormatter().format(record)
+    assert "private-error-fixture" not in str(dict(span.attributes))
+
+
+@pytest.mark.parametrize("endpoint", ["sse", "resume"])
+@pytest.mark.parametrize(
+    "code", [None, 12, ["bad"], {"bad": "value"}, "private_fixture", "x" * 100]
+)
+def test_stream_error_code_is_allowlisted(
+    span_exporter, monkeypatch, caplog, endpoint, code
+):
+    event = EventEnvelope(
+        version="2", sequence=1, type="error", payload={"code": code}
+    )
+    client = _event_stream_client(monkeypatch, [event])
+    with caplog.at_level(logging.INFO, logger="ai-service.http"):
+        response = _post_event_stream(client, endpoint)
+
+    assert response.status_code == 200
+    failure = next(r for r in caplog.records if getattr(r, "event", None) == "request.failed")
+    assert failure.error_code == "stream_error"
+    span = span_exporter.get_finished_spans()[0]
+    assert span.attributes["error.code"] == "stream_error"
+    assert span.status.status_code.name == "ERROR"
+
+
+@pytest.mark.parametrize("endpoint", ["sse", "resume"])
+def test_replayed_pause_does_not_hide_final_outcome(
+    span_exporter, monkeypatch, caplog, endpoint
+):
+    events = [
+        EventEnvelope(version="2", sequence=1, type="run.paused", payload={}),
+        EventEnvelope(version="2", sequence=2, type="text", payload={"content": "ok"}),
+        EventEnvelope(version="2", sequence=3, type="done", payload={}),
+    ]
+    client = _event_stream_client(monkeypatch, events)
+    with caplog.at_level(logging.INFO, logger="ai-service.http"):
+        response = _post_event_stream(client, endpoint)
+
+    assert response.status_code == 200
+    summary = next(r for r in caplog.records if getattr(r, "event", None) == "request.completed")
+    assert summary.outcome == "done"
+    assert span_exporter.get_finished_spans()[0].status.status_code.name == "OK"
+
+
+@pytest.mark.parametrize("endpoint", ["sse", "resume"])
+def test_stream_error_cannot_be_overwritten_by_done(
+    span_exporter, monkeypatch, caplog, endpoint
+):
+    events = [
+        EventEnvelope(
+            version="2", sequence=1, type="error", payload={"code": "v2_disabled"}
+        ),
+        EventEnvelope(version="2", sequence=2, type="done", payload={}),
+    ]
+    client = _event_stream_client(monkeypatch, events)
+    with caplog.at_level(logging.INFO, logger="ai-service.http"):
+        response = _post_event_stream(client, endpoint)
+
+    assert response.status_code == 200
+    failure = next(r for r in caplog.records if getattr(r, "event", None) == "request.failed")
+    assert failure.outcome == "error"
+    assert failure.error_code == "v2_disabled"
+    assert span_exporter.get_finished_spans()[0].status.status_code.name == "ERROR"
+
+
+@pytest.mark.parametrize("endpoint", ["sse", "resume"])
+def test_stream_error_is_logged_with_tracing_disabled(monkeypatch, caplog, endpoint):
+    monkeypatch.setattr(tracing, "get_tracer", lambda: None)
+    event = EventEnvelope(
+        version="2", sequence=1, type="error", payload={"code": "v2_disabled"}
+    )
+    client = _event_stream_client(monkeypatch, [event])
+    with caplog.at_level(logging.INFO, logger="ai-service.http"):
+        response = _post_event_stream(client, endpoint)
+
+    assert response.status_code == 200
+    failure = next(r for r in caplog.records if getattr(r, "event", None) == "request.failed")
+    assert failure.outcome == "error"
+    assert failure.error_code == "v2_disabled"
+    assert failure.trace_id == ""

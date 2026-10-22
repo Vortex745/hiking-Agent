@@ -644,6 +644,18 @@ function SuperAgent() {
         }
         return updated
       })
+    } else if (event.type === 'thought') {
+      // Model reasoning the kernel's public-text filter removed. Providers
+      // without reasoning emit no such event, so the trace simply stays
+      // without a thought line.
+      const content = typeof event.payload.content === 'string' ? event.payload.content : ''
+      if (!content) return
+      const traceEvent: AgentTraceEvent = {
+        type: 'thought',
+        content,
+        metadata: event.payload as Record<string, unknown>,
+      }
+      appendTraceEvent(setMessages, traceEvent, { isStreaming: true })
     } else if (event.type === 'tool_call' || event.type === 'tool_result') {
       const traceEvent: AgentTraceEvent = {
         type: event.type,

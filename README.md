@@ -1,7 +1,7 @@
 # AI Hiking _(ai-hiking)_
 
 [![standard-readme compliant](https://img.shields.io/badge/readme%20style-standard-brightgreen.svg?style=flat-square)](https://github.com/RichardLitt/standard-readme)
-![Deploy](https://img.shields.io/github/actions/workflow/status/Vortex745/hiking-ai/deploy.yml?branch=main&label=deploy&logo=githubactions&style=flat-square)
+![CI](https://img.shields.io/github/actions/workflow/status/Vortex745/hiking-ai/deploy.yml?label=CI&logo=githubactions&style=flat-square)
 ![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=white&style=flat-square)
 ![Vite](https://img.shields.io/badge/Vite-5-646CFF?logo=vite&logoColor=white&style=flat-square)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white&style=flat-square)
@@ -219,7 +219,25 @@ ai-hiking/
 
 ## 测试
 
-CI 的验证 job 定义在 `.github/workflows/deploy.yml`（推送到 `main` 或 PR 时运行）。本地按同样顺序执行：
+CI 定义在 [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)，工作流名称为 `CI`。每次分支推送、PR、合并队列和手动触发都会运行。三个服务并行检查：
+
+| 检查 | 内容 |
+|---|---|
+| Frontend build and browser regression | Node.js 22，`npm ci`、TypeScript 检查、Vite 生产构建、Chromium 会话切换回归 |
+| Gateway vet, test and build | 按 `gateway/go.mod` 设置 Go，依赖校验、`go vet`、`go test`、编译 |
+| Backend and evaluation contracts (offline) | Python 3.12，离线恢复并核验 fork、联合安装依赖、`pip check`、后端全量离线回归、评估契约 |
+
+`Validate services` 汇总三个检查，只有全部成功才通过；失败、取消或跳过均不能放行。可在 GitHub 分支保护中将其设为 required status check。新提交会取消同一 ref 上的旧运行，任务设有超时，并缓存 npm、Go 和 pip 下载。
+
+Actions 产物保留 7 天：`frontend-dist` 为前端构建，`frontend-browser-results` 包含浏览器日志、预览服务日志及成功截图，`backend-test-results` 包含后端与评估的 JUnit XML。后端回归失败时，已成功安装依赖的评估契约仍会执行并独立记录结果。
+
+本地使用以下命令复现各服务检查。Python 测试先在终端设置离线测试环境（以下为 Bash；PowerShell 使用对应的 `$env:变量名 = "值"`）：
+
+```bash
+export OPENAI_API_KEY=ci-placeholder-not-a-credential
+export KERNEL_LIVE_E2E=0 HIKING_EVAL_LIVE=0
+export LANGFUSE_ENABLED=false DEEPEVAL_TELEMETRY_OPT_OUT=YES
+```
 
 1. 恢复受控 UniHarness fork（离线 bundle，无网络协议）：
 
@@ -254,13 +272,30 @@ Frontend：
 cd frontend
 npm ci
 npm run build
+npx playwright install chromium
+```
+
+在一个终端启动生产预览：
+
+```bash
+npm run preview -- --host 127.0.0.1 --port 4173 --strictPort
+```
+
+在另一个终端的 `frontend/` 下执行浏览器回归（API/SSE 使用测试数据，无需启动后端）：
+
+```bash
+BASE_URL=http://127.0.0.1:4173 npm run test:browser
 ```
 
 Gateway：
 
 ```bash
 cd gateway
+go mod download
+go mod verify
+go vet ./...
 go test ./...
+go build -trimpath -o ../test-report/gateway .
 ```
 
 ### 评分状态与结论范围
@@ -275,29 +310,7 @@ go test ./...
 
 ### GitHub Actions
 
-`main` 分支推送会触发 `.github/workflows/deploy.yml`：
-
-1. 校验前端、Gateway、AI Service 语法和生产 Compose 文件。
-2. 构建 `ai-service`、`gateway`、`frontend` 三个镜像。
-3. 推送到 Docker Hub 仓库 `zijinn123/ai-hiking`。
-4. 发布 pgvector 的 runtime 镜像副本。
-5. 通过 SSH 上传 `docker-compose.prod.yml` 和生产 `.env`。
-6. 在服务器上拉取 `sha-*` 镜像并重启服务。
-
-需要的 GitHub Secrets：
-
-| Secret | 说明 |
-|---|---|
-| `DOCKERHUB_USERNAME` | Docker Hub 用户名 |
-| `DOCKERHUB_TOKEN` | Docker Hub Token |
-| `DEPLOY_HOST` | 服务器地址 |
-| `DEPLOY_USER` | SSH 用户 |
-| `DEPLOY_SSH_KEY` | SSH 私钥 |
-| `DEPLOY_PORT` | SSH 端口 |
-| `DEPLOY_PATH` | 服务器部署目录 |
-| `OPENAI_API_KEY` | 生产 LLM Key |
-| `EMBEDDING_API_KEY` | 生产 Embedding Key |
-| `RERANK_API_KEY` | 生产 Rerank Key |
+`.github/workflows/deploy.yml` 沿用历史文件名，目前执行上文的 CI 检查。运行 CI 无需配置 GitHub Secrets；其中的模型 Key 是构造测试对象用的占位值。生产发布通过下述部署方式单独进行。
 
 ### 生产 Compose
 

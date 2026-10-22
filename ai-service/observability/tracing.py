@@ -294,6 +294,18 @@ def record_exception(span: Any, exc: BaseException) -> None:
         return None
 
 
+def record_stream_error(span: Any, code: str) -> None:
+    """Mark an SSE business failure using only an adapter-allowlisted code."""
+    try:
+        from opentelemetry.trace import Status, StatusCode
+
+        span.set_attribute("error.type", "StreamError")
+        span.set_attribute("error.code", code)
+        span.set_status(Status(StatusCode.ERROR))
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
 def mark_ok(span: Any) -> None:
     try:
         from opentelemetry.trace import Status, StatusCode

@@ -7,11 +7,12 @@ the old "trace everything through callbacks" design.
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from langchain_core.callbacks import BaseCallbackHandler
 
-from observability import tracing
+from observability import llm_log, tracing
 from observability.redaction import scrub_text
 
 
@@ -93,3 +94,105 @@ class ToolSpanCallbackHandler(BaseCallbackHandler):
 
     async def on_tool_error_async(self, error, **kwargs) -> None:
         self.on_tool_error(error, **kwargs)
+
+
+class ToolLogCallbackHandler(BaseCallbackHandler):
+    """Write one ``llm.tool`` record per tool invocation.
+
+    Deliberately log-only: spans stay with :class:`ToolSpanCallbackHandler` so
+    enabling the local log never changes the exported trace tree.
+    """
+
+    def __init__(self) -> None:
+        self._started: dict[Any, tuple[str, float, Any, Any]] = {}
+
+    @staticmethod
+    def _tool_name(serialized: Any) -> str:
+        raw = ""
+        if isinstance(serialized, dict):
+            raw = str(serialized.get("name") or serialized.get("id") or "")
+        return raw.split(".")[-1] or "tool"
+
+    def on_tool_start(self, serialized, input_str=None, **kwargs) -> None:
+        if not llm_log.enabled():
+            return
+        metadata = kwargs.get("metadata") or {}
+        args = kwargs.get("inputs")
+        if args is None:
+            args = input_str
+        self._started[kwargs.get("run_id")] = (
+            self._tool_name(serialized),
+            time.perf_counter(),
+            args,
+            metadata.get("langgraph_step"),
+        )
+
+    def on_tool_end(self, output, **kwargs) -> None:
+        entry = self._started.pop(kwargs.get("run_id"), None)
+        if entry is None:
+            return
+        name, started, args, step = entry
+        text = _output_text(output)
+        # Domain adapters turn timeouts/exceptions into a normal public error
+        # result; without this check the failure would look like a success.
+        error_type = _domain_error_type(name, text)
+        llm_log.tool(
+            tool=name,
+            args=args,
+            status="error" if error_type else "ok",
+            duration_ms=round((time.perf_counter() - started) * 1000, 1),
+            output_chars=len(text),
+            error_type=error_type,
+            langgraph_step=step,
+        )
+
+    def on_tool_error(self, error, **kwargs) -> None:
+        entry = self._started.pop(kwargs.get("run_id"), None)
+        if entry is None:
+            return
+        name, started, args, step = entry
+        llm_log.tool(
+            tool=name,
+            args=args,
+            status="error",
+            duration_ms=round((time.perf_counter() - started) * 1000, 1),
+            error=error,
+            langgraph_step=step,
+        )
+
+    async def on_tool_start_async(self, serialized, input_str=None, **kwargs) -> None:
+        self.on_tool_start(serialized, input_str, **kwargs)
+
+    async def on_tool_end_async(self, output, **kwargs) -> None:
+        self.on_tool_end(output, **kwargs)
+
+    async def on_tool_error_async(self, error, **kwargs) -> None:
+        self.on_tool_error(error, **kwargs)
+
+
+def _output_text(output: Any) -> str:
+    content = getattr(output, "content", output)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                parts.append(str(block.get("text", "")))
+            else:
+                parts.append(str(block))
+        return "".join(parts)
+    return str(content or "")
+
+
+def _domain_error_type(tool_name: str, text: str) -> str:
+    """Stable public error wording from the domain-tool adapter."""
+    if f"工具 {tool_name} 执行超时" in text:
+        return "ToolTimeout"
+    if f"工具 {tool_name} 执行失败" in text:
+        return "ToolError"
+    # Builtin tools (Agent/task, filesystem, …) report failures as an
+    # ``<error>…</error>`` result instead of raising; that is not a success.
+    if text.lstrip().startswith("<error>"):
+        return "ToolError"
+    return ""

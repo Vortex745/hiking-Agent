@@ -177,6 +177,67 @@ def _sse_frame(envelope: EventEnvelope) -> str:
     return f"data: {envelope.to_json_line()}\n\n"
 
 
+# Only stable public codes may leave the event payload for logs/traces.
+# New or malformed codes retain failure visibility through stream_error.
+_STREAM_ERROR_CODES = frozenset({
+    "artifact_evidence_persistence_failed",
+    "artifact_export_failed",
+    "artifact_generation_failed",
+    "bash_execution_failed",
+    "bash_plan_invalid",
+    "checkpoint_unavailable",
+    "context_unavailable",
+    "conversation_forbidden",
+    "cowork_unauthorized",
+    "effect_in_flight",
+    "effect_outcome_unknown",
+    "empty_model_output",
+    "evidence_unavailable",
+    "internal_error",
+    "kernel_model_build_failed",
+    "kernel_run_failed",
+    "kernel_unavailable",
+    "model_timeout",
+    "model_unavailable",
+    "no_resolved_approval",
+    "run_not_found",
+    "sandbox_creation_failed",
+    "sandbox_lease_lost",
+    "sandbox_quota",
+    "sandbox_timeout",
+    "sandbox_type_invalid",
+    "sandbox_unavailable",
+    "tool_denied",
+    "unknown_profile",
+    "v2_disabled",
+})
+
+
+def _observe_stream_event(request: Request, span: Any, item: EventEnvelope | str) -> None:
+    """Publish typed outcomes without buffering or parsing serialized SSE."""
+    if not isinstance(item, EventEnvelope):
+        return
+    # An error must never be overwritten by a later success marker.
+    if getattr(request.state, "stream_outcome", None) == "error":
+        return
+    outcome = {
+        "error": "error",
+        "done": "done",
+        "cancelled": "cancelled",
+        "run.paused": "paused",
+    }.get(item.type, "unknown")
+    request.state.stream_outcome = outcome
+    span.set_attribute("chat.outcome", outcome)
+    if outcome == "error":
+        code = item.payload.get("code")
+        safe_code = (
+            code if isinstance(code, str) and code in _STREAM_ERROR_CODES
+            else "stream_error"
+        )
+        request.state.stream_error_code = safe_code
+        tracing.record_stream_error(span, safe_code)
+
+
 # ---- Stub response generation --------------------------------------------
 
 # The artifact profile owns a run-scoped sandbox. The sandbox is created
@@ -408,8 +469,10 @@ async def chat_v2_sse(req: ChatV2Request, request: Request):
                             if run_id:
                                 span.set_attribute("run.id", run_id)
                                 run_id_recorded = True
+                        _observe_stream_event(request, span, item)
                         yield item if isinstance(item, str) else _sse_frame(item)
-                    tracing.mark_ok(span)
+                    if getattr(request.state, "stream_outcome", None) in (None, "done"):
+                        tracing.mark_ok(span)
                 except BaseException as exc:
                     tracing.record_exception(span, exc)
                     raise
@@ -1041,8 +1104,10 @@ async def chat_v2_resume(
                     async for item in orchestrator.stream_resume(
                         run_id=run_id, from_seq=from_seq
                     ):
+                        _observe_stream_event(request, span, item)
                         yield item if isinstance(item, str) else _sse_frame(item)
-                    tracing.mark_ok(span)
+                    if getattr(request.state, "stream_outcome", None) in (None, "done"):
+                        tracing.mark_ok(span)
                 except BaseException as exc:
                     tracing.record_exception(span, exc)
                     raise

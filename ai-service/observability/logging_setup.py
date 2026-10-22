@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 import time
 from contextvars import ContextVar
+from datetime import datetime, timezone
 from typing import Any
 
 from config import settings
@@ -33,6 +35,28 @@ from observability.request_context import (
 request_id_var: ContextVar[str | None] = ContextVar("request_id", default=None)
 trace_id_var: ContextVar[str | None] = ContextVar("trace_id", default=None)
 
+SERVICE_NAME = "ai-service"
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _utc_iso_ms(created: float) -> str:
+    """One timestamp format for every channel: UTC, millisecond precision, Z."""
+    return (
+        datetime.fromtimestamp(created, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+        + "Z"
+    )
+
+
+def _caller(record: logging.LogRecord) -> str:
+    return f"{record.filename}:{record.lineno}[{record.funcName}]"[:120]
+
+
+def _sanitize_line(text: str) -> str:
+    """Keep one record on one line in text mode; JSON relies on escaping."""
+    return _CONTROL_CHARS.sub(
+        " ", str(text).replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    )
+
 _PINNED_KEYS = (
     "ts",
     "level",
@@ -40,11 +64,11 @@ _PINNED_KEYS = (
     "msg",
     "request_id",
     "trace_id",
-    "method",
-    "route",
-    "status",
-    "duration_ms",
 )
+
+# Third-party HTTP clients log every outbound call at INFO. In the product's
+# structured stream that is transport noise, not a business milestone.
+_QUIET_LOGGERS = ("httpx", "httpx2", "httpcore")
 
 # Instance attributes every LogRecord already carries; never dump them as
 # extra fields (they are noise and may include paths).
@@ -56,9 +80,13 @@ _STANDARD_ATTRS = set(
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
-            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "ts": _utc_iso_ms(record.created),
             "level": record.levelname,
             "event": record.name,
+            "logger": record.name,
+            "service": SERVICE_NAME,
+            "schema": 1,
+            "caller": _caller(record),
             "msg": scrub_text(record.getMessage(), 2000),
             "request_id": getattr(record, "request_id", None)
             or request_id_var.get()
@@ -93,7 +121,7 @@ class JsonFormatter(logging.Formatter):
             payload["exc_info"] = scrub_text(
                 self.formatException(record.exc_info), 4000
             )
-        return json.dumps(payload, ensure_ascii=False)
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
 class TextFormatter(logging.Formatter):
@@ -101,10 +129,34 @@ class TextFormatter(logging.Formatter):
         request_id = getattr(record, "request_id", None) or request_id_var.get() or "-"
         trace_id = getattr(record, "trace_id", None) or trace_id_var.get() or "-"
         return (
-            f"{self.formatTime(record, '%Y-%m-%dT%H:%M:%S%z')} "
+            f"{_utc_iso_ms(record.created)} "
             f"{record.levelname} {record.name} request_id={request_id} "
-            f"trace_id={trace_id} {record.getMessage()}"
+            f"trace_id={trace_id} {_caller(record)} | {_sanitize_line(record.getMessage())}"
         )
+
+
+class _ConsoleStreamHandler(logging.StreamHandler):
+    """Keep whole records on consoles that cannot encode every character."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = self.format(record)
+            try:
+                self.stream.write(message + self.terminator)
+            except UnicodeEncodeError as exc:
+                if isinstance(self.formatter, JsonFormatter):
+                    # JSON requires \u escapes, not backslashreplace's \U / \x.
+                    message = json.dumps(json.loads(message), ensure_ascii=True)
+                else:
+                    message = message.encode(
+                        exc.encoding, errors="backslashreplace"
+                    ).decode(exc.encoding)
+                self.stream.write(message + self.terminator)
+            self.flush()
+        except RecursionError:
+            raise
+        except Exception:
+            self.handleError(record)
 
 
 _configured = False
@@ -115,7 +167,7 @@ def configure_logging() -> None:
     if _configured:
         return
     _configured = True
-    handler = logging.StreamHandler(sys.stdout)
+    handler = _ConsoleStreamHandler(sys.stdout)
     handler.setFormatter(
         JsonFormatter() if settings.log_format != "text" else TextFormatter()
     )
@@ -124,6 +176,13 @@ def configure_logging() -> None:
     root.setLevel(getattr(logging, settings.log_level, logging.INFO))
     # Access logs are produced by our middleware; don't double-log.
     logging.getLogger("uvicorn.access").disabled = True
+    for name in _QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+    # Local agent execution log (LLM_LOG). Disabled by default; failures in
+    # setup are contained by llm_log itself.
+    from observability import llm_log
+
+    llm_log.setup()
 
 
 class RequestContextMiddleware:
@@ -193,9 +252,26 @@ class RequestContextMiddleware:
             # the shared ASGI state because their body runs in a child task.
             state_trace_id = (scope.get("state") or {}).get("trace_id", "")
             effective_trace_id = trace_id or state_trace_id or trace_id_var.get() or ""
+            state = scope.get("state") or {}
+            stream_outcome = state.get("stream_outcome")
+            stream_error_code = state.get("stream_error_code", "")
+            failed = error is not None or status_code >= 500 or stream_outcome == "error"
+            if failed:
+                outcome = "error"
+            elif status_code >= 400:
+                outcome = "client_error"
+            else:
+                outcome = stream_outcome or "ok"
+            if failed:
+                level = logging.ERROR
+            elif status_code >= 400:
+                level = logging.WARNING
+            else:
+                level = logging.INFO
             method = scope.get("method", "")
             logger = logging.getLogger("ai-service.http")
-            logger.info(
+            logger.log(
+                level,
                 "request completed",
                 extra={
                     "event": "request.completed",
@@ -205,9 +281,13 @@ class RequestContextMiddleware:
                     "route": route_path,
                     "status": status_code,
                     "duration_ms": duration_ms,
+                    "outcome": outcome,
+                    "error_code": stream_error_code,
                 },
             )
-            if error is not None or status_code >= 500:
+            # A bare 5xx has no cause to report; only a real exception or an
+            # in-band stream error earns the extra failure line.
+            if error is not None or stream_outcome == "error":
                 logger.error(
                     "request failed",
                     extra={
@@ -218,8 +298,13 @@ class RequestContextMiddleware:
                         "route": route_path,
                         "status": status_code,
                         "duration_ms": duration_ms,
-                        "error_type": type(error).__name__ if error else "",
-                        "error_msg": scrub_text(str(error), 500) if error else "",
+                        "outcome": outcome,
+                        "error_code": stream_error_code,
+                        "error_type": (
+                            type(error).__name__ if error is not None
+                            else "StreamError" if stream_outcome == "error" else ""
+                        ),
+                        "error_message": scrub_text(str(error), 500) if error else "",
                     },
                 )
             request_id_var.reset(request_token)

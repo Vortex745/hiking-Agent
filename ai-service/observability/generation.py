@@ -15,7 +15,7 @@ import json
 import time
 from typing import Any
 
-from observability import tracing
+from observability import llm_log, tracing
 from observability.redaction import sanitize_messages, scrub_text
 
 _MAX_TEXT = 4000
@@ -151,6 +151,54 @@ def _chunk_text(chunk: Any) -> str:
     return str(content or "")
 
 
+_SUBAGENT_TAG_PREFIX = "uniharness:subagent:"
+
+
+def _agent_from_run_manager(run_manager: Any) -> str:
+    """Attribution comes from the vendored runner's per-call tag.
+
+    A ContextVar entered in the tool-start callback is NOT visible to the
+    subagent's model call (probe, 2026-10-21), so tags are the trustworthy
+    signal here.
+    """
+    for tag in getattr(run_manager, "tags", None) or ():
+        if isinstance(tag, str) and tag.startswith(_SUBAGENT_TAG_PREFIX):
+            return f"subagent:{tag[len(_SUBAGENT_TAG_PREFIX):]}"
+    return "main"
+
+
+def _log_generation(
+    model: Any,
+    messages: Any,
+    kwargs: dict,
+    *,
+    text: str,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    ttft_ms: float | None,
+    started: float,
+    error: BaseException | None = None,
+    run_manager: Any = None,
+) -> None:
+    """Mirror the span payload into the local LLM_LOG sink (when enabled)."""
+    if not llm_log.enabled():
+        return
+    llm_log.generation(
+        model=_model_name(model),
+        provider=_provider(model),
+        temperature=getattr(model, "temperature", None),
+        tools=_tool_names(kwargs.get("tools")),
+        messages=messages,
+        output=text,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        ttft_ms=ttft_ms,
+        duration_ms=round((time.perf_counter() - started) * 1000, 1),
+        error=error,
+        agent=_agent_from_run_manager(run_manager),
+    )
+
+
 def trace_chat_model(model: Any) -> Any:
     """Wrap a chat model instance so each inference call emits a span."""
     if model is None or getattr(model, "_obs_generation_traced", False):
@@ -165,6 +213,7 @@ def trace_chat_model(model: Any) -> Any:
 
         async def traced_agenerate(messages, stop=None, run_manager=None, **kwargs):
             attrs = _request_attributes(model, messages, kwargs)
+            started = time.perf_counter()
             with tracing.start_span("chat.generation", attrs) as span:
                 try:
                     result = await original_agenerate(
@@ -172,10 +221,34 @@ def trace_chat_model(model: Any) -> Any:
                     )
                 except BaseException as exc:
                     tracing.record_exception(span, exc)
+                    _log_generation(
+                        model,
+                        messages,
+                        kwargs,
+                        text="",
+                        input_tokens=None,
+                        output_tokens=None,
+                        ttft_ms=None,
+                        started=started,
+                        run_manager=run_manager,
+                        error=exc,
+                    )
                     raise
                 input_tokens, output_tokens = _usage_from_result(result)
                 _apply_usage(span, input_tokens, output_tokens)
-                span.set_attribute("gen_ai.output.messages", _text_from_result(result))
+                text = _text_from_result(result)
+                span.set_attribute("gen_ai.output.messages", text)
+                _log_generation(
+                    model,
+                    messages,
+                    kwargs,
+                    text=text,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    ttft_ms=None,
+                    started=started,
+                    run_manager=run_manager,
+                )
                 tracing.mark_ok(span)
                 return result
 
@@ -185,6 +258,7 @@ def trace_chat_model(model: Any) -> Any:
 
         def traced_generate(messages, stop=None, run_manager=None, **kwargs):
             attrs = _request_attributes(model, messages, kwargs)
+            started = time.perf_counter()
             with tracing.start_span("chat.generation", attrs) as span:
                 try:
                     result = original_generate(
@@ -192,10 +266,34 @@ def trace_chat_model(model: Any) -> Any:
                     )
                 except BaseException as exc:
                     tracing.record_exception(span, exc)
+                    _log_generation(
+                        model,
+                        messages,
+                        kwargs,
+                        text="",
+                        input_tokens=None,
+                        output_tokens=None,
+                        ttft_ms=None,
+                        started=started,
+                        run_manager=run_manager,
+                        error=exc,
+                    )
                     raise
                 input_tokens, output_tokens = _usage_from_result(result)
                 _apply_usage(span, input_tokens, output_tokens)
-                span.set_attribute("gen_ai.output.messages", _text_from_result(result))
+                text = _text_from_result(result)
+                span.set_attribute("gen_ai.output.messages", text)
+                _log_generation(
+                    model,
+                    messages,
+                    kwargs,
+                    text=text,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    ttft_ms=None,
+                    started=started,
+                    run_manager=run_manager,
+                )
                 tracing.mark_ok(span)
                 return result
 
@@ -242,8 +340,19 @@ def trace_chat_model(model: Any) -> Any:
                     # Cancellation and client disconnect still report the
                     # usage collected so far; only real failures skip mark_ok.
                     _apply_usage(span, input_tokens, output_tokens)
-                    span.set_attribute(
-                        "gen_ai.output.messages", scrub_text("".join(chunks), _MAX_TEXT)
+                    text = scrub_text("".join(chunks), _MAX_TEXT)
+                    span.set_attribute("gen_ai.output.messages", text)
+                    _log_generation(
+                        model,
+                        messages,
+                        kwargs,
+                        text=text,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        ttft_ms=first_token_ms,
+                        started=started,
+                        run_manager=run_manager,
+                        error=error,
                     )
                     if error is None:
                         tracing.mark_ok(span)
@@ -289,8 +398,19 @@ def trace_chat_model(model: Any) -> Any:
                     raise
                 finally:
                     _apply_usage(span, input_tokens, output_tokens)
-                    span.set_attribute(
-                        "gen_ai.output.messages", scrub_text("".join(chunks), _MAX_TEXT)
+                    text = scrub_text("".join(chunks), _MAX_TEXT)
+                    span.set_attribute("gen_ai.output.messages", text)
+                    _log_generation(
+                        model,
+                        messages,
+                        kwargs,
+                        text=text,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        ttft_ms=first_token_ms,
+                        started=started,
+                        run_manager=run_manager,
+                        error=error,
                     )
                     if error is None:
                         tracing.mark_ok(span)

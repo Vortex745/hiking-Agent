@@ -10,6 +10,14 @@ import (
 
 // Shared proxy helpers used by the RAG and v2 handlers.
 
+func copyCorrelationHeaders(c *gin.Context, req *http.Request) {
+	for _, header := range []string{"X-Request-ID", "traceparent"} {
+		if value := c.Request.Header.Get(header); value != "" {
+			req.Header.Set(header, value)
+		}
+	}
+}
+
 // proxyRequest forwards a non-streaming request to the AI service and
 // passes the response through verbatim including status code.
 func proxyRequest(c *gin.Context, method, url string, body io.Reader) {
@@ -23,11 +31,7 @@ func proxyRequest(c *gin.Context, method, url string, body io.Reader) {
 	if contentType := c.Request.Header.Get("Content-Type"); contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
-	for _, header := range []string{"X-Request-ID", "traceparent"} {
-		if value := c.Request.Header.Get(header); value != "" {
-			req.Header.Set(header, value)
-		}
-	}
+	copyCorrelationHeaders(c, req)
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -82,6 +86,7 @@ func proxyHealthRequest(c *gin.Context, module, url, fallbackURL string) {
 		return
 	}
 	req.Header.Set("Accept", "application/json")
+	copyCorrelationHeaders(c, req)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -108,6 +113,7 @@ func proxyHealthRequest(c *gin.Context, module, url, fallbackURL string) {
 		return
 	}
 	fallbackReq.Header.Set("Accept", "application/json")
+	copyCorrelationHeaders(c, fallbackReq)
 
 	fallbackResp, err := client.Do(fallbackReq)
 	if err != nil {

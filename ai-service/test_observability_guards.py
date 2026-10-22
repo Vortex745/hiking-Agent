@@ -79,6 +79,7 @@ EXPECTED_FACADE_API = {
     "mark_ok",
     "observation_attributes",
     "record_exception",
+    "record_stream_error",
     "reset_session",
     "set_session",
     "shutdown_tracing",

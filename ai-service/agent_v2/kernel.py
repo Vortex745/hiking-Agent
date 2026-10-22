@@ -22,8 +22,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
-from observability import tracing
-from observability.callbacks import ToolSpanCallbackHandler
+from observability import llm_log, tracing
+from observability.callbacks import ToolLogCallbackHandler, ToolSpanCallbackHandler
 
 logger = logging.getLogger("ai-service.agent_v2.kernel")
 
@@ -40,26 +40,33 @@ def _strip_reasoning(text: str) -> str:
 
 
 class _StreamingPublicText:
-    """Strip reasoning even when a provider splits its tags across tokens."""
+    """Strip reasoning even when a provider splits its tags across tokens.
+
+    Hidden reasoning is not discarded: it accumulates in ``reasoning`` and
+    each :meth:`feed` exposes the newly hidden text through
+    :meth:`take_reasoning`, so the caller can publish it as a separate
+    ``thought`` event while the public answer stays clean.
+    """
 
     def __init__(self) -> None:
         self.pending = ""
         self.hidden = False
         self.started = False
         self.whitespace = ""
+        self.reasoning = ""
+        self._reasoning_delta = ""
 
     def feed(self, content: str, *, final: bool = False) -> str:
         self.pending += content
-        visible = ""
+        visible: list[str] = []
+        self._reasoning_delta = ""
         while self.pending:
             opening = self.pending.find("<")
             if opening == -1:
-                if not self.hidden:
-                    visible += self.pending
+                self._collect(self.pending, visible)
                 self.pending = ""
                 break
-            if not self.hidden:
-                visible += self.pending[:opening]
+            self._collect(self.pending[:opening], visible)
             self.pending = self.pending[opening:]
             closing = self.pending.find(">")
             if closing == -1:
@@ -68,24 +75,73 @@ class _StreamingPublicText:
                               "<reasoning>", "</reasoning>", "<mm:think>", "</mm:think>")
                 if not final and any(tag.startswith(self.pending.lower()) for tag in candidates):
                     break
-                if not self.hidden:
-                    visible += self.pending
+                self._collect(self.pending, visible)
                 self.pending = ""
                 break
             tag = self.pending[:closing + 1]
             self.pending = self.pending[closing + 1:]
             if _REASONING_TAG.fullmatch(tag):
                 self.hidden = not tag.startswith("</")
-            elif not self.hidden:
-                visible += tag
-        visible = self.whitespace + visible
+            else:
+                self._collect(tag, visible)
+        joined = self.whitespace + "".join(visible)
         if not self.started:
-            visible = visible.lstrip()
-        text = visible.rstrip()
-        self.whitespace = visible[len(text):]
+            joined = joined.lstrip()
+        text = joined.rstrip()
+        self.whitespace = joined[len(text):]
         if text:
             self.started = True
         return text
+
+    def _collect(self, text: str, visible: list[str]) -> None:
+        if not text:
+            return
+        if self.hidden:
+            self.reasoning += text
+            self._reasoning_delta += text
+        else:
+            visible.append(text)
+
+    def take_reasoning(self) -> str:
+        delta = self._reasoning_delta
+        self._reasoning_delta = ""
+        return delta
+
+
+class _ThoughtBuffer:
+    """Batch hidden reasoning into readable chunks with a per-turn cap."""
+
+    def __init__(
+        self,
+        on_thought: Callable[[str], Awaitable[None]] | None,
+        *,
+        flush_chars: int = 180,
+        max_chars: int = 8000,
+    ) -> None:
+        self._on_thought = on_thought
+        self._buffer = ""
+        self._emitted = 0
+        self._flush_chars = flush_chars
+        self._max_chars = max_chars
+
+    async def add(self, text: str) -> None:
+        if self._on_thought is None or not text:
+            return
+        self._buffer += text
+        if len(self._buffer) >= self._flush_chars:
+            await self.flush()
+
+    async def flush(self) -> None:
+        chunk, self._buffer = self._buffer, ""
+        if self._on_thought is None or not chunk.strip():
+            return
+        remaining = self._max_chars - self._emitted
+        if remaining <= 0:
+            return
+        if len(chunk) > remaining:
+            chunk = chunk[:remaining]
+        self._emitted += len(chunk)
+        await self._on_thought(chunk)
 
 # Built-in tool groups exposed by the vendored fork's create_agent.
 BUILTIN_TOOL_GROUPS: frozenset[str] = frozenset({"cli", "web", "todo", "task", "skills"})
@@ -363,6 +419,20 @@ def build_kernel_messages(
     return messages
 
 
+def _callbacks_for_turn(turn_span: Any) -> list[Any]:
+    """Tool callbacks for this turn: spans and/or the local execution log.
+
+    The log handler is independent of tracing so enabling LLM_LOG never
+    requires Langfuse, and enabling tracing never duplicates log records.
+    """
+    handlers: list[Any] = []
+    if tracing.tracing_enabled():
+        handlers.append(ToolSpanCallbackHandler(parent_span=turn_span))
+    if llm_log.enabled():
+        handlers.append(ToolLogCallbackHandler())
+    return handlers
+
+
 async def run_chat_turn(
     *,
     system_prompt: str,
@@ -377,13 +447,17 @@ async def run_chat_turn(
     approval_callback: Any | None = None,
     subagent_definitions: dict[str, Any] | None = None,
     on_text: Callable[[str, list[dict[str, Any]]], Awaitable[None]] | None = None,
+    on_thought: Callable[[str], Awaitable[None]] | None = None,
     history: list[dict[str, str]] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Run ONE chat turn through the real UniHarness model loop (T28 entry).
 
     ``on_text`` receives filtered model deltas when supplied; callers enforce
-    the evidence gate before publishing them. Other kernel consumers retain
-    the single-result invocation. Returns ``(final_text, audit_entries)``.
+    the evidence gate before publishing them. ``on_thought`` receives the
+    reasoning the public text filter hid (``<think>`` blocks or a provider's
+    ``reasoning_content`` delta); it is an opt-in side channel and never
+    changes the public answer. Other kernel consumers retain the
+    single-result invocation. Returns ``(final_text, audit_entries)``.
     Audit records bind every tool
     execution and every permission denial to the public run identity so the
     stream layer can emit evidence events; adapters and the gate share one
@@ -439,6 +513,15 @@ async def run_chat_turn(
             "gen_ai.operation.name": "invoke_agent",
         },
     ) as turn_span:
+        # Started inside the span so the turn's first record inherits the
+        # trace id the span publishes. ``trace_id_var`` is intentionally not
+        # reset on span exit (the request summary is written later).
+        turn_token = llm_log.begin_turn(
+            run_id=run_id or "",
+            model=str(getattr(settings, "openai_model", "") or ""),
+            message_chars=len(message),
+            history_count=len(history or []),
+        )
         try:
             try:
                 agent = await assemble_kernel_agent(config, settings)
@@ -455,12 +538,11 @@ async def run_chat_turn(
             )
             # Ticket 04: only tool spans ride on callbacks. Generations are
             # traced by the model decorator (ticket 03), avoiding duplicate
-            # generation nodes.
-            if tracing.tracing_enabled():
+            # generation nodes. LLM_LOG rides the same seam without spans.
+            callbacks = _callbacks_for_turn(turn_span)
+            if callbacks:
                 invoke_config = dict(invoke_config or {})
-                invoke_config["callbacks"] = [
-                    ToolSpanCallbackHandler(parent_span=turn_span)
-                ]
+                invoke_config["callbacks"] = callbacks
             # Ticket 05 (T08): ONE input construction for every kernel invocation —
             # bounded history first, the current user message appended exactly once.
             input_messages = build_kernel_messages(message=message, history=history)
@@ -474,6 +556,7 @@ async def run_chat_turn(
                     else:
                         result = {}
                         public_text = _StreamingPublicText()
+                        thoughts = _ThoughtBuffer(on_thought)
                         step = None
                         async with asyncio.timeout(240):
                             async for mode, data in agent.astream(
@@ -493,6 +576,8 @@ async def run_chat_turn(
                                 if getattr(chunk, "tool_call_chunks", None) or getattr(chunk, "tool_calls", None):
                                     continue
                                 if metadata.get("langgraph_step") != step:
+                                    # A new model step opens a new reasoning segment.
+                                    await thoughts.flush()
                                     public_text = _StreamingPublicText()
                                     step = metadata.get("langgraph_step")
                                 content = getattr(chunk, "content", "")
@@ -502,12 +587,27 @@ async def run_chat_turn(
                                         for block in content
                                         if isinstance(block, str) or (isinstance(block, dict) and block.get("type") == "text")
                                     )
+                                # Some OpenAI-compatible providers return reasoning
+                                # out-of-band instead of inside <think> tags.
+                                extra = getattr(chunk, "additional_kwargs", None)
+                                if isinstance(extra, dict):
+                                    for key in ("reasoning_content", "reasoning"):
+                                        hidden = extra.get(key)
+                                        if isinstance(hidden, str):
+                                            await thoughts.add(hidden)
                                 delta = public_text.feed(content if isinstance(content, str) else "")
+                                hidden_delta = public_text.take_reasoning()
+                                if hidden_delta:
+                                    await thoughts.add(hidden_delta)
                                 if delta:
                                     await on_text(delta, audit_entries)
                             delta = public_text.feed("", final=True)
+                            hidden_delta = public_text.take_reasoning()
+                            if hidden_delta:
+                                await thoughts.add(hidden_delta)
                             if delta:
                                 await on_text(delta, audit_entries)
+                            await thoughts.flush()
                 except TimeoutError as exc:
                     raise KernelModelFailure("model_timeout", "模型响应超时，请稍后重试。") from exc
                 text = extract_final_text(result)
@@ -525,9 +625,11 @@ async def run_chat_turn(
             if not text:
                 raise KernelModelFailure("empty_model_output", "未生成有效回复，请重试。")
             tracing.mark_ok(turn_span)
+            llm_log.end_turn(turn_token, status="ok", final_text=text)
             return text, audit_entries
         except BaseException as exc:
             tracing.record_exception(turn_span, exc)
+            llm_log.end_turn(turn_token, status="error", error=exc)
             raise
 
 

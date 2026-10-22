@@ -12,11 +12,15 @@ const assert = require('node:assert/strict');
 const BASE_URL = process.env.BASE_URL || 'http://localhost:5173';
 
 const event = (type, metadata = {}, content = '') => ({ type, metadata, content });
-const searchCall = event('tool_call', { tool: 'hiking_knowledge_search' });
+const searchCall = event('tool_call', {
+  tool: 'hiking_knowledge_search',
+  args: { query: '雪线' },
+});
 const searchOk = event('tool_result', {
   tool: 'hiking_knowledge_search',
   status: 'ok',
   duration_ms: 1200,
+  evidence: { has_chunks: true, chunks: [{}, {}, {}, {}] },
 });
 const searchError = event('tool_result', {
   tool: 'hiking_knowledge_search',
@@ -130,6 +134,15 @@ const messages = [
     content: 'Case 13 answer',
     traceEvents: [parallelCallA, parallelCallB, parallelResultA, parallelResultB],
   },
+  { role: 'user', content: 'Case 14 prompt' },
+  {
+    role: 'assistant',
+    content: 'Case 14 answer',
+    traceEvents: [
+      event('thought', { step: 0 }, '先确认用户问的是雪线徒步，需要结合季节与海拔判断风险。'),
+      event('thought', { step: 0 }, '检索知识库中的雪线注意事项，再给出保守建议。'),
+    ],
+  },
 ];
 
 let passed = 0;
@@ -210,7 +223,19 @@ const contentLines = (page, index) =>
       1,
     );
     assert.equal(await contentLines(page, 1).count(), 1);
-    ok('running without events shows thinking summary and contextual line');
+    // Only the executing step rotates; the summary icon stays static.
+    const summarySpins = await traceRoot(page, 1)
+      .locator('[data-slot="trace-collapsible-trigger"] [data-slot="trace-icon"] svg')
+      .first()
+      .evaluate(node => node.classList.contains('animate-spin'));
+    assert.equal(summarySpins, false, 'summary icon must not rotate');
+    const stepSpins = await contentLines(page, 1)
+      .first()
+      .locator('[data-slot="trace-icon"] svg')
+      .first()
+      .evaluate(node => node.classList.contains('animate-spin'));
+    assert.equal(stepSpins, true, 'the executing step keeps the rotating icon');
+    ok('running without events rotates only the executing step');
 
     // 2. Running tool call closed by its result: one merged line.
     assert.equal(
@@ -226,6 +251,13 @@ const contentLines = (page, index) =>
       await traceRoot(page, 3).getByText('正在检索徒步知识库', { exact: true }).count(),
       0,
     );
+    assert.equal(
+      await traceRoot(page, 3)
+        .getByText('查询「雪线」 · 1.2s · 4 条', { exact: true })
+        .count(),
+      1,
+      'call arguments and result detail share one description',
+    );
     ok('tool_call + tool_result merges into one completed line');
 
     // 3. Completed result-only run: collapsed summary, expandable.
@@ -238,11 +270,15 @@ const contentLines = (page, index) =>
       0,
       'collapsed by default',
     );
+    const blockColor = await case3
+      .locator('[data-slot="agent-activity-block"]')
+      .evaluate(node => getComputedStyle(node).backgroundColor);
+    assert.notEqual(blockColor, 'rgba(0, 0, 0, 0)', 'trace sits on a filled block');
     await case3Trigger.focus();
     await page.keyboard.press('Enter');
     assert.equal(await case3Trigger.getAttribute('aria-expanded'), 'true');
     await case3.getByText('已检索徒步知识库', { exact: true }).waitFor();
-    assert.equal(await case3.getByText('1.2s', { exact: true }).count(), 1);
+    assert.equal(await case3.getByText('1.2s · 4 条', { exact: true }).count(), 1);
     const openAnimation = await case3
       .locator('[data-slot="trace-collapsible-content"]')
       .evaluate(node => getComputedStyle(node).animationName);
@@ -322,10 +358,18 @@ const contentLines = (page, index) =>
     );
     ok('reject resolves the approval line into an error line and keeps it expanded');
 
-    // 8. Unknown event only: no trace at all.
+    // 8. Unknown event only: no activity line, just the settled record.
     assert.equal(await messageRoot(page, 15).getByText('Case 8 answer', { exact: true }).count(), 1);
-    assert.equal(await traceRoot(page, 15).count(), 0);
-    ok('unknown event types produce no trace');
+    const case8 = traceRoot(page, 15);
+    const case8Trigger = case8.getByRole('button', { name: '思考过程', exact: true });
+    assert.equal(await case8Trigger.count(), 1);
+    await case8Trigger.click();
+    assert.equal(await contentLines(page, 15).count(), 1);
+    assert.equal(
+      await case8.getByText('已理解你的问题并生成回答', { exact: true }).count(),
+      1,
+    );
+    ok('unknown event types produce no activity line');
 
     // 9. Running with answer text: generating summary and answer line.
     const case9 = traceRoot(page, 17);
@@ -335,10 +379,19 @@ const contentLines = (page, index) =>
     assert.equal(await contentLines(page, 17).count(), 2);
     ok('running with answer text shows the generating summary and answer line');
 
-    // 10. Completed without events: no trace.
-    assert.equal(await traceRoot(page, 19).count(), 0);
-    assert.equal(await page.locator('[data-slot="agent-activity"]').count(), 11);
-    ok('completed run without events produces no trace');
+    // 10. Completed without events keeps a collapsed thinking record.
+    const case10 = traceRoot(page, 19);
+    const case10Trigger = case10.getByRole('button', { name: '思考过程', exact: true });
+    assert.equal(await case10Trigger.count(), 1);
+    assert.equal(await case10Trigger.getAttribute('aria-expanded'), 'false');
+    await case10Trigger.click();
+    await case10.getByText('已理解你的问题并生成回答', { exact: true }).waitFor();
+    assert.equal(
+      await case10.getByText('已理解你的问题并生成回答', { exact: true }).count(),
+      1,
+    );
+    assert.equal(await page.locator('[data-slot="agent-activity"]').count(), 14);
+    ok('completed run without events keeps a collapsed thinking record');
 
     // 11. Paused approval while the run is still streaming: the wait state
     // must win even though isStreaming keeps the message running.
@@ -391,6 +444,20 @@ const contentLines = (page, index) =>
       0,
     );
     ok('parallel same-tool calls pair with their results in FIFO order');
+
+    // 14. Thought chunks merge into one reasoning paragraph.
+    const case14 = traceRoot(page, 27);
+    const case14Trigger = case14.getByRole('button', { name: '思考过程', exact: true });
+    assert.equal(await case14Trigger.count(), 1);
+    assert.equal(await case14Trigger.getAttribute('aria-expanded'), 'false');
+    await case14Trigger.click();
+    await case14.getByText('思考', { exact: true }).waitFor();
+    const detail = case14.locator('[data-slot="trace-detail"]');
+    assert.equal(await detail.count(), 1);
+    const reasoning = await detail.innerText();
+    assert.match(reasoning, /先确认用户问的是雪线徒步/);
+    assert.match(reasoning, /检索知识库中的雪线注意事项/);
+    ok('thought events merge into one reasoning paragraph');
 
     // Old widgets are gone.
     assert.equal(await page.getByText('思考流程信息', { exact: false }).count(), 0);

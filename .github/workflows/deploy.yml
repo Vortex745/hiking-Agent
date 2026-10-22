@@ -1,23 +1,119 @@
-name: Validate Vercel App
+name: CI
 
 on:
   push:
-    branches:
-      - main
   pull_request:
+  merge_group:
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: validate-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  validate:
-    name: Validate services
+  frontend:
+    name: Frontend build and browser regression
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Type check and build frontend
+        run: npm run build
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Browser session regression
+        env:
+          BASE_URL: http://127.0.0.1:4173
+          SCREENSHOT_PATH: ${{ runner.temp }}/frontend-ci/session-switch.png
+        run: |
+          mkdir -p "$RUNNER_TEMP/frontend-ci"
+          npm run preview -- --host 127.0.0.1 --port 4173 --strictPort > "$RUNNER_TEMP/frontend-ci/preview.log" 2>&1 &
+          preview_pid=$!
+          trap 'kill "$preview_pid" 2>/dev/null || true' EXIT
+          curl --fail --silent --show-error --retry 30 --retry-delay 1 --retry-connrefused "$BASE_URL" > /dev/null
+          npm run test:browser 2>&1 | tee "$RUNNER_TEMP/frontend-ci/browser.log"
+
+      - name: Upload browser evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-browser-results
+          path: ${{ runner.temp }}/frontend-ci/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload frontend build
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  gateway:
+    name: Gateway vet, test and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: gateway
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: gateway/go.mod
+          cache-dependency-path: gateway/go.sum
+
+      - name: Download gateway dependencies
+        run: go mod download
+
+      - name: Verify gateway dependencies
+        run: go mod verify
+
+      - name: Vet gateway
+        run: go vet ./...
+
+      - name: Test gateway
+        run: go test ./...
+
+      - name: Build gateway
+        run: go build -trimpath -o "$RUNNER_TEMP/gateway" .
+
+  backend:
+    name: Backend and evaluation contracts (offline)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       # Default validation is fully offline: no external model calls and no
       # Jev/OPENAI credentials are needed. Cred-gated live contracts skip
@@ -28,44 +124,30 @@ jobs:
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       LANGFUSE_ENABLED: "false"
       DEEPEVAL_TELEMETRY_OPT_OUT: "YES"
+      KERNEL_LIVE_E2E: "0"
+      HIKING_EVAL_LIVE: "0"
       # Contract helpers construct ChatOpenAI(...) on non-calling paths
       # (factory wiring, identity probes). With openai>=2 that constructor
       # requires a non-empty key. This value is intentionally fake and is
       # deliberately NOT paired with OPENAI_BASE_URL, so every cred-gated
-      # live test still records a skip (KERNEL_LIVE_E2E / HIKING_EVAL_LIVE
-      # remain unset; no external model call happens in this job).
+      # live test still records a skip (live opt-in flags are disabled).
       OPENAI_API_KEY: "ci-placeholder-not-a-credential"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Validate frontend
-        working-directory: frontend
-        run: |
-          npm ci
-          npm run build
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: gateway/go.mod
-          cache-dependency-path: gateway/go.sum
-
-      - name: Validate gateway
-        working-directory: gateway
-        run: go test ./...
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            ai-service/requirements.txt
+            ai-service/requirements-test.txt
+            evals/deepeval/requirements.txt
+            third_party/uniharness/libs/uniharness/pyproject.toml
 
       # The vendored UniHarness fork is restored from the tracked offline
       # bundle (no network protocol; git metadata validated against the
@@ -83,7 +165,11 @@ jobs:
           python -m pip install -r ai-service/requirements-test.txt -e third_party/uniharness/libs/uniharness -r evals/deepeval/requirements.txt
 
       - name: Check installed dependency consistency
+        id: dependencies
         run: python -m pip check
+
+      - name: Prepare test reports
+        run: mkdir -p "$RUNNER_TEMP/backend-ci"
 
       # Full offline backend regression. Includes the kernel identity tests
       # (third_party/uniharness was restored with real git metadata above)
@@ -93,10 +179,39 @@ jobs:
       # compilation is NOT a substitute for these behavior tests.
       - name: Offline backend regression
         working-directory: ai-service
-        run: python -m pytest -q -rs
+        run: python -m pytest -q -rs --junitxml="$RUNNER_TEMP/backend-ci/backend.xml"
 
       # Stable offline evaluation entry: contract results are recorded as
       # passed/failed with semantic quality explicitly not_evaluated (no
       # external model or judge call happens in this job).
       - name: Evaluation contract (offline)
-        run: python -m pytest -q evals/test_evaluation_contract.py
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        run: python -m pytest -q -rs evals/test_evaluation_contract.py --junitxml="$RUNNER_TEMP/backend-ci/evaluation.xml"
+
+      - name: Upload backend and evaluation reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-results
+          path: ${{ runner.temp }}/backend-ci/*.xml
+          if-no-files-found: ignore
+          retention-days: 7
+
+  validate:
+    # Keep the existing check name so branch protection can require one gate.
+    name: Validate services
+    if: ${{ always() }}
+    needs: [frontend, gateway, backend]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      FRONTEND_RESULT: ${{ needs.frontend.result }}
+      GATEWAY_RESULT: ${{ needs.gateway.result }}
+      BACKEND_RESULT: ${{ needs.backend.result }}
+    steps:
+      - name: Require all service checks to pass
+        run: |
+          printf 'Frontend: %s\nGateway: %s\nBackend: %s\n' "$FRONTEND_RESULT" "$GATEWAY_RESULT" "$BACKEND_RESULT"
+          test "$FRONTEND_RESULT" = success
+          test "$GATEWAY_RESULT" = success
+          test "$BACKEND_RESULT" = success

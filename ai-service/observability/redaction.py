@@ -13,9 +13,12 @@ import re
 
 REDACTED = "[REDACTED]"
 TOOL_OUTPUT_LIMIT = 4000
-DOCUMENT_LIMIT = 160
-DOCUMENT_COUNT_LIMIT = 25
 _MAX_STRUCTURED_DEPTH = 3
+
+# WeKnora spec §6: non-terminal output must stay free of ANSI color sequences.
+# Library messages carry raw ESC bytes; JSON would only escape them, and any
+# consumer that decodes the value gets the control character back.
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 _SECRET_PATTERNS = (
     re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+"),
@@ -63,11 +66,19 @@ _DENIED_KEYS = {
     "api_key",
     "apikey",
     "secret",
+    "secret_key",
+    "private_key",
     "password",
+    "passwd",
     "token",
     "access_token",
     "refresh_token",
     "id_token",
+    "ticket",
+    "pairing_link",
+    "authorization_url",
+    "authorization_attempt",
+    "assertion",
     "latitude",
     "longitude",
     "lat",
@@ -112,6 +123,7 @@ def is_denied_key(key) -> bool:
 def scrub_text(value: str, limit: int = TOOL_OUTPUT_LIMIT, *, _depth: int = 0) -> str:
     """Redact credentials/location values and truncate to ``limit`` chars."""
     text = "" if value is None else str(value)
+    text = _ANSI_ESCAPE.sub("", text)
     stripped = text.strip()
     if _depth < _MAX_STRUCTURED_DEPTH and stripped[:1] in {"{", "["}:
         try:
@@ -179,15 +191,3 @@ def sanitize_messages(messages) -> list[dict]:
 
 def sanitize_error(exc: BaseException, limit: int = 500) -> str:
     return f"{type(exc).__name__}: {scrub_text(str(exc), limit)}"
-
-
-def sanitize_documents(documents) -> list[dict]:
-    """Bound retrieved documents to the spec's 25 x 160 character budget."""
-    bounded = []
-    for document in list(documents or [])[:DOCUMENT_COUNT_LIMIT]:
-        if isinstance(document, dict):
-            text = document.get("content", document.get("page_content", ""))
-        else:
-            text = getattr(document, "page_content", str(document))
-        bounded.append({"content": scrub_text(text, DOCUMENT_LIMIT)})
-    return bounded

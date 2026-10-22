@@ -38,6 +38,7 @@ from uniharness.harness.permission import SafetyRule as KernelSafetyRule
 from uniharness.tools.base import BaseAgentTool
 from uniharness.types import ToolResult
 
+from observability import llm_log
 from agent_v2.kernel import KernelAssemblyError  # noqa: F401  (module-level re-export for builders)
 
 logger = logging.getLogger("ai-service.agent_v2.kernel_tools")
@@ -991,13 +992,13 @@ class ProductGateRule(KernelSafetyRule):
             server_id, tool = mcp
             allowed_servers = tuple(getattr(self._profile, "allowed_mcp_servers", None) or ())
             if server_id not in allowed_servers:
-                self._record_denial(tool_name, "unknown_mcp_server")
+                self._record_denial(tool_name, "unknown_mcp_server", tool_args)
                 return PermissionDecision(result=PermissionResult.DENIED, reason="unknown_mcp_server")
             from agent_v2.mcp_registry import resolve_mcp_server
 
             cfg = resolve_mcp_server(server_id)
             if tool not in cfg.tool_allowlist:
-                self._record_denial(tool_name, "unauthorized_mcp_tool")
+                self._record_denial(tool_name, "unauthorized_mcp_tool", tool_args)
                 return PermissionDecision(
                     result=PermissionResult.DENIED, reason="unauthorized_mcp_tool"
                 )
@@ -1012,7 +1013,7 @@ class ProductGateRule(KernelSafetyRule):
 
             level = _classify(tool_name.split("__")[-1], default=_RiskLevel.HIGH)
             if _needs_approval(level):
-                self._record_denial(tool_name, "high_risk_requires_approval")
+                self._record_denial(tool_name, "high_risk_requires_approval", tool_args)
                 return PermissionDecision(
                     result=PermissionResult.DENIED,
                     reason="该操作需要审批，当前阶段暂不可用。",
@@ -1024,7 +1025,7 @@ class ProductGateRule(KernelSafetyRule):
         if verdict.decision.value == "allow":
             return None
         if verdict.decision.value == "deny":
-            self._record_denial(tool_name, verdict.reason)
+            self._record_denial(tool_name, verdict.reason, tool_args)
             return PermissionDecision(result=PermissionResult.DENIED, reason=verdict.reason)
         # needs_approval: T31 will map durable approvals; today fail closed.
         self._record_denial(tool_name, verdict.reason)
@@ -1033,7 +1034,23 @@ class ProductGateRule(KernelSafetyRule):
             reason="该操作需要审批，当前阶段暂不可用。",
         )
 
-    def _record_denial(self, tool_name: str, reason: str) -> None:
+    def _record_denial(
+        self,
+        tool_name: str,
+        reason: str,
+        tool_args: dict[str, Any] | None = None,
+    ) -> None:
+        # The local execution log must see denials even when no audit sink is
+        # attached for this turn.
+        try:
+            llm_log.tool_denied(
+                tool=tool_name,
+                reason=reason,
+                args=tool_args,
+                run_id=self._run_id,
+            )
+        except Exception:  # pragma: no cover - defensive
+            pass
         if self._audit_sink is None:
             return
         try:

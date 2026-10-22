@@ -23,20 +23,26 @@ func NewHealthHandler(aiServiceURL string) *HealthHandler {
 func (h *HealthHandler) Health(c *gin.Context) {
 	aiStatus := "ok"
 	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get(fmt.Sprintf("%s/health", h.aiServiceURL))
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, fmt.Sprintf("%s/health", h.aiServiceURL), nil)
 	if err != nil {
 		aiStatus = "unreachable"
 	} else {
-		defer resp.Body.Close()
-		body, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode != http.StatusOK {
-			aiStatus = fmt.Sprintf("error: %s", string(body))
+		copyCorrelationHeaders(c, req)
+		resp, err := client.Do(req)
+		if err != nil {
+			aiStatus = "unreachable"
+		} else {
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			if resp.StatusCode != http.StatusOK {
+				aiStatus = fmt.Sprintf("error: %s", string(body))
+			}
 		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"status":    "ok",
-		"service":   "gateway",
+		"status":     "ok",
+		"service":    "gateway",
 		"ai_service": aiStatus,
 	})
 }

@@ -187,6 +187,14 @@ export function reduceV2Event(
         assistantText: base.assistantText + readString(event.payload, 'content'),
       }
 
+    case 'thought':
+      // Reasoning side channel: it never touches the public answer text, but
+      // it does prove the run is still active.
+      return {
+        ...base,
+        status: 'running',
+      }
+
     case 'heartbeat':
       // Spec decision #27 + AC2: heartbeat is a keepalive event. It
       // advances the sequence cursor and marks the run as started but

@@ -3390,8 +3390,11 @@ class RunOrchestrator:
                     mark_terminal_safe(self._runs_repo, run_id, "error")
                     return
 
-            deltas: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
+            deltas: asyncio.Queue[tuple[str, str]] = asyncio.Queue(maxsize=1)
             streamed_text = ""
+            thoughts_enabled = bool(
+                getattr(self._settings, "agent_v2_thoughts_enabled", True)
+            )
 
             async def on_text(delta: str, kernel_audits: list[dict[str, Any]]) -> None:
                 combined_audits = audit_entries + kernel_audits
@@ -3401,7 +3404,11 @@ class RunOrchestrator:
                     if not has_hiking_knowledge_evidence(combined_audits, run_id=run_id):
                         return
                 if delta:
-                    await deltas.put(delta)
+                    await deltas.put(("text", delta))
+
+            async def on_thought(delta: str) -> None:
+                if delta:
+                    await deltas.put(("thought", delta))
 
             task = asyncio.create_task(self._kernel_turn(
                 system_prompt=system_prompt,
@@ -3415,6 +3422,7 @@ class RunOrchestrator:
                 subagent_definitions=sub_defs or None,
                 history=history,
                 on_text=on_text,
+                on_thought=on_thought if thoughts_enabled else None,
             ))
             try:
                 heartbeat_at = time.monotonic()
@@ -3423,7 +3431,7 @@ class RunOrchestrator:
                         yield emit("cancelled", {"code": "cancelled", "message": "运行已被取消。"})
                         return
                     try:
-                        delta = await asyncio.wait_for(deltas.get(), timeout=0.25)
+                        kind, delta = await asyncio.wait_for(deltas.get(), timeout=0.25)
                     except TimeoutError:
                         if time.monotonic() - heartbeat_at >= 15:
                             yield emit("heartbeat", {})
@@ -3432,6 +3440,9 @@ class RunOrchestrator:
                     if is_cancelled(self._runs_repo, run_id):
                         yield emit("cancelled", {"code": "cancelled", "message": "运行已被取消。"})
                         return
+                    if kind == "thought":
+                        yield emit("thought", {"content": delta})
+                        continue
                     streamed_text += delta
                     yield emit("text", {"content": delta})
                 response_text, kernel_audit_entries = await task

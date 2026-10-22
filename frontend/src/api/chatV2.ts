@@ -29,6 +29,7 @@ export type V2EventType =
   | 'run_started'
   | 'progress'
   | 'text'
+  | 'thought'
   | 'tool_call'
   | 'tool_result'
   | 'artifact_candidate'
@@ -205,6 +206,7 @@ function isV2EventType(value: unknown): value is V2EventType {
     value === 'run_started' ||
     value === 'progress' ||
     value === 'text' ||
+    value === 'thought' ||
     value === 'tool_call' ||
     value === 'tool_result' ||
     value === 'artifact_candidate' ||

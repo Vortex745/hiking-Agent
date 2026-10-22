@@ -84,12 +84,17 @@ def test_kernel_uses_real_graph_tokens_and_filters_split_reasoning(monkeypatch, 
     monkeypatch.setattr(module, "assemble_kernel_agent", assemble)
     async def scenario():
         chunks = []
+        thoughts = []
         async def on_text(text, audits):
             chunks.append(text)
+        async def on_thought(text):
+            thoughts.append(text)
         final, _ = await module.run_chat_turn(system_prompt="test", message="hi",
-            settings=SimpleNamespace(), on_text=on_text, history=history)
+            settings=SimpleNamespace(), on_text=on_text, on_thought=on_thought,
+            history=history)
         assert len(chunks) > 1
         assert "".join(chunks) == final == "徒步安全第一。"
+        assert "".join(thoughts) == "private chain"
         expected = [(entry["role"], entry["content"]) for entry in history or []]
         assert agent.inputs == {"messages": expected + [("user", "hi")]}
         assert agent.closed
@@ -216,4 +221,59 @@ def test_disconnect_cancels_incremental_kernel(tmp_path):
         finally:
             await gen.aclose()
         await asyncio.wait_for(closed.wait(), 2)
+    asyncio.run(scenario())
+
+
+def test_thought_events_precede_text_and_replay(tmp_path):
+    async def scenario():
+        async def kernel(**kwargs):
+            await kwargs["on_thought"]("先确认季节与海拔。")
+            await kwargs["on_thought"]("再核对雪线与撤退点。")
+            await kwargs["on_text"]("建议携带冰爪。", EVIDENCE)
+            return "建议携带冰爪。", EVIDENCE
+
+        repo = _repo(tmp_path)
+        orch = RunOrchestrator(settings=_settings(), runs_repo=repo,
+                               memory=_FakeMemory(), kernel_turn=kernel)
+        req = ChatFlowRequest(message="雪线徒步", request_id="stream-thought")
+        events = [event async for event in orch.stream_chat(req, subject_id=SUBJECT_ID)]
+        types = [event.type for event in events]
+        assert "thought" in types
+        assert types.index("thought") < types.index("text")
+        assert "".join(
+            event.payload["content"] for event in events if event.type == "thought"
+        ) == "先确认季节与海拔。再核对雪线与撤退点。"
+        replay = [event async for event in orch.stream_chat(req, subject_id=SUBJECT_ID)]
+        assert [(event.type, event.payload) for event in replay] == [
+            (event.type, event.payload) for event in events
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_thoughts_can_be_disabled_without_touching_text(tmp_path):
+    async def scenario():
+        seen = {}
+
+        async def kernel(**kwargs):
+            seen["on_thought"] = kwargs.get("on_thought")
+            await kwargs["on_text"]("正常回答。", EVIDENCE)
+            return "正常回答。", EVIDENCE
+
+        orch = RunOrchestrator(
+            settings=_settings(agent_v2_thoughts_enabled=False),
+            runs_repo=_repo(tmp_path),
+            memory=_FakeMemory(),
+            kernel_turn=kernel,
+        )
+        events = [event async for event in orch.stream_chat(
+            ChatFlowRequest(message="徒步", request_id="stream-thought-off"),
+            subject_id=SUBJECT_ID,
+        )]
+        assert seen["on_thought"] is None
+        assert [event.type for event in events if event.type == "thought"] == []
+        assert "".join(
+            event.payload["content"] for event in events if event.type == "text"
+        ) == "正常回答。"
+
     asyncio.run(scenario())

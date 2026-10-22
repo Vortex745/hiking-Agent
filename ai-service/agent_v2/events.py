@@ -63,10 +63,14 @@ EventVersion = Literal["2"]
 #   required to retry. This event is NOT itself a stream terminal —
 #   the ``error`` terminal still follows to satisfy the
 #   exactly-one-terminal-per-stream contract.
+# ``thought`` carries model reasoning the public text filter removed
+# (``<think>`` blocks or a provider reasoning delta). It is optional: a
+# provider that emits no reasoning simply produces no such event.
 EventType = Literal[
     "run_started",
     "progress",
     "text",
+    "thought",
     "tool_call",
     "tool_result",
     "artifact_candidate",

@@ -1,7 +1,7 @@
 // Regression probe for the session-switch white screen.
-// Run from the repository root with the bundled Playwright runtime:
-// Set NODE_PATH to a directory containing Playwright; CHROME_PATH optionally
-// selects an installed browser. BASE_URL defaults to the project's Vite port.
+// Run with npm run test:browser after npx playwright install chromium.
+// CHROME_PATH optionally selects an installed browser instead of Chromium.
+// BASE_URL defaults to the project's Vite port.
 const { chromium } = require('playwright');
 const assert = require('node:assert/strict');
 const errors = [];
@@ -9,7 +9,6 @@ const errors = [];
 (async () => {
   const browser = await chromium.launch({
     headless: true,
-    channel: process.env.CHROME_PATH ? undefined : 'chrome',
     executablePath: process.env.CHROME_PATH,
   });
   try {

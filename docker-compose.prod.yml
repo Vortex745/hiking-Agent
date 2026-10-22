@@ -46,6 +46,9 @@ services:
       # Ticket 06: production explicitly disables trace export instead of
       # relying on empty credentials; self-hosted Langfuse can override.
       LANGFUSE_ENABLED: ${LANGFUSE_ENABLED:-false}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_BASE_URL: ${LANGFUSE_BASE_URL:-https://cloud.langfuse.com}
       OBSERVABILITY_SAMPLE_RATIO: ${OBSERVABILITY_SAMPLE_RATIO:-1.0}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LOG_FORMAT: ${LOG_FORMAT:-json}

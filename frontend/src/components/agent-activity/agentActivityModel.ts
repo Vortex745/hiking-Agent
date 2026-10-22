@@ -29,6 +29,8 @@ export interface ActivityLine {
   status: ActivityStatus;
   title: string;
   description?: string;
+  /** Full reasoning text for thought lines; rendered as a paragraph. */
+  detail?: string;
   /** Present on tool lines so results can close the right call. */
   toolName?: string;
   /** Present on approval lines so resolutions match the right approval. */
@@ -147,6 +149,106 @@ function isUnresolvedApproval(metadata: Record<string, unknown> | undefined) {
   return !status || !RESOLVED_APPROVAL_STATUSES.has(status);
 }
 
+const MAX_ARG_LENGTH = 48;
+
+function truncateText(value: string, limit = MAX_ARG_LENGTH): string {
+  return value.length > limit ? `${value.slice(0, limit - 1)}…` : value;
+}
+
+function readScalar(value: unknown): string | undefined {
+  if (typeof value === 'string') return readText(value);
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  if (typeof value === 'boolean') return value ? '是' : '否';
+  return undefined;
+}
+
+/**
+ * One compact, human-readable line for the tool's own arguments. Only known
+ * tools get bespoke wording; unknown tools fall back to their first scalars so
+ * a new tool still shows something truthful instead of nothing.
+ */
+function describeToolArgs(tool: string, args: unknown): string | undefined {
+  if (!isRecord(args)) return undefined;
+
+  switch (tool) {
+    case 'hiking_knowledge_search':
+    case 'web_search':
+    case 'memory_search': {
+      const query = readText(args.query);
+      return query ? `查询「${truncateText(query)}」` : undefined;
+    }
+    case 'web_scraping': {
+      const url = readText(args.url);
+      return url ? `抓取 ${truncateText(url, 56)}` : undefined;
+    }
+    case 'risk_assessment': {
+      const target = readText(args.destination) ?? readText(args.route);
+      const days = readScalar(args.days);
+      if (target && days) return `${truncateText(target)} · ${days} 天`;
+      return target ? `路线 ${truncateText(target)}` : undefined;
+    }
+    case 'gear_checklist': {
+      const days = readScalar(args.days);
+      const season = readText(args.season);
+      const parts = [days ? `${days} 天` : undefined, season].filter(
+        (part): part is string => Boolean(part),
+      );
+      return parts.length > 0 ? parts.join(' · ') : undefined;
+    }
+    case 'generate_pdf': {
+      const filename = readText(args.filename);
+      return filename ? truncateText(filename, 40) : undefined;
+    }
+    case 'sandbox_bash': {
+      const command = readText(args.command);
+      return command ? truncateText(command, 56) : undefined;
+    }
+    default: {
+      const parts: string[] = [];
+      for (const value of Object.values(args)) {
+        const scalar = readScalar(value);
+        if (scalar) parts.push(truncateText(scalar, 24));
+        if (parts.length === 2) break;
+      }
+      return parts.length > 0 ? parts.join(' · ') : undefined;
+    }
+  }
+}
+
+/** Duration, evidence count and failure reason for a settled tool call. */
+function describeToolResult(
+  metadata: Record<string, unknown> | undefined,
+): string | undefined {
+  if (!metadata) return undefined;
+
+  const parts: string[] = [];
+  const duration = formatDuration(metadata.duration_ms);
+  if (duration) parts.push(duration);
+
+  const evidence = isRecord(metadata.evidence) ? metadata.evidence : undefined;
+  const chunks = Array.isArray(evidence?.chunks) ? evidence.chunks.length : 0;
+  if (chunks > 0) parts.push(`${chunks} 条`);
+
+  const status = readMetadataText(metadata, 'status');
+  if (status && status !== 'ok' && status !== 'recovered') {
+    const reason =
+      readMetadataText(metadata, 'reason') ?? readMetadataText(metadata, 'message');
+    if (reason) parts.push(truncateText(reason, 36));
+  }
+
+  return parts.length > 0 ? parts.join(' · ') : undefined;
+}
+
+function joinDescriptions(
+  left: string | undefined,
+  right: string | undefined,
+): string | undefined {
+  if (!left) return right;
+  if (!right || right === left) return left;
+  if (left.includes(right)) return left;
+  return `${left} · ${right}`;
+}
+
 /**
  * Returns the index of the first line matching `match`, searching forward
  * from the start (FIFO call pairing) or backward from the end (most recent
@@ -169,6 +271,15 @@ function findLineIndex(
     if (line && match(line)) return i;
   }
   return -1;
+}
+
+/** Reasoning ends as soon as the next real step starts. */
+function settleThoughtLines(lines: ActivityLine[]) {
+  for (const line of lines) {
+    if (line.kind === 'thought' && line.status === 'running') {
+      line.status = 'done';
+    }
+  }
 }
 
 function findRunningToolLine(
@@ -244,8 +355,29 @@ export function buildAgentActivity(input: {
 
   events.forEach((event, index) => {
     const metadata = event.metadata;
+    // Any non-reasoning step means the previous reasoning segment is over.
+    if (event.type !== 'thought') settleThoughtLines(lines);
 
     switch (event.type) {
+      case 'thought': {
+        const content =
+          readText(event.content) ?? readMetadataText(metadata, 'content');
+        if (!content) return;
+        const previous = lines[lines.length - 1];
+        if (previous && previous.kind === 'thought' && previous.status === 'running') {
+          previous.detail = `${previous.detail ?? ''}${content}`;
+          return;
+        }
+        lines.push({
+          id: `event-${index}`,
+          kind: 'thought',
+          status: 'running',
+          title: '思考',
+          detail: content,
+        });
+        return;
+      }
+
       case 'tool_call': {
         const tool = readMetadataText(metadata, 'tool');
         if (!tool) return;
@@ -253,13 +385,16 @@ export function buildAgentActivity(input: {
 
         // Every call creates a line, including parallel calls to the same
         // tool. Results pair with the earliest still-running call (FIFO).
-        lines.push({
+        const callLine: ActivityLine = {
           id: `event-${index}`,
           kind: 'tool',
           status: 'running',
           title: `正在${toolAction(tool)}`,
           toolName: tool,
-        });
+        };
+        const callDetail = describeToolArgs(tool, metadata?.args);
+        if (callDetail) callLine.description = callDetail;
+        lines.push(callLine);
         return;
       }
 
@@ -278,7 +413,7 @@ export function buildAgentActivity(input: {
             ? `${action}被拒绝`
             : `${action}失败`;
         const lineStatus: ActivityStatus = succeeded ? 'done' : 'error';
-        const description = succeeded ? formatDuration(metadata?.duration_ms) : undefined;
+        const description = describeToolResult(metadata);
 
         const runningIndex = findRunningToolLine(lines, tool);
 
@@ -290,7 +425,9 @@ export function buildAgentActivity(input: {
               status: lineStatus,
               title,
             };
-            if (description) merged.description = description;
+            const detail = joinDescriptions(running.description, description);
+            if (detail) merged.description = detail;
+            else delete merged.description;
             lines[runningIndex] = merged;
           }
           return;
@@ -396,6 +533,9 @@ export function buildAgentActivity(input: {
   // running: the run is paused waiting for the user, not generating.
   const approvalWait = lastApprovalUnresolved;
 
+  // The answer has started (or the run ended), so no reasoning is still live.
+  if (!isRunning || hasText) settleThoughtLines(lines);
+
   if (!isRunning) {
     // A completed run settles every still-running line. Errors and pending
     // approvals are deliberately kept as-is.
@@ -431,6 +571,18 @@ export function buildAgentActivity(input: {
         title: '正在理解你的问题与上下文',
       });
     }
+  }
+
+  if (!isRunning && hasText && lines.length === 0) {
+    // Keep a thinking record after the answer arrives: a plain chat run has
+    // no tool events, so without this line the trace disappears entirely
+    // once streaming ends.
+    lines.push({
+      id: 'state-thought-done',
+      kind: 'thought',
+      status: 'done',
+      title: '已理解你的问题并生成回答',
+    });
   }
 
   if (!isRunning && lines.length === 0) {
@@ -474,7 +626,7 @@ export function buildAgentActivity(input: {
       summary = '正在处理';
     }
   } else {
-    summary = `已完成 ${stepCount} 个步骤`;
+    summary = stepCount > 0 ? `已完成 ${stepCount} 个步骤` : '思考过程';
   }
 
   return {
