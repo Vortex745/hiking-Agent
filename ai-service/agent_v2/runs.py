@@ -33,6 +33,8 @@ from agent_v2.execution_contract import (
     ExecutionErrorCode,
     policy_hash,
 )
+from agent_v2.effect_repair import effect_known_facts, effect_unknown_part
+from agent_v2.effects import repair_age_seconds, repair_next_action
 from agent_v2.execution_policy import (
     ResolvedPolicySnapshot,
     profile_from_policy,
@@ -1142,6 +1144,66 @@ class RunRepository:
             effect_key, reason, claim_token=claim_token
         )
 
+    # -- effect repair (BCDEF ticket 05) -------------------------------
+
+    def get_effect_by_effect_id(self, effect_id: str) -> EffectRecord | None:
+        return self.control.get_effect_by_effect_id(effect_id)
+
+    def claim_effect_repair(
+        self,
+        effect_key: str,
+        *,
+        owner: str,
+    ) -> tuple[EffectRecord | None, bool]:
+        """CAS-claim the reconciliation of an ``outcome_unknown`` effect."""
+        return self.control.claim_effect_repair(effect_key, owner=owner)
+
+    def complete_effect_repair(
+        self,
+        effect_key: str,
+        result_json: str,
+        *,
+        request_id: str = "",
+        actor: str = "",
+    ) -> tuple[EffectRecord | None, bool]:
+        """CAS-commit the operator-confirmed result on the original row."""
+        return self.control.complete_effect_repair(
+            effect_key,
+            result_json,
+            request_id=request_id,
+            actor=actor,
+        )
+
+    def abandon_effect_repair(
+        self,
+        effect_key: str,
+        *,
+        request_id: str = "",
+        actor: str = "",
+        reason: str = "",
+    ) -> tuple[EffectRecord | None, bool]:
+        """Fail-closed repair decision; the effect stays ``outcome_unknown``."""
+        return self.control.abandon_effect_repair(
+            effect_key,
+            request_id=request_id,
+            actor=actor,
+            reason=reason,
+        )
+
+    def fail_effect_repair(self, effect_key: str, error: str) -> EffectRecord | None:
+        return self.control.fail_effect_repair(effect_key, error)
+
+    def revert_effect_repair(
+        self,
+        effect_key: str,
+        error: str,
+        *,
+        request_id: str = "",
+    ) -> EffectRecord | None:
+        return self.control.revert_effect_repair(
+            effect_key, error, request_id=request_id
+        )
+
     # -- events ---------------------------------------------------------
 
     def persist_event(
@@ -1704,6 +1766,29 @@ class RunRepository:
                     "result": _effect_result_payload(record.result_json),
                     "failure_reason": record.failure_reason,
                     "committed_at": record.committed_at,
+                    # BCDEF ticket 05: unknown-outcome reconciliation is
+                    # replay-visible — identity, known facts, the unknown
+                    # part, repair state/attempts, last error, age and the
+                    # next operator/janitor action. All additive.
+                    "repair_status": record.repair_status or "none",
+                    "repair_attempts": record.repair_attempts,
+                    "repair_last_error": (
+                        record.repair_last_error or record.failure_reason
+                    ),
+                    "repair_request_id": record.repair_request_id,
+                    "repair_claimed_by": record.repair_claimed_by,
+                    "repair_updated_at": record.repair_updated_at,
+                    "repair_note": record.repair_note,
+                    "repair_age_seconds": repair_age_seconds(
+                        record.repair_updated_at or record.updated_at
+                    ),
+                    "repair_next_action": repair_next_action(
+                        record.status,
+                        record.repair_status,
+                        result_known=bool(record.result_json),
+                    ),
+                    "known_facts": effect_known_facts(record),
+                    "unknown_part": effect_unknown_part(record),
                 }
                 for record in effects
             ],

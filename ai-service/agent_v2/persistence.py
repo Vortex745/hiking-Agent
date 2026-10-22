@@ -290,6 +290,19 @@ CREATE TABLE IF NOT EXISTS effects (
     claim_expires_at TEXT,
     lease_id TEXT,
     fencing_token INTEGER NOT NULL DEFAULT 0,
+    -- BCDEF ticket 05: reconciliation/repair state for an
+    -- ``outcome_unknown`` effect. ``repair_status`` is one of
+    -- none/repair_pending/repair_claimed/repaired/abandoned; attempts
+    -- counts claims/repair passes; the last error and request id make
+    -- repair retries idempotent and auditable.
+    repair_status TEXT NOT NULL DEFAULT 'none',
+    repair_attempts INTEGER NOT NULL DEFAULT 0,
+    repair_last_error TEXT,
+    repair_request_id TEXT,
+    repair_claimed_by TEXT,
+    repair_claimed_at TEXT,
+    repair_updated_at TEXT,
+    repair_note TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     committed_at TEXT,
@@ -597,6 +610,15 @@ class EffectRecord:
     claim_expires_at: str | None = None
     lease_id: str | None = None
     fencing_token: int = 0
+    # BCDEF ticket 05: unknown-outcome reconciliation/repair state.
+    repair_status: str = "none"
+    repair_attempts: int = 0
+    repair_last_error: str | None = None
+    repair_request_id: str | None = None
+    repair_claimed_by: str | None = None
+    repair_claimed_at: str | None = None
+    repair_updated_at: str | None = None
+    repair_note: str | None = None
 
     @property
     def is_terminal(self) -> bool:
@@ -659,6 +681,14 @@ class ControlStore:
                 "claim_expires_at": "TEXT",
                 "lease_id": "TEXT",
                 "fencing_token": "INTEGER NOT NULL DEFAULT 0",
+                "repair_status": "TEXT NOT NULL DEFAULT 'none'",
+                "repair_attempts": "INTEGER NOT NULL DEFAULT 0",
+                "repair_last_error": "TEXT",
+                "repair_request_id": "TEXT",
+                "repair_claimed_by": "TEXT",
+                "repair_claimed_at": "TEXT",
+                "repair_updated_at": "TEXT",
+                "repair_note": "TEXT",
             },
             "sandbox_leases": {
                 "owner_id": "TEXT",
@@ -2117,10 +2147,12 @@ class ControlStore:
         now = _now_iso()
         sql = (
             "UPDATE effects SET status = 'outcome_unknown', "
-            "failure_reason = ?, updated_at = ? "
+            "failure_reason = ?, updated_at = ?, "
+            "repair_status = 'repair_pending', repair_updated_at = ?, "
+            "repair_last_error = ? "
             "WHERE effect_key = ? AND status IN ('executing', 'claimed')"
         )
-        params: tuple[Any, ...] = (reason, now, effect_key)
+        params: tuple[Any, ...] = (reason, now, now, reason, effect_key)
         if claim_token is not None:
             sql += " AND claim_token = ?"
             params = params + (claim_token,)
@@ -2196,10 +2228,12 @@ class ControlStore:
         now = _now_iso()
         sql = (
             "UPDATE effects SET status = 'outcome_unknown', "
-            "failure_reason = ?, updated_at = ? "
+            "failure_reason = ?, updated_at = ?, "
+            "repair_status = 'repair_pending', repair_updated_at = ?, "
+            "repair_last_error = ? "
             "WHERE effect_key = ? AND status = 'committed'"
         )
-        params: tuple[Any, ...] = (reason, now, effect_key)
+        params: tuple[Any, ...] = (reason, now, now, reason, effect_key)
         if claim_token is not None:
             sql += " AND claim_token = ?"
             params = params + (claim_token,)
@@ -2234,7 +2268,198 @@ class ControlStore:
             claim_expires_at=row["claim_expires_at"],
             lease_id=row["lease_id"],
             fencing_token=int(row["fencing_token"] or 0),
+            repair_status=row["repair_status"] or "none",
+            repair_attempts=int(row["repair_attempts"] or 0),
+            repair_last_error=row["repair_last_error"],
+            repair_request_id=row["repair_request_id"],
+            repair_claimed_by=row["repair_claimed_by"],
+            repair_claimed_at=row["repair_claimed_at"],
+            repair_updated_at=row["repair_updated_at"],
+            repair_note=row["repair_note"],
         )
+
+    # -- effect repair (BCDEF ticket 05) ------------------------------
+
+    def get_effect_by_effect_id(self, effect_id: str) -> EffectRecord | None:
+        """Resolve an effect by its public ``effect_id``.
+
+        New rows store ``effect_id`` alongside the legacy ``effect_key``
+        (same value), so the path parameter can be looked up directly.
+        Legacy rows without an ``effect_id`` fall back to the effect key.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM effects WHERE effect_key = ? OR effect_id = ? "
+            "ORDER BY (effect_key = ?) DESC LIMIT 1",
+            (effect_id, effect_id, effect_id),
+        ).fetchone()
+        return self._row_to_effect(row) if row is not None else None
+
+    def claim_effect_repair(
+        self,
+        effect_key: str,
+        *,
+        owner: str,
+        now: str | None = None,
+    ) -> tuple[EffectRecord | None, bool]:
+        """CAS-claim the repair of one ``outcome_unknown`` effect.
+
+        Only ``outcome_unknown`` rows with an open repair can be claimed.
+        A different owner cannot steal a live claim; the same owner may
+        re-claim idempotently (attempts increment for audit). The claim
+        never changes the effect status and never executes anything.
+        """
+        now_iso = now or _now_iso()
+        self._conn.execute("BEGIN")
+        try:
+            cur = self._conn.execute(
+                "UPDATE effects SET repair_status = 'repair_claimed', "
+                "repair_claimed_by = ?, repair_claimed_at = ?, "
+                "repair_attempts = repair_attempts + 1, "
+                "repair_updated_at = ? "
+                "WHERE effect_key = ? AND status = 'outcome_unknown' "
+                "AND (repair_status IN ('repair_pending', 'none') "
+                "     OR (repair_status = 'repair_claimed' "
+                "         AND repair_claimed_by = ?))",
+                (owner, now_iso, now_iso, effect_key, owner),
+            )
+            won = cur.rowcount == 1
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return self.get_effect(effect_key), won
+
+    def complete_effect_repair(
+        self,
+        effect_key: str,
+        result_json: str,
+        *,
+        request_id: str = "",
+        actor: str = "",
+        now: str | None = None,
+    ) -> tuple[EffectRecord | None, bool]:
+        """CAS-complete a repair with the operator-confirmed result.
+
+        ``outcome_unknown`` → ``committed`` in ONE update: the result,
+        the repaired status and the request identity commit together, so
+        a concurrent retry observes either the unknown row or the single
+        repaired result (never a half state). The original effect key,
+        run id and approval identity are untouched.
+        """
+        now_iso = now or _now_iso()
+        note = f"repaired by {actor}" if actor else "repaired"
+        self._conn.execute("BEGIN")
+        try:
+            cur = self._conn.execute(
+                "UPDATE effects SET status = 'committed', result_json = ?, "
+                "committed_at = ?, updated_at = ?, claim_token = NULL, "
+                "repair_status = 'repaired', repair_request_id = ?, "
+                "repair_attempts = repair_attempts + 1, "
+                "repair_claimed_by = NULL, repair_updated_at = ?, "
+                "repair_last_error = NULL, repair_note = ? "
+                "WHERE effect_key = ? AND status = 'outcome_unknown' "
+                "AND repair_status IN ('repair_pending', 'repair_claimed', 'none')",
+                (
+                    result_json,
+                    now_iso,
+                    now_iso,
+                    request_id,
+                    now_iso,
+                    note,
+                    effect_key,
+                ),
+            )
+            won = cur.rowcount == 1
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return self.get_effect(effect_key), won
+
+    def abandon_effect_repair(
+        self,
+        effect_key: str,
+        *,
+        request_id: str = "",
+        actor: str = "",
+        reason: str = "",
+        now: str | None = None,
+    ) -> tuple[EffectRecord | None, bool]:
+        """Fail-closed decision: keep the effect unknown, stop repairing.
+
+        The effect status stays ``outcome_unknown`` (execution remains
+        terminal and unsafe to retry); only the repair state changes to
+        ``abandoned``. No success result is ever published for it.
+        """
+        now_iso = now or _now_iso()
+        note = f"abandoned by {actor}" if actor else "abandoned"
+        self._conn.execute("BEGIN")
+        try:
+            cur = self._conn.execute(
+                "UPDATE effects SET repair_status = 'abandoned', "
+                "repair_request_id = ?, repair_claimed_by = NULL, "
+                "repair_updated_at = ?, repair_note = ? "
+                "WHERE effect_key = ? AND status = 'outcome_unknown' "
+                "AND repair_status IN ('repair_pending', 'repair_claimed', 'none')",
+                (request_id, now_iso, f"{note}: {reason}" if reason else note, effect_key),
+            )
+            won = cur.rowcount == 1
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return self.get_effect(effect_key), won
+
+    def fail_effect_repair(
+        self,
+        effect_key: str,
+        error: str,
+        *,
+        now: str | None = None,
+    ) -> EffectRecord | None:
+        """Record a failed repair attempt; the repair stays pending.
+
+        Used when a repair cannot publish its replayable result. The
+        effect stays ``outcome_unknown``/``repair_pending`` so a retry is
+        allowed, but the failure reason and attempt are durable.
+        """
+        now_iso = now or _now_iso()
+        self._conn.execute(
+            "UPDATE effects SET repair_status = 'repair_pending', "
+            "repair_last_error = ?, repair_claimed_by = NULL, "
+            "repair_updated_at = ? "
+            "WHERE effect_key = ? AND status = 'outcome_unknown' "
+            "AND repair_status IN ('repair_pending', 'repair_claimed', 'none')",
+            (error, now_iso, effect_key),
+        )
+        return self.get_effect(effect_key)
+
+    def revert_effect_repair(
+        self,
+        effect_key: str,
+        error: str,
+        *,
+        request_id: str = "",
+        now: str | None = None,
+    ) -> EffectRecord | None:
+        """Revert a committed repair whose result event was not durable.
+
+        A repair only counts once the final result is replayable. When
+        the event write fails after the ledger commit, the narrow
+        ``committed(repaired) → outcome_unknown(repair_pending)`` edge
+        keeps the known result in ``result_json`` but refuses to present
+        it as the final replayable outcome.
+        """
+        now_iso = now or _now_iso()
+        self._conn.execute(
+            "UPDATE effects SET status = 'outcome_unknown', "
+            "repair_status = 'repair_pending', repair_last_error = ?, "
+            "repair_updated_at = ?, repair_claimed_by = NULL "
+            "WHERE effect_key = ? AND status = 'committed' "
+            "AND repair_status = 'repaired' AND repair_request_id = ?",
+            (error, now_iso, effect_key, request_id),
+        )
+        return self.get_effect(effect_key)
 
     # -- redacted observability (Ticket 16) ---------------------------
 
