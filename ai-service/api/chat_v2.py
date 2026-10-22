@@ -573,6 +573,11 @@ async def chat_v2_snapshot(
         # replay explain which policy this run executed under).
         "policy_hash": snapshot.policy_hash,
         "policy_schema_version": snapshot.policy_schema_version,
+        # BCDEF ticket 09: additive adapter provenance (source/target
+        # version, adapter id, timestamp) and, when the frozen policy
+        # cannot be adapted, the stable failure reason + next action.
+        "policy_provenance": snapshot.policy_provenance,
+        "policy_failure": snapshot.policy_failure,
     }
 
 

@@ -37,8 +37,11 @@ from typing import Any
 
 from agent_v2.effects import EffectStatus, compute_effect_key
 from agent_v2.approvals import compute_approval_id, compute_expiry
+from agent_v2.execution_contract import policy_hash
+from agent_v2.execution_policy import build_execution_policy
 from agent_v2.run_orchestration import ChatFlowRequest, RunOrchestrator
-from agent_v2.persistence import CheckpointsStore, ControlStore
+from agent_v2.persistence import CheckpointsStore, ControlStore, PolicySnapshotWrite
+from agent_v2.profiles import resolve_profile
 from agent_v2.runs import RunRepository
 
 
@@ -62,6 +65,20 @@ def _settings(**overrides: Any) -> Any:
     }
     base.update(overrides)
     return SimpleNamespace(**base)
+
+
+def _seed_frozen_policy(repo: RunRepository, run_id: str, profile_id: str) -> None:
+    """Ticket 09: hand-assembled paused runs need a frozen policy snapshot."""
+    policy = build_execution_policy(resolve_profile(profile_id), _settings())
+    write = PolicySnapshotWrite(
+        policy_json=json.dumps(policy, sort_keys=True, separators=(",", ":")),
+        policy_hash=policy_hash(policy),
+        schema_version=policy["schema_version"],
+        source_version=policy["source_version"],
+        compatibility_json=json.dumps(policy["compatibility"]),
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+    repo.control.insert_policy_snapshot(run_id=run_id, policy=write)
 
 
 class _FakeComputer:
@@ -383,6 +400,7 @@ def test_cowork_bash_resume_executes_approved_command(tmp_path):
         profile_id="cowork",
         user_message="在沙箱里创建一个文件",
     )
+    _seed_frozen_policy(repo, run_id, "cowork")
     repo.create_sandbox_lease(
         run_id=run_id,
         sandbox_type=computer.sandbox_type,

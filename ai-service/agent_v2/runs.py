@@ -38,6 +38,11 @@ from agent_v2.execution_policy import (
     profile_from_policy,
     serialize_policy,
 )
+from agent_v2.policy_adapters import (
+    adapt_policy_snapshot,
+    describe_policy_record,
+    missing_snapshot_failure,
+)
 from agent_v2.persistence import (
     ApprovalRecord,
     ArtifactRecord,
@@ -92,6 +97,11 @@ class RunSnapshot:
     # readers can explain which policy a run executed under.
     policy_hash: str = ""
     policy_schema_version: int = 0
+    # BCDEF ticket 09: adapter provenance (source/target version, adapter
+    # id, timestamp) and, when the stored policy cannot be adapted, the
+    # stable failure reason + next action. Both are additive.
+    policy_provenance: dict[str, Any] | None = None
+    policy_failure: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -550,13 +560,15 @@ class RunRepository:
         )
 
     def resolve_policy_snapshot(self, run_id: str) -> ResolvedPolicySnapshot:
-        """Return the validated frozen policy of ``run_id``.
+        """Return the frozen policy of ``run_id`` through the adapter chain.
 
         Fails closed with ``policy_snapshot_missing`` when no snapshot was
         written, and with ``policy_incompatible`` when the stored content
-        does not match its recorded hash, targets an unsupported schema,
-        or cannot be interpreted. Ticket 09 adapters and ticket 10
-        projection consume this API.
+        cannot be adapted safely (unknown schema version, hash mismatch,
+        missing critical field, adapter failure). Ticket 09: a legacy
+        snapshot (version 0) is lifted to the native version by the
+        registered, pure adapter; an incompatible one NEVER falls back to
+        current defaults.
         """
         record = self.control.get_policy_snapshot(run_id)
         if record is None:
@@ -564,49 +576,7 @@ class RunRepository:
                 ExecutionErrorCode.POLICY_SNAPSHOT_MISSING,
                 f"run {run_id} has no frozen execution policy snapshot",
             )
-        try:
-            policy = json.loads(record.policy_json)
-        except (TypeError, ValueError) as exc:
-            raise BoundaryError(
-                ExecutionErrorCode.POLICY_INCOMPATIBLE,
-                f"run {run_id} policy snapshot is not valid JSON",
-            ) from exc
-        if not isinstance(policy, dict):
-            raise BoundaryError(
-                ExecutionErrorCode.POLICY_INCOMPATIBLE,
-                f"run {run_id} policy snapshot is not a mapping",
-            )
-        if policy_hash(policy) != record.policy_hash:
-            raise BoundaryError(
-                ExecutionErrorCode.POLICY_INCOMPATIBLE,
-                f"run {run_id} policy hash mismatch",
-            )
-        if record.schema_version not in SUPPORTED_SCHEMA_VERSIONS:
-            raise BoundaryError(
-                ExecutionErrorCode.POLICY_INCOMPATIBLE,
-                f"run {run_id} policy schema {record.schema_version} "
-                f"is not supported",
-            )
-        if int(policy.get("schema_version", -1)) != record.schema_version:
-            raise BoundaryError(
-                ExecutionErrorCode.POLICY_INCOMPATIBLE,
-                f"run {run_id} policy schema does not match its hash content",
-            )
-        try:
-            compatibility = json.loads(record.compatibility_json or "{}")
-        except (TypeError, ValueError):
-            compatibility = {}
-        if not isinstance(compatibility, dict):
-            compatibility = {}
-        return ResolvedPolicySnapshot(
-            run_id=run_id,
-            policy=policy,
-            policy_hash=record.policy_hash,
-            schema_version=record.schema_version,
-            source_version=record.source_version,
-            created_at=record.created_at,
-            compatibility=compatibility,
-        )
+        return adapt_policy_snapshot(record)
 
     def get_policy_snapshot(self, run_id: str) -> PolicySnapshotRecord | None:
         """Raw persisted snapshot row (no validation), or None."""
@@ -1209,6 +1179,13 @@ class RunRepository:
         sequence_cursor = self.checkpoints.get_last_sequence(run_id)
         pending = self.checkpoints.get_pending_actions(run_id)
         policy_snapshot = self.control.get_policy_snapshot(run_id)
+        if policy_snapshot is None:
+            policy_provenance = None
+            policy_failure = missing_snapshot_failure(run_id)
+        else:
+            description = describe_policy_record(policy_snapshot)
+            policy_provenance = description["policy_provenance"]
+            policy_failure = description["policy_failure"]
 
         return RunSnapshot(
             run_id=run.run_id,
@@ -1240,6 +1217,8 @@ class RunRepository:
                 if policy_snapshot is not None
                 else 0
             ),
+            policy_provenance=policy_provenance,
+            policy_failure=policy_failure,
         )
 
     # -- cancel ---------------------------------------------------------

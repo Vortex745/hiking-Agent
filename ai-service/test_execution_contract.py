@@ -718,7 +718,9 @@ def test_adapter_registry_is_exact_version_paired() -> None:
     assert contract.get_adapter(10, 11) is adapter
     assert contract.get_adapter(11, 10) is None
     assert contract.get_adapter(10, 12) is None
-    assert contract.get_adapter(0, 1) is None
+    # Ticket 09 owns the real 0 -> 1 policy-snapshot pair, so exact-pair
+    # behavior is asserted on a version no runtime module registers.
+    assert contract.get_adapter(900, 901) is None
 
     adapted = contract.get_adapter(10, 11)
     assert adapted is not None
