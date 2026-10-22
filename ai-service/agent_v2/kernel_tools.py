@@ -30,6 +30,7 @@ from collections.abc import Mapping
 import logging
 import shlex
 import time
+import uuid
 from typing import Any, Callable
 
 from pydantic import BaseModel, Field
@@ -326,11 +327,23 @@ class ProductSandboxBridge:
     owns WHERE and HOW it executes (workspace chdir, timeout, env isolation).
     No host paths cross this boundary — exports go through the product
     artifact service only.
+
+    BCDEF ticket 06: when a :class:`agent_v2.leases.SandboxLeaseGuard` is
+    supplied, every command revalidates the durable active lease and
+    fencing token BEFORE touching the sandbox. A stale/expired worker
+    fails closed with a stable error instead of running unleased.
     """
 
-    def __init__(self, computer: Any, workspace_path: str) -> None:
+    def __init__(
+        self,
+        computer: Any,
+        workspace_path: str,
+        *,
+        lease_guard: Any | None = None,
+    ) -> None:
         self._computer = computer
         self.workspace_hint = str(workspace_path)
+        self._lease_guard = lease_guard
 
     @property
     def is_running(self) -> bool:
@@ -346,6 +359,14 @@ class ProductSandboxBridge:
         from uniharness.exceptions import CLIError
 
         from agent_v2.computer import SandboxUnavailableError
+        from agent_v2.leases import SandboxLeaseLostError
+
+        # Ticket 06: no sandbox side effect without a valid active lease.
+        if self._lease_guard is not None:
+            try:
+                self._lease_guard.assert_active()
+            except SandboxLeaseLostError as exc:
+                raise CLIError(f"{exc.code}: {exc.message}") from exc
 
         started = time.perf_counter()
         try:
@@ -506,20 +527,35 @@ class CoworkBashTool(BoundedDomainTool):
         run_id: str | None,
         effects: Any | None,  # RunRepository
         audit_sink: AuditSink | None,
+        lease_guard: Any | None = None,
     ) -> None:
         async def _exec(command: str) -> Any:
             return await bridge.run(command)
 
         super().__init__(delegate=_exec, run_id=run_id or "", audit_sink=audit_sink)
         self._effects = effects
+        self._lease_guard = lease_guard
         self._command = ""
 
     def _record(self, entry: dict[str, Any]) -> None:
         entry.setdefault("tool", self.name)
         super()._record(entry)
 
+    def _assert_lease(self) -> None:
+        if self._lease_guard is not None:
+            self._lease_guard.assert_active()
+
     async def execute(self, params: _BashParams) -> ToolResult:
-        from agent_v2.effects import EffectStatus, compute_effect_key, serialize_result
+        from agent_v2.effects import (
+            DEFAULT_EFFECT_CLAIM_TTL_SECONDS,
+            EffectClaim,
+            EffectStatus,
+            canonical_effect_status,
+            compute_effect_key,
+            execute_claimed,
+            serialize_result,
+        )
+        from agent_v2.leases import SandboxLeaseLostError
 
         started = time.perf_counter()
         self._command = params.command
@@ -542,24 +578,72 @@ class CoworkBashTool(BoundedDomainTool):
 
             stored = _json.loads(recovered.result_json) if recovered and recovered.result_json else {}
             return ToolResult(output=stored.get("stdout", "") or "")
-        if rec.status == EffectStatus.EXECUTING.value:
+        if canonical_effect_status(rec.status) == EffectStatus.CLAIMED.value:
             # Prior crash mid-execution → outcome_unknown semantics forbid
             # silent replay; requires human reconciliation.
             self._record({"phase": "denied", "ok": False, "code": "outcome_unknown", "duration_ms": 0})
             return ToolResult(error="上次执行结果未知（outcome_unknown），需人工处理，禁止自动重放。")
-        if rec.status != EffectStatus.AUTHORIZED.value:
+        if rec.status not in ("authorized", "pending"):
             self._record({"phase": "denied", "ok": False, "code": f"effect_{rec.status}", "duration_ms": 0})
             return ToolResult(error=f"effect 状态 {rec.status} 不允许执行。")
 
-        _, won = self._effects.transition_effect_to_executing(effect_key)
+        # Ticket 06: the lease must be active BEFORE the claim and again
+        # right before the command. A missing/expired/fenced lease blocks
+        # execution with a stable public error — never unleased work.
+        try:
+            self._assert_lease()
+        except SandboxLeaseLostError as exc:
+            self._record({"phase": "denied", "ok": False, "code": exc.code, "duration_ms": 0})
+            return ToolResult(error=f"{exc.code}: 沙箱租赁无效，已拒绝执行。")
+
+        lease = (
+            self._effects.get_sandbox_lease(self._run_id)
+            if hasattr(self._effects, "get_sandbox_lease")
+            else None
+        )
+        claim_token = uuid.uuid4().hex
+        _record, won = self._effects.claim_effect(
+            effect_key,
+            owner=f"cowork-bash:{uuid.uuid4().hex}",
+            claim_token=claim_token,
+            ttl_seconds=DEFAULT_EFFECT_CLAIM_TTL_SECONDS,
+            lease_id=lease.lease_id if lease is not None else "",
+            fencing_token=lease.fencing_token if lease is not None else 0,
+        )
         if not won:
             self._record({"phase": "denied", "ok": False, "code": "effect_race_lost", "duration_ms": 0})
             return ToolResult(error="该操作已由另一执行者接管。")
+        claim = EffectClaim(
+            effect_id=effect_key,
+            claim_token=claim_token,
+            owner="cowork-bash",
+            lease_id=lease.lease_id if lease is not None else "",
+            fencing_token=lease.fencing_token if lease is not None else 0,
+        )
 
         try:
-            res = await self._delegate(params.command)
+            res = await execute_claimed(claim, lambda: self._delegate(params.command))
+        except SandboxLeaseLostError as exc:
+            self._effects.mark_effect_failed(
+                effect_key, f"lease:{exc.code}", claim_token=claim_token
+            )
+            self._record({"phase": "result", "ok": False, "code": exc.code, "duration_ms": 0})
+            return ToolResult(error=f"{exc.code}: 沙箱租赁无效，命令未执行。")
         except Exception as exc:
-            self._effects.mark_effect_outcome_unknown(effect_key, type(exc).__name__)
+            self._effects.mark_effect_outcome_unknown(
+                effect_key, type(exc).__name__, claim_token=claim_token
+            )
+            self._record({"phase": "result", "ok": False, "code": "outcome_unknown", "duration_ms": 0})
+            return ToolResult(error="执行结果未知（outcome_unknown），需人工处理，禁止自动重放。")
+
+        # Re-check the fence AFTER the command returned: a takeover during
+        # execution makes the outcome indeterminate → no success publish.
+        try:
+            self._assert_lease()
+        except SandboxLeaseLostError:
+            self._effects.mark_effect_outcome_unknown(
+                effect_key, "lease_lost_after_execution", claim_token=claim_token
+            )
             self._record({"phase": "result", "ok": False, "code": "outcome_unknown", "duration_ms": 0})
             return ToolResult(error="执行结果未知（outcome_unknown），需人工处理，禁止自动重放。")
 
@@ -573,10 +657,15 @@ class CoworkBashTool(BoundedDomainTool):
             "truncated": bool(getattr(res, "truncated", False)),
         }
         if exit_code == 0:
-            self._effects.commit_effect(effect_key, serialize_result(result_dict))
+            committed = self._effects.commit_effect(
+                effect_key, serialize_result(result_dict), claim_token=claim_token
+            )
+            if committed is None or canonical_effect_status(committed.status) != "committed":
+                self._record({"phase": "result", "ok": False, "code": "outcome_unknown", "duration_ms": duration_ms})
+                return ToolResult(error="执行结果未知（outcome_unknown），需人工处理，禁止自动重放。")
             self._record({"phase": "result", "ok": True, "code": None, "duration_ms": duration_ms})
             return ToolResult(output=result_dict["stdout"] or "(no output)")
-        self._effects.mark_effect_failed(effect_key)
+        self._effects.mark_effect_failed(effect_key, claim_token=claim_token)
         self._record({"phase": "result", "ok": False, "code": f"exit_{exit_code}", "duration_ms": duration_ms})
         return ToolResult(error=f"命令失败（exit={exit_code}）。")
 

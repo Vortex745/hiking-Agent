@@ -34,8 +34,11 @@ from __future__ import annotations
 
 import json
 import uuid
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Callable
+
+from agent_v2.execution_contract import BoundaryError, ExecutionErrorCode
 
 
 class EffectStatus(str, Enum):
@@ -70,6 +73,129 @@ class EffectStatus(str, Enum):
     COMMITTED = "committed"
     OUTCOME_UNKNOWN = "outcome_unknown"
     FAILED = "failed"
+
+    # BCDEF ticket 04 canonical names. ``AUTHORIZED``/``EXECUTING`` are
+    # the legacy stored values kept readable; new writers may store the
+    # canonical pair. :func:`canonical_effect_status` maps both onto one
+    # taxonomy so the state machine has a single vocabulary.
+    PENDING = "pending"
+    CLAIMED = "claimed"
+
+
+# Legacy stored status -> canonical ticket-04 status. ``pending`` is the
+# durable "authorized, not yet claimed" row and ``claimed`` is the row a
+# worker owns (the legacy ``executing``). Terminal values are unchanged.
+_EFFECT_STATUS_ALIASES: dict[str, str] = {
+    "authorized": EffectStatus.PENDING.value,
+    "pending": EffectStatus.PENDING.value,
+    "executing": EffectStatus.CLAIMED.value,
+    "claimed": EffectStatus.CLAIMED.value,
+    "committed": EffectStatus.COMMITTED.value,
+    "failed": EffectStatus.FAILED.value,
+    "outcome_unknown": EffectStatus.OUTCOME_UNKNOWN.value,
+}
+
+# Statuses a worker may claim (CAS source state). Both the legacy and
+# the canonical spelling are accepted so old rows stay claimable.
+CLAIMABLE_EFFECT_STATUSES: frozenset[str] = frozenset({"authorized", "pending"})
+
+# Statuses that mean "a worker owns this effect". A second claimer must
+# never execute; it either returns the committed result or a stable
+# conflict/in-flight answer.
+CLAIMED_EFFECT_STATUSES: frozenset[str] = frozenset({"executing", "claimed"})
+
+
+def canonical_effect_status(status: str) -> str:
+    """Map a stored effect status onto the canonical taxonomy.
+
+    Unknown values are returned unchanged (fail visible, not silently
+    coerced) so a corrupt row cannot be mistaken for a claimable one.
+    """
+    return _EFFECT_STATUS_ALIASES.get(status, status)
+
+
+def is_claimable_effect_status(status: str) -> bool:
+    return status in CLAIMABLE_EFFECT_STATUSES
+
+
+def is_claimed_effect_status(status: str) -> bool:
+    return status in CLAIMED_EFFECT_STATUSES
+
+
+# Default claim TTL. The claim token is the fencing credential for the
+# commit; the expiry is audit/reconciliation metadata (a crashed claim is
+# NEVER re-claimed automatically — recovery transitions to
+# ``outcome_unknown`` instead).
+DEFAULT_EFFECT_CLAIM_TTL_SECONDS: float = 300.0
+
+
+@dataclass(frozen=True, slots=True)
+class EffectIdentity:
+    """Stable identity of one logical side effect.
+
+    ``effect_id`` is derived from ``(run_id, tool_name, canonical args)``
+    so a retry of the same logical tool call always maps to the same
+    ledger row. ``idempotency_key`` is the stable external key derived
+    from the same identity — it is never regenerated on retry.
+    """
+
+    effect_id: str
+    idempotency_key: str
+    run_id: str
+    tool_name: str
+
+    def audit_summary(self) -> dict[str, str]:
+        """Auditable, content-free summary for events/logs."""
+        return {
+            "effect_id": self.effect_id,
+            "idempotency_key": self.idempotency_key,
+            "run_id": self.run_id,
+            "tool": self.tool_name,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class EffectClaim:
+    """A fenced claim on one effect row.
+
+    Only the holder of ``claim_token`` may commit, fail, or mark the
+    effect ``outcome_unknown``. ``lease_id``/``fencing_token`` bind a
+    sandbox effect claim to the sandbox active lease that authorized it.
+    """
+
+    effect_id: str
+    claim_token: str
+    owner: str = ""
+    lease_id: str = ""
+    fencing_token: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.effect_id or not self.effect_id.strip():
+            raise ValueError("effect claim requires a non-empty effect_id")
+        if not self.claim_token or not self.claim_token.strip():
+            raise ValueError("effect claim requires a non-empty claim_token")
+
+
+class EffectNotClaimedError(BoundaryError):
+    """Raised when execution is attempted without a winning claim."""
+
+    def __init__(self, message: str = "effect claim required before execution") -> None:
+        super().__init__(ExecutionErrorCode.EFFECT_NOT_CLAIMED, message)
+
+
+def execute_claimed(
+    claim: EffectClaim | None,
+    execute: Callable[[], Any],
+) -> Any:
+    """Run ``execute`` only when ``claim`` is a valid fenced claim.
+
+    This is the structural guard for "claim happens BEFORE any external
+    side effect": callers cannot reach the executor without the claim
+    object returned by the ledger CAS.
+    """
+    if claim is None:
+        raise EffectNotClaimedError()
+    return execute()
 
 
 # Namespace UUID for effect key derivation. SEPARATE from the approvals
@@ -125,6 +251,31 @@ def compute_external_idempotency_key(
     ``OUTCOME_UNKNOWN`` (spec AC3).
     """
     return str(uuid.uuid5(_EFFECT_NAMESPACE, f"external|{tool_name}|{effect_key}"))
+
+
+def compute_effect_identity(
+    *,
+    run_id: str,
+    tool_name: str,
+    args: dict[str, Any] | None,
+) -> EffectIdentity:
+    """Return the stable identity bundle for one logical side effect.
+
+    ``effect_id`` is the deterministic ledger key (legacy ``effect_key``)
+    and ``idempotency_key`` is the external key. Both derive from the
+    same ``(run_id, tool_name, canonical args)`` input, so retries map to
+    the SAME effect and never mint a fresh key.
+    """
+    effect_id = compute_effect_key(run_id=run_id, tool_name=tool_name, args=args)
+    return EffectIdentity(
+        effect_id=effect_id,
+        idempotency_key=compute_external_idempotency_key(
+            effect_key=effect_id, tool_name=tool_name
+        ),
+        run_id=run_id,
+        tool_name=tool_name,
+    )
+
 
 
 def serialize_result(result: dict[str, Any] | None) -> str:

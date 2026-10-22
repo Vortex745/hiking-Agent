@@ -782,6 +782,13 @@ class ExecutionErrorCode(str, Enum):
     POLICY_SNAPSHOT_MISSING = "policy_snapshot_missing"
     DUPLICATE_TERMINAL = "duplicate_terminal"
     REPAIR_PENDING = "repair_pending"
+    # Ticket 04: a side effect was attempted without a winning ledger
+    # claim (or with a stale/fenced claim). Stable and retryable only
+    # through a fresh claim — never by re-executing blindly.
+    EFFECT_NOT_CLAIMED = "effect_not_claimed"
+    # Ticket 06: the sandbox fencing token no longer matches the active
+    # lease generation; the stale worker must stop before side effects.
+    LEASE_FENCING_REJECTED = "lease_fencing_rejected"
 
 
 # Whether a failure can be repaired without re-running the model or
@@ -799,6 +806,8 @@ ERROR_RECOVERABLE: dict[ExecutionErrorCode, bool] = {
     ExecutionErrorCode.POLICY_SNAPSHOT_MISSING: False,
     ExecutionErrorCode.DUPLICATE_TERMINAL: False,
     ExecutionErrorCode.REPAIR_PENDING: True,
+    ExecutionErrorCode.EFFECT_NOT_CLAIMED: True,
+    ExecutionErrorCode.LEASE_FENCING_REJECTED: True,
 }
 
 

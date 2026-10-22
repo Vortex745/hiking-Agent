@@ -50,6 +50,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Callable
@@ -73,10 +74,14 @@ from agent_v2.computer import (
     SandboxUnavailableError,
 )
 from agent_v2.effects import (
+    DEFAULT_EFFECT_CLAIM_TTL_SECONDS,
+    EffectClaim,
     EffectStatus,
+    canonical_effect_status,
     compute_effect_key,
     compute_external_idempotency_key,
     deserialize_result,
+    execute_claimed,
     serialize_result,
 )
 from agent_v2.events import (
@@ -87,6 +92,11 @@ from agent_v2.events import (
 )
 from agent_v2.execution_contract import BoundaryError
 from agent_v2.execution_policy import build_execution_policy, freeze_settings
+from agent_v2.leases import (
+    SANDBOX_LEASE_TTL_SECONDS,
+    SandboxLeaseGuard,
+    SandboxLeaseLostError,
+)
 from agent_v2.memory_tools import extract_sensitive_memory
 from agent_v2.observability import CapacityExceeded
 from agent_v2.permissions import PermissionDecision, PermissionGate
@@ -448,8 +458,10 @@ def _failed_effect_public_error(copy: EffectCopy, reason: str) -> tuple[str, str
     """Map a recorded FAILED reason to the public ``error`` (code, message).
 
     Sandbox refusals keep the stable ``sandbox_unavailable`` code (and the
-    original message) on every resume/replay; all other failures keep the
-    per-tool ``copy.failure_code`` mapping.
+    original message) on every resume/replay; lease fence refusals keep
+    their stable ``lease_expired``/``lease_fencing_rejected``/
+    ``sandbox_lease_lost`` code; all other failures keep the per-tool
+    ``copy.failure_code`` mapping.
     """
     if reason.startswith(_SANDBOX_UNAVAILABLE_REASON_PREFIX):
         detail = reason[len(_SANDBOX_UNAVAILABLE_REASON_PREFIX):]
@@ -457,6 +469,9 @@ def _failed_effect_public_error(copy: EffectCopy, reason: str) -> tuple[str, str
             _SANDBOX_UNAVAILABLE_CODE,
             f"{_SANDBOX_UNAVAILABLE_MESSAGE_PREFIX}{detail}",
         )
+    if reason.startswith("lease:"):
+        code = reason[len("lease:"):] or "sandbox_lease_lost"
+        return code, f"{copy.error_failure_prefix}{code}"
     return copy.failure_code, f"{copy.error_failure_prefix}{reason}"
 
 
@@ -532,6 +547,16 @@ def _tool_result_payloads(entries: list[dict[str, Any]]) -> list[dict[str, Any]]
     return payloads
 
 
+def _effect_meta(
+    effect_key: str, external_idempotency_key: str
+) -> dict[str, Any]:
+    """Replay-visible effect identity merged into tool/effect events."""
+    return {
+        "effect_id": effect_key,
+        "idempotency_key": external_idempotency_key,
+    }
+
+
 async def drive_effect(
     *,
     runs_repo: RunRepository,
@@ -548,14 +573,19 @@ async def drive_effect(
     execute: Callable[[], dict[str, Any]],
     emit: EmitLike,
     outcome: EffectDriveResult,
+    emit_required: EmitLike | None = None,
+    post_execute_check: Callable[[], None] | None = None,
+    lease_id: str = "",
+    fencing_token: int = 0,
 ) -> AsyncGenerator[Any, None]:
-    """Drive ONE tool execution through the effect ledger (Ticket 39).
+    """Drive ONE tool execution through the effect ledger (Ticket 39/04).
 
     This is the single authority for the ledger transitions:
 
     * spec AC1 — insert the row in ``authorized`` BEFORE execution;
-    * spec AC7 — CAS ``authorized → executing``; exactly one executor
-      wins, the loser must not re-execute;
+    * ticket 04 — CAS ``authorized/pending → executing/claimed`` with a
+      fenced claim token; exactly one executor wins, the loser must not
+      re-execute;
     * spec AC2 — ``committed`` returns the stored result without
       re-execution (and re-emits the tool_call/tool_result pair when
       the event log is missing them);
@@ -566,17 +596,25 @@ async def drive_effect(
     * prior ``failed`` / ``outcome_unknown`` → terminal error, no
       re-execution;
     * commit failure after a successful side effect →
-      ``outcome_unknown`` so a retry cannot re-execute (spec AC4).
+      ``outcome_unknown`` so a retry cannot re-execute (spec AC4);
+    * ticket 04 publication gate — the success ``tool_result`` is
+      emitted ONLY after the external call returned, the ledger commit
+      held the claim token, and ``emit_required`` (when supplied)
+      durably persisted the event. Serialization / ledger / event
+      failures all become ``outcome_unknown`` with NO success result.
 
     Yields whatever ``emit`` returns (envelopes or rendered frames).
     The caller decides, from ``outcome.status`` / ``outcome
     .preserve_sandbox``, whether to continue its flow (export, text,
     done) or stop.
     """
+    publish = emit_required or emit
     existing_effect = runs_repo.get_effect(effect_key)
 
     # Executing: distinguish a live concurrent executor from a crashed one.
-    if existing_effect is not None and existing_effect.status == EffectStatus.EXECUTING.value:
+    if existing_effect is not None and canonical_effect_status(
+        existing_effect.status
+    ) == EffectStatus.CLAIMED.value:
         if _effect_executor_is_live(all_events, copy.tool_name):
             outcome.status = "in_flight"
             outcome.preserve_sandbox = True
@@ -612,6 +650,7 @@ async def drive_effect(
             yield emit("tool_call", {
                 "tool": copy.tool_name,
                 "args": tool_args,
+                **_effect_meta(effect_key, external_idempotency_key),
             })
         err_code, err_message = _failed_effect_public_error(copy, reason)
         yield emit("tool_result", {
@@ -651,8 +690,27 @@ async def drive_effect(
                 yield emit("tool_call", {
                     "tool": copy.tool_name,
                     "args": tool_args,
+                    **_effect_meta(effect_key, external_idempotency_key),
                 })
-            yield emit("tool_result", copy.ok_tool_result(stored, tool_args))
+            try:
+                yield publish(
+                    "tool_result",
+                    copy.ok_tool_result(stored, tool_args)
+                    | {"effect_id": effect_key},
+                )
+            except Exception:
+                logger.exception(
+                    "run_orchestration: effect tool_result publish failed for "
+                    "%s run_id=%s (recovered committed result)",
+                    copy.tool_name, run_id,
+                )
+                outcome.status = "outcome_unknown"
+                yield emit("error", {
+                    "code": "effect_event_persist_failed",
+                    "message": copy.commit_unknown_message,
+                })
+                mark_terminal_safe(runs_repo, run_id, "error")
+                return
             has_tool_result_ok = True
 
     if not has_tool_result_ok:
@@ -671,8 +729,19 @@ async def drive_effect(
             except Exception:
                 existing_effect = runs_repo.get_effect(effect_key)
 
-        # CAS transition ``authorized → executing`` (spec AC7).
-        _, won = runs_repo.transition_effect_to_executing(effect_key)
+        # CAS claim ``authorized/pending → executing/claimed`` with a
+        # fenced claim token (BCDEF ticket 04). Exactly one caller wins;
+        # only the winner may reach the external side effect.
+        claim_token = uuid.uuid4().hex
+        claim_owner = f"effect-worker:{uuid.uuid4().hex}"
+        _record, won = runs_repo.claim_effect(
+            effect_key,
+            owner=claim_owner,
+            claim_token=claim_token,
+            ttl_seconds=DEFAULT_EFFECT_CLAIM_TTL_SECONDS,
+            lease_id=lease_id,
+            fencing_token=fencing_token,
+        )
         if not won:
             current = runs_repo.get_effect(effect_key)
             if current is not None and current.status == EffectStatus.COMMITTED.value:
@@ -680,7 +749,24 @@ async def drive_effect(
                 outcome.status = "recovered"
                 outcome.stored_result = stored
                 outcome.has_tool_result_ok = True
-                yield emit("tool_result", copy.ok_tool_result(stored, tool_args))
+                try:
+                    yield publish(
+                        "tool_result",
+                        copy.ok_tool_result(stored, tool_args)
+                        | {"effect_id": effect_key},
+                    )
+                except Exception:
+                    logger.exception(
+                        "run_orchestration: effect tool_result publish failed "
+                        "for %s run_id=%s (CAS-loser recovered result)",
+                        copy.tool_name, run_id,
+                    )
+                    outcome.status = "outcome_unknown"
+                    yield emit("error", {
+                        "code": "effect_event_persist_failed",
+                        "message": copy.commit_unknown_message,
+                    })
+                    mark_terminal_safe(runs_repo, run_id, "error")
             elif current is not None and current.status in (
                 EffectStatus.OUTCOME_UNKNOWN.value,
                 EffectStatus.FAILED.value,
@@ -689,6 +775,8 @@ async def drive_effect(
                     outcome.status = "outcome_unknown"
                     yield emit("effect.outcome_unknown", {
                         "effect_key": effect_key,
+                        "effect_id": effect_key,
+                        "idempotency_key": external_idempotency_key,
                         "tool": copy.tool_name,
                         "message": copy.unknown_message,
                     })
@@ -701,6 +789,7 @@ async def drive_effect(
                         "tool": copy.tool_name,
                         "status": "error",
                         "content": f"{copy.tool_result_failure_prefix}{_failed_effect_reason_text(reason)}",
+                        "effect_id": effect_key,
                     })
                     # Same mapping as the direct FAILED branch — a recorded
                     # sandbox refusal keeps ``sandbox_unavailable`` (D1).
@@ -718,16 +807,48 @@ async def drive_effect(
                 })
             return
 
-        # We won the CAS — emit tool_call and execute the tool.
+        # We won the CAS — emit tool_call and execute the tool. The
+        # executor is reachable ONLY through ``execute_claimed``: the
+        # claim object is the structural "claim before side effect" guard.
+        claim = EffectClaim(
+            effect_id=effect_key,
+            claim_token=claim_token,
+            owner=claim_owner,
+            lease_id=lease_id,
+            fencing_token=fencing_token,
+        )
         outcome.status = "executed"
         yield emit("tool_call", {
             "tool": copy.tool_name,
             "args": tool_args,
+            **_effect_meta(effect_key, external_idempotency_key),
         })
         try:
-            result = execute()
+            result = execute_claimed(claim, execute)
+        except SandboxLeaseLostError as exc:
+            # The lease fence refused BEFORE any sandbox command ran:
+            # nothing executed, so the effect is definitively failed and
+            # the public code stays stable on every replay.
+            runs_repo.mark_effect_failed(
+                effect_key,
+                reason=f"lease:{exc.code}",
+                claim_token=claim_token,
+            )
+            outcome.status = "failed"
+            yield emit("tool_result", {
+                "tool": copy.tool_name,
+                "status": "error",
+                "content": f"{copy.tool_result_failure_prefix}{exc.message}",
+                "effect_id": effect_key,
+            })
+            yield emit("error", {
+                "code": exc.code,
+                "message": f"{copy.error_failure_prefix}{exc.message}",
+            })
+            mark_terminal_safe(runs_repo, run_id, "error")
+            return
         except SandboxTimeoutError as exc:
-            runs_repo.mark_effect_failed(effect_key, reason=str(exc))
+            runs_repo.mark_effect_failed(effect_key, reason=str(exc), claim_token=claim_token)
             outcome.status = "failed"
             yield emit("tool_result", {
                 "tool": copy.tool_name,
@@ -763,7 +884,7 @@ async def drive_effect(
             mark_terminal_safe(runs_repo, run_id, "error")
             return
         except ComputerError as exc:
-            runs_repo.mark_effect_failed(effect_key, reason=str(exc))
+            runs_repo.mark_effect_failed(effect_key, reason=str(exc), claim_token=claim_token)
             outcome.status = "failed"
             yield emit("tool_result", {
                 "tool": copy.tool_name,
@@ -777,24 +898,62 @@ async def drive_effect(
             mark_terminal_safe(runs_repo, run_id, "error")
             return
 
-        # Success — commit the effect with the result (spec AC2).
-        # Spec AC4: a bookkeeping failure after the side effect completed
-        # must become outcome_unknown so a retry cannot re-execute.
+        # The external operation returned. Before publishing ANY success,
+        # re-check the lease fence (a takeover during execution makes the
+        # outcome indeterminate) and commit the ledger under the claim.
+        if post_execute_check is not None:
+            try:
+                post_execute_check()
+            except SandboxLeaseLostError as exc:
+                runs_repo.mark_effect_outcome_unknown(
+                    effect_key,
+                    reason=f"lease:{exc.code}",
+                    claim_token=claim_token,
+                )
+                outcome.status = "outcome_unknown"
+                yield emit("effect.outcome_unknown", {
+                    "effect_key": effect_key,
+                    "effect_id": effect_key,
+                    "idempotency_key": external_idempotency_key,
+                    "tool": copy.tool_name,
+                    "message": copy.commit_unknown_message,
+                })
+                yield emit("error", {
+                    "code": exc.code,
+                    "message": copy.commit_unknown_message,
+                })
+                mark_terminal_safe(runs_repo, run_id, "error")
+                return
+
+        # Success — serialize + commit the effect under the claim token
+        # (spec AC2). Any bookkeeping failure after the side effect
+        # completed must become outcome_unknown so a retry cannot
+        # re-execute (spec AC4, ticket 04).
+        committed = None
         try:
-            runs_repo.commit_effect(effect_key, serialize_result(result))
+            serialized = serialize_result(result)
+            committed = runs_repo.commit_effect(
+                effect_key, serialized, claim_token=claim_token
+            )
         except Exception:
             logger.exception(
-                "run_orchestration: commit_effect failed for %s run_id=%s; "
+                "run_orchestration: effect commit failed for %s run_id=%s; "
                 "marking outcome_unknown",
                 copy.tool_name, run_id,
             )
+        if committed is None or canonical_effect_status(committed.status) != (
+            EffectStatus.COMMITTED.value
+        ):
             runs_repo.mark_effect_outcome_unknown(
                 effect_key,
                 reason=copy.commit_unknown_reason,
+                claim_token=claim_token,
             )
             outcome.status = "outcome_unknown"
             yield emit("effect.outcome_unknown", {
                 "effect_key": effect_key,
+                "effect_id": effect_key,
+                "idempotency_key": external_idempotency_key,
                 "tool": copy.tool_name,
                 "message": copy.commit_unknown_message,
             })
@@ -807,7 +966,40 @@ async def drive_effect(
 
         outcome.stored_result = result
         outcome.has_tool_result_ok = True
-        yield emit("tool_result", copy.ok_tool_result(result, tool_args))
+        try:
+            yield publish(
+                "tool_result",
+                copy.ok_tool_result(result, tool_args) | {"effect_id": effect_key},
+            )
+        except Exception:
+            # External op + ledger committed, but the success event is
+            # not replayable. Fence the committed row to outcome_unknown
+            # (same claim) and publish an error instead of a success.
+            logger.exception(
+                "run_orchestration: effect success event not durable for "
+                "%s run_id=%s; fencing to outcome_unknown",
+                copy.tool_name, run_id,
+            )
+            runs_repo.mark_effect_publication_failed(
+                effect_key,
+                reason="success_event_not_durable",
+                claim_token=claim_token,
+            )
+            outcome.status = "outcome_unknown"
+            outcome.has_tool_result_ok = False
+            yield emit("effect.outcome_unknown", {
+                "effect_key": effect_key,
+                "effect_id": effect_key,
+                "idempotency_key": external_idempotency_key,
+                "tool": copy.tool_name,
+                "message": copy.commit_unknown_message,
+            })
+            yield emit("error", {
+                "code": "effect_outcome_unknown",
+                "message": copy.commit_unknown_message,
+            })
+            mark_terminal_safe(runs_repo, run_id, "error")
+            return
     else:
         # Tool already executed in a prior resume — the event log is the
         # source of truth; no ledger transition may re-run it (spec AC5).
