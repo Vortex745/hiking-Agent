@@ -98,9 +98,11 @@ from agent_v2.profiles import (
 )
 from agent_v2.runs import (
     ApprovalRecord,
+    AssistantPersistFailure,
     RunAlreadyTerminal,
     RunRepository,
     RunSnapshot,
+    TerminalPersistFailure,
 )
 from agent_v2.startup import is_cowork_authorized
 
@@ -227,6 +229,15 @@ def mark_terminal_safe(
             runs_repo.mark_run_error(run_id)
         # ``cancelled`` is set by the cancel API; the stream does not
         # call mark_run_cancelled because the DB row already reflects it.
+    except RunAlreadyTerminal:
+        # Ticket 03: the finalize fence CASes the status BEFORE the
+        # terminal frame is released, so this legacy best-effort stamp is
+        # normally a no-op now. Not a warning.
+        logger.debug(
+            "chat_v2: run_id=%s already terminal at mark_run_%s",
+            run_id,
+            terminal,
+        )
     except Exception as exc:
         logger.warning(
             "chat_v2: mark_run_%s failed for run_id=%s: %s",
@@ -234,6 +245,164 @@ def mark_terminal_safe(
             run_id,
             exc,
         )
+
+
+# Run-lifecycle terminals (``run.paused`` is a stream terminal only).
+_RUN_TERMINAL_TYPES = frozenset({"done", "error", "cancelled"})
+
+
+class _CloseStreamSilently(BaseException):
+    """Internal control flow: end this SSE generator with NO terminal.
+
+    Used when the persistence fence itself failed (assistant write or
+    terminal write). The stream must close without pretending success;
+    snapshot/replay explain the state afterwards. Derives from
+    ``BaseException`` (like ``GeneratorExit``) so ``except Exception``
+    handlers in the profile flows cannot swallow it and emit a fake
+    terminal.
+    """
+
+
+def _envelope_from_terminal(
+    stream: EventStream, terminal: dict[str, Any]
+) -> EventEnvelope:
+    """Rebuild the exact envelope of a persisted terminal row."""
+    return EventEnvelope(
+        version=terminal.get("version", "2"),
+        sequence=terminal["sequence"],
+        type=terminal["type"],
+        payload=terminal["payload"],
+        request_id=terminal.get("request_id", stream.request_id),
+        conversation_id=terminal.get("conversation_id", stream.conversation_id),
+        run_id=terminal.get("run_id", stream.run_id),
+        event_id=terminal.get("event_id", ""),
+        timestamp=terminal.get("timestamp", ""),
+    )
+
+
+def _finalize_stream_terminal(
+    *,
+    stream: EventStream,
+    runs_repo: RunRepository,
+    run_id: str,
+    request_id: str,
+    envelope: EventEnvelope,
+    assistant_content: str,
+) -> EventEnvelope:
+    """Persist the assistant + terminal before the frame may be released.
+
+    Returns the authoritative terminal envelope (identical ids/sequence
+    to what replay will return). Raises :class:`_CloseStreamSilently`
+    when the fence fails and no truthful terminal can be published.
+    """
+    current = runs_repo.get_run(run_id)
+    if current is not None and current.status in (
+        "admission_pending",
+        "admission_failed",
+    ):
+        # Admission failure: the durable explanation is the run status +
+        # admission event, not an execution terminal. Keep the historical
+        # plain-persist behaviour (ticket 02 repair owns this window).
+        try:
+            runs_repo.persist_event(
+                run_id=run_id,
+                sequence=envelope.sequence,
+                event_type=envelope.type,
+                payload=envelope.payload,
+                request_id=request_id,
+                conversation_id=envelope.conversation_id,
+                event_id=envelope.event_id,
+                timestamp=envelope.timestamp,
+            )
+        except Exception:
+            logger.exception(
+                "chat_v2: admission-failure terminal persist failed for "
+                "run_id=%s; closing without a terminal",
+                run_id,
+            )
+            runs_repo.record_terminal_persist_failure(run_id)
+            raise _CloseStreamSilently() from None
+        return envelope
+
+    try:
+        result = runs_repo.finalize_run(
+            run_id=run_id,
+            request_id=request_id,
+            terminal_type=envelope.type,
+            payload=dict(envelope.payload),
+            sequence=envelope.sequence,
+            event_id=envelope.event_id,
+            timestamp=envelope.timestamp,
+            assistant_content=assistant_content or None,
+        )
+        if not result.created and result.terminal["sequence"] != envelope.sequence:
+            # Another stream already persisted the authoritative terminal;
+            # yielding its old sequence here would break monotonicity.
+            raise _CloseStreamSilently()
+        return _envelope_from_terminal(stream, result.terminal)
+    except AssistantPersistFailure:
+        logger.exception(
+            "chat_v2: assistant persistence failed for run_id=%s; "
+            "refusing to publish %s",
+            run_id,
+            envelope.type,
+        )
+        # No done over an unpersisted answer. Error/cancelled remain
+        # truthful without assistant content; done becomes the stable
+        # assistant_persist_failed error. The failed frame never left the
+        # server, so the stream may build one replacement terminal.
+        try:
+            stream.reopen_after_failed_persistence()
+            if envelope.type == "done":
+                retry_type = "error"
+                retry_payload: dict[str, Any] = {
+                    "code": "assistant_persist_failed",
+                    "message": "助手回复未成功落库，已停止发布完成终态。",
+                    "recoverable": True,
+                }
+            else:
+                retry_type = envelope.type
+                retry_payload = dict(envelope.payload)
+            replacement = stream.build(retry_type, retry_payload)
+            result = runs_repo.finalize_run(
+                run_id=run_id,
+                request_id=request_id,
+                terminal_type=replacement.type,
+                payload=dict(replacement.payload),
+                sequence=replacement.sequence,
+                event_id=replacement.event_id,
+                timestamp=replacement.timestamp,
+                assistant_content=None,
+            )
+            if not result.created and result.terminal["sequence"] != replacement.sequence:
+                raise _CloseStreamSilently()
+            return _envelope_from_terminal(stream, result.terminal)
+        except Exception:
+            logger.exception(
+                "chat_v2: fallback terminal persist failed for run_id=%s; "
+                "closing without a terminal",
+                run_id,
+            )
+            runs_repo.record_terminal_persist_failure(run_id)
+            raise _CloseStreamSilently() from None
+    except TerminalPersistFailure:
+        logger.exception(
+            "chat_v2: terminal persistence failed for run_id=%s; closing "
+            "without a terminal",
+            run_id,
+        )
+        runs_repo.record_terminal_persist_failure(run_id)
+        raise _CloseStreamSilently() from None
+    except _CloseStreamSilently:
+        raise
+    except Exception:
+        logger.exception(
+            "chat_v2: finalize fence failed for run_id=%s; closing without "
+            "a terminal",
+            run_id,
+        )
+        runs_repo.record_terminal_persist_failure(run_id)
+        raise _CloseStreamSilently() from None
 
 
 def synthesize_terminal_type(snapshot: RunSnapshot | None) -> str | None:
@@ -1347,35 +1516,64 @@ class RunOrchestrator:
         # Build the emit closures. They wrap build + persist (+ render
         # for the legacy hooks) so the flow generators below stay linear
         # and persistence-aware.
+        #
+        # Ticket 03: public text is buffered so the terminal fence can
+        # persist the WHOLE assistant reply (including a cancelled
+        # partial answer) before any run terminal is released.
+        assistant_parts: list[str] = []
+
         def _emit(event_type: str, payload: dict[str, Any]) -> EventEnvelope:
+            if event_type == "text":
+                content = payload.get("content")
+                if isinstance(content, str) and content:
+                    assistant_parts.append(content)
             envelope = stream.build(event_type, payload)
             if runs_repo is not None and run_id is not None:
-                try:
-                    runs_repo.persist_event(
+                if event_type in _RUN_TERMINAL_TYPES:
+                    # The fence may replace ``done`` with the stable
+                    # assistant_persist_failed error; telemetry and the
+                    # wire must both observe the released terminal.
+                    envelope = _finalize_stream_terminal(
+                        stream=stream,
+                        runs_repo=runs_repo,
                         run_id=run_id,
-                        sequence=envelope.sequence,
-                        event_type=envelope.type,
-                        payload=envelope.payload,
                         request_id=req.request_id,
-                        conversation_id=conversation_id,
-                        event_id=envelope.event_id,
-                        timestamp=envelope.timestamp,
+                        envelope=envelope,
+                        assistant_content="".join(assistant_parts),
                     )
-                except Exception:
-                    logger.exception(
-                        "chat_v2: persist_event failed for request_id=%s seq=%d; "
-                        "stream continues but reconnect may miss this event",
-                        req.request_id,
-                        envelope.sequence,
-                    )
+                else:
+                    try:
+                        runs_repo.persist_event(
+                            run_id=run_id,
+                            sequence=envelope.sequence,
+                            event_type=envelope.type,
+                            payload=envelope.payload,
+                            request_id=req.request_id,
+                            conversation_id=conversation_id,
+                            event_id=envelope.event_id,
+                            timestamp=envelope.timestamp,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "chat_v2: persist_event failed for request_id=%s seq=%d; "
+                            "stream continues but reconnect may miss this event",
+                            req.request_id,
+                            envelope.sequence,
+                        )
             if telemetry is not None and run_id is not None:
                 try:
-                    tool_name = payload.get("tool")
-                    state = payload.get("status") or payload.get("decision")
-                    error_code = payload.get("code") if event_type == "error" else None
+                    tool_name = envelope.payload.get("tool")
+                    state = envelope.payload.get("status") or envelope.payload.get(
+                        "decision"
+                    )
+                    error_code = (
+                        envelope.payload.get("code")
+                        if envelope.type == "error"
+                        else None
+                    )
                     telemetry.observe_event(
                         run_id,
-                        event_type=event_type,
+                        event_type=envelope.type,
                         duration_ms=(time.perf_counter() - telemetry_started) * 1000,
                         tool_name=tool_name if isinstance(tool_name, str) else None,
                         state=state if isinstance(state, str) else None,
@@ -1781,15 +1979,29 @@ class RunOrchestrator:
             )
             return
 
+        except _CloseStreamSilently:
+            # Ticket 03: the persistence fence failed (assistant or
+            # terminal write). Close without pretending success; the
+            # snapshot/replay path exposes the stable explanation.
+            logger.error(
+                "chat_v2: closing stream without terminal after a failed "
+                "persistence fence for request_id=%s",
+                req.request_id,
+            )
+            return
+
         except Exception as exc:
             # Unexpected error. Emit a terminal error if the stream is
             # still open; otherwise the previous terminal stands.
             logger.exception("chat_v2: unexpected error for request_id=%s", req.request_id)
             if not stream.terminal_emitted:
-                yield _emit("error", {
-                    "code": "internal_error",
-                    "message": "内部错误，请重试。",
-                })
+                try:
+                    yield _emit("error", {
+                        "code": "internal_error",
+                        "message": "内部错误，请重试。",
+                    })
+                except _CloseStreamSilently:
+                    return
             mark_terminal_safe(runs_repo, run_id, "error")
             return
 
@@ -2471,12 +2683,42 @@ class RunOrchestrator:
         return self._runs_repo.get_snapshot(run_id)
 
     def load_events(self, run_id: str, *, from_seq: int = 0) -> list[dict[str, Any]]:
-        """Read stored events with sequence > ``from_seq`` (replay)."""
+        """Read replay events with sequence > ``from_seq``.
+
+        Ticket 03: a terminal run whose terminal event could not be
+        persisted replays a deterministic synthetic error terminal
+        (``terminal_persist_failed``) instead of looking unfinished.
+        """
         if self._runs_repo is None:
             return []
-        return self._runs_repo.get_events_since(run_id=run_id, from_seq=from_seq)
+        return self._runs_repo.get_replay_events(run_id=run_id, from_seq=from_seq)
 
     async def stream_resume(
+        self,
+        *,
+        run_id: str,
+        from_seq: int = 0,
+    ) -> AsyncGenerator[EventEnvelope, None]:
+        """Resume stream wrapper: closes silently on a failed finalize fence.
+
+        Ticket 03: the continuation may only publish its terminal after
+        the assistant + terminal durability fence. When that fence fails
+        the stream closes without a terminal; snapshot/replay explain it.
+        """
+        try:
+            async for envelope in self._stream_resume_impl(
+                run_id=run_id, from_seq=from_seq
+            ):
+                yield envelope
+        except _CloseStreamSilently:
+            logger.error(
+                "run_orchestration: closing resume stream without terminal "
+                "after a failed persistence fence for run_id=%s",
+                run_id,
+            )
+            return
+
+    async def _stream_resume_impl(
         self,
         *,
         run_id: str,
@@ -2521,10 +2763,15 @@ class RunOrchestrator:
         # Replay stored events > from_seq (so the client can restore state).
         # We also scan ALL stored events (from_seq=0) to determine which
         # resume steps have already been completed (spec AC5 idempotency).
-        replay_events = runs_repo.get_events_since(run_id=run_id, from_seq=from_seq)
+        # Ticket 03: replay reads may synthesize a stable terminal for a
+        # terminal run whose terminal event failed to persist; nothing is
+        # written, so repeated reads agree.
+        replay_events = runs_repo.get_replay_events(
+            run_id=run_id, from_seq=from_seq
+        )
         all_events = (
             replay_events if from_seq == 0
-            else runs_repo.get_events_since(run_id=run_id, from_seq=0)
+            else runs_repo.get_replay_events(run_id=run_id, from_seq=0)
         )
         for evt in replay_events:
             yield EventEnvelope(
@@ -2555,33 +2802,64 @@ class RunOrchestrator:
         )
         stream.advance_to(last_seq)
 
+        # Ticket 03: the assistant reply of a resumed run is the text
+        # already replayed plus what this continuation emits; the fence
+        # persists it before the terminal.
+        assistant_parts: list[str] = [
+            evt["payload"].get("content", "")
+            for evt in all_events
+            if evt.get("type") == "text"
+            and isinstance(evt.get("payload"), dict)
+            and isinstance(evt["payload"].get("content"), str)
+        ]
+
         def emit(event_type: str, payload: dict[str, Any]) -> EventEnvelope:
+            if event_type == "text":
+                content = payload.get("content")
+                if isinstance(content, str) and content:
+                    assistant_parts.append(content)
             envelope = stream.build(event_type, payload)
-            try:
-                runs_repo.persist_event(
+            if event_type in _RUN_TERMINAL_TYPES:
+                envelope = _finalize_stream_terminal(
+                    stream=stream,
+                    runs_repo=runs_repo,
                     run_id=run_id,
-                    sequence=envelope.sequence,
-                    event_type=envelope.type,
-                    payload=envelope.payload,
                     request_id=run.request_id,
-                    conversation_id=run.conversation_id,
-                    event_id=envelope.event_id,
-                    timestamp=envelope.timestamp,
+                    envelope=envelope,
+                    assistant_content="".join(assistant_parts),
                 )
-            except Exception:
-                logger.exception(
-                    "run_orchestration: persist_event failed during resume "
-                    "for run_id=%s seq=%d",
-                    run_id, envelope.sequence,
-                )
+            else:
+                try:
+                    runs_repo.persist_event(
+                        run_id=run_id,
+                        sequence=envelope.sequence,
+                        event_type=envelope.type,
+                        payload=envelope.payload,
+                        request_id=run.request_id,
+                        conversation_id=run.conversation_id,
+                        event_id=envelope.event_id,
+                        timestamp=envelope.timestamp,
+                    )
+                except Exception:
+                    logger.exception(
+                        "run_orchestration: persist_event failed during resume "
+                        "for run_id=%s seq=%d",
+                        run_id, envelope.sequence,
+                    )
             if telemetry is not None:
                 try:
-                    tool_name = payload.get("tool")
-                    state = payload.get("status") or payload.get("decision")
-                    error_code = payload.get("code") if event_type == "error" else None
+                    tool_name = envelope.payload.get("tool")
+                    state = envelope.payload.get("status") or envelope.payload.get(
+                        "decision"
+                    )
+                    error_code = (
+                        envelope.payload.get("code")
+                        if envelope.type == "error"
+                        else None
+                    )
                     telemetry.observe_event(
                         run_id,
-                        event_type=event_type,
+                        event_type=envelope.type,
                         duration_ms=(time.perf_counter() - telemetry_started) * 1000,
                         tool_name=tool_name if isinstance(tool_name, str) else None,
                         state=state if isinstance(state, str) else None,
@@ -3351,7 +3629,10 @@ class RunOrchestrator:
         run_id: str,
         req: ChatFlowRequest,
     ) -> AsyncGenerator[EventEnvelope, None]:
-        stored = runs_repo.get_events_since(run_id=run_id, from_seq=0)
+        # Ticket 03: the replay read synthesizes a stable terminal for a
+        # terminal run whose terminal write failed; it is not persisted,
+        # so repeated replays agree instead of inventing a new terminal.
+        stored = runs_repo.get_replay_events(run_id=run_id, from_seq=0)
         has_terminal = False
         max_seq = 0
         for evt in stored:
@@ -3650,24 +3931,6 @@ class RunOrchestrator:
             response_text = streamed_text + remaining
         if remaining:
             yield emit("text", {"content": remaining})
-
-        # Spec #13 phase 2 (T07): persist the assistant reply so
-        # conversation history (RAG page restore, snapshots) sees both
-        # sides. Best-effort: history loss must not fail the stream.
-        if req.conversation_id and response_text and self._runs_repo is not None:
-            try:
-                self._runs_repo.checkpoints.append_message(
-                    conversation_id=req.conversation_id,
-                    run_id=run_id,
-                    role="assistant",
-                    content=response_text,
-                    sequence=2,
-                )
-            except Exception:
-                logger.exception(
-                    "chat_v2: assistant message persistence failed for run_id=%s",
-                    run_id,
-                )
 
 
 # ---- Paused-run janitor (Ticket 41) -----------------------------------------

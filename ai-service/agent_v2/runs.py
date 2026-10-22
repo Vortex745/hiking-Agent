@@ -41,15 +41,18 @@ from agent_v2.execution_policy import (
 from agent_v2.persistence import (
     ApprovalRecord,
     ArtifactRecord,
+    AssistantMessagePersistenceError,
     CheckpointsStore,
     ControlStore,
     EffectRecord,
+    FinalizeRecord,
     PolicySnapshotRecord,
     PolicySnapshotWrite,
     RunAlreadyTerminal,
     RunNotFound,
     RunRecord,
     SandboxLeaseRecord,
+    TerminalEventPersistenceError,
 )
 from agent_v2.profiles import CapabilityProfile
 
@@ -92,6 +95,18 @@ class RunSnapshot:
     # readers can explain which policy a run executed under.
     policy_hash: str = ""
     policy_schema_version: int = 0
+    # BCDEF ticket 03: terminal persistence / replay explanation. All
+    # additive — the existing envelope and snapshot path are unchanged.
+    control_status: str = ""
+    terminal_event_type: str | None = None
+    terminal_event_id: str = ""
+    terminal_event_sequence: int = 0
+    terminal_persisted: bool = False
+    terminal_persist_failed: bool = False
+    terminal_error_code: str | None = None
+    error_code: str | None = None
+    recoverable: bool = False
+    state_reconciled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +116,47 @@ class CancelOutcome:
     accepted: bool
     reason: str
     run_id: str
+
+
+class AssistantPersistFailure(BoundaryError):
+    """The assistant reply could not be made durable before the terminal."""
+
+    def __init__(self, message: str = "") -> None:
+        super().__init__(
+            ExecutionErrorCode.ASSISTANT_PERSIST_FAILED,
+            message,
+            recoverable=True,
+        )
+
+
+class TerminalPersistFailure(BoundaryError):
+    """The terminal event could not be made durable; the stream must close."""
+
+    def __init__(self, message: str = "") -> None:
+        super().__init__(
+            ExecutionErrorCode.TERMINAL_PERSIST_FAILED,
+            message,
+            recoverable=True,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FinalizeResult:
+    """Outcome of the assistant + terminal finalize fence.
+
+    ``terminal`` is the authoritative persisted envelope (a dict in the v2
+    wire shape), ``created`` is False when an existing terminal was
+    returned idempotently, and ``reconciled`` marks a control-DB CAS that
+    failed after the durable event commit (snapshot/replay reconcile the
+    status from the event).
+    """
+
+    terminal: dict[str, Any]
+    created: bool
+    status: str
+    assistant_persisted: bool
+    assistant_content: str
+    reconciled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +194,16 @@ class AdmissionResult:
 # Statuses that a retry must replay, never repair or execute again.
 _NON_REPAIRABLE_STATUSES = frozenset(
     {"done", "error", "cancelled", "outcome_unknown"}
+)
+
+# Run-lifecycle terminal event types (``run.paused`` is a stream terminal
+# only and deliberately excluded).
+_RUN_TERMINAL_TYPES = frozenset({"done", "error", "cancelled"})
+
+# Terminal control statuses whose replay may need a synthetic terminal
+# when the durable event write never happened.
+_REPLAY_TERMINAL_STATUSES = frozenset(
+    {"done", "error", "cancelled", "admission_failed"}
 )
 
 
@@ -1017,6 +1083,20 @@ class RunRepository:
             timestamp=timestamp,
         )
 
+    @staticmethod
+    def _stored_event_dict(stored: Any) -> dict[str, Any]:
+        return {
+            "version": "2",
+            "event_id": stored.event_id,
+            "sequence": stored.sequence,
+            "run_id": stored.run_id,
+            "conversation_id": stored.conversation_id,
+            "timestamp": stored.created_at,
+            "type": stored.event_type,
+            "request_id": stored.request_id,
+            "payload": json.loads(stored.payload_json),
+        }
+
     def get_events_since(
         self,
         *,
@@ -1033,20 +1113,207 @@ class RunRepository:
             run_id=run_id,
             from_seq=from_seq,
         )
-        return [
-            {
-                "version": "2",
-                "event_id": s.event_id,
-                "sequence": s.sequence,
-                "run_id": s.run_id,
-                "conversation_id": s.conversation_id,
-                "timestamp": s.created_at,
-                "type": s.event_type,
-                "request_id": s.request_id,
-                "payload": json.loads(s.payload_json),
+        return [self._stored_event_dict(s) for s in stored]
+
+    # -- terminal finalize fence (BCDEF ticket 03) ----------------------
+
+    def finalize_run(
+        self,
+        *,
+        run_id: str,
+        request_id: str,
+        terminal_type: str,
+        payload: dict[str, Any],
+        sequence: int,
+        event_id: str | None = None,
+        timestamp: str | None = None,
+        assistant_content: str | None = None,
+    ) -> FinalizeResult:
+        """Durably finalize one run: assistant → terminal event → status CAS.
+
+        The assistant message (exactly once, derived per-conversation
+        sequence) and the terminal event commit in ONE checkpoints
+        transaction. Only after that commit does the control DB CAS the
+        run status. The canonical conversation comes from the run row, so
+        callers never need to pass ``conversation_id``.
+
+        Failure semantics:
+
+        * assistant write fails → :class:`AssistantPersistFailure`; no
+          terminal was written, so the orchestration can safely publish a
+          stable ``assistant_persist_failed`` error terminal instead;
+        * terminal event write fails → :class:`TerminalPersistFailure` and
+          the control row is flagged ``terminal_persist_failed``;
+        * the status CAS fails after the event commit → the persisted
+          terminal is still returned (``reconciled=True``); snapshot and
+          replay reconcile the status from the event, and no second
+          terminal is ever created.
+        """
+        if terminal_type not in _RUN_TERMINAL_TYPES:
+            raise ValueError(f"invalid terminal type: {terminal_type!r}")
+        run = self.control.get_run(run_id)
+        if run is None:
+            raise RunNotFound(f"run_id={run_id}")
+        if run.status in ("admission_pending", "admission_failed"):
+            raise BoundaryError(
+                ExecutionErrorCode.ADMISSION_FAILED,
+                f"run {run_id} is {run.status}; finalize is not an admission repair",
+            )
+
+        effective_type = terminal_type
+        effective_payload = dict(payload)
+        existing = self.checkpoints.get_terminal_event(run_id)
+        if existing is not None:
+            # A durable terminal already exists; return it exactly.
+            effective_type = existing.event_type
+        elif run.status in _RUN_TERMINAL_TYPES and run.status != terminal_type:
+            # Cancelled (or otherwise terminated) while the stream was
+            # finishing: the control fact wins. Persist that terminal
+            # instead of publishing a contradicting one.
+            effective_type = run.status
+            effective_payload = {
+                "code": run.status,
+                "message": "运行已结束。",
+                "unknown_dropped": payload.get("unknown_dropped", 0),
             }
-            for s in stored
-        ]
+
+        try:
+            record: FinalizeRecord = self.checkpoints.finalize_terminal(
+                run_id=run_id,
+                conversation_id=run.conversation_id,
+                request_id=request_id,
+                terminal_type=effective_type,
+                payload=effective_payload,
+                sequence=sequence,
+                event_id=event_id,
+                timestamp=timestamp,
+                assistant_content=assistant_content,
+            )
+        except AssistantMessagePersistenceError as exc:
+            raise AssistantPersistFailure(str(exc)) from exc
+        except TerminalEventPersistenceError as exc:
+            self.record_terminal_persist_failure(run_id)
+            raise TerminalPersistFailure(str(exc)) from exc
+
+        status = record.terminal.event_type
+        reconciled = False
+        try:
+            status, _transitioned = self.control.finalize_run_status(
+                run_id=run_id,
+                terminal_type=record.terminal.event_type,
+            )
+        except RunAlreadyTerminal:
+            current = self.control.get_run(run_id)
+            status = current.status if current is not None else status
+            reconciled = True
+        except Exception:
+            logger.exception(
+                "finalize_run: status CAS failed after terminal commit for "
+                "run_id=%s; snapshot/replay will reconcile from the event",
+                run_id,
+            )
+            reconciled = True
+
+        assistant_persisted = record.assistant_message_id is not None or not (
+            assistant_content or ""
+        )
+        return FinalizeResult(
+            terminal=self._stored_event_dict(record.terminal),
+            created=record.terminal_created,
+            status=status,
+            assistant_persisted=assistant_persisted,
+            assistant_content=record.assistant_content,
+            reconciled=reconciled,
+        )
+
+    def record_terminal_persist_failure(self, run_id: str) -> None:
+        """Mark a run whose terminal event could not be made durable.
+
+        Best effort: the stream is already closing, so a failure here is
+        logged and the snapshot falls back to "terminal status without a
+        persisted terminal event" = ``terminal_persist_failed``.
+        """
+        try:
+            self.control.mark_terminal_persist_failed(run_id)
+        except Exception:
+            logger.exception(
+                "finalize_run: could not mark terminal_persist_failed for "
+                "run_id=%s",
+                run_id,
+            )
+
+    def get_replay_events(
+        self,
+        *,
+        run_id: str,
+        from_seq: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Replay events plus a stable synthetic terminal when needed.
+
+        A terminal run whose terminal event was never persisted (write
+        failure, hard crash) must not replay as an endless running stream.
+        This returns a DETERMINISTIC synthetic terminal (stable event_id
+        and sequence derived from the run row) with a stable
+        ``terminal_persist_failed`` (or ``cancelled``/``admission_failed``)
+        explanation. Nothing is written, so repeated reads agree.
+        """
+        events = self.get_events_since(run_id=run_id, from_seq=from_seq)
+        run = self.control.get_run(run_id)
+        if run is None or run.status not in _REPLAY_TERMINAL_STATUSES:
+            return events
+        all_events = (
+            events
+            if from_seq == 0
+            else self.get_events_since(run_id=run_id, from_seq=0)
+        )
+        if any(event["type"] in _RUN_TERMINAL_TYPES for event in all_events):
+            return events
+        synthetic = self._synthetic_terminal_event(run)
+        if synthetic["sequence"] > from_seq:
+            events.append(synthetic)
+        return events
+
+    def _synthetic_terminal_event(self, run: RunRecord) -> dict[str, Any]:
+        """Stable replay terminal for a terminal run with no stored one."""
+        if run.status == "cancelled":
+            event_type = "cancelled"
+            marker = "cancelled"
+            payload: dict[str, Any] = {
+                "code": "cancelled",
+                "message": "运行已取消。",
+                "recoverable": False,
+            }
+        elif run.status == "admission_failed":
+            event_type = "error"
+            marker = "admission-failed"
+            payload = {
+                "code": "admission_failed",
+                "message": "请求未被接纳，未执行模型调用。",
+                "recoverable": True,
+            }
+        else:
+            event_type = "error"
+            marker = "terminal-persist-failed"
+            payload = {
+                "code": ExecutionErrorCode.TERMINAL_PERSIST_FAILED.value,
+                "message": (
+                    "运行已结束，但终态事件未能持久化；请以快照状态为准。"
+                ),
+                "recoverable": True,
+                "terminal_persisted": False,
+            }
+        payload["unknown_dropped"] = 0
+        return {
+            "version": "2",
+            "event_id": f"{run.run_id}:{marker}",
+            "sequence": self.checkpoints.get_last_sequence(run.run_id) + 1,
+            "run_id": run.run_id,
+            "conversation_id": run.conversation_id,
+            "timestamp": run.updated_at,
+            "type": event_type,
+            "request_id": run.request_id,
+            "payload": payload,
+        }
 
     # -- bounded conversation history for the model (Ticket 05 / T07) ---
 
@@ -1209,14 +1476,74 @@ class RunRepository:
         sequence_cursor = self.checkpoints.get_last_sequence(run_id)
         pending = self.checkpoints.get_pending_actions(run_id)
         policy_snapshot = self.control.get_policy_snapshot(run_id)
+        stored_terminal = self.checkpoints.get_terminal_event(run_id)
+
+        # Ticket 03: the persisted terminal event is authoritative for the
+        # user-visible status. A successful event commit whose control CAS
+        # failed must not read back as "still running"; a terminal control
+        # row without an event is explained as terminal_persist_failed.
+        control_status = run.status
+        status = control_status
+        terminal_type = run.terminal_type
+        state_reconciled = False
+        if (
+            stored_terminal is not None
+            and control_status not in _RUN_TERMINAL_TYPES
+            and control_status != "admission_failed"
+        ):
+            status = terminal_type = stored_terminal.event_type
+            state_reconciled = True
+        elif (
+            stored_terminal is not None
+            and control_status in _RUN_TERMINAL_TYPES
+            and control_status != stored_terminal.event_type
+        ):
+            status = terminal_type = stored_terminal.event_type
+            state_reconciled = True
+
+        terminal_payload: dict[str, Any] = {}
+        if stored_terminal is not None:
+            try:
+                decoded = json.loads(stored_terminal.payload_json)
+                if isinstance(decoded, dict):
+                    terminal_payload = decoded
+            except (TypeError, ValueError):
+                terminal_payload = {}
+        terminal_error_code = (
+            terminal_payload.get("code")
+            if stored_terminal is not None
+            and stored_terminal.event_type == "error"
+            else None
+        )
+        terminal_persist_failed = bool(run.terminal_persist_failed) or (
+            control_status in _RUN_TERMINAL_TYPES
+            and stored_terminal is None
+            and control_status != "cancelled"
+        )
+
+        error_code: str | None = None
+        if terminal_persist_failed:
+            error_code = ExecutionErrorCode.TERMINAL_PERSIST_FAILED.value
+        elif control_status == "admission_failed" and stored_terminal is None:
+            error_code = "admission_failed"
+        elif terminal_error_code:
+            error_code = str(terminal_error_code)
+        recoverable = bool(
+            terminal_persist_failed
+            or (
+                stored_terminal is not None
+                and stored_terminal.event_type == "error"
+                and terminal_payload.get("recoverable") is True
+            )
+        )
 
         return RunSnapshot(
             run_id=run.run_id,
             request_id=run.request_id,
             conversation_id=run.conversation_id,
             profile_id=run.profile_id,
-            status=run.status,
-            terminal_type=run.terminal_type,
+            status=status,
+            terminal_type=terminal_type,
             created_at=run.created_at,
             updated_at=run.updated_at,
             terminal_at=run.terminal_at,
@@ -1240,6 +1567,26 @@ class RunRepository:
                 if policy_snapshot is not None
                 else 0
             ),
+            control_status=control_status,
+            terminal_event_type=(
+                stored_terminal.event_type
+                if stored_terminal is not None
+                else None
+            ),
+            terminal_event_id=(
+                stored_terminal.event_id if stored_terminal is not None else ""
+            ),
+            terminal_event_sequence=(
+                stored_terminal.sequence if stored_terminal is not None else 0
+            ),
+            terminal_persisted=stored_terminal is not None,
+            terminal_persist_failed=terminal_persist_failed,
+            terminal_error_code=(
+                str(terminal_error_code) if terminal_error_code else None
+            ),
+            error_code=error_code,
+            recoverable=recoverable,
+            state_reconciled=state_reconciled,
         )
 
     # -- cancel ---------------------------------------------------------
@@ -1281,9 +1628,12 @@ class RunRepository:
 __all__ = [
     "ApprovalRecord",
     "ArtifactRecord",
+    "AssistantPersistFailure",
     "CancelOutcome",
+    "FinalizeResult",
     "RunAlreadyTerminal",
     "RunNotFound",
     "RunRepository",
     "RunSnapshot",
+    "TerminalPersistFailure",
 ]

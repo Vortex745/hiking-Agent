@@ -266,7 +266,9 @@ def test_conversation_write_failure_fails_closed_and_retry_repairs(
     assert second[0].payload["admission"]["status"] == "repaired"
     assert len(calls) == 1
     messages = repo.checkpoints.get_messages(conversation_id=run.conversation_id)
-    assert [m.role for m in messages] == ["user"]
+    # Ticket 03: the assistant reply is durable for the derived canonical
+    # conversation too (it no longer depends on a client conversation_id).
+    assert [m.role for m in messages] == ["user", "assistant"]
 
     # A further retry is a pure replay: no second model call.
     third = _stream(orch, "req-adm-convfail")
@@ -301,7 +303,11 @@ def test_user_message_write_failure_fails_closed_and_repairs_on_retry(
     assert second[-1].type == "done"
     assert len(calls) == 1
     messages = repo.checkpoints.get_messages(conversation_id=run.conversation_id)
-    assert [m.content for m in messages] == ["带什么装备？"]
+    # Ticket 03: user + assistant are both durable; no hardcoded sequence.
+    assert [m.role for m in messages] == ["user", "assistant"]
+    assert [m.sequence for m in messages] == [0, 1]
+    answer = next(e.payload["content"] for e in second if e.type == "text")
+    assert messages[1].content == answer
 
 
 def test_admission_repair_after_admitted_mark_failure_is_replayable(

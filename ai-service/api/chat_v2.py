@@ -573,6 +573,20 @@ async def chat_v2_snapshot(
         # replay explain which policy this run executed under).
         "policy_hash": snapshot.policy_hash,
         "policy_schema_version": snapshot.policy_schema_version,
+        # BCDEF ticket 03: terminal persistence / replay explanation. The
+        # persisted terminal event is authoritative; a terminal control row
+        # without one is exposed as ``terminal_persist_failed`` (additive
+        # fields — existing clients ignore them).
+        "control_status": snapshot.control_status,
+        "terminal_event_type": snapshot.terminal_event_type,
+        "terminal_event_id": snapshot.terminal_event_id,
+        "terminal_event_sequence": snapshot.terminal_event_sequence,
+        "terminal_persisted": snapshot.terminal_persisted,
+        "terminal_persist_failed": snapshot.terminal_persist_failed,
+        "terminal_error_code": snapshot.terminal_error_code,
+        "error_code": snapshot.error_code,
+        "recoverable": snapshot.recoverable,
+        "state_reconciled": snapshot.state_reconciled,
     }
 
 

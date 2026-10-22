@@ -121,7 +121,12 @@ CREATE TABLE IF NOT EXISTS runs (
     terminal_type TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    terminal_at TEXT
+    terminal_at TEXT,
+    -- BCDEF ticket 03: set when the run is terminal but its terminal
+    -- event could not be durably written. Snapshot/replay surface it as
+    -- ``terminal_persist_failed``; the row keeps its terminal status so
+    -- the run can never be resumed or re-executed.
+    terminal_persist_failed INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_conversation ON runs(conversation_id);
@@ -329,6 +334,7 @@ class RunRecord:
     created_at: str
     updated_at: str
     terminal_at: str | None
+    terminal_persist_failed: bool = False
 
     @property
     def is_terminal(self) -> bool:
@@ -545,7 +551,19 @@ class ControlStore:
         self.db_path = db_path
         self._conn = _connect(db_path)
         self._conn.executescript(_CONTROL_SCHEMA)
+        self._migrate_terminal_persist_failed()
         logger.info("ControlStore ready at %s", db_path)
+
+    def _migrate_terminal_persist_failed(self) -> None:
+        """Add the ticket 03 marker column to pre-existing runs tables."""
+        columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(runs)")
+        }
+        if "terminal_persist_failed" not in columns:
+            self._conn.execute(
+                "ALTER TABLE runs ADD COLUMN terminal_persist_failed "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
 
     def close(self) -> None:
         self._conn.close()
@@ -610,7 +628,106 @@ class ControlStore:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             terminal_at=row["terminal_at"],
+            terminal_persist_failed=bool(row["terminal_persist_failed"]),
         )
+
+    # -- terminal fence (BCDEF ticket 03) -------------------------------
+
+    def finalize_run_status(
+        self,
+        *,
+        run_id: str,
+        terminal_type: str,
+    ) -> tuple[str, bool]:
+        """CAS a run to its terminal status after the durable event commit.
+
+        Returns ``(status, transitioned)``. Re-applying the SAME terminal
+        is an idempotent no-op (``transitioned=False``) so duplicate
+        finalize calls cannot create a second terminal or resurrect a
+        finished run. A DIFFERENT terminal on an already-terminal run
+        raises :class:`RunAlreadyTerminal` — the first terminal wins.
+        """
+        if terminal_type not in ("done", "error", "cancelled"):
+            raise ValueError(f"invalid terminal type: {terminal_type!r}")
+        current = self.get_run(run_id)
+        if current is None:
+            raise RunNotFound(f"run_id={run_id}")
+        if current.is_terminal:
+            if current.status == terminal_type or current.terminal_type == terminal_type:
+                self._conn.execute(
+                    "UPDATE runs SET terminal_persist_failed = 0 WHERE run_id = ?",
+                    (run_id,),
+                )
+                return current.status, False
+            raise RunAlreadyTerminal(
+                f"run {run_id} already terminal "
+                f"(status={current.status}, type={current.terminal_type})"
+            )
+
+        now = _now_iso()
+        self._conn.execute("BEGIN")
+        try:
+            cursor = self._conn.execute(
+                "UPDATE runs SET status = ?, terminal_type = ?, updated_at = ?, "
+                "terminal_at = ?, terminal_persist_failed = 0 "
+                "WHERE run_id = ? AND status NOT IN "
+                "('done', 'error', 'cancelled', 'admission_failed')",
+                (terminal_type, terminal_type, now, now, run_id),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        if cursor.rowcount == 0:
+            # A concurrent writer won the CAS. Re-read: the same terminal
+            # is idempotent, a different one is a duplicate-terminal error.
+            refreshed = self.get_run(run_id)
+            if refreshed is None:
+                raise RunNotFound(f"run_id={run_id}")
+            if (
+                refreshed.status == terminal_type
+                or refreshed.terminal_type == terminal_type
+            ):
+                return refreshed.status, False
+            raise RunAlreadyTerminal(
+                f"run {run_id} already terminal "
+                f"(status={refreshed.status}, type={refreshed.terminal_type})"
+            )
+        return terminal_type, True
+
+    def mark_terminal_persist_failed(self, run_id: str) -> str:
+        """Record that the run's terminal event could not be persisted.
+
+        The run is moved to ``error`` (unless it already reached a
+        terminal status, which is preserved) and flagged so snapshot and
+        replay can expose a stable ``terminal_persist_failed`` state.
+        Idempotent.
+        """
+        current = self.get_run(run_id)
+        if current is None:
+            raise RunNotFound(f"run_id={run_id}")
+        if current.is_terminal:
+            self._conn.execute(
+                "UPDATE runs SET terminal_persist_failed = 1 WHERE run_id = ?",
+                (run_id,),
+            )
+            return current.status
+        now = _now_iso()
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute(
+                "UPDATE runs SET status = 'error', terminal_type = 'error', "
+                "updated_at = ?, terminal_at = ?, terminal_persist_failed = 1 "
+                "WHERE run_id = ? AND status NOT IN "
+                "('done', 'error', 'cancelled', 'admission_failed')",
+                (now, now, run_id),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        refreshed = self.get_run(run_id)
+        return refreshed.status if refreshed is not None else "error"
 
     # -- admission fence (BCDEF ticket 02) ------------------------------
 
@@ -861,6 +978,7 @@ class ControlStore:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             terminal_at=row["terminal_at"],
+            terminal_persist_failed=bool(row["terminal_persist_failed"]),
         )
 
     # -- cancel ---------------------------------------------------------
@@ -1879,6 +1997,31 @@ class StoredEvent:
     created_at: str
 
 
+@dataclass(frozen=True, slots=True)
+class FinalizeRecord:
+    """Result of the fused assistant + terminal write (ticket 03).
+
+    ``terminal`` is the authoritative persisted terminal — either the one
+    just written or the pre-existing one returned idempotently.
+    ``assistant_content`` is the content actually stored (an existing row
+    wins so replay never contradicts the first write).
+    """
+
+    terminal: StoredEvent
+    terminal_created: bool
+    assistant_message_id: str | None
+    assistant_sequence: int | None
+    assistant_content: str
+
+
+class AssistantMessagePersistenceError(RuntimeError):
+    """Raised when the assistant message of a finalize transaction fails."""
+
+
+class TerminalEventPersistenceError(RuntimeError):
+    """Raised when the terminal event of a finalize transaction fails."""
+
+
 class CheckpointsStore:
     """chat_checkpoints.sqlite — conversation + message + event history."""
 
@@ -1982,7 +2125,7 @@ class CheckpointsStore:
         conversation_id: str,
         run_id: str,
         content: str,
-        sequence: int = 0,
+        sequence: int | None = None,
     ) -> tuple[str, bool]:
         """Idempotently persist the ONE user message of ``run_id``.
 
@@ -1990,6 +2133,11 @@ class CheckpointsStore:
         the partial UNIQUE(run_id) WHERE role='user' index; the loser
         re-reads the winner's row, so a request_id can never accumulate a
         second user message.
+
+        ``sequence`` is derived from the conversation's existing messages
+        when omitted (ticket 03): a fresh conversation starts at 0, and a
+        follow-up run continues after the previous assistant message
+        instead of reusing 0.
         """
         row = self._conn.execute(
             "SELECT message_id FROM messages WHERE run_id = ? AND role = 'user' "
@@ -1998,6 +2146,8 @@ class CheckpointsStore:
         ).fetchone()
         if row is not None:
             return row["message_id"], False
+        if sequence is None:
+            sequence = self.get_next_message_sequence(conversation_id)
         try:
             message_id = self.append_message(
                 conversation_id=conversation_id,
@@ -2016,6 +2166,205 @@ class CheckpointsStore:
                 raise
             return row["message_id"], False
         return message_id, True
+
+    def get_next_message_sequence(self, conversation_id: str) -> int:
+        """Next free per-conversation message sequence (0 for a new one).
+
+        Message sequences order the user/assistant turns of ONE
+        conversation; every event sequence is per-run. Deriving instead
+        of hardcoding keeps a second run's user/assistant rows after the
+        first run's assistant row.
+        """
+        row = self._conn.execute(
+            "SELECT COALESCE(MAX(sequence), -1) AS max_seq FROM messages "
+            "WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        return int(row["max_seq"]) + 1
+
+    def get_assistant_message(self, run_id: str) -> MessageRecord | None:
+        """The ONE assistant message persisted for ``run_id``, if any."""
+        row = self._conn.execute(
+            "SELECT * FROM messages WHERE run_id = ? AND role = 'assistant' "
+            "ORDER BY rowid ASC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        return _row_to_message(row) if row is not None else None
+
+    def get_terminal_event(self, run_id: str) -> StoredEvent | None:
+        """The persisted run-lifecycle terminal of ``run_id``, if any.
+
+        ``run.paused`` is a stream terminal, not a run terminal, so it is
+        deliberately excluded.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM run_events WHERE run_id = ? "
+            "AND event_type IN ('done', 'error', 'cancelled') "
+            "ORDER BY sequence ASC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        return self._row_to_stored_event(row) if row is not None else None
+
+    def finalize_terminal(
+        self,
+        *,
+        run_id: str,
+        conversation_id: str,
+        request_id: str,
+        terminal_type: str,
+        payload: dict[str, Any],
+        sequence: int,
+        event_id: str | None = None,
+        timestamp: str | None = None,
+        assistant_content: str | None = None,
+    ) -> FinalizeRecord:
+        """Persist the assistant reply and the terminal event together.
+
+        Ticket 03 fence: the assistant message (when any) is written
+        exactly once with a derived conversation sequence, in the SAME
+        transaction as the terminal event. A failure in either half rolls
+        both back, so a terminal can never become durable before the
+        assistant it reports.
+
+        Idempotent: if the run already has a run-lifecycle terminal, that
+        row is returned unchanged (``terminal_created=False``) and only a
+        missing assistant row is backfilled. Duplicate finalizes therefore
+        cannot create a second terminal.
+        """
+        if terminal_type not in ("done", "error", "cancelled"):
+            raise ValueError(f"invalid terminal type: {terminal_type!r}")
+        eid = event_id or str(uuid.uuid4())
+        now = timestamp or _now_iso()
+        payload_json = json.dumps(payload, ensure_ascii=False)
+
+        self._conn.execute("BEGIN")
+        try:
+            existing = self.get_terminal_event(run_id)
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+
+        assistant_id: str | None = None
+        assistant_sequence: int | None = None
+        assistant_text = ""
+        try:
+            if assistant_content:
+                existing_assistant = self.get_assistant_message(run_id)
+                if existing_assistant is not None:
+                    assistant_id = existing_assistant.message_id
+                    assistant_sequence = existing_assistant.sequence
+                    assistant_text = existing_assistant.content
+                else:
+                    assistant_sequence = self.get_next_message_sequence(
+                        conversation_id
+                    )
+                    assistant_id = str(uuid.uuid4())
+                    self._conn.execute(
+                        "INSERT INTO messages "
+                        "(message_id, conversation_id, run_id, role, content, "
+                        " sequence, created_at) "
+                        "VALUES (?, ?, ?, 'assistant', ?, ?, ?)",
+                        (
+                            assistant_id,
+                            conversation_id,
+                            run_id,
+                            assistant_content,
+                            assistant_sequence,
+                            now,
+                        ),
+                    )
+                    self._conn.execute(
+                        "UPDATE conversations SET last_active_at = ? "
+                        "WHERE conversation_id = ?",
+                        (now, conversation_id),
+                    )
+                    assistant_text = assistant_content
+        except Exception as exc:
+            self._conn.execute("ROLLBACK")
+            raise AssistantMessagePersistenceError(
+                f"assistant message write failed for run_id={run_id}"
+            ) from exc
+
+        if existing is not None:
+            try:
+                self._conn.execute("COMMIT")
+            except Exception as exc:
+                self._conn.execute("ROLLBACK")
+                raise TerminalEventPersistenceError(
+                    f"could not commit finalize for run_id={run_id}"
+                ) from exc
+            return FinalizeRecord(
+                terminal=existing,
+                terminal_created=False,
+                assistant_message_id=assistant_id,
+                assistant_sequence=assistant_sequence,
+                assistant_content=assistant_text,
+            )
+
+        try:
+            inserted = self._insert_terminal_event(
+                event_id=eid,
+                run_id=run_id,
+                sequence=sequence,
+                event_type=terminal_type,
+                payload_json=payload_json,
+                request_id=request_id,
+                conversation_id=conversation_id,
+                created_at=now,
+            )
+            self._conn.execute("COMMIT")
+        except Exception as exc:
+            self._conn.execute("ROLLBACK")
+            raise TerminalEventPersistenceError(
+                f"terminal event write failed for run_id={run_id}"
+            ) from exc
+        return FinalizeRecord(
+            terminal=inserted,
+            terminal_created=True,
+            assistant_message_id=assistant_id,
+            assistant_sequence=assistant_sequence,
+            assistant_content=assistant_text,
+        )
+
+    def _insert_terminal_event(
+        self,
+        *,
+        event_id: str,
+        run_id: str,
+        sequence: int,
+        event_type: str,
+        payload_json: str,
+        request_id: str,
+        conversation_id: str,
+        created_at: str,
+    ) -> StoredEvent:
+        """Raw terminal insert inside the caller's transaction."""
+        self._conn.execute(
+            "INSERT INTO run_events "
+            "(event_id, run_id, sequence, event_type, payload_json, "
+            " request_id, conversation_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event_id,
+                run_id,
+                sequence,
+                event_type,
+                payload_json,
+                request_id,
+                conversation_id,
+                created_at,
+            ),
+        )
+        return StoredEvent(
+            event_id=event_id,
+            run_id=run_id,
+            sequence=sequence,
+            event_type=event_type,
+            payload_json=payload_json,
+            request_id=request_id,
+            conversation_id=conversation_id,
+            created_at=created_at,
+        )
 
     def clear_conversation(self, conversation_id: str) -> int:
         """Delete all messages of a conversation; return the removed count.
