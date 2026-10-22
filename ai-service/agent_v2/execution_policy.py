@@ -226,7 +226,14 @@ def freeze_settings(settings: Any, policy: Mapping[str, Any]) -> FrozenSettings:
 
 @dataclass(frozen=True, slots=True)
 class ResolvedPolicySnapshot:
-    """Validated view of one persisted policy snapshot."""
+    """Validated view of one persisted policy snapshot.
+
+    Ticket 09 adds the adapter provenance additively: ``schema_version``
+    and ``policy_hash`` describe the policy actually USED (the adapted
+    target), while ``source_schema_version``/``original_policy_hash``
+    preserve the stored identity for audit. Native snapshots report
+    ``adapter_id == "native"`` and an empty chain.
+    """
 
     run_id: str
     policy: Mapping[str, Any]
@@ -235,6 +242,11 @@ class ResolvedPolicySnapshot:
     source_version: str
     created_at: str
     compatibility: Mapping[str, Any]
+    source_schema_version: int = EXECUTION_SCHEMA_VERSION
+    adapter_id: str = "native"
+    adapted_at: str = ""
+    original_policy_hash: str = ""
+    adapter_chain: tuple[Mapping[str, Any], ...] = ()
 
     def profile(self) -> CapabilityProfile:
         return profile_from_policy(self.policy)
@@ -245,6 +257,18 @@ class ResolvedPolicySnapshot:
                 ExecutionErrorCode.POLICY_INCOMPATIBLE,
                 f"policy schema {self.schema_version} is not supported",
             )
+
+    def provenance_payload(self) -> dict[str, Any]:
+        """JSON-safe adapter provenance for snapshot/replay readers."""
+        return {
+            "source_schema_version": self.source_schema_version,
+            "target_schema_version": self.schema_version,
+            "adapter_id": self.adapter_id,
+            "adapted_at": self.adapted_at,
+            "source_policy_hash": self.original_policy_hash,
+            "target_policy_hash": self.policy_hash,
+            "adapter_chain": [dict(step) for step in self.adapter_chain],
+        }
 
 
 __all__ = [

@@ -9,6 +9,7 @@ the computer is a counting fake (no real sandbox, no network).
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
@@ -18,12 +19,19 @@ from typing import Any
 import pytest
 
 from agent_v2.approvals import compute_approval_id, compute_expiry
+from agent_v2.execution_contract import policy_hash
+from agent_v2.execution_policy import build_execution_policy
 from agent_v2.leases import (
     SandboxLeaseGuard,
     SandboxLeaseLostError,
     lease_is_expired,
 )
-from agent_v2.persistence import CheckpointsStore, ControlStore
+from agent_v2.persistence import (
+    CheckpointsStore,
+    ControlStore,
+    PolicySnapshotWrite,
+)
+from agent_v2.profiles import resolve_profile
 from agent_v2.run_orchestration import RunOrchestrator
 from agent_v2.runs import RunRepository
 
@@ -575,8 +583,23 @@ def _settings(**overrides: Any) -> Any:
     return SimpleNamespace(**base)
 
 
+def _seed_frozen_policy(repo: RunRepository, run_id: str, profile_id: str = "cowork") -> None:
+    """Ticket 09: a resumable run needs its admission-frozen policy snapshot."""
+    policy = build_execution_policy(resolve_profile(profile_id), _settings())
+    write = PolicySnapshotWrite(
+        policy_json=json.dumps(policy, sort_keys=True, separators=(",", ":")),
+        policy_hash=policy_hash(policy),
+        schema_version=policy["schema_version"],
+        source_version=policy["source_version"],
+        compatibility_json=json.dumps(policy["compatibility"]),
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+    repo.control.insert_policy_snapshot(run_id=run_id, policy=write)
+
+
 def _paused_cowork_state(repo: RunRepository, request_id: str, command: str = "echo hi") -> tuple[str, str]:
     run_id = _make_run(repo, request_id)
+    _seed_frozen_policy(repo, run_id)
     repo.acquire_sandbox_lease(
         run_id=run_id,
         owner_id="first-stream",

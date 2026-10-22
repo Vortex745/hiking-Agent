@@ -97,6 +97,7 @@ from agent_v2.leases import (
     SandboxLeaseGuard,
     SandboxLeaseLostError,
 )
+from agent_v2.policy_adapters import policy_error_payload
 from agent_v2.memory_tools import extract_sensitive_memory
 from agent_v2.observability import CapacityExceeded
 from agent_v2.permissions import PermissionDecision, PermissionGate
@@ -3153,6 +3154,65 @@ class RunOrchestrator:
             """Durable publish gate: raises when the event cannot persist."""
             return _emit_impl(event_type, payload, strict=True)
 
+        # BCDEF ticket 09: resolve the frozen execution policy through the
+        # versioned adapter chain BEFORE any continuation work. The resume
+        # uses the ADAPTED snapshot — never current config. An unusable
+        # snapshot (unknown version, hash mismatch, missing critical field,
+        # missing snapshot) terminates the run with a stable
+        # ``policy_incompatible``/``policy_snapshot_missing`` error and a
+        # ``next_action`` for janitor/manual handling. No model, effect or
+        # sandbox work happens after a failure here.
+        try:
+            resolved_policy = runs_repo.resolve_policy_snapshot(run_id)
+            resolved_policy.profile()  # capability reconstruction must succeed
+            policy_settings = freeze_settings(self._settings, resolved_policy.policy)
+        except BoundaryError as exc:
+            logger.error(
+                "run_orchestration: policy snapshot unusable during resume "
+                "for run_id=%s: %s",
+                run_id,
+                exc,
+            )
+            failure = policy_error_payload(exc)
+            failure["message"] = (
+                "运行策略快照无法安全恢复，已停止执行；"
+                "请等待人工或 janitor 处理。"
+            )
+            yield emit("error", failure)
+            mark_terminal_safe(runs_repo, run_id, "error")
+            return
+        except Exception:
+            logger.exception(
+                "run_orchestration: unexpected policy resolution failure "
+                "during resume for run_id=%s",
+                run_id,
+            )
+            yield emit("error", {
+                "code": "policy_incompatible",
+                "reason": "policy_snapshot_unreadable",
+                "recoverable": False,
+                "next_action": "janitor",
+                "message": "运行策略快照读取失败，已停止执行，等待 janitor 处理。",
+            })
+            mark_terminal_safe(runs_repo, run_id, "error")
+            return
+
+        if resolved_policy.source_schema_version != resolved_policy.schema_version:
+            # Ticket 09: a legacy snapshot was lifted. Record the provenance
+            # durably (progress is replayable) before the continuation. A
+            # crashed prior resume may already have persisted it — never
+            # duplicate the metadata.
+            already_recorded = any(
+                evt["type"] == "progress"
+                and evt["payload"].get("stage") == "policy.adapted"
+                for evt in all_events
+            )
+            if not already_recorded:
+                yield emit("progress", {
+                    "stage": "policy.adapted",
+                    **resolved_policy.provenance_payload(),
+                })
+
         # Look up the resolved approval that authorized this resume.
         approvals = runs_repo.list_approvals_for_run(run_id)
         resolved = next((a for a in approvals if a.is_terminal), None)
@@ -3408,7 +3468,7 @@ class RunOrchestrator:
                 try:
                     plan_text, plan_audit_entries = await _kernel_plan_turn(
                         kernel_turn=self._kernel_turn,
-                        settings=self._settings,
+                        settings=policy_settings,  # ticket 09: adapted frozen policy
                         checkpoint_store=self._kernel_checkpoints,
                         computer=computer,
                         workspace_path=workspace_path,

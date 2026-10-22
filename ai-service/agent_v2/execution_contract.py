@@ -898,6 +898,17 @@ def get_adapter(
     return _LEGACY_ADAPTERS.get((from_version, to_version))
 
 
+def registered_adapter_pairs() -> tuple[tuple[int, int], ...]:
+    """Return the registered ``(from_version, to_version)`` pairs, sorted.
+
+    Ticket 09 needs this to resolve a multi-hop adapter chain without
+    reaching into the registry's private mapping. The registry itself is
+    still the single source of truth and duplicate registration still
+    fails.
+    """
+    return tuple(sorted(_LEGACY_ADAPTERS))
+
+
 def adapt_legacy_run_status(value: str) -> RunStatus:
     """Map a stored run status to :class:`RunStatus`.
 
