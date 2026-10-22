@@ -498,6 +498,7 @@ async def _kernel_plan_turn(
     workspace_path: str,
     message: str,
     run_id: str | None,
+    lease_guard: Any | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Run the plan-writing kernel turn over the run-scoped sandbox bridge.
 
@@ -505,6 +506,10 @@ async def _kernel_plan_turn(
     merges the kernel's own audits with the sandbox tools' audits, ready
     for :func:`_tool_result_payloads`. Kernel failures propagate as
     ``KernelModelFailure``; the caller maps them to its own terminal.
+
+    Ticket 06: when ``lease_guard`` is supplied every sandbox command
+    (read/write/run) revalidates the durable active lease + fencing token
+    before touching the sandbox.
     """
     from agent_v2.kernel_tools import (
         ProductSandboxBridge,
@@ -512,7 +517,9 @@ async def _kernel_plan_turn(
         SandboxWriteTool,
     )
 
-    bridge = ProductSandboxBridge(computer, workspace_path)
+    bridge = ProductSandboxBridge(
+        computer, workspace_path, lease_guard=lease_guard
+    )
     sandbox_audits: list[dict[str, Any]] = []
     sandbox_tools = (
         SandboxReadTool(bridge=bridge, run_id=run_id, audit_sink=sandbox_audits.append),
@@ -1412,6 +1419,65 @@ class RunOrchestrator:
         self._sandbox_cleanup = sandbox_cleanup
         self._gate_factory = gate_factory
 
+    def _acquire_sandbox_lease(
+        self,
+        *,
+        run_id: str | None,
+        computer: Computer,
+        workspace_path: str,
+    ) -> tuple[SandboxLeaseGuard | None, str | None, str]:
+        """Acquire the durable active sandbox lease (BCDEF ticket 06).
+
+        Returns ``(guard, error_code, error_message)``. A persistence
+        failure, a non-active lease, or an expired lease fails closed:
+        the caller emits the stable error, cleans the workspace, and
+        terminates instead of executing unleased.
+
+        With persistence disabled (``runs_repo is None``) no durable
+        lease exists, so the legacy non-persistent mode returns
+        ``(None, None, "")``.
+        """
+        runs_repo = self._runs_repo
+        if runs_repo is None or run_id is None:
+            return None, None, ""
+        owner_id = f"sandbox-owner:{uuid.uuid4().hex}"
+        try:
+            lease, _acquired = runs_repo.acquire_sandbox_lease(
+                run_id=run_id,
+                owner_id=owner_id,
+                sandbox_type=computer.sandbox_type,
+                workspace_path=workspace_path,
+                sandbox_identity=f"{computer.sandbox_type}:{workspace_path}",
+                ttl_seconds=SANDBOX_LEASE_TTL_SECONDS,
+            )
+        except Exception:
+            logger.exception(
+                "run_orchestration: acquire_sandbox_lease failed for "
+                "run_id=%s; refusing to execute unleased (workspace=%s)",
+                run_id, workspace_path,
+            )
+            return None, "sandbox_lease_unavailable", (
+                "无法获得持久沙箱租约，已停止执行。"
+            )
+        if lease is None or lease.status != "active":
+            return None, "sandbox_lease_unavailable", (
+                "沙箱租约不可用（未激活），已停止执行。"
+            )
+        if lease.is_expired():
+            runs_repo.expire_sandbox_lease(run_id)
+            return None, "lease_expired", (
+                "沙箱租约已过期，无法继续执行。"
+            )
+        guard = SandboxLeaseGuard(
+            runs_repo,
+            run_id=run_id,
+            fencing_token=lease.fencing_token,
+            lease_id=lease.lease_id,
+            owner_id=owner_id,
+            ttl_seconds=SANDBOX_LEASE_TTL_SECONDS,
+        )
+        return guard, None, ""
+
     def _export_artifact(
         self,
         *,
@@ -2063,20 +2129,17 @@ class RunOrchestrator:
             mark_terminal_safe(runs_repo, run_id, "error")
             return
 
-        # Persist the lease (best-effort).
-        if runs_repo is not None and run_id is not None:
-            try:
-                runs_repo.create_sandbox_lease(
-                    run_id=run_id,
-                    sandbox_type=computer.sandbox_type,
-                    workspace_path=workspace_path,
-                )
-            except Exception:
-                logger.exception(
-                    "run_orchestration: create_sandbox_lease failed for "
-                    "run_id=%s; continuing without lease record (workspace=%s)",
-                    run_id, workspace_path,
-                )
+        # BCDEF ticket 06: acquire the durable active lease BEFORE the
+        # planner/pause flow. Failure is terminal — never hold an
+        # unleased sandbox.
+        lease_guard, lease_error, lease_message = self._acquire_sandbox_lease(
+            run_id=run_id, computer=computer, workspace_path=workspace_path
+        )
+        if lease_error is not None:
+            self._sandbox_cleanup(computer, workspace_path, runs_repo, run_id)
+            yield emit("error", {"code": lease_error, "message": lease_message})
+            mark_terminal_safe(runs_repo, run_id, "error")
+            return
 
         # Ticket 31: the bash command is planned by the real UniHarness
         # model loop (a non-executing turn — the planner has no shell
@@ -2311,22 +2374,16 @@ class RunOrchestrator:
             mark_terminal_safe(runs_repo, run_id, "error")
             return
 
-        # Persist the lease (best-effort). Lease persistence failure does not
-        # block the run — the workspace path is logged so operators can find
-        # the sandbox manually if the lease row is missing.
-        if runs_repo is not None and run_id is not None:
-            try:
-                runs_repo.create_sandbox_lease(
-                    run_id=run_id,
-                    sandbox_type=computer.sandbox_type,
-                    workspace_path=workspace_path,
-                )
-            except Exception:
-                logger.exception(
-                    "run_orchestration: create_sandbox_lease failed for "
-                    "run_id=%s; continuing without lease record (workspace=%s)",
-                    run_id, workspace_path,
-                )
+        # BCDEF ticket 06: acquire the durable active lease BEFORE any
+        # sandbox work. Failure is terminal — never execute unleased.
+        lease_guard, lease_error, lease_message = self._acquire_sandbox_lease(
+            run_id=run_id, computer=computer, workspace_path=workspace_path
+        )
+        if lease_error is not None:
+            self._sandbox_cleanup(computer, workspace_path, runs_repo, run_id)
+            yield emit("error", {"code": lease_error, "message": lease_message})
+            mark_terminal_safe(runs_repo, run_id, "error")
+            return
 
         try:
             # Cancel check before tool_call.
@@ -2442,6 +2499,7 @@ class RunOrchestrator:
                     workspace_path=workspace_path,
                     message=req.message,
                     run_id=run_id,
+                    lease_guard=lease_guard,
                 )
             except KernelModelFailure as exc:
                 yield emit("error", {"code": exc.code, "message": exc.message})
@@ -2459,9 +2517,23 @@ class RunOrchestrator:
 
             # Generate PDF inside sandbox. Fail-closed: timeout/error → terminal.
             try:
+                if lease_guard is not None:
+                    lease_guard.assert_active()
                 relative_path = computer.generate_pdf(
                     workspace_path, plan_content, _ARTIFACT_FILENAME
                 )
+            except SandboxLeaseLostError as exc:
+                yield emit("tool_result", {
+                    "tool": "generate_pdf",
+                    "status": "error",
+                    "content": f"沙箱租约无效：{exc.message}",
+                })
+                yield emit("error", {
+                    "code": exc.code,
+                    "message": f"沙箱租约无效，已停止执行：{exc.message}",
+                })
+                mark_terminal_safe(runs_repo, run_id, "error")
+                return
             except SandboxTimeoutError as exc:
                 yield emit("tool_result", {
                     "tool": "generate_pdf",
@@ -2747,7 +2819,9 @@ class RunOrchestrator:
         )
         stream.advance_to(last_seq)
 
-        def emit(event_type: str, payload: dict[str, Any]) -> EventEnvelope:
+        def _emit_impl(
+            event_type: str, payload: dict[str, Any], *, strict: bool
+        ) -> EventEnvelope:
             envelope = stream.build(event_type, payload)
             try:
                 runs_repo.persist_event(
@@ -2761,6 +2835,11 @@ class RunOrchestrator:
                     timestamp=envelope.timestamp,
                 )
             except Exception:
+                if strict:
+                    # BCDEF ticket 04: a success tool_result may only be
+                    # published once the effect event is replayable; the
+                    # driver turns this raise into outcome_unknown.
+                    raise
                 logger.exception(
                     "run_orchestration: persist_event failed during resume "
                     "for run_id=%s seq=%d",
@@ -2789,6 +2868,13 @@ class RunOrchestrator:
                     )
             return envelope
 
+        def emit(event_type: str, payload: dict[str, Any]) -> EventEnvelope:
+            return _emit_impl(event_type, payload, strict=False)
+
+        def emit_required(event_type: str, payload: dict[str, Any]) -> EventEnvelope:
+            """Durable publish gate: raises when the event cannot persist."""
+            return _emit_impl(event_type, payload, strict=True)
+
         # Look up the resolved approval that authorized this resume.
         approvals = runs_repo.list_approvals_for_run(run_id)
         resolved = next((a for a in approvals if a.is_terminal), None)
@@ -2796,6 +2882,17 @@ class RunOrchestrator:
             yield emit("error", {
                 "code": "no_resolved_approval",
                 "message": "运行已恢复但未找到已解决的审批。",
+            })
+            mark_terminal_safe(runs_repo, run_id, "error")
+            return
+
+        # BCDEF ticket 06: revalidate the run status BEFORE continuing.
+        # Only a paused run (awaiting the decision) or a running run
+        # (decision recorded) may start sandbox work again.
+        if run.status not in ("paused", "running"):
+            yield emit("error", {
+                "code": "run_not_resumable",
+                "message": f"运行状态 {run.status} 不允许继续执行。",
             })
             mark_terminal_safe(runs_repo, run_id, "error")
             return
@@ -2864,6 +2961,63 @@ class RunOrchestrator:
             mark_terminal_safe(runs_repo, run_id, "error")
             return
 
+        # BCDEF ticket 06: an expired lease cannot be renewed by the old
+        # worker and must NOT be silently bypassed with a new sandbox.
+        if lease.is_expired():
+            runs_repo.expire_sandbox_lease(run_id)
+            if not has_approval_resolved:
+                yield emit("approval.resolved", {
+                    "approval_id": resolved.approval_id,
+                    "tool": resolved.tool_name,
+                    "decision": "approve",
+                    "status": resolved.status,
+                    "message": "用户已批准操作，继续执行。",
+                })
+            yield emit("error", {
+                "code": "lease_expired",
+                "message": (
+                    "沙箱租约已过期，无法安全恢复运行；请重新发起请求。"
+                ),
+            })
+            mark_terminal_safe(runs_repo, run_id, "error")
+            return
+
+        # Revalidate the lease generation (heartbeat under the CURRENT
+        # fencing token). A stale token or a lost row fails closed.
+        lease_owner = f"resume:{uuid.uuid4().hex}"
+        renewed_lease, lease_renewed = runs_repo.renew_sandbox_lease(
+            run_id=run_id,
+            fencing_token=lease.fencing_token,
+            owner_id=lease_owner,
+            ttl_seconds=SANDBOX_LEASE_TTL_SECONDS,
+        )
+        if not lease_renewed or renewed_lease is None:
+            if not has_approval_resolved:
+                yield emit("approval.resolved", {
+                    "approval_id": resolved.approval_id,
+                    "tool": resolved.tool_name,
+                    "decision": "approve",
+                    "status": resolved.status,
+                    "message": "用户已批准操作，继续执行。",
+                })
+            yield emit("error", {
+                "code": "sandbox_lease_lost",
+                "message": (
+                    "沙箱租约已被其他执行者接管或失效，无法安全恢复运行。"
+                ),
+            })
+            mark_terminal_safe(runs_repo, run_id, "error")
+            return
+        lease = renewed_lease
+        lease_guard = SandboxLeaseGuard(
+            runs_repo,
+            run_id=run_id,
+            fencing_token=lease.fencing_token,
+            lease_id=lease.lease_id,
+            owner_id=lease_owner,
+            ttl_seconds=SANDBOX_LEASE_TTL_SECONDS,
+        )
+
         # Reconstruct the Computer bound to the leased workspace through
         # the injected factory (the adapter hook resolves the adapter
         # global lazily so contract-test monkeypatch points keep working).
@@ -2909,10 +3063,13 @@ class RunOrchestrator:
             if resolved.tool_name == "sandbox_bash":
                 async for envelope in self._resume_cowork_bash_steps(
                     emit=emit,
+                    emit_required=emit_required,
                     runs_repo=runs_repo,
                     run_id=run_id,
                     computer=computer,
                     workspace_path=workspace_path,
+                    lease=lease,
+                    lease_guard=lease_guard,
                     resolved=resolved,
                     approved_args=approved_args,
                     has_tool_call=has_tool_call,
@@ -2979,6 +3136,7 @@ class RunOrchestrator:
                         workspace_path=workspace_path,
                         message=user_message,
                         run_id=run_id,
+                        lease_guard=lease_guard,
                     )
                 except KernelModelFailure as exc:
                     yield emit("error", {"code": exc.code, "message": exc.message})
@@ -2991,6 +3149,10 @@ class RunOrchestrator:
                 plan_content = plan_text
 
             def _execute_pdf() -> dict[str, Any]:
+                # Ticket 06: heartbeat + revalidate the fenced lease right
+                # before the sandbox side effect.
+                lease_guard.renew()
+                lease_guard.assert_active()
                 generated = computer.generate_pdf(
                     workspace_path, plan_content, artifact_filename
                 )
@@ -3011,6 +3173,10 @@ class RunOrchestrator:
                 execute=_execute_pdf,
                 emit=emit,
                 outcome=outcome,
+                emit_required=emit_required,
+                post_execute_check=lease_guard.assert_active,
+                lease_id=lease.lease_id,
+                fencing_token=lease.fencing_token,
             ):
                 yield envelope
             if outcome.status in ("failed", "outcome_unknown", "in_flight"):
@@ -3159,10 +3325,13 @@ class RunOrchestrator:
         self,
         *,
         emit: EmitEnvelope,
+        emit_required: EmitEnvelope,
         runs_repo: RunRepository,
         run_id: str,
         computer: Computer,
         workspace_path: str,
+        lease: Any,
+        lease_guard: SandboxLeaseGuard,
         resolved: ApprovalRecord,
         approved_args: dict[str, Any],
         has_tool_call: bool,
@@ -3206,6 +3375,10 @@ class RunOrchestrator:
         outcome = EffectDriveResult()
 
         def _execute_bash() -> dict[str, Any]:
+            # Ticket 06: heartbeat + revalidate the fenced lease right
+            # before the sandbox side effect.
+            lease_guard.renew()
+            lease_guard.assert_active()
             bash_result = computer.run_bash(
                 workspace_path,
                 bash_command,
@@ -3235,6 +3408,10 @@ class RunOrchestrator:
             execute=_execute_bash,
             emit=emit,
             outcome=outcome,
+            emit_required=emit_required,
+            post_execute_check=lease_guard.assert_active,
+            lease_id=lease.lease_id,
+            fencing_token=lease.fencing_token,
         ):
             yield envelope
         if outcome.status in ("failed", "outcome_unknown", "in_flight"):
@@ -3466,6 +3643,21 @@ class RunOrchestrator:
                     "message": (
                         "沙箱租赁已丢失或销毁，无法安全恢复运行（spec AC7）。"
                         "请重新发起请求。"
+                    ),
+                },
+            )
+        # BCDEF ticket 06: an expired lease cannot authorize a resume;
+        # surface a stable lease_expired reason and leave the decision
+        # unrecorded (the run stays paused for reconciliation).
+        if lease.is_expired():
+            runs_repo.expire_sandbox_lease(approval.run_id)
+            return ApprovalDecisionOutcome(
+                status="sandbox_lease_lost",
+                payload={
+                    "approval_id": approval_id,
+                    "reason": "lease_expired",
+                    "message": (
+                        "沙箱租约已过期，无法安全恢复运行；请重新发起请求。"
                     ),
                 },
             )
