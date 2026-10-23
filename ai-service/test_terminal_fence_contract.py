@@ -19,6 +19,9 @@ snapshot/events):
 from __future__ import annotations
 
 import asyncio
+import json
+import sqlite3
+import threading
 from typing import Any
 
 import pytest
@@ -292,6 +295,305 @@ def test_status_cas_failure_reconciles_snapshot_without_second_terminal(tmp_path
         assert terminals[0]["event_id"] == result.terminal["event_id"]
     finally:
         repo.close()
+
+
+# ---- S2: one durable terminal per run at the repository seam ----------------
+
+
+def _terminal_rows(path: str, run_id: str) -> list[tuple[str, int, str]]:
+    """Read the durable terminals with an independent connection."""
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        return [
+            (row["event_id"], row["sequence"], row["event_type"])
+            for row in conn.execute(
+                "SELECT event_id, sequence, event_type FROM run_events"
+                " WHERE run_id = ? AND event_type IN ('cancelled', 'done', 'error') "
+                "ORDER BY sequence",
+                (run_id,),
+            )
+        ]
+    finally:
+        conn.close()
+
+
+def _assistant_rows(path: str, run_id: str) -> list[str]:
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        return [
+            row["content"]
+            for row in conn.execute(
+                "SELECT content FROM messages WHERE run_id = ? AND role = 'assistant'"
+                " ORDER BY rowid",
+                (run_id,),
+            )
+        ]
+    finally:
+        conn.close()
+
+
+def _race_repos(tmp_path):
+    """TWO repositories = two independent connections over the same files."""
+    return [_repo(tmp_path) for _ in range(2)]
+
+
+def test_two_connections_racing_finalize_produce_one_terminal(tmp_path):
+    creator = _repo(tmp_path)
+    try:
+        run_id = _admit(creator, request_id="req-race")
+    finally:
+        creator.close()
+
+    checkpoints_path = str(tmp_path / "ckpt.sqlite")
+    repos = _race_repos(tmp_path)
+    barrier = threading.Barrier(2)
+    results: list[Any] = []
+    errors: list[BaseException] = []
+
+    def worker(index: int, repo: RunRepository) -> None:
+        try:
+            barrier.wait(timeout=10)
+            results.append(
+                repo.finalize_run(
+                    run_id=run_id,
+                    request_id="req-race",
+                    terminal_type="done" if index == 0 else "cancelled",
+                    payload={"code": "done" if index == 0 else "cancelled"},
+                    sequence=2 if index == 0 else 5,
+                    assistant_content=f"答案-{index}",
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - failure evidence
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=worker, args=(index, repo))
+        for index, repo in enumerate(repos)
+    ]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+
+        assert not errors, errors
+        assert len(results) == 2
+        # One terminal row, and both callers were handed THAT row.
+        terminals = _terminal_rows(checkpoints_path, run_id)
+        assert len(terminals) == 1
+        assert {result.terminal["event_id"] for result in results} == {terminals[0][0]}
+        assert {result.terminal["sequence"] for result in results} == {terminals[0][1]}
+        assert sorted(result.created for result in results) == [False, True]
+
+        # The loser committed nothing: exactly one assistant message, and it
+        # is the winner's — never a half of the losing attempt.
+        assistants = _assistant_rows(checkpoints_path, run_id)
+        winner = next(result for result in results if result.created)
+        loser = next(result for result in results if not result.created)
+        assert assistants == [winner.assistant_content]
+        assert {"答案-0", "答案-1"} - set(assistants) == (
+            {"答案-1"} if winner.assistant_content == "答案-0" else {"答案-0"}
+        )
+        # Both callers report the same durable answer they can show the user.
+        assert loser.assistant_content == winner.assistant_content
+        assert loser.assistant_persisted is True
+
+        replay = repos[0].get_replay_events(run_id=run_id)
+        assert [e["type"] for e in replay if e["type"] in TERMINALS] == [
+            terminals[0][2]
+        ]
+        assert replay[-1]["event_id"] == winner.terminal["event_id"]
+    finally:
+        for repo in repos:
+            repo.close()
+
+
+def test_a_later_done_never_overrides_an_earlier_durable_error(tmp_path):
+    """The canonical is the earliest terminal, whoever wrote it."""
+    first = _repo(tmp_path)
+    second = _repo(tmp_path)
+    try:
+        run_id = _admit(first, request_id="req-override")
+        written = _finalize(
+            first, run_id, terminal="error", sequence=3,
+            assistant="部分答案", request_id="req-override",
+        )
+        assert written.created is True
+
+        repeated = second.finalize_run(
+            run_id=run_id,
+            request_id="req-override",
+            terminal_type="done",
+            payload={"code": "done"},
+            sequence=9,
+            assistant_content="迟到的成功",
+        )
+
+        assert repeated.created is False
+        assert repeated.terminal["event_id"] == written.terminal["event_id"]
+        assert repeated.terminal["type"] == "error"
+        assert _terminal_rows(str(tmp_path / "ckpt.sqlite"), run_id) == [
+            (written.terminal["event_id"], 3, "error")
+        ]
+        assert _assistant_rows(str(tmp_path / "ckpt.sqlite"), run_id) == ["部分答案"]
+        assert repeated.assistant_content == "部分答案"
+
+        snapshot = second.get_snapshot(run_id)
+        assert snapshot is not None
+        assert snapshot.terminal_event_type == "error"
+        assert [m["content"] for m in snapshot.messages if m["role"] == "assistant"] == [
+            "部分答案"
+        ]
+        replay = second.get_replay_events(run_id=run_id)
+        assert [e["event_id"] for e in replay if e["type"] in TERMINALS] == [
+            written.terminal["event_id"]
+        ]
+    finally:
+        first.close()
+        second.close()
+
+
+def test_terminal_write_rejected_without_a_durable_canonical_is_a_failure(
+    tmp_path,
+):
+    """No persistent terminal → never pretend the finalize succeeded."""
+    repo = _repo(tmp_path)
+    try:
+        run_id = _admit(repo, request_id="req-seq-clash")
+        # Something else already owns sequence 2 of this run's stream.
+        repo.persist_event(
+            run_id=run_id, sequence=2, event_type="tool_result",
+            payload={"tool": "x", "ok": True}, request_id="req-seq-clash",
+            conversation_id="conv-req-seq-clash",
+        )
+
+        with pytest.raises(TerminalPersistFailure):
+            _finalize(repo, run_id, sequence=2, request_id="req-seq-clash")
+
+        assert _terminal_rows(str(tmp_path / "ckpt.sqlite"), run_id) == []
+        # The assistant half of the failed transaction is gone too.
+        assert _assistant_rows(str(tmp_path / "ckpt.sqlite"), run_id) == []
+        snapshot = repo.get_snapshot(run_id)
+        assert snapshot is not None
+        assert snapshot.terminal_persisted is False
+        assert snapshot.terminal_persist_failed is True
+    finally:
+        repo.close()
+
+
+def test_two_paused_events_of_one_run_are_both_durable(tmp_path):
+    """``run.paused`` is a stream terminal, not a run terminal.
+
+    The one-terminal-per-run constraint must not block the approval flow:
+    a run may pause, resume and pause again before it ends.
+    """
+    repo = _repo(tmp_path)
+    try:
+        run_id = _admit(repo, request_id="req-paused-twice")
+        for sequence in (2, 3):
+            repo.persist_event(
+                run_id=run_id,
+                sequence=sequence,
+                event_type="run.paused",
+                payload={"reason": "approval", "approval_id": f"ap-{sequence}"},
+                request_id="req-paused-twice",
+                conversation_id="conv-req-paused-twice",
+            )
+
+        events = repo.get_events_since(run_id=run_id, from_seq=0)
+        assert [e["type"] for e in events].count("run.paused") == 2
+        assert repo.checkpoints.get_terminal_event(run_id) is None
+        assert repo.get_run(run_id).status == "running"
+
+        # ...and the run still finalizes exactly once afterwards.
+        result = _finalize(repo, run_id, sequence=4, request_id="req-paused-twice")
+        assert result.created is True
+        assert _terminal_rows(str(tmp_path / "ckpt.sqlite"), run_id) == [
+            (result.terminal["event_id"], 4, "done")
+        ]
+    finally:
+        repo.close()
+
+
+def test_upgraded_legacy_run_reports_one_canonical_everywhere(tmp_path):
+    """Archive the conflicts, then first response, snapshot and replay agree."""
+    repo = _repo(tmp_path)
+    try:
+        run_id = _admit(repo, request_id="req-legacy-canonical")
+        canonical = _finalize(
+            repo, run_id, terminal="error", sequence=3,
+            assistant="部分答案", request_id="req-legacy-canonical",
+        )
+        path = repo.checkpoints.db_path
+        # A pre-S2 process left two more terminals behind.
+        conn = sqlite3.connect(path, isolation_level=None)
+        try:
+            conn.execute("BEGIN")
+            conn.execute("DROP INDEX idx_run_events_one_terminal")
+            for event_id, sequence, event_type in (
+                ("legacy-done", 6, "done"),
+                ("legacy-cancelled", 7, "cancelled"),
+            ):
+                conn.execute(
+                    "INSERT INTO run_events (event_id, run_id, sequence, event_type,"
+                    " payload_json, request_id, conversation_id, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (event_id, run_id, sequence, event_type,
+                     json.dumps({"code": event_type}), "req-legacy-canonical",
+                     "conv-req-legacy-canonical", "2026-01-01T00:00:00Z"),
+                )
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
+    finally:
+        repo.close()
+
+    reopened = _repo(tmp_path)
+    try:
+        assert _terminal_rows(path, run_id) == [
+            (canonical.terminal["event_id"], 3, "error")
+        ]
+        archived = reopened.checkpoints._conn.execute(
+            "SELECT event_id, canonical_event_id FROM run_event_terminal_archive"
+            " WHERE run_id = ? ORDER BY sequence",
+            (run_id,),
+        ).fetchall()
+        assert [row["event_id"] for row in archived] == [
+            "legacy-done", "legacy-cancelled",
+        ]
+        assert {row["canonical_event_id"] for row in archived} == {
+            canonical.terminal["event_id"]
+        }
+
+        snapshot = reopened.get_snapshot(run_id)
+        assert snapshot is not None
+        assert snapshot.terminal_event_type == "error"
+        assert snapshot.terminal_persisted is True
+        assert [m["content"] for m in snapshot.messages if m["role"] == "assistant"] == [
+            "部分答案"
+        ]
+
+        replay = reopened.get_replay_events(run_id=run_id)
+        terminals = [e for e in replay if e["type"] in TERMINALS]
+        assert [e["event_id"] for e in terminals] == [canonical.terminal["event_id"]]
+
+        again = reopened.finalize_run(
+            run_id=run_id,
+            request_id="req-legacy-canonical",
+            terminal_type="done",
+            payload={"code": "done"},
+            sequence=8,
+            assistant_content="部分答案",
+        )
+        assert again.created is False
+        assert again.terminal["event_id"] == canonical.terminal["event_id"]
+        assert again.terminal["sequence"] == snapshot.terminal_event_sequence
+        assert snapshot.terminal_event_id == canonical.terminal["event_id"]
+        assert again.assistant_content == "部分答案"
+    finally:
+        reopened.close()
 
 
 # ---- orchestration fence -----------------------------------------------------

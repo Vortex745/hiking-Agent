@@ -20,6 +20,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 import api.chat_v2 as chat_v2_module
+from agent_v2.execution_contract import BoundaryError
 from agent_v2.run_orchestration import ChatFlowRequest, RunOrchestrator
 from agent_v2.runs import RunRepository
 from test_run_orchestration_chat import (
@@ -414,6 +415,59 @@ def test_events_endpoint_replays_admission_failure_and_repair(tmp_path: Path, mo
     assert events[0]["type"] == "run_started"
     assert events[0]["payload"]["admission"]["status"] == "repaired"
     assert [e["type"] for e in events].count("done") == 1
+    assert len(calls) == 1
+
+
+def test_admission_failed_still_completes_only_via_dedicated_repair(
+    tmp_path: Path, monkeypatch,
+):
+    """S2 control: the terminal constraint changed nothing for admission.
+
+    ``admission_failed`` keeps its dedicated repair transition: a plain
+    finalize is refused, and the repair still supersedes the stale
+    admission error instead of stacking a second terminal on the run.
+    """
+    repo = _repo(tmp_path)
+    calls: list[dict[str, Any]] = []
+    _fail_once(
+        monkeypatch,
+        repo.control,
+        "mark_run_admitted",
+        RuntimeError("status write failed"),
+    )
+    orch = _orchestrator(repo, calls)
+
+    first = _stream(orch, "req-adm-one-terminal")
+    assert [e.type for e in first] == ["run_started", "error"]
+    run = repo.control.get_run_by_request("req-adm-one-terminal")
+    assert run is not None and run.status == "admission_failed"
+    stored = repo.get_events_since(run_id=run.run_id, from_seq=0)
+    assert [e["type"] for e in stored] == ["run_started", "error"]
+
+    # Finalize is not an admission repair: refused before any write.
+    with pytest.raises(BoundaryError):
+        repo.finalize_run(
+            run_id=run.run_id,
+            request_id="req-adm-one-terminal",
+            terminal_type="done",
+            payload={"code": "done"},
+            sequence=3,
+            assistant_content="不该出现的答案",
+        )
+    assert [
+        e["type"] for e in repo.get_events_since(run_id=run.run_id, from_seq=0)
+    ] == ["run_started", "error"]
+    assert repo.checkpoints.get_assistant_message(run.run_id) is None
+    assert calls == []
+
+    # The dedicated repair path still completes the run — with ONE terminal.
+    second = _stream(orch, "req-adm-one-terminal")
+    assert second[-1].type == "done"
+    assert second[0].payload["admission"]["repaired"] is True
+    replay = repo.get_replay_events(run_id=run.run_id)
+    terminals = [e for e in replay if e["type"] in TERMINALS]
+    assert [e["type"] for e in terminals] == ["done"]
+    assert repo.get_run(run.run_id).status == "done"
     assert len(calls) == 1
 
 
