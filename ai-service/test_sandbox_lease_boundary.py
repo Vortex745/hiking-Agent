@@ -882,3 +882,255 @@ def test_cleanup_release_is_idempotent_end_to_end(tmp_path):
         assert again.failure_reason is None
     finally:
         repo.close()
+
+
+# ---- ALR ticket 04: atomic settlement, fenced success, dedupe ----------------
+
+
+def _lease_with_run(repo: RunRepository, request_id: str, workspace: str):
+    run_id = _make_run(repo, request_id)
+    lease, _acquired = repo.acquire_sandbox_lease(
+        run_id=run_id,
+        owner_id=f"worker-{request_id}",
+        sandbox_type="local_native",
+        workspace_path=workspace,
+        sandbox_identity=f"local_native:{workspace}",
+    )
+    assert lease is not None and lease.status == "active"
+    return run_id, lease
+
+
+def test_real_cleanup_success_settles_the_original_failed_lease_to_destroyed(
+    tmp_path,
+):
+    """T04-04: a REAL cleanup success after a settled failure transitions
+    the ORIGINAL failed lease — same lease id, same workspace, same
+    generation — to ``destroyed`` / ``succeeded`` with the real usage and
+    the failure reason cleared, all in the one settlement (the fenced
+    transition ticket 06's retry builds on)."""
+    from agent_v2.sandbox_lifecycle import (
+        SandboxCleanupResult,
+        settle_terminal_cleanup,
+    )
+
+    repo = _repo(tmp_path)
+    try:
+        run_id, lease = _lease_with_run(repo, "req-04-fenced", "/ws/fenced")
+
+        # The failure settlement: failed lease + pending_janitor + task.
+        failure = SandboxCleanupResult.failure(
+            "cleanup failed: workspace locked",
+            partial_usage={"files_deleted": 2, "bytes_written": 10},
+        )
+        task_id = settle_terminal_cleanup(
+            repo,
+            computer=_FakeComputer(),
+            workspace_path="/ws/fenced",
+            run_id=run_id,
+            outcome=failure,
+        )
+        assert task_id is not None
+        failed = repo.get_sandbox_lease(run_id)
+        assert failed is not None
+        assert failed.status == "failed"
+        assert failed.cleanup_status == "pending_janitor"
+        assert failed.failure_reason
+
+        # The REAL success for the SAME original target.
+        success = SandboxCleanupResult.success(
+            {"duration_ms": 5, "files_deleted": 7, "bytes_written": 128}
+        )
+        settle_terminal_cleanup(
+            repo,
+            computer=_FakeComputer(),
+            workspace_path="/ws/fenced",
+            run_id=run_id,
+            outcome=success,
+        )
+
+        settled = repo.get_sandbox_lease(run_id)
+        assert settled is not None
+        assert settled.status == "destroyed"
+        assert settled.cleanup_status == "succeeded"
+        assert settled.cleanup_error is None
+        # The failure reason is cleared and the REAL success usage replaced
+        # the preserved partial usage.
+        assert settled.failure_reason is None
+        assert settled.resource_usage == {
+            "duration_ms": 5, "files_deleted": 7, "bytes_written": 128
+        }
+        # The ORIGINAL lease identity survives — no new generation, no
+        # forged token, and the janitor task association stands.
+        assert settled.lease_id == lease.lease_id
+        assert settled.fencing_token == lease.fencing_token
+        assert settled.janitor_task_id == task_id
+        rows = repo.control._conn.execute(
+            "SELECT COUNT(*) FROM sandbox_leases WHERE run_id = ?", (run_id,)
+        ).fetchone()[0]
+        assert rows == 1
+    finally:
+        repo.close()
+
+
+def test_success_settlement_for_a_stale_target_never_touches_the_successor(
+    tmp_path,
+):
+    """T04-04 (mismatch): a success attempt whose identity does NOT match
+    the current lease — a successor generation took the row over, or the
+    cleaned workspace is not the leased one — must not modify the
+    successor lease and must not forge a new generation."""
+    from agent_v2.sandbox_lifecycle import (
+        SandboxCleanupResult,
+        settle_terminal_cleanup,
+    )
+
+    repo = _repo(tmp_path)
+    try:
+        run_id, original = _lease_with_run(repo, "req-04-stale", "/ws/original")
+
+        failure = SandboxCleanupResult.failure("cleanup failed: locked")
+        settle_terminal_cleanup(
+            repo,
+            computer=_FakeComputer(),
+            workspace_path="/ws/original",
+            run_id=run_id,
+            outcome=failure,
+        )
+
+        # A successor generation takes the SAME row over (resume/retry).
+        successor, acquired = repo.acquire_sandbox_lease(
+            run_id=run_id,
+            owner_id="worker-successor",
+            sandbox_type="local_native",
+            workspace_path="/ws/successor",
+            sandbox_identity="local_native:/ws/successor",
+        )
+        assert acquired is True
+        assert successor is not None
+        assert successor.status == "active"
+        assert successor.fencing_token == original.fencing_token + 1
+        assert successor.lease_id != original.lease_id
+        # The successor inherits the row-level pending_janitor record from
+        # the failed generation (it re-records when IT settles) — but it
+        # has no failure of its own and no usage evidence.
+        assert successor.failure_reason is None
+        assert successor.resource_usage is None
+
+        # (a) The fenced storage primitive with the ORIGINAL identity is
+        # refused: the successor row is untouched.
+        record, settled = repo.settle_cleanup_success(
+            run_id=run_id,
+            lease_id=original.lease_id,
+            workspace_path="/ws/original",
+            sandbox_identity=original.sandbox_identity or "",
+            fencing_token=original.fencing_token,
+            resource_usage={"duration_ms": 1},
+        )
+        assert settled is False
+        assert record is not None
+        assert record.status == "active"
+        assert record.fencing_token == successor.fencing_token
+        assert record.lease_id == successor.lease_id
+        assert record.failure_reason is None  # successor has no failure to clear
+        assert record.resource_usage is None
+        assert record.cleanup_status != "succeeded"
+
+        # (b) The production lifecycle entry refuses a success for a
+        # workspace that is not the leased one — same protection from the
+        # orchestration side.
+        settle_terminal_cleanup(
+            repo,
+            computer=_FakeComputer(),
+            workspace_path="/ws/original",  # the stale, superseded target
+            run_id=run_id,
+            outcome=SandboxCleanupResult.success({"duration_ms": 1}),
+        )
+        after = repo.get_sandbox_lease(run_id)
+        assert after is not None
+        assert after.status == "active"
+        assert after.lease_id == successor.lease_id
+        assert after.fencing_token == successor.fencing_token
+        assert after.cleanup_status != "succeeded"
+        assert after.failure_reason is None
+        assert after.resource_usage is None
+        # No generation was forged and no second row exists.
+        rows = repo.control._conn.execute(
+            "SELECT COUNT(*) FROM sandbox_leases WHERE run_id = ?", (run_id,)
+        ).fetchone()[0]
+        assert rows == 1
+    finally:
+        repo.close()
+
+
+def test_duplicate_failure_settlement_keeps_exactly_one_active_dedupe_task(
+    tmp_path,
+):
+    """T04-03: settling the SAME failure repeatedly never produces a second
+    ACTIVE dedupe task — before and after the task is claimed — and the
+    settled lease facts stay stable (first-release evidence preserved)."""
+    from agent_v2.sandbox_lifecycle import (
+        SandboxCleanupResult,
+        settle_terminal_cleanup,
+    )
+
+    repo = _repo(tmp_path)
+    try:
+        run_id, _lease = _lease_with_run(repo, "req-04-dedupe", "/ws/dedupe")
+        failure = SandboxCleanupResult.failure(
+            "cleanup failed: locked",
+            partial_usage={"files_deleted": 1},
+        )
+
+        first = settle_terminal_cleanup(
+            repo, computer=_FakeComputer(), workspace_path="/ws/dedupe",
+            run_id=run_id, outcome=failure,
+        )
+        assert first is not None
+        assert len(repo.list_janitor_tasks(kind="cleanup")) == 1
+
+        # A duplicate settlement of the SAME failure reuses the task.
+        second = settle_terminal_cleanup(
+            repo, computer=_FakeComputer(), workspace_path="/ws/dedupe",
+            run_id=run_id, outcome=failure,
+        )
+        assert second == first
+        assert len(repo.list_janitor_tasks(kind="cleanup")) == 1
+        lease_after = repo.get_sandbox_lease(run_id)
+        assert lease_after is not None
+        assert lease_after.status == "failed"
+        assert lease_after.cleanup_status == "pending_janitor"
+        assert lease_after.janitor_task_id == first
+        assert lease_after.resource_usage == {"files_deleted": 1}
+
+        # While the task is CLAIMED its active dedupe key still collapses
+        # duplicates — and the claim fence itself keeps working.
+        claimed, won = repo.claim_janitor_task(first, owner="janitor-04")
+        assert won is True and claimed is not None
+        third = settle_terminal_cleanup(
+            repo, computer=_FakeComputer(), workspace_path="/ws/dedupe",
+            run_id=run_id, outcome=failure,
+        )
+        assert third == first
+        tasks = repo.list_janitor_tasks(kind="cleanup")
+        assert len(tasks) == 1
+        assert tasks[0].status == "claimed"
+
+        _record, released = repo.complete_janitor_task(
+            first, owner="janitor-04", expected_attempt=claimed.attempts
+        )
+        assert released is True
+
+        # Exactly one row total; the done row released its dedupe key, so
+        # the NEXT round of the same logical work may open a new task.
+        active = repo.control._conn.execute(
+            "SELECT COUNT(*) FROM janitor_tasks "
+            "WHERE kind = 'cleanup' AND dedupe_key IS NOT NULL"
+        ).fetchone()[0]
+        assert active == 0
+        rows = repo.control._conn.execute(
+            "SELECT COUNT(*) FROM janitor_tasks WHERE run_id = ?", (run_id,)
+        ).fetchone()[0]
+        assert rows == 1
+    finally:
+        repo.close()
+

@@ -1519,3 +1519,406 @@ def test_real_adapter_success_path_settles_lease_with_real_usage(
         reset_boundary_metrics()
 
 
+# ---- ALR ticket 04: atomic cleanup settlement under write faults -------------
+#
+# Ticket 03 made the failure settlement honest; ticket 04 makes it ATOMIC.
+# The durable facts of a failed terminal cleanup — the failed lease with
+# the preserved partial usage and failure reason, the ``pending_janitor``
+# cleanup record, and exactly one deduped janitor retry task carrying the
+# ORIGINAL target evidence — must commit TOGETHER in one control
+# transaction, or not at all. A write fault anywhere between those writes
+# must roll the whole settlement back, and a retry must then produce ONE
+# complete settlement for the original target.
+#
+# The fault enters through the REAL production HTTP cleanup-failure path
+# (real ASGI request → real ``_build_run_orchestrator`` wiring → real
+# ``_cleanup_sandbox`` adapter → real RunRepository over tmp SQLite) with
+# a controlled Computer whose physical teardown fails. The injection is
+# statement-level on the REAL connection: one actual SQL write raises
+# ``sqlite3.OperationalError`` at the chosen write point, which is
+# baseline-agnostic — the pre-fix code (one transaction per repository
+# call) keeps the earlier writes committed, the atomic settlement rolls
+# everything back together.
+
+
+class _SettlementWriteFault:
+    """Fail ONE real SQL write statement at a chosen settlement write point.
+
+    Wraps the REAL control connection of a real repository: every
+    statement is delegated to SQLite untouched until, after a statement
+    containing ``arm`` has executed, the first statement containing
+    ``fire`` raises ``sqlite3.OperationalError`` — the shape a real
+    mid-write disk failure produces. ``arm=None`` fires on the first
+    ``fire`` statement outright.
+    """
+
+    def __init__(self, store: ControlStore, arm: str, fire: str, message: str) -> None:
+        self._store = store
+        self._real = store._conn
+        self._arm = arm
+        self._fire = fire
+        self._message = message
+        self.armed = arm is None
+        self.fired = False
+        store._conn = self
+
+    def execute(self, sql: str, params: Any = ()) -> Any:
+        if not self.fired:
+            if self._arm is not None and self._arm in sql:
+                self.armed = True
+            if self.armed and self._fire in sql:
+                self.fired = True
+                raise sqlite3.OperationalError(self._message)
+        return self._real.execute(sql, params)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+    def restore(self) -> None:
+        self._store._conn = self._real
+
+
+def _settlement_facts(db_path: Path, run_id: str) -> dict[str, Any]:
+    """Every durable settlement fact, read through a SEPARATE connection.
+
+    A second connection only ever sees COMMITTED state — the external
+    view any other process would get, never the settling connection's
+    private transaction view.
+    """
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        lease = conn.execute(
+            "SELECT lease_id, status, cleanup_status, cleanup_error, "
+            "janitor_task_id, failure_reason, resource_usage_json, "
+            "fencing_token, workspace_path, sandbox_identity "
+            "FROM sandbox_leases WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        tasks = conn.execute(
+            "SELECT task_id, status, dedupe_key, evidence_json "
+            "FROM janitor_tasks WHERE dedupe_key = ?",
+            (f"cleanup:{run_id}",),
+        ).fetchall()
+    finally:
+        conn.close()
+    return {"lease": lease, "tasks": tasks}
+
+
+def _complete_failure_settlement_problems(facts: dict[str, Any], run_id: str) -> list[str]:
+    """Why ``facts`` is NOT the complete failure settlement (empty = it is)."""
+    problems: list[str] = []
+    lease, tasks = facts["lease"], facts["tasks"]
+    if lease is None:
+        return ["no lease row"]
+    if len(tasks) != 1:
+        problems.append(f"expected exactly 1 cleanup task, found {len(tasks)}")
+        return problems
+    task = tasks[0]
+    if task["status"] != "pending":
+        problems.append(f"task status {task['status']!r} != 'pending'")
+    evidence = json.loads(task["evidence_json"])
+    if lease["status"] != "failed":
+        problems.append(f"lease status {lease['status']!r} != 'failed'")
+    if lease["cleanup_status"] != "pending_janitor":
+        problems.append(f"cleanup_status {lease['cleanup_status']!r} != 'pending_janitor'")
+    if lease["janitor_task_id"] != task["task_id"]:
+        problems.append("lease is not associated with the janitor task")
+    if not lease["failure_reason"]:
+        problems.append("lease carries no failure reason")
+    if not lease["resource_usage_json"]:
+        problems.append("lease carries no preserved partial usage")
+    if evidence.get("run_id") != run_id:
+        problems.append("task evidence lost the run id")
+    if evidence.get("lease_id") != lease["lease_id"]:
+        problems.append("task evidence lost the ORIGINAL lease id")
+    if evidence.get("workspace_path") != lease["workspace_path"]:
+        problems.append("task evidence lost the ORIGINAL workspace")
+    if evidence.get("fencing_token") != lease["fencing_token"]:
+        problems.append("task evidence lost the ORIGINAL fencing token")
+    if not evidence.get("failure_reason"):
+        problems.append("task evidence lost the failure reason")
+    return problems
+
+
+def _untouched_state_problems(facts: dict[str, Any]) -> list[str]:
+    """Why ``facts`` is NOT the untouched pre-settlement state (empty = it is)."""
+    problems: list[str] = []
+    lease, tasks = facts["lease"], facts["tasks"]
+    if tasks:
+        problems.append(f"{len(tasks)} durable janitor task(s) exist")
+    if lease is None:
+        problems.append("no lease row")
+        return problems
+    if lease["status"] != "active":
+        problems.append(f"lease status {lease['status']!r} != 'active'")
+    if lease["cleanup_status"] is not None:
+        problems.append(f"cleanup_status {lease['cleanup_status']!r} is set")
+    if lease["janitor_task_id"] is not None:
+        problems.append("janitor_task_id is set")
+    if lease["failure_reason"] is not None:
+        problems.append("failure_reason is set")
+    if lease["resource_usage_json"] is not None:
+        problems.append("resource_usage is set")
+    return problems
+
+
+def _assert_all_or_nothing(facts: dict[str, Any], run_id: str) -> None:
+    """The atomicity invariant (T04-02): the durable facts are either the
+    COMPLETE failure settlement or the untouched pre-settlement state —
+    anything else is a half-settled bug (orphan task / unrecorded
+    failure)."""
+    settled = _complete_failure_settlement_problems(facts, run_id)
+    untouched = _untouched_state_problems(facts)
+    if settled and untouched:
+        pytest.fail(
+            "half-settled cleanup settlement — durable facts match neither "
+            f"the complete state ({settled}) nor the untouched state ({untouched})"
+        )
+
+
+def _retry_terminal_cleanup_through_production_entry(
+    assembly: "_RealAssembly", computer: Any, run_id: str
+) -> None:
+    """Re-enter the production settlement the HTTP finally block uses.
+
+    The run is already terminal (resume is replay-only), so the retry is
+    the same production entry the finally block calls — the real cleanup
+    adapter over the controlled Computer, then the durable settlement.
+    """
+    lease = assembly.repo.get_sandbox_lease(run_id)
+    assert lease is not None
+    orch = RunOrchestrator(
+        settings=chat_v2_module.settings,
+        runs_repo=assembly.repo,
+        computer_factory=lambda *a, **k: computer,
+        sandbox_cleanup=chat_v2_module._cleanup_sandbox,
+        gate_factory=None,
+    )
+    orch._run_terminal_cleanup(computer, lease.workspace_path, assembly.repo, run_id)
+
+
+def _drive_to_approved_resume(assembly: "_RealAssembly", request_id: str) -> tuple[str, list[dict[str, Any]]]:
+    """First stream → pause → approve; the RESUME is the caller's to drive."""
+    frames = assembly.stream(request_id)
+    assert _types(frames)[-1] == "run.paused", _types(frames)
+    run_id, approval_id = assembly.paused_approval(request_id)
+    assembly.decide(approval_id, request_id=f"dec-{request_id}")
+    return run_id, []
+
+
+def _faulted_cleanup_failure_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    request_id: str,
+    arm: str | None,
+    fire: str,
+    message: str,
+) -> tuple[Any, "_RealAssembly", str, "_SettlementWriteFault"]:
+    """Drive the REAL HTTP cleanup-failure path with one injected write fault.
+
+    Returns ``(computer, assembly, run_id, fault)`` — the fault has fired
+    and been restored by the time the HTTP resume returns.
+    """
+    from agent_v2.computer import LocalNativeComputer
+
+    computer = _CountingCleanupFailureComputer(
+        LocalNativeComputer(failure_mode="cleanup")
+    )
+    assembly = _RealAssembly(tmp_path, monkeypatch, computer=computer)
+    run_id, _ = _drive_to_approved_resume(assembly, request_id)
+    fault = _SettlementWriteFault(assembly.repo.control, arm, fire, message)
+    return computer, assembly, run_id, fault
+
+
+def test_cleanup_failure_between_task_and_lease_writes_settles_all_or_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """T04-02 (the ticket demo): a write fault BETWEEN the janitor task
+    insert and the failed-lease write must roll the whole settlement back
+    — never a durable orphan task for a lease that was never marked
+    failed. A retry then produces exactly ONE complete settlement for the
+    ORIGINAL target."""
+    reset_boundary_metrics()
+    computer, assembly, run_id, fault = _faulted_cleanup_failure_run(
+        tmp_path,
+        monkeypatch,
+        request_id="alr04-between-task-lease",
+        arm="INSERT INTO janitor_tasks",
+        fire="UPDATE sandbox_leases SET status = ?",
+        message="injected disk failure: between janitor task insert and "
+        "failed lease write",
+    )
+    try:
+        resumed = assembly.resume(run_id)
+        fault.restore()
+
+        # The physical teardown really ran and failed, and the original
+        # terminal stands — a settlement fault never rewrites it.
+        assert _types(resumed)[-1] == "done", _types(resumed)
+        assert assembly.repo.get_run(run_id).status == "done"
+        assert computer.cleanup_calls
+
+        _assert_all_or_nothing(_settlement_facts(tmp_path / "control.sqlite", run_id), run_id)
+        # The rolled-back settlement claimed no durable backlog either.
+        assert get_boundary_metrics().snapshot()["cleanup_pending"] == 0
+
+        # Retry through the production entry: exactly ONE complete
+        # settlement for the ORIGINAL target.
+        _retry_terminal_cleanup_through_production_entry(assembly, computer, run_id)
+        facts = _settlement_facts(tmp_path / "control.sqlite", run_id)
+        assert _complete_failure_settlement_problems(facts, run_id) == []
+        assert get_boundary_metrics().snapshot()["cleanup_pending"] == 1
+    finally:
+        fault.restore()
+        assembly.close()
+        reset_boundary_metrics()
+
+
+def test_cleanup_failure_between_lease_and_cleanup_writes_settles_all_or_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """T04-02: a write fault BETWEEN the failed-lease write and the
+    ``pending_janitor`` cleanup record must roll the whole settlement
+    back — never a failed lease without its pending_janitor record and
+    task association."""
+    reset_boundary_metrics()
+    computer, assembly, run_id, fault = _faulted_cleanup_failure_run(
+        tmp_path,
+        monkeypatch,
+        request_id="alr04-between-lease-cleanup",
+        arm="UPDATE sandbox_leases SET status = ?",
+        fire="UPDATE sandbox_leases SET cleanup_status = ?",
+        message="injected disk failure: between failed lease write and "
+        "pending_janitor cleanup record",
+    )
+    try:
+        resumed = assembly.resume(run_id)
+        fault.restore()
+
+        assert _types(resumed)[-1] == "done", _types(resumed)
+        assert assembly.repo.get_run(run_id).status == "done"
+
+        _assert_all_or_nothing(_settlement_facts(tmp_path / "control.sqlite", run_id), run_id)
+        assert get_boundary_metrics().snapshot()["cleanup_pending"] == 0
+
+        _retry_terminal_cleanup_through_production_entry(assembly, computer, run_id)
+        facts = _settlement_facts(tmp_path / "control.sqlite", run_id)
+        assert _complete_failure_settlement_problems(facts, run_id) == []
+        assert get_boundary_metrics().snapshot()["cleanup_pending"] == 1
+    finally:
+        fault.restore()
+        assembly.close()
+        reset_boundary_metrics()
+
+
+def test_cleanup_failure_during_task_insert_leaves_nothing_and_retry_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """T04-02 (first-write control): a fault ON the janitor task insert
+    itself must leave NOTHING durable — and the retry still produces the
+    one complete original-target settlement."""
+    reset_boundary_metrics()
+    computer, assembly, run_id, fault = _faulted_cleanup_failure_run(
+        tmp_path,
+        monkeypatch,
+        request_id="alr04-on-task-insert",
+        arm=None,
+        fire="INSERT INTO janitor_tasks",
+        message="injected disk failure: on janitor task insert",
+    )
+    try:
+        resumed = assembly.resume(run_id)
+        fault.restore()
+
+        assert _types(resumed)[-1] == "done", _types(resumed)
+        assert assembly.repo.get_run(run_id).status == "done"
+
+        _assert_all_or_nothing(_settlement_facts(tmp_path / "control.sqlite", run_id), run_id)
+        assert get_boundary_metrics().snapshot()["cleanup_pending"] == 0
+
+        _retry_terminal_cleanup_through_production_entry(assembly, computer, run_id)
+        facts = _settlement_facts(tmp_path / "control.sqlite", run_id)
+        assert _complete_failure_settlement_problems(facts, run_id) == []
+        assert get_boundary_metrics().snapshot()["cleanup_pending"] == 1
+    finally:
+        fault.restore()
+        assembly.close()
+        reset_boundary_metrics()
+
+
+def test_unwritable_database_claims_no_durable_settlement_and_keeps_signals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """T04-05: with the control database COMPLETELY unwritable, the
+    settlement claims no durable success and no enqueue — the original
+    run terminal and the pre-settlement lease facts stand untouched,
+    while the existing cleanup-failure log signal survives for later
+    explicit handling (which then completes once writes return)."""
+    import logging
+
+    from agent_v2.computer import LocalNativeComputer
+
+    class _UnwritableAtCleanupComputer(LocalNativeComputer):
+        """A controlled Computer whose teardown failure also turns the
+        REAL control connection fully unwritable (``PRAGMA query_only``),
+        so the production settlement that follows hits a read-only DB."""
+
+        cleanup_calls: list[str] = []
+        arm_conn: Any = None
+
+        def __init__(self) -> None:
+            super().__init__(failure_mode="cleanup")
+            self.unwritable = True
+
+        def cleanup(self, workspace_path: str) -> Any:
+            _UnwritableAtCleanupComputer.cleanup_calls.append(workspace_path)
+            if self.unwritable and _UnwritableAtCleanupComputer.arm_conn is not None:
+                _UnwritableAtCleanupComputer.arm_conn.execute("PRAGMA query_only = ON")
+            return super().cleanup(workspace_path)
+
+    reset_boundary_metrics()
+    computer = _UnwritableAtCleanupComputer()
+    assembly = _RealAssembly(tmp_path, monkeypatch, computer=computer)
+    _UnwritableAtCleanupComputer.arm_conn = assembly.repo.control._conn
+    try:
+        run_id, _ = _drive_to_approved_resume(assembly, "alr04-unwritable")
+        with caplog.at_level(logging.ERROR, logger="agent_v2.sandbox_lifecycle"):
+            resumed = assembly.resume(run_id)
+
+        # The original terminal stands: the run is done, the answer and
+        # the artifact were already durable.
+        assert _types(resumed)[-1] == "done", _types(resumed)
+        assert assembly.repo.get_run(run_id).status == "done"
+        assert _UnwritableAtCleanupComputer.cleanup_calls
+
+        # No durable claims of any kind: no janitor task, no failed
+        # lease, no pending_janitor record, no enqueue signal.
+        facts = _settlement_facts(tmp_path / "control.sqlite", run_id)
+        assert _untouched_state_problems(facts) == [], dict(facts["lease"] or {})
+        assert get_boundary_metrics().snapshot()["cleanup_pending"] == 0
+
+        # The existing cleanup-failure log signal is preserved for
+        # operators (later explicit handling — no silent swallow).
+        assert any(
+            record.name == "agent_v2.sandbox_lifecycle"
+            and record.levelno >= logging.ERROR
+            for record in caplog.records
+        ), [r.message for r in caplog.records]
+
+        # Once writes return, the SAME explicit retry completes the one
+        # original-target settlement — the preserved signal was actionable.
+        computer.unwritable = False
+        _UnwritableAtCleanupComputer.arm_conn.execute("PRAGMA query_only = OFF")
+        _retry_terminal_cleanup_through_production_entry(assembly, computer, run_id)
+        facts = _settlement_facts(tmp_path / "control.sqlite", run_id)
+        assert _complete_failure_settlement_problems(facts, run_id) == []
+        assert assembly.repo.get_run(run_id).status == "done"
+        assert get_boundary_metrics().snapshot()["cleanup_pending"] == 1
+    finally:
+        _UnwritableAtCleanupComputer.arm_conn = None
+        assembly.close()
+        reset_boundary_metrics()
+
+

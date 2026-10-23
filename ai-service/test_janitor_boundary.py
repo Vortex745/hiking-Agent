@@ -2280,3 +2280,55 @@ def test_duplicate_resume_and_cleanup_add_no_extra_side_effects(tmp_path):
         assert len(repo.list_artifacts_for_run(run.run_id)) == 1
     finally:
         repo.close()
+
+
+# ---- ALR ticket 04: settlement dedupe + claim fencing stay intact -------------
+
+
+def test_duplicate_cleanup_settlement_keeps_one_task_and_the_claim_fence(tmp_path):
+    """T04-03: repeated failure settlement through the production entry
+    keeps EXACTLY ONE active dedupe task across the claim lifecycle, and
+    the settled task remains normally claim-fenceable (existing janitor
+    semantics unchanged by the atomic settlement)."""
+    repo = _repo(tmp_path)
+    try:
+        run_id, _approval = _paused_pdf_run(repo, "req-04-settle-dedupe")
+        computer = _FakeComputer()
+
+        def failing_cleanup(comp, workspace_path, runs, rid) -> None:
+            raise RuntimeError("teardown stuck")
+
+        orch = _orchestrator(repo, computer, cleanup=failing_cleanup)
+        _resume(orch, run_id)
+
+        settled = repo.get_sandbox_lease(run_id)
+        assert settled is not None
+        assert settled.cleanup_status == "pending_janitor"
+        assert settled.janitor_task_id
+        assert len(repo.list_janitor_tasks(kind="cleanup")) == 1
+
+        # Duplicate settlements reuse the SAME active task — claimed or not.
+        orch._run_terminal_cleanup(computer, f"/ws/{run_id}", repo, run_id)
+        orch._run_terminal_cleanup(computer, f"/ws/{run_id}", repo, run_id)
+        tasks = repo.list_janitor_tasks(kind="cleanup")
+        assert len(tasks) == 1
+        assert tasks[0].task_id == settled.janitor_task_id
+
+        # The claim fence on the settled task keeps its exact semantics:
+        # one winner, stale owner refused.
+        claimed, won = repo.claim_janitor_task(
+            settled.janitor_task_id, owner="janitor-a"
+        )
+        assert won is True and claimed is not None
+        _again, stolen = repo.claim_janitor_task(
+            settled.janitor_task_id, owner="janitor-b"
+        )
+        assert stolen is False
+
+        # Even while claimed, the active dedupe key still collapses a
+        # duplicate settlement onto the same row.
+        orch._run_terminal_cleanup(computer, f"/ws/{run_id}", repo, run_id)
+        assert len(repo.list_janitor_tasks(kind="cleanup")) == 1
+        assert repo.get_janitor_task(settled.janitor_task_id).status == "claimed"
+    finally:
+        repo.close()

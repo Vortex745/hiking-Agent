@@ -18,15 +18,15 @@ This module owns the fix:
   ``partial_usage``) and unexpected exceptions into the typed result, and
   performs NO lease mutation of its own.
 * :func:`settle_terminal_cleanup` is the settlement entry for the run's
-  CURRENT resource: success destroys the lease with the real usage and
-  records ``succeeded``; failure enqueues exactly one idempotent janitor
-  retry for the ORIGINAL target, destroys the lease as ``failed`` with
-  the preserved partial usage, and records ``pending_janitor``.
-
-Ticket 04 makes the failure settlement atomic. To keep that possible,
-every write helper here performs exactly ONE repository call with no
-transaction of its own — the transaction boundaries stay where the
-repository puts them.
+  CURRENT resource, and it is ATOMIC (ALR ticket 04): success settles
+  the identity-matched lease to ``destroyed`` + ``succeeded`` with the
+  real usage in ONE fenced repository transaction (a lease the same
+  generation had settled ``failed`` is repaired by the same commit);
+  failure commits the failed lease (preserved partial usage + failure
+  reason), the ``pending_janitor`` cleanup record and exactly one
+  idempotent janitor retry for the ORIGINAL target in ONE control
+  transaction — together or not at all. The repository owns every
+  transaction boundary; this module never wraps a write in another one.
 """
 
 from __future__ import annotations
@@ -212,28 +212,6 @@ def build_cleanup_evidence(
     }
 
 
-def enqueue_cleanup_retry(
-    runs_repo: Any,
-    *,
-    run_id: str,
-    lease_id: str,
-    evidence: dict[str, Any],
-) -> tuple[Any, bool]:
-    """Enqueue the idempotent janitor retry for the ORIGINAL target.
-
-    Thin, transaction-free pass-through over the repository's deduped
-    enqueue (``cleanup:{run_id}``), so ticket 04 can lift this write into
-    the atomic settlement without another transaction wrapper.
-    """
-    return runs_repo.enqueue_janitor_task(
-        kind="cleanup",
-        run_id=run_id,
-        lease_id=lease_id,
-        evidence=evidence,
-        dedupe_key=CLEANUP_TASK_DEDUPE_KEY.format(run_id=run_id),
-    )
-
-
 def settle_terminal_cleanup(
     runs_repo: Any,
     *,
@@ -242,16 +220,24 @@ def settle_terminal_cleanup(
     run_id: str | None,
     outcome: SandboxCleanupResult,
 ) -> str | None:
-    """Settle the durable records for the run's CURRENT resource.
+    """Settle the durable records for the run's CURRENT resource — ATOMICALLY.
 
-    Success: destroy the lease carrying the real usage and record
-    ``succeeded``. Failure: enqueue one idempotent janitor retry for the
-    original target, destroy the lease as ``failed`` with the preserved
-    partial usage + failure reason, and record ``pending_janitor``.
+    Success: the repository's fenced settlement transitions the lease
+    whose identity (lease id / workspace / fencing generation) was read
+    BEFORE the physical cleanup to ``destroyed`` + ``succeeded`` with the
+    real usage — in one transaction. A lease settled ``failed`` by the
+    SAME generation is repaired by the same commit (ticket 06's retry
+    fence); a successor generation is never touched.
 
-    Each step is ONE repository write with no transaction of its own
-    (ticket 04 wraps them atomically). Bookkeeping failures are logged
-    and never re-raise: the terminal that was already emitted stands.
+    Failure: the repository's ONE-transaction settlement commits the
+    failed lease (preserved partial usage + failure reason), the
+    ``pending_janitor`` cleanup record, and exactly one idempotent
+    janitor retry for the ORIGINAL target — together or not at all.
+
+    Bookkeeping failures (e.g. a fully unwritable database) are logged
+    and never re-raise: the terminal that was already emitted stands, no
+    durable success or enqueue is claimed, and the logged failure stays
+    available for later explicit handling.
 
     Returns the janitor task id on the failure path, else ``None``.
     """
@@ -259,12 +245,30 @@ def settle_terminal_cleanup(
         return None
     try:
         if outcome.succeeded:
-            runs_repo.destroy_sandbox_lease(
+            lease = runs_repo.get_sandbox_lease(run_id)
+            if lease is None:
+                return None
+            if lease.workspace_path != workspace_path:
+                # The cleanup succeeded for a workspace this lease does not
+                # own — a stale worker after a successor takeover. Settling
+                # it would credit the wrong (or someone else's) resource.
+                logger.warning(
+                    "sandbox_lifecycle: refusing success settlement for "
+                    "run_id=%s — cleanup workspace %s is not the leased "
+                    "workspace %s",
+                    run_id,
+                    workspace_path,
+                    lease.workspace_path,
+                )
+                return None
+            runs_repo.settle_cleanup_success(
                 run_id=run_id,
+                lease_id=lease.lease_id,
+                workspace_path=lease.workspace_path,
+                sandbox_identity=lease.sandbox_identity or "",
+                fencing_token=lease.fencing_token,
                 resource_usage=outcome.usage,
-                failure_reason=None,
             )
-            runs_repo.record_sandbox_cleanup(run_id, status=CLEANUP_SUCCEEDED)
             return None
 
         evidence = build_cleanup_evidence(
@@ -274,26 +278,15 @@ def settle_terminal_cleanup(
             run_id=run_id,
             outcome=outcome,
         )
-        task, _created = enqueue_cleanup_retry(
-            runs_repo,
+        task, _created, _lease = runs_repo.settle_cleanup_failure(
             run_id=run_id,
             lease_id=evidence["lease_id"],
             evidence=evidence,
+            dedupe_key=CLEANUP_TASK_DEDUPE_KEY.format(run_id=run_id),
+            resource_usage=outcome.partial_usage,
+            failure_reason=outcome.failure_reason,
         )
-        lease = runs_repo.get_sandbox_lease(run_id)
-        if lease is not None and lease.status == "active":
-            runs_repo.destroy_sandbox_lease(
-                run_id=run_id,
-                resource_usage=outcome.partial_usage,
-                failure_reason=outcome.failure_reason,
-            )
-        runs_repo.record_sandbox_cleanup(
-            run_id,
-            status=CLEANUP_PENDING_JANITOR,
-            error=outcome.failure_reason,
-            janitor_task_id=task.task_id,
-        )
-        return task.task_id
+        return task.task_id if task is not None else None
     except Exception:
         logger.exception(
             "sandbox_lifecycle: recording cleanup failure / janitor task "
