@@ -597,6 +597,10 @@ async def chat_v2_snapshot(
         # unknown-outcome repair state (status/attempts/last error/age/
         # next action/known facts/unknown part). Additive.
         "effects": snapshot.effects,
+        # BCDEF ticket 10: additive capability projection summary of the
+        # frozen policy (policy hash, capability ids/count, MCP services,
+        # risk/approval policy). Existing clients ignore the new key.
+        "capability_projection": snapshot.capability_projection,
     }
 
 

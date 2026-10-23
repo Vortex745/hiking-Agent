@@ -41,6 +41,7 @@ from uniharness.types import ToolResult
 
 from observability import llm_log
 from agent_v2.kernel import KernelAssemblyError  # noqa: F401  (module-level re-export for builders)
+from agent_v2.permissions import PermissionDecision as ProductPermissionDecision
 
 logger = logging.getLogger("ai-service.agent_v2.kernel_tools")
 
@@ -885,7 +886,7 @@ _build_profile_mcp_unavailable_note = "MCP-server-unavailable"
 
 
 def build_profile_mcp_servers(
-    profile: Any, settings: Any
+    profile: Any, settings: Any, projection: Any | None = None
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     """Materialize uni-kernel MCP configs for the profile's allowlist.
 
@@ -895,20 +896,44 @@ def build_profile_mcp_servers(
     context instead of a mid-run failure; fabricating evidence is never an
     option. When credential expansion fails for any included server that is
     also fail-closed via :class:`KernelAssemblyError`.
+
+    BCDEF ticket 10: when ``projection`` is supplied its frozen
+    ``mcp_services`` decides WHICH servers are reachable; the live registry
+    only supplies connection parameters/credentials. Adding a server or a
+    tool to the live registry after admission cannot widen the run.
     """
     from agent_v2.mcp_registry import (
+        UnknownMcpServerError,
         check_mcp_available,
         expand_credentials,
         resolve_mcp_server,
     )
 
-    allowed = getattr(profile, "allowed_mcp_servers", None)
+    if projection is not None:
+        allowed = tuple(
+            service.server_id for service in projection.mcp_services
+        )
+    else:
+        allowed = getattr(profile, "allowed_mcp_servers", None)
     if not allowed:
         return {}, []
     servers: dict[str, dict[str, Any]] = {}
     audits: list[dict[str, Any]] = []
     for server_id in sorted(allowed):
-        cfg = resolve_mcp_server(server_id)
+        try:
+            cfg = resolve_mcp_server(server_id)
+        except UnknownMcpServerError:
+            logger.warning(
+                "mcp preflight drop %s: server missing from the live registry",
+                server_id,
+            )
+            audits.append({
+                "phase": "mcp_unavailable",
+                "ok": False,
+                "code": "mcp_server_unavailable",
+                "server_id": server_id,
+            })
+            continue
         try:
             available = check_mcp_available(cfg, settings)
             if not available:
@@ -963,24 +988,43 @@ def build_chat_extra_tools(
     audit_sink: AuditSink | None,
     memory_service: Any | None = None,
     subject_id: str | None = None,
+    projection: Any | None = None,
 ) -> list[BoundedDomainTool]:
     """Instantiate adapters for the profile's implementable tool surface.
 
-    Fail-closed check: every ``profile.allowed_tools`` name must be either an
+    Fail-closed check: every allowed tool name must be either an
     implemented adapter, a deferred product-layer capability (memory_*), or
     the caller explicitly narrows allowed_tools upstream. Otherwise assembly
     refuses to start (unknown surface ⇒ no silent partial exposure).
+
+    BCDEF ticket 10: when ``projection`` is supplied, the frozen projection
+    (not the live profile) decides which product tools are constructed; MCP
+    and skill capabilities are mounted by their own builder and never
+    treated as product adapters.
     """
     from agent_v2.kernel import KernelAssemblyError
 
-    profile_key = getattr(getattr(profile, "profile_id", None), "value", str(getattr(profile, "profile_id", "")))
+    if projection is not None:
+        profile_key = projection.profile_id
+        allowed_names = {
+            name
+            for name in projection.allowed_tool_names
+            if not name.startswith("mcp__") and not name.startswith("skill:")
+        }
+    else:
+        profile_key = getattr(
+            getattr(profile, "profile_id", None),
+            "value",
+            str(getattr(profile, "profile_id", "")),
+        )
+        allowed_names = set(profile.allowed_tools)
     registry = PROFILE_TOOL_ADAPTERS.get(profile_key)
     if registry is None:
         raise KernelAssemblyError(f"no kernel tool adapters registered for profile {profile_key!r}")
 
     memory_names = {"memory_save", "memory_search"}
     missing = sorted(
-        set(profile.allowed_tools)
+        set(allowed_names)
         - set(registry)
         - memory_names
     )
@@ -991,22 +1035,22 @@ def build_chat_extra_tools(
         )
     tools: list[BoundedDomainTool] = [
         registry[name](run_id=run_id, audit_sink=audit_sink, delegate=_unwrapped_delegate(name))
-        for name in sorted(set(profile.allowed_tools) & set(registry))
+        for name in sorted(set(allowed_names) & set(registry))
     ]
     # Ticket 32: memory tools require BOTH the product service and a
     # server-resolved subject; without either they are not constructed and
     # the kernel never sees a way to touch long-term memory.
-    if memory_names & set(profile.allowed_tools):
+    if memory_names & set(allowed_names):
         if memory_service is None or not subject_id:
             raise KernelAssemblyError(
                 "profile 允许 memory_* 但缺少已认证主体或 memory service —— fail closed"
             )
-        if "memory_save" in profile.allowed_tools:
+        if "memory_save" in allowed_names:
             tools.append(MemorySaveTool(
                 memory=memory_service, subject_id=subject_id,
                 run_id=run_id, audit_sink=audit_sink,
             ))
-        if "memory_search" in profile.allowed_tools:
+        if "memory_search" in allowed_names:
             tools.append(MemorySearchTool(
                 memory=memory_service, subject_id=subject_id,
                 run_id=run_id, audit_sink=audit_sink,
@@ -1046,7 +1090,7 @@ def _delegate_for(tool_name: str) -> Callable[..., Any]:
 
 
 class ProductGateRule(KernelSafetyRule):
-    """Bridge product PermissionGate verdicts into the kernel gate.
+    """Bridge the frozen capability projection into the kernel gate.
 
     Registered as THE rule of the kernel PermissionGate handed to
     ``create_agent(permission_gate=...)`` so every kernel tool call is
@@ -1054,8 +1098,16 @@ class ProductGateRule(KernelSafetyRule):
 
     * ALLOW → returns None (chain continues → upstream default allow);
     * DENY  → kernel DENIED carrying the stable public reason;
-    * NEEDS_APPROVAL → DENIED for now (durable approval arrives with T31);
-      recorded in the shared audit sink so denial evidence is observable.
+    * NEEDS_APPROVAL → DENIED for now; the durable approval ladder runs
+      in the product flow before any effect is claimed. Recorded in the
+      shared audit sink so denial evidence is observable.
+
+    BCDEF ticket 10: the decision comes from the admission-frozen
+    :class:`agent_v2.capability_projection.CapabilityProjection` (allowed
+    tools + risk + approval requirement + frozen MCP grants), not from
+    live profile/registry state. Callers without a frozen projection (test
+    seams, toolless paths) get an equivalent projection built from the
+    profile they were handed.
     """
 
     def __init__(
@@ -1064,70 +1116,79 @@ class ProductGateRule(KernelSafetyRule):
         *,
         run_id: str | None,
         audit_sink: AuditSink | None,
+        projection: Any | None = None,
     ) -> None:
-        from agent_v2.permissions import PermissionGate as ProductGate
+        if projection is None:
+            from agent_v2.capability_projection import (
+                legacy_capability_projection,
+            )
 
-        self._product_gate = ProductGate()
+            projection = legacy_capability_projection(
+                profile, run_id=run_id or ""
+            )
+        self._projection = projection
         self._profile = profile
         self._run_id = run_id or ""
         self._audit_sink = audit_sink
 
     def check(self, tool_name: str, tool_args: dict[str, Any]) -> PermissionDecision | None:
-        # Ticket 29: MCP tool names are policy-checked against the profile's
-        # server allowlist AND the server's declared tool_allowlist — the
-        # model or a client can never widen either layer.
-        mcp = _split_mcp_tool_name(tool_name)
-        if mcp is not None:
-            server_id, tool = mcp
-            allowed_servers = tuple(getattr(self._profile, "allowed_mcp_servers", None) or ())
-            if server_id not in allowed_servers:
-                self._record_denial(tool_name, "unknown_mcp_server", tool_args)
-                return PermissionDecision(result=PermissionResult.DENIED, reason="unknown_mcp_server")
-            from agent_v2.mcp_registry import resolve_mcp_server
+        authorization = self._projection.authorize(tool_name, tool_args)
 
-            cfg = resolve_mcp_server(server_id)
-            if tool not in cfg.tool_allowlist:
-                self._record_denial(tool_name, "unauthorized_mcp_tool", tool_args)
-                return PermissionDecision(
-                    result=PermissionResult.DENIED, reason="unauthorized_mcp_tool"
-                )
-            # Approved pair → judged by the PRODUCT risk classifier so
-            # high-risk MCP tools require the same approval ladder as the
-            # rest of the surface; low-risk pairs pass without noise.
-            from tools.risk_classifier import (
-                RiskLevel as _RiskLevel,
-                classify_tool as _classify,
-                requires_confirmation as _needs_approval,
+        if authorization.decision is ProductPermissionDecision.ALLOW:
+            # MCP calls are recorded so execute authorization is auditable
+            # and replayable; low-risk builtin calls stay silent (no noise).
+            if authorization.source == "mcp":
+                self._record_authorized(tool_name, authorization)
+            return None
+        if authorization.decision is ProductPermissionDecision.DENY:
+            self._record_denial(
+                tool_name, authorization.reason, tool_args, authorization
             )
-
-            level = _classify(tool_name.split("__")[-1], default=_RiskLevel.HIGH)
-            if _needs_approval(level):
-                self._record_denial(tool_name, "high_risk_requires_approval", tool_args)
-                return PermissionDecision(
-                    result=PermissionResult.DENIED,
-                    reason="该操作需要审批，当前阶段暂不可用。",
-                )
-            return None
-
-        verdict = self._product_gate.evaluate(self._profile, tool_name, tool_args)
-
-        if verdict.decision.value == "allow":
-            return None
-        if verdict.decision.value == "deny":
-            self._record_denial(tool_name, verdict.reason, tool_args)
-            return PermissionDecision(result=PermissionResult.DENIED, reason=verdict.reason)
-        # needs_approval: T31 will map durable approvals; today fail closed.
-        self._record_denial(tool_name, verdict.reason)
+            return PermissionDecision(
+                result=PermissionResult.DENIED, reason=authorization.reason
+            )
+        # needs_approval: the product flow owns the durable approval; the
+        # kernel turn itself never executes an unapproved high-risk tool.
+        self._record_denial(
+            tool_name, authorization.reason, tool_args, authorization
+        )
         return PermissionDecision(
             result=PermissionResult.DENIED,
             reason="该操作需要审批，当前阶段暂不可用。",
         )
+
+    def _authorization_meta(self, authorization: Any) -> dict[str, Any]:
+        meta = self._projection.event_meta(
+            getattr(authorization, "tool_name", "") or ""
+        )
+        # The sink entries already carry run_id; keep the rest of the
+        # run/policy binding additive for replay consumers.
+        meta.pop("run_id", None)
+        return meta
+
+    def _record_authorized(self, tool_name: str, authorization: Any) -> None:
+        if self._audit_sink is None:
+            return
+        entry: dict[str, Any] = {
+            "run_id": self._run_id,
+            "tool": tool_name,
+            "phase": "authorized",
+            "ok": True,
+            "code": None,
+            "duration_ms": 0,
+        }
+        entry.update(self._authorization_meta(authorization))
+        try:
+            self._audit_sink(entry)
+        except Exception:
+            logger.exception("gate authorization audit failed (non-fatal)")
 
     def _record_denial(
         self,
         tool_name: str,
         reason: str,
         tool_args: dict[str, Any] | None = None,
+        authorization: Any | None = None,
     ) -> None:
         # The local execution log must see denials even when no audit sink is
         # attached for this turn.
@@ -1142,23 +1203,49 @@ class ProductGateRule(KernelSafetyRule):
             pass
         if self._audit_sink is None:
             return
+        entry: dict[str, Any] = {
+            "run_id": self._run_id,
+            "tool": tool_name,
+            "phase": "denied",
+            "ok": False,
+            "code": reason,
+            "duration_ms": 0,
+        }
+        if authorization is not None:
+            if getattr(authorization, "capability_id", ""):
+                entry["capability_id"] = authorization.capability_id
+            if getattr(authorization, "source", ""):
+                entry["source"] = authorization.source
+            entry.update(
+                {
+                    key: value
+                    for key, value in self._authorization_meta(authorization).items()
+                    if key not in {"capability_id", "source"}
+                }
+            )
         try:
-            self._audit_sink({
-                "run_id": self._run_id,
-                "tool": tool_name,
-                "phase": "denied",
-                "ok": False,
-                "code": reason,
-                "duration_ms": 0,
-            })
+            self._audit_sink(entry)
         except Exception:
             logger.exception("gate denial audit failed (non-fatal)")
 
 
-def build_chat_kernel_gate(profile: Any, *, run_id: str | None, audit_sink: AuditSink | None) -> Any:
+def build_chat_kernel_gate(
+    profile: Any,
+    *,
+    run_id: str | None,
+    audit_sink: AuditSink | None,
+    projection: Any | None = None,
+) -> Any:
     """Build the kernel PermissionGate carrying the product bridge rule."""
     from uniharness.harness.permission import PermissionGate as KernelGate
 
     gate = KernelGate()
-    gate.register_rule(ProductGateRule(profile, run_id=run_id, audit_sink=audit_sink))
+    gate.register_rule(
+        ProductGateRule(
+            profile,
+            run_id=run_id,
+            audit_sink=audit_sink,
+            projection=projection,
+        )
+    )
     return gate
