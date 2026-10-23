@@ -157,11 +157,14 @@ class SandboxLeaseGuard:
                 SandboxLeaseLostError.LEASE_EXPIRED,
                 f"sandbox lease for run {self.run_id!r} expired",
             )
-        if (
-            self.fencing_token
-            and record.fencing_token
-            and record.fencing_token != self.fencing_token
-        ):
+        if record.fencing_token != self.fencing_token:
+            # BCDEF review B1: the comparison is UNCONDITIONAL. ``0`` used
+            # to short-circuit this guard, so a worker holding the stored
+            # pre-ticket-06 default silently disabled fencing and kept
+            # executing sandbox work after a newer generation took the
+            # lease over. Legacy rows are normalized to generation 1 by the
+            # additive migration, so every stored lease is fenceable and
+            # any token that is not the current generation is stale.
             raise SandboxLeaseLostError(
                 SandboxLeaseLostError.LEASE_FENCING_REJECTED,
                 f"stale fencing token {self.fencing_token} for run "

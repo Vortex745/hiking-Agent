@@ -1253,9 +1253,13 @@ class RunRepository:
         result_json: str,
         *,
         claim_token: str | None = None,
+        fencing_token: int | None = None,
     ) -> EffectRecord | None:
         return self.control.commit_effect(
-            effect_key, result_json, claim_token=claim_token
+            effect_key,
+            result_json,
+            claim_token=claim_token,
+            fencing_token=fencing_token,
         )
 
     def mark_effect_outcome_unknown(

@@ -241,6 +241,11 @@ class EffectClaim:
     Only the holder of ``claim_token`` may commit, fail, or mark the
     effect ``outcome_unknown``. ``lease_id``/``fencing_token`` bind a
     sandbox effect claim to the sandbox active lease that authorized it.
+
+    BCDEF review B1: ``fencing_token`` is a generation, not an optional
+    flag — ``0`` is a real value that used to read as "unset" and disabled
+    the CAS comparison. A claim bound to a lease therefore MUST carry the
+    lease generation (leases start at 1); only a lease-less claim keeps 0.
     """
 
     effect_id: str
@@ -254,6 +259,14 @@ class EffectClaim:
             raise ValueError("effect claim requires a non-empty effect_id")
         if not self.claim_token or not self.claim_token.strip():
             raise ValueError("effect claim requires a non-empty claim_token")
+        if self.fencing_token < 0:
+            raise ValueError("fencing_token must be non-negative")
+        if self.lease_id and self.fencing_token < 1:
+            raise ValueError(
+                "a lease-bound effect claim requires the lease "
+                "fencing generation (got "
+                f"{self.fencing_token} for lease {self.lease_id!r})"
+            )
 
 
 class EffectNotClaimedError(BoundaryError):
