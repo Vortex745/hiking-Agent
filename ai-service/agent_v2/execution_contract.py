@@ -789,6 +789,19 @@ class ExecutionErrorCode(str, Enum):
     # Ticket 06: the sandbox fencing token no longer matches the active
     # lease generation; the stale worker must stop before side effects.
     LEASE_FENCING_REJECTED = "lease_fencing_rejected"
+    # BCDEF ticket 10: the frozen policy cannot be projected into a
+    # complete capability/risk/MCP set. Never degrade to unconstrained
+    # execution; a human must inspect the snapshot.
+    CAPABILITY_PROJECTION_FAILED = "capability_projection_failed"
+    # BCDEF ticket 10: a tool call is not in the admission-frozen
+    # capability projection (or its MCP server/tool grant).
+    TOOL_NOT_AUTHORIZED = "tool_not_authorized"
+    # BCDEF ticket 10: a projection/effect call was presented under a
+    # policy hash that is not the run's frozen policy hash.
+    POLICY_HASH_MISMATCH = "policy_hash_mismatch"
+    # BCDEF ticket 10: a second executor attempted an effect that a live
+    # claim already owns. Stable and retryable; never re-execute.
+    DUPLICATE_EFFECT = "duplicate_effect"
 
 
 # Whether a failure can be repaired without re-running the model or
@@ -808,6 +821,15 @@ ERROR_RECOVERABLE: dict[ExecutionErrorCode, bool] = {
     ExecutionErrorCode.REPAIR_PENDING: True,
     ExecutionErrorCode.EFFECT_NOT_CLAIMED: True,
     ExecutionErrorCode.LEASE_FENCING_REJECTED: True,
+    # A projection failure or policy-hash mismatch is a policy decision:
+    # the run must not continue and a new run would use the same frozen
+    # policy, so recovery is manual/janitor work.
+    ExecutionErrorCode.CAPABILITY_PROJECTION_FAILED: False,
+    ExecutionErrorCode.TOOL_NOT_AUTHORIZED: False,
+    ExecutionErrorCode.POLICY_HASH_MISMATCH: False,
+    # A duplicate in-flight effect is resolvable by waiting for the
+    # owner's durable outcome; it is never resolved by re-execution.
+    ExecutionErrorCode.DUPLICATE_EFFECT: True,
 }
 
 

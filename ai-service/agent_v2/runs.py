@@ -122,6 +122,10 @@ class RunSnapshot:
     # stable failure reason + next action. Both are additive.
     policy_provenance: dict[str, Any] | None = None
     policy_failure: dict[str, Any] | None = None
+    # BCDEF ticket 10: additive projection summary of the frozen policy —
+    # policy hash, capability ids/count, MCP services, risk/approval
+    # policy. None when the run has no projectable frozen snapshot.
+    capability_projection: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1640,6 +1644,24 @@ class RunRepository:
             policy_provenance = description["policy_provenance"]
             policy_failure = description["policy_failure"]
 
+        # BCDEF ticket 10: expose the frozen policy's projection summary
+        # additively for snapshot/replay consumers. A read-only snapshot
+        # must never fail because of a projection problem — the execution
+        # paths fail closed separately; here the summary is simply omitted.
+        capability_projection: dict[str, Any] | None = None
+        if policy_snapshot is not None and policy_failure is None:
+            try:
+                from agent_v2.capability_projection import (
+                    build_capability_projection,
+                )
+
+                resolved = self.resolve_policy_snapshot(run_id)
+                capability_projection = build_capability_projection(
+                    resolved.policy, run_id=run_id
+                ).summary()
+            except Exception:
+                capability_projection = None
+
         return RunSnapshot(
             run_id=run.run_id,
             request_id=run.request_id,
@@ -1724,6 +1746,7 @@ class RunRepository:
             ),
             policy_provenance=policy_provenance,
             policy_failure=policy_failure,
+            capability_projection=capability_projection,
         )
 
     # -- cancel ---------------------------------------------------------

@@ -592,6 +592,10 @@ async def chat_v2_snapshot(
         # cannot be adapted, the stable failure reason + next action.
         "policy_provenance": snapshot.policy_provenance,
         "policy_failure": snapshot.policy_failure,
+        # BCDEF ticket 10: additive capability projection summary of the
+        # frozen policy (policy hash, capability ids/count, MCP services,
+        # risk/approval policy). Existing clients ignore the new key.
+        "capability_projection": snapshot.capability_projection,
     }
 
 
