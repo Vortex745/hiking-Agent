@@ -299,7 +299,20 @@ def test_rejected_resume_emits_resolved_and_done_without_execution(tmp_path):
 # ---- concurrent resume: sandbox preservation ----------------------------------
 
 
-def test_concurrent_resume_preserves_sandbox_while_executor_is_live(tmp_path):
+def test_concurrent_resume_with_executing_effect_converges_unknown_without_liveness_inference(
+    tmp_path,
+):
+    """agent-lifecycle-repair ticket 02 (T02-08).
+
+    The 300s recent-tool_call liveness inference is removed: a resume
+    that HOLDS the per-run execution token and finds the effect
+    ``executing`` has no surviving owner by construction (a live
+    executor would still hold the token), so even a fresh tool_call
+    event converges to ``outcome_unknown`` — never ``effect_in_flight``,
+    never a re-execution. The double-click mutual-delete protection now
+    comes from ownership itself: the losing resume never reaches this
+    driver (see test_resume_execution_ownership_contract.py).
+    """
     repo = _repo(tmp_path)
     computer = _FakeComputer()
     cleanups: list[Any] = []
@@ -309,8 +322,8 @@ def test_concurrent_resume_preserves_sandbox_while_executor_is_live(tmp_path):
         approval_id=approval_id, status="approved", decision_request_id="dec-40conc"
     )
 
-    # Simulate the concurrent CAS winner: an effect left EXECUTING plus
-    # a recent persisted tool_call proving the executor is live.
+    # A crashed CAS winner: an effect left EXECUTING plus a persisted
+    # tool_call that is BRAND NEW (the old heuristic called this "live").
     effect_key = compute_effect_key(
         run_id=run_id, tool_name="generate_pdf", args={"filename": "hiking-plan.pdf"}
     )
@@ -337,16 +350,18 @@ def test_concurrent_resume_preserves_sandbox_while_executor_is_live(tmp_path):
     items = _stream_resume(orch, run_id)
 
     types = [e.type for e in items]
-    # The replay includes the winner's tool_call (seq 100); the
-    # continuation is approval.resolved then the in-flight error.
-    assert types[-2:] == ["approval.resolved", "error"]
-    assert items[-1].payload["code"] == "effect_in_flight"
-    # The sandbox is PRESERVED — the live winner may still commit. No
-    # cleanup ran and the effect is untouched.
-    assert cleanups == []
+    # The replay includes the crashed executor's tool_call (seq 100); the
+    # continuation converges to outcome_unknown with NO re-execution.
+    assert types[-3:] == [
+        "approval.resolved", "effect.outcome_unknown", "error",
+    ]
+    assert items[-1].payload["code"] == "effect_outcome_unknown"
+    # No re-execution, no sandbox command.
     assert computer.pdfs == []
+    run = repo.get_run(run_id)
+    assert run is not None and run.status == "error"
     effect = repo.get_effect(effect_key)
-    assert effect is not None and effect.status == EffectStatus.EXECUTING.value
+    assert effect is not None and effect.status == EffectStatus.OUTCOME_UNKNOWN.value
 
 
 def test_crashed_executing_effect_becomes_outcome_unknown_on_resume(tmp_path):
@@ -618,3 +633,64 @@ def test_approved_pdf_resume_stops_when_the_effect_row_cannot_be_persisted(tmp_p
     ] == [], caplog.text
 
 
+
+
+# ---- full-cycle resource protection (ALR ticket 05) ---------------------------
+
+
+def test_resume_computer_initialization_failure_settles_owned_resources(tmp_path):
+    """T05-02: the resume owns the renewed lease + leased workspace BEFORE
+    the Computer is reconstructed. A factory failure must settle those
+    owned resources — registered for the ORIGINAL target through ticket
+    04's atomic failure settlement — instead of leaking an active lease on
+    an error run; no new workspace is created."""
+    repo = _repo(tmp_path)
+    computer = _FakeComputer()
+    cleanups: list[Any] = []
+    orch = _resume_orchestrator(repo, computer, cleanups)
+    run_id, approval_id = _run_pause_flow(orch, repo, "req-40compinit")
+    repo.resolve_approval(
+        approval_id=approval_id, status="approved", decision_request_id="dec-40ci"
+    )
+    lease_before = repo.get_sandbox_lease(run_id)
+    assert lease_before is not None and lease_before.status == "active"
+
+    def broken_factory(sandbox_type=None, **_kwargs):
+        raise ValueError(f"unknown sandbox type {sandbox_type}")
+
+    failing_orch = RunOrchestrator(
+        settings=_settings(),
+        runs_repo=repo,
+        kernel_turn=orch._kernel_turn,
+        computer_factory=broken_factory,
+        sandbox_cleanup=(
+            lambda computer_arg, workspace_path, runs_repo_arg, run_id_arg:
+            run_sandbox_cleanup(computer_arg, workspace_path)
+        ),
+    )
+
+    items = _stream_resume(failing_orch, run_id)
+
+    types = [e.type for e in items]
+    assert types[-1] == "error", types
+    assert items[-1].payload["code"] == "sandbox_type_invalid"
+    run = repo.get_run(run_id)
+    assert run is not None and run.status == "error"
+    # No physical cleanup could run (no Computer exists), so nothing was
+    # torn down here — the janitor retry owns the physical work.
+    assert cleanups == []
+    # The owned lease is settled for the ORIGINAL target: no active lease
+    # and exactly one cleanup retry task carrying the original identity.
+    lease = repo.get_sandbox_lease(run_id)
+    assert lease is not None
+    assert lease.status != "active"
+    assert lease.status == "failed"
+    assert lease.cleanup_status == "pending_janitor"
+    tasks = repo.list_janitor_tasks(kind="cleanup")
+    assert len(tasks) == 1
+    assert tasks[0].dedupe_key == f"cleanup:{run_id}"
+    evidence = tasks[0].evidence
+    assert evidence["lease_id"] == lease_before.lease_id
+    assert evidence["workspace_path"] == lease_before.workspace_path
+    assert evidence["sandbox_identity"] == lease_before.sandbox_identity
+    assert evidence["fencing_token"] == lease_before.fencing_token
