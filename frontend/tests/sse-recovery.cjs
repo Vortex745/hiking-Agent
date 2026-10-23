@@ -1,0 +1,331 @@
+// BCDEF ticket 11 — SSE recovery & client cancel/gap behavior.
+// Run with: npm run build, then npx vite preview --port 4173, then
+//   BASE_URL=http://127.0.0.1:4173 node tests/sse-recovery.cjs
+// CHROME_PATH optionally selects an installed browser instead of Chromium.
+//
+// Scenarios (all route-mocked; zero real backend, zero real model calls):
+//  1. live stream closes WITHOUT a terminal → snapshot + /events
+//     reconciliation: no fake [连接错误], run not lost, no re-POST.
+//  2. refresh over a dropped-progress hole → visible gap notice
+//     (server-replayed progress.gap), single terminal, no extra SSE POST.
+//  3. duplicate terminals in replay → rendered exactly once.
+//  4. paused run refresh → approval prompt restored from snapshot
+//     pending_approvals; persisted cursor NOT advanced past the pause.
+//  5. outcome_unknown snapshot → first-class [结果未知] rendering, no
+//     approval/resume affordance, no automatic model call.
+//  6. snapshot done + terminal_persist_failed → done suppressed, stable
+//     error shown, run marked non-complete (not streaming).
+const { chromium } = require('playwright');
+const assert = require('node:assert/strict');
+
+const RUN_KEY = 'ai-hiking-agent-v2-active-run';
+const CHAT_KEY = 'ai-hiking-agent-chat';
+const CHAT_ID_KEY = 'ai-hiking-agent-chat-id';
+
+const env = (runId, seq, type, payload = {}) => ({
+  version: '2',
+  event_id: `${runId}-ev-${seq}`,
+  sequence: seq,
+  type,
+  payload,
+  request_id: 'req-fix',
+  conversation_id: 'chat-fix',
+  run_id: runId,
+  timestamp: '2026-10-23T00:00:00+00:00',
+});
+
+const sseBody = events => events.map(e => `data: ${JSON.stringify(e)}\n\n`).join('');
+
+const snapshotBase = (over = {}) => ({
+  run_id: 'run-fix',
+  request_id: 'req-fix',
+  conversation_id: 'chat-fix',
+  profile_id: 'chat',
+  status: 'running',
+  terminal_type: null,
+  created_at: '2026-10-23T00:00:00+00:00',
+  updated_at: '2026-10-23T00:00:05+00:00',
+  terminal_at: null,
+  sequence_cursor: 0,
+  messages: [
+    { role: 'user', content: '恢复测试问题', sequence: 0, run_id: 'run-fix' },
+  ],
+  pending_actions: [],
+  terminal_persisted: false,
+  terminal_persist_failed: false,
+  error_code: null,
+  recoverable: false,
+  state_reconciled: false,
+  pending_approvals: [],
+  ...over,
+});
+
+(async () => {
+  const browser = await chromium.launch({
+    headless: true,
+    executablePath: process.env.CHROME_PATH,
+  });
+  const base = process.env.BASE_URL || 'http://localhost:5173';
+  const results = [];
+
+  const openPage = async ({ run, snapshot, eventsFor, sse, extraRoutes = {} }) => {
+    const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+    page.setDefaultTimeout(8000);
+    const errors = [];
+    const calls = { sse: 0, snapshot: 0, events: 0, cancel: 0 };
+    const eventsQueries = [];
+    page.on('pageerror', error => errors.push(error.stack || String(error)));
+    await page.route('**/*', route => {
+      const url = new URL(route.request().url());
+      const p = url.pathname;
+      if (p === '/api/v2/chat/sse') {
+        calls.sse += 1;
+        return route.fulfill({ contentType: 'text/event-stream', body: sseBody(sse || []) });
+      }
+      if (p.startsWith('/api/v2/chat/snapshot/')) {
+        calls.snapshot += 1;
+        return route.fulfill({ json: snapshot });
+      }
+      if (p.startsWith('/api/v2/chat/events/')) {
+        calls.events += 1;
+        const fromSeq = Number(url.searchParams.get('from_seq') || '0');
+        eventsQueries.push(fromSeq);
+        return route.fulfill({ json: { run_id: 'run-fix', from_seq: fromSeq, events: eventsFor(fromSeq) } });
+      }
+      if (p.startsWith('/api/v2/chat/cancel/')) {
+        calls.cancel += 1;
+        return route.fulfill({ status: 200, json: { accepted: true, reason: 'cancelled', run_id: 'run-fix' } });
+      }
+      if (extraRoutes[p]) {
+        return route.fulfill(extraRoutes[p]);
+      }
+      return p.startsWith('/api/') ? route.fulfill({ json: { enabled: false } }) : route.continue();
+    });
+    await page.addInitScript(
+      ({ runKey, chatKey, chatIdKey, runSeed }) => {
+        navigator.geolocation.getCurrentPosition = (_s, failure) => failure?.({ code: 1, message: 'fixture' });
+        localStorage.setItem(chatIdKey, 'chat-fix');
+        localStorage.setItem(chatKey, JSON.stringify([]));
+        if (runSeed) localStorage.setItem(runKey, JSON.stringify(runSeed));
+      },
+      { runKey: RUN_KEY, chatKey: CHAT_KEY, chatIdKey: CHAT_ID_KEY, runSeed: run || null },
+    );
+    await page.goto(base);
+    return { page, errors, calls, eventsQueries };
+  };
+
+  const contentTexts = async page =>
+    page.locator('[data-full-text]').evaluateAll(nodes => nodes.map(n => n.getAttribute('data-full-text')));
+
+  const readRun = async page =>
+    page.evaluate(key => localStorage.getItem(key), RUN_KEY);
+
+  // ---- 1. live disconnect → snapshot reconciliation (no fake error) ----------
+  {
+    const { page, errors, calls } = await openPage({
+      run: null,
+      sse: [
+        env('run-fix', 1, 'run_started'),
+        env('run-fix', 2, 'progress', { message: '正在检索' }),
+        env('run-fix', 3, 'text', { content: '已流出的半段回答' }),
+        // transport closes here — NO terminal frame.
+      ],
+      snapshot: snapshotBase({
+        status: 'done',
+        terminal_type: 'done',
+        terminal_persisted: true,
+        terminal_event_type: 'done',
+        sequence_cursor: 4,
+        messages: [
+          { role: 'user', content: '恢复测试问题', sequence: 0, run_id: 'run-fix' },
+          { role: 'assistant', content: '已流出的半段回答', sequence: 1, run_id: 'run-fix' },
+        ],
+      }),
+      eventsFor: fromSeq => (fromSeq < 4 ? [env('run-fix', 4, 'done')] : []),
+    });
+    await page.getByRole('textbox', { name: '输入徒步问题' }).fill('恢复测试问题');
+    await page.getByRole('button', { name: '发送消息' }).click();
+    await page.waitForFunction(
+      key => localStorage.getItem(key) === null,
+      RUN_KEY,
+      { timeout: 6000 },
+    );
+    const texts = await contentTexts(page);
+    const assistant = texts.filter(t => t.includes('已流出的半段回答'));
+    assert.ok(assistant.length === 1, `scenario 1: run content preserved exactly once, got ${JSON.stringify(texts)}`);
+    assert.ok(
+      texts.every(t => !t.includes('[连接错误]') && !t.includes('stream_closed_without_terminal')),
+      `scenario 1: no faked connection error, got ${JSON.stringify(texts)}`,
+    );
+    assert.equal(calls.sse, 1, 'scenario 1: reconciliation never re-POSTs /chat/sse (no extra model call)');
+    assert.deepEqual(errors, [], 'scenario 1: uncaught browser errors');
+    await page.close();
+    results.push('1 live disconnect → snapshot/replay reconciliation, no [连接错误], run kept');
+  }
+
+  // ---- 2. refresh over a progress hole → visible gap notice ------------------
+  {
+    const { page, errors, calls } = await openPage({
+      run: {
+        run_id: 'run-fix', request_id: 'req-fix', conversation_id: 'chat-fix',
+        sequence_cursor: 1, user_message: '恢复测试问题', v2_status: 'running',
+      },
+      sse: [],
+      snapshot: snapshotBase({
+        status: 'done', terminal_type: 'done', terminal_persisted: true, sequence_cursor: 6,
+      }),
+      eventsFor: fromSeq => (fromSeq < 6 ? [
+        // server replay surfaces the hole between 1 and 5.
+        env('run-fix', 2, 'progress.gap', { from_sequence: 1, to_sequence: 5, dropped: 3 }),
+        env('run-fix', 5, 'text', { content: '恢复后的完整回答' }),
+        env('run-fix', 6, 'done'),
+      ] : []),
+    });
+    await page.locator('[data-full-text]').first().waitFor();
+    const texts = await contentTexts(page);
+    assert.ok(
+      texts.some(t => t.includes('[注意] 部分进度更新丢失（序列 1 → 5，共 3 条）')),
+      `scenario 2: gap notice visible, got ${JSON.stringify(texts)}`,
+    );
+    assert.ok(
+      texts.some(t => t.includes('恢复后的完整回答') && t.includes('部分进度更新丢失')),
+      'scenario 2: gap notice and recovered answer share the single assistant turn',
+    );
+    assert.equal(texts.filter(t => t.includes('恢复后的完整回答')).length, 1, 'scenario 2: one assistant message');
+    assert.equal(calls.sse, 0, 'scenario 2: recovery made no model call');
+    await page.waitForFunction(key => localStorage.getItem(key) === null, RUN_KEY);
+    assert.deepEqual(errors, [], 'scenario 2: uncaught browser errors');
+    await page.close();
+    results.push('2 dropped progress → replay progress.gap rendered as a visible notice');
+  }
+
+  // ---- 3. duplicate terminals render once ------------------------------------
+  {
+    const { page, errors } = await openPage({
+      run: {
+        run_id: 'run-fix', request_id: 'req-fix', conversation_id: 'chat-fix',
+        sequence_cursor: 0, user_message: '恢复测试问题', v2_status: 'running',
+      },
+      sse: [],
+      snapshot: snapshotBase({ status: 'done', terminal_persisted: true, sequence_cursor: 4 }),
+      eventsFor: fromSeq => (fromSeq < 4 ? [
+        env('run-fix', 1, 'run_started'),
+        env('run-fix', 2, 'text', { content: '只应出现一次的终态回答' }),
+        env('run-fix', 3, 'done'),
+        env('run-fix', 4, 'done', { note: 'duplicate' }), // late second terminal
+      ] : []),
+    });
+    await page.locator('[data-full-text]').first().waitFor();
+    await page.waitForFunction(key => localStorage.getItem(key) === null, RUN_KEY);
+    const texts = await contentTexts(page);
+    const hits = texts.filter(t => t.includes('只应出现一次的终态回答'));
+    assert.equal(hits.length, 1, 'scenario 3: exactly one assistant message');
+    assert.equal(hits[0], '只应出现一次的终态回答', 'scenario 3: duplicate terminal added nothing to the rendered turn');
+    assert.deepEqual(errors, [], 'scenario 3: uncaught browser errors');
+    await page.close();
+    results.push('3 duplicate terminal from replay ignored (single render, counted in reducer state)');
+  }
+
+  // ---- 4. paused approval survives refresh -----------------------------------
+  {
+    const approval = {
+      approval_id: 'apr-9', run_id: 'run-fix', tool: 'sandbox_bash',
+      args: { command: 'ls' }, risk_level: 'high',
+      impact: '在沙箱内执行 Bash 命令：ls',
+      expires_at: '2027-01-01T00:00:00+00:00',
+      message: '需要您的批准才能在沙箱内执行 Bash 命令。',
+    };
+    const { page, errors, eventsQueries } = await openPage({
+      run: {
+        run_id: 'run-fix', request_id: 'req-fix', conversation_id: 'chat-fix',
+        sequence_cursor: 2, user_message: '要审批的问题', v2_status: 'paused',
+        pending_approval: null,
+      },
+      sse: [],
+      snapshot: snapshotBase({ status: 'paused', sequence_cursor: 3, pending_approvals: [approval] }),
+      eventsFor: fromSeq => (fromSeq < 3 ? [env('run-fix', 3, 'run.paused', { approval_id: 'apr-9' })] : []),
+    });
+    await page.getByText('工具审批：sandbox_bash', { exact: false }).waitFor();
+    await page.getByRole('button', { name: '批准' }).waitFor();
+    assert.ok(eventsQueries.includes(2), 'scenario 4: replay started from the held cursor (2), not past the pause');
+    const stored = JSON.parse(await readRun(page));
+    assert.equal(stored.sequence_cursor, 2, 'scenario 4: paused run keeps the persisted cursor un-advanced (AC6)');
+    assert.equal(stored.pending_approval.approval_id, 'apr-9', 'scenario 4: approval restored from snapshot pending_approvals');
+    assert.equal(stored.v2_status, 'paused');
+    assert.deepEqual(errors, [], 'scenario 4: uncaught browser errors');
+    await page.close();
+    results.push('4 paused approval restored on refresh from snapshot pending_approvals; cursor held');
+  }
+
+  // ---- 5. outcome_unknown first-class, non-continuable ------------------------
+  {
+    const { page, errors, calls } = await openPage({
+      run: {
+        run_id: 'run-fix', request_id: 'req-fix', conversation_id: 'chat-fix',
+        sequence_cursor: 1, user_message: '恢复测试问题', v2_status: 'running',
+      },
+      sse: [],
+      snapshot: snapshotBase({
+        status: 'outcome_unknown',
+        sequence_cursor: 2,
+        messages: [
+          { role: 'user', content: '恢复测试问题', sequence: 0, run_id: 'run-fix' },
+          { role: 'assistant', content: '外部调用已发出，结果未知', sequence: 1, run_id: 'run-fix' },
+        ],
+      }),
+      eventsFor: () => [], // no terminal event row — the snapshot finalizes the run
+    });
+    await page.locator('[data-full-text]').first().waitFor();
+    const texts = await contentTexts(page);
+    const ou = texts.filter(t => t.includes('[结果未知]'));
+    assert.equal(ou.length, 1, `scenario 5: outcome_unknown rendered once, got ${JSON.stringify(texts)}`);
+    assert.ok(ou[0].includes('外部调用已发出，结果未知'), 'scenario 5: snapshot messages backfill the turn');
+    assert.ok(!texts.some(t => t.includes('[连接错误]')), 'scenario 5: not a fake network error');
+    assert.equal(await page.getByRole('button', { name: '批准' }).count(), 0, 'scenario 5: no approval/resume affordance');
+    assert.equal(calls.sse, 0, 'scenario 5: outcome_unknown never triggers a model call');
+    await page.waitForFunction(key => localStorage.getItem(key) === null, RUN_KEY);
+    assert.deepEqual(errors, [], 'scenario 5: uncaught browser errors');
+    await page.close();
+    results.push('5 outcome_unknown = first-class [结果未知] status, non-continuable, no model call');
+  }
+
+  // ---- 6. done suppressed when terminal_persist_failed ------------------------
+  {
+    const { page, errors } = await openPage({
+      run: {
+        run_id: 'run-fix', request_id: 'req-fix', conversation_id: 'chat-fix',
+        sequence_cursor: 0, user_message: '恢复测试问题', v2_status: 'running',
+      },
+      sse: [],
+      snapshot: snapshotBase({
+        status: 'done',
+        terminal_persisted: false,
+        terminal_persist_failed: true,
+        error_code: 'terminal_persist_failed',
+        sequence_cursor: 2,
+      }),
+      eventsFor: fromSeq => (fromSeq < 2 ? [
+        env('run-fix', 1, 'run_started'),
+        env('run-fix', 2, 'text', { content: '内容有了但终态没落库' }),
+      ] : []),
+    });
+    await page.locator('[data-full-text]').first().waitFor();
+    const texts = await contentTexts(page);
+    assert.ok(
+      texts.some(t => t.includes('[错误] terminal_persist_failed')),
+      `scenario 6: stable terminal_persist_failed error rendered, got ${JSON.stringify(texts)}`,
+    );
+    assert.ok(
+      texts.every(t => !t.includes('已完成')),
+      'scenario 6: done suppressed when the terminal never became durable (AC7)',
+    );
+    await page.waitForFunction(key => localStorage.getItem(key) === null, RUN_KEY);
+    assert.deepEqual(errors, [], 'scenario 6: uncaught browser errors');
+    await page.close();
+    results.push('6 done suppressed on terminal_persist_failed; stable error, run non-complete');
+  }
+
+  await browser.close();
+  console.log(`PASS: sse-recovery — ${results.length} scenarios.`);
+  for (const r of results) console.log(`  - ${r}`);
+})().catch(error => { console.error(error); process.exitCode = 1; });

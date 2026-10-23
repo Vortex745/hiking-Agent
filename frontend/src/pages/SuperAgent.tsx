@@ -18,6 +18,7 @@ import {
   planV2Recovery,
   V2_TERMINAL_RUN_STATUSES,
   type V2EventEnvelope,
+  type V2RunSnapshot,
   type V2ApprovalRequest,
   type V2ApprovalDecisionResponse,
   type V2Memory,
@@ -29,6 +30,8 @@ import {
   initialV2State,
   isV2Terminal,
   isV2Paused,
+  reconcileV2Snapshot,
+  assistantTextFromSnapshot,
   readArtifact as readArtifactFromPayload,
   type V2ConversationState,
 } from '../api/v2Reducer'
@@ -183,7 +186,10 @@ interface V2PersistedRun {
   pending_approval?: V2ApprovalRequest | null
   // Ticket 11: last-known run status so recovery knows whether to
   // re-attach a stream, re-show the approval prompt, or do nothing.
-  v2_status?: 'running' | 'paused' | 'done' | 'error' | 'cancelled'
+  // BCDEF ticket 11: ``outcome_unknown`` / ``admission_failed`` are
+  // first-class terminal statuses — recovery trusts them locally and
+  // never re-executes (they are NON-continuable; only ``paused`` resumes).
+  v2_status?: 'running' | 'paused' | 'done' | 'error' | 'cancelled' | 'outcome_unknown' | 'admission_failed'
 }
 const V2_RUN_KEY = 'ai-hiking-agent-v2-active-run'
 function loadV2PersistedRun(): V2PersistedRun | null {
@@ -578,6 +584,7 @@ function SuperAgent() {
   // so the effect can reference them without forward-reference issues.
   // Store transport deltas immediately; MarkdownText owns visual pacing.
   const handleV2Event = useCallback((event: V2EventEnvelope) => {
+    const prevCursor = v2StateRef.current.sequenceCursor
     const next = reduceV2Event(v2StateRef.current, event)
     v2StateRef.current = next
 
@@ -594,10 +601,19 @@ function SuperAgent() {
     // Ticket 11: also persist ``pending_approval`` and ``v2_status`` so
     // a refresh while paused re-shows the prompt without round-tripping
     // through /events first.
+    //
+    // BCDEF ticket 11 (AC6): ``run.paused`` must NOT advance the persisted
+    // cursor. The pause only becomes durable when the control row reaches
+    // ``paused`` AFTER the frame was already streamed — a refresh landing
+    // inside that window would replay from a cursor past the pause and
+    // lose the approval prompt. Holding the cursor one frame back keeps
+    // the pause replayable (reducing the replay is idempotent), and the
+    // prompt itself is mirrored into ``pending_approval`` + restored from
+    // snapshot ``pending_approvals`` as belt-and-braces.
     if (v2RunRef.current) {
       v2RunRef.current = {
         ...v2RunRef.current,
-        sequence_cursor: next.sequenceCursor,
+        sequence_cursor: event.type === 'run.paused' ? prevCursor : next.sequenceCursor,
         pending_approval: next.pendingApproval,
         v2_status: next.status === 'idle' ? undefined : next.status,
       }
@@ -690,6 +706,22 @@ function SuperAgent() {
           }
         }
         return updated
+      })
+    } else if (event.type === 'progress.gap') {
+      // BCDEF ticket 11: droppable progress left a hole — the server's
+      // replay synthesizes this envelope (the stream loop synthesizes it
+      // locally for live jumps). Show the gap; never treat it as stalled
+      // progress or completion, and never trigger a model call.
+      const notice = next.reviewNotices[next.reviewNotices.length - 1]
+        || `部分进度更新丢失（序列 ${String(event.payload.from_sequence ?? '?')} → ${String(event.payload.to_sequence ?? '?')}）`
+      const traceEvent: AgentTraceEvent = {
+        type: 'review_notice',
+        content: notice,
+        metadata: event.payload as Record<string, unknown>,
+      }
+      appendTraceEvent(setMessages, traceEvent, {
+        content: last => `${last.content}${last.content.trim() ? '\n\n' : ''}[注意] ${notice}`,
+        isStreaming: true,
       })
     } else if (event.type === 'effect.outcome_unknown') {
       // A02: side effect finished with unknown outcome — the server
@@ -799,9 +831,22 @@ function SuperAgent() {
           (typeof event.payload.code === 'string' && event.payload.code) ||
           '运行出错'
         const separator = last.content.trim() ? '\n\n' : ''
+        // BCDEF ticket 11: an unknown external-effect outcome is a
+        // distinct terminal, not a generic failure. Render it apart (the
+        // reducer already set status ``outcome_unknown`` — sticky,
+        // non-continuable, never auto-retried) so the user waits for
+        // background reconciliation instead of being prompted to retry.
+        const outcomeUnknown =
+          code === 'effect_outcome_unknown' ||
+          code === 'outcome_unknown' ||
+          v2StateRef.current.status === 'outcome_unknown'
         return [
           ...updated.slice(0, -1),
-          { ...last, content: `${last.content}${separator}[错误] ${message}`, isStreaming: false },
+          {
+            ...last,
+            content: `${last.content}${separator}${outcomeUnknown ? '[结果未知] ' : '[错误] '}${message}`,
+            isStreaming: false,
+          },
         ]
       }
       // done: just finalize streaming.
@@ -810,6 +855,23 @@ function SuperAgent() {
     setIsSending(false)
     cleanupRef.current = null
   }, [rotateChatIdAfterForbidden])
+
+  // BCDEF ticket 11: anomaly counters wired into every v2 stream
+  // connection. The stream loop suppresses duplicate stream-terminals and
+  // reports parser drops here, so both stay observable in state instead
+  // of being silently accepted.
+  const countDuplicateTerminal = useCallback(() => {
+    v2StateRef.current = {
+      ...v2StateRef.current,
+      duplicateTerminalCount: v2StateRef.current.duplicateTerminalCount + 1,
+    }
+  }, [])
+  const countDroppedFrame = useCallback(() => {
+    v2StateRef.current = {
+      ...v2StateRef.current,
+      droppedCount: v2StateRef.current.droppedCount + 1,
+    }
+  }, [])
 
   // Ticket 11: attach a v2 SSE stream to a URL. Shared by the initial
   // /chat/sse request, the recovery effect's re-attach, and the resume
@@ -831,9 +893,192 @@ function SuperAgent() {
       onEvent: handlers.onEvent,
       onTerminal: handlers.onTerminal,
       onError: handlers.onError,
+      // BCDEF ticket 11: anomalies are counted, never silently dropped.
+      onDuplicateTerminal: countDuplicateTerminal,
+      onDroppedFrame: countDroppedFrame,
     })
     cleanupRef.current = cleanup
+  }, [countDuplicateTerminal, countDroppedFrame])
+
+  // BCDEF ticket 11 (AC3): a live stream that closed WITHOUT a terminal is
+  // NOT a connection error to fake and a run to discard — the run may be
+  // perfectly healthy server-side. The snapshot + durable replay are the
+  // authoritative recovery source: fetch /snapshot + /events?from_seq=
+  // cursor, fold them into the reducer state, and finalize/continue the
+  // UI from server truth. Never leaves the UI "streaming" when the
+  // snapshot is terminal; never re-posts /chat/sse (no extra model call);
+  // never creates a new conversation (canonical run_id/conversation_id
+  // come from the persisted run + snapshot).
+  const recoveredAssistantContent = useCallback((next: V2ConversationState): string => {
+    let content = `${next.assistantText}${v2NoticeSuffix(next.reviewNotices)}`
+    if (next.status === 'outcome_unknown') {
+      content += `\n\n[结果未知] ${next.errorMessage || '操作结果未知，等待后台对账修复，不会自动重放。'}`
+    } else if (next.status === 'error') {
+      content += `\n\n[错误] ${next.errorMessage || '运行出错'}`
+    } else if (next.status === 'cancelled') {
+      content += `\n\n${USER_CANCELLED_MESSAGE}`
+    }
+    return content
   }, [])
+
+  const reconcileAfterStreamLoss = useCallback(async () => {
+    const persisted = v2RunRef.current
+    if (!persisted) {
+      setIsSending(false)
+      cleanupRef.current = null
+      return
+    }
+    const recoveryId = persisted.run_id || persisted.request_id
+
+    const finalizeLocalWithoutServerTruth = (hint: string) => {
+      setMessages(prev => {
+        const updated = [...prev]
+        const last = updated[updated.length - 1]
+        if (last && last.role === 'assistant' && !last.content.includes(hint)) {
+          const separator = last.content.trim() ? '\n\n' : ''
+          updated[updated.length - 1] = {
+            ...last,
+            content: `${last.content}${separator}${hint}`,
+            isStreaming: false,
+          }
+        } else if (last && last.role === 'assistant') {
+          updated[updated.length - 1] = { ...last, isStreaming: false }
+        }
+        return updated
+      })
+      setIsSending(false)
+      cleanupRef.current = null
+    }
+
+    let snapshot: V2RunSnapshot | null
+    try {
+      snapshot = await fetchV2Snapshot(recoveryId)
+    } catch {
+      // The snapshot endpoint itself is unreachable. Keep the persisted
+      // run so the NEXT refresh retries the authoritative path — this is
+      // deliberately not a faked [连接错误] and never clears the run.
+      finalizeLocalWithoutServerTruth('[提示] 连接已中断，暂时无法获取运行快照；刷新页面可继续恢复该运行。')
+      return
+    }
+
+    const applyRecovered = async (): Promise<'terminal' | 'paused' | 'running'> => {
+      let replayEvents: V2EventEnvelope[] = []
+      try {
+        const replay = await fetchV2Events(snapshot?.run_id || recoveryId, persisted.sequence_cursor)
+        replayEvents = replay.events.map(evt => ({
+          version: '2',
+          sequence: evt.sequence,
+          type: evt.type,
+          payload: evt.payload,
+          request_id: evt.request_id,
+          conversation_id: evt.conversation_id,
+          run_id: evt.run_id,
+          event_id: evt.event_id,
+          timestamp: evt.timestamp,
+        }))
+      } catch {
+        // Replay unavailable — the snapshot alone stays authoritative.
+      }
+      const next = reconcileV2Snapshot(reduceV2Events(v2StateRef.current, replayEvents), snapshot)
+      // The snapshot messages are the fallback when replay cannot
+      // complete the assistant turn (event row lost but message durable).
+      if (!next.assistantText && snapshot) {
+        const fallback = assistantTextFromSnapshot(snapshot, snapshot.run_id)
+        if (fallback) next.assistantText = fallback
+      }
+      v2StateRef.current = next
+      // Persisted cursor: never advance past a pause (AC6 — the paused
+      // frame is only durable once the server confirms it, and replaying
+      // the pause/approval pair is idempotent).
+      if (v2RunRef.current) {
+        v2RunRef.current = {
+          ...v2RunRef.current,
+          sequence_cursor:
+            next.status === 'paused'
+              ? persisted.sequence_cursor
+              : Math.max(next.sequenceCursor, snapshot?.sequence_cursor ?? 0),
+          pending_approval: next.pendingApproval,
+          v2_status: next.status === 'idle' ? undefined : next.status,
+        }
+        saveV2PersistedRun(v2RunRef.current)
+      }
+      // Full rebuild (not append) — idempotent under repeated recovery:
+      // the same state always renders the same single message (AC8).
+      setMessages(prev => {
+        const updated = [...prev]
+        const last = updated[updated.length - 1]
+        if (last && last.role === 'assistant') {
+          updated[updated.length - 1] = {
+            ...last,
+            content: recoveredAssistantContent(next),
+            isStreaming: !isV2Terminal(next) && !isV2Paused(next),
+            artifacts: next.artifacts.length > 0 ? next.artifacts : last.artifacts,
+          }
+        }
+        return updated
+      })
+      if (isV2Terminal(next)) {
+        v2RunRef.current = null
+        saveV2PersistedRun(null)
+        setV2ApprovalState('idle')
+        setPendingApproval(null)
+        setIsSending(false)
+        cleanupRef.current = null
+        return 'terminal'
+      }
+      if (isV2Paused(next)) {
+        setV2ApprovalState('idle')
+        setPendingApproval(next.pendingApproval ?? persisted.pending_approval ?? null)
+        cleanupRef.current = null
+        return 'paused'
+      }
+      return 'running'
+    }
+
+    const outcome = await applyRecovered()
+    if (outcome !== 'running') return
+
+    if (snapshot === null) {
+      // The server has no durable run at all — nothing to reconcile.
+      // Finalize the local turn with a stable note (NOT a faked network
+      // error, NOT a cleared run with lost content).
+      v2RunRef.current = null
+      saveV2PersistedRun(null)
+      finalizeLocalWithoutServerTruth('[提示] 本次运行未能形成可恢复的服务记录，请重新发送。')
+      return
+    }
+
+    // Snapshot still running: poll the authoritative source until the run
+    // terminalizes / pauses (same bounded polling as mount recovery).
+    const deadline = Date.now() + RECOVERY_POLL_TIMEOUT_MS
+    const poll = async () => {
+      if (!v2RunRef.current) return
+      let next: V2RunSnapshot | null = null
+      try {
+        next = await fetchV2Snapshot(recoveryId)
+      } catch {
+        // transient — keep polling until the deadline.
+      }
+      if (!v2RunRef.current) return
+      if (next === null) {
+        v2RunRef.current = null
+        saveV2PersistedRun(null)
+        finalizeLocalWithoutServerTruth('[提示] 运行记录已不可查，请刷新页面。')
+        return
+      }
+      snapshot = next
+      if (V2_TERMINAL_RUN_STATUSES.has(next.status) || next.status === 'paused') {
+        void applyRecovered()
+        return
+      }
+      if (Date.now() >= deadline) {
+        finalizeLocalWithoutServerTruth('[提示] 任务耗时较长，后台仍在执行；可稍后刷新查看结果。')
+        return
+      }
+      setTimeout(() => { void poll() }, RECOVERY_POLL_INTERVAL_MS)
+    }
+    setTimeout(() => { void poll() }, RECOVERY_POLL_INTERVAL_MS)
+  }, [recoveredAssistantContent])
 
   // Ticket 11: submit the user's approve/reject decision and open the
   // resume SSE stream. Spec AC4 + AC6: the decision is idempotent w.r.t.
@@ -906,6 +1151,14 @@ function SuperAgent() {
       onEvent: handleV2Event,
       onTerminal: handleV2Terminal,
       onError: (error) => {
+        // BCDEF ticket 11: a resume stream that closed without a terminal
+        // reconciles against snapshot/replay too — the decision was already
+        // recorded server-side, so this is never a "恢复失败" to fake and
+        // never a re-decision or extra model call.
+        if (error === 'stream_closed_without_terminal') {
+          void reconcileAfterStreamLoss()
+          return
+        }
         setConnectionStatus('error')
         v2StateRef.current = {
           ...v2StateRef.current,
@@ -928,7 +1181,7 @@ function SuperAgent() {
         cleanupRef.current = null
       },
     })
-  }, [v2ApprovalState, attachV2Stream, handleV2Event, handleV2Terminal])
+  }, [v2ApprovalState, attachV2Stream, handleV2Event, handleV2Terminal, reconcileAfterStreamLoss])
 
   // Ticket 08 + 11 + A06: refresh recovery as an explicit state machine
   // driven by planV2Recovery. On mount: a locally terminal run skips the
@@ -956,7 +1209,7 @@ function SuperAgent() {
       setPendingApproval(null)
     }
 
-    const applyReplay = async (): Promise<V2ConversationState> => {
+    const applyReplay = async (snapshot: V2RunSnapshot | null): Promise<V2ConversationState> => {
       const replay = await fetchV2Events(recoveryId, persistedRun.sequence_cursor)
       const replayEnvelopes: V2EventEnvelope[] = replay.events.map(evt => ({
         version: '2',
@@ -969,7 +1222,17 @@ function SuperAgent() {
         event_id: evt.event_id,
         timestamp: evt.timestamp,
       }))
-      const next = reduceV2Events(v2StateRef.current, replayEnvelopes)
+      let next = reconcileV2Snapshot(
+        reduceV2Events(v2StateRef.current, replayEnvelopes),
+        snapshot,
+      )
+      // AC3: snapshot ``messages`` are the fallback when the replay
+      // cannot complete the picture (assistant row durable in the
+      // conversation DB but the SSE event row was lost).
+      if (!next.assistantText && snapshot) {
+        const fallback = assistantTextFromSnapshot(snapshot, snapshot.run_id)
+        if (fallback) next = { ...next, assistantText: fallback }
+      }
       v2StateRef.current = next
 
       setMessages(prev => {
@@ -980,14 +1243,19 @@ function SuperAgent() {
             restored.push({ role: 'user', content: persistedRun.user_message })
           }
           const isActive = next.status === 'running' || next.status === 'paused'
-          if (next.assistantText || isActive) {
+          // BCDEF ticket 11: a terminal recovery (done/error/cancelled/
+          // outcome_unknown) with no streamed text still needs the
+          // assistant turn — that is where the stable terminal renders.
+          if (next.assistantText || isActive || isV2Terminal(next)) {
             restored.push({
               role: 'assistant',
               // Review fix: replayed effect.outcome_unknown events live in
               // reviewNotices (the live path appends them to content
-              // directly) — re-append so the replay preserves them.
-              content: `${next.assistantText}${v2NoticeSuffix(next.reviewNotices)}`,
-              isStreaming: !isV2Terminal(next),
+              // directly) — re-append so the replay preserves them. The
+              // terminal suffix (error / 结果未知 / cancelled) renders the
+              // one terminal distinctly and never as plain text (AC5/AC7).
+              content: recoveredAssistantContent(next),
+              isStreaming: !isV2Terminal(next) && !isV2Paused(next),
               // A02: artifacts delivered before the refresh are part of
               // the replay state — reattach so download cards survive.
               artifacts: next.artifacts.length > 0 ? next.artifacts : undefined,
@@ -997,25 +1265,33 @@ function SuperAgent() {
         }
         // Polling replays: refresh the trailing assistant message in
         // place so text/artifacts produced while polling show up when
-        // the run finishes.
+        // the run finishes. Full rebuild from reducer state — repeated
+        // recovery renders the SAME single message (AC8: no duplicated
+        // UI text on repeated recovery).
         const updated = [...prev]
         const last = updated[updated.length - 1]
         if (last && last.role === 'assistant') {
           updated[updated.length - 1] = {
             ...last,
-            content: `${next.assistantText}${v2NoticeSuffix(next.reviewNotices)}`,
-            isStreaming: !isV2Terminal(next),
+            content: recoveredAssistantContent(next),
+            isStreaming: !isV2Terminal(next) && !isV2Paused(next),
             artifacts: next.artifacts.length > 0 ? next.artifacts : undefined,
           }
         }
         return updated
       })
 
-      // Update the persisted cursor so the next recovery starts from here.
+      // Update the persisted cursor so the next recovery starts from
+      // here. AC6: a paused run keeps the ORIGINAL cursor — the pause is
+      // not yet a durable server fact until the snapshot confirms the
+      // continuation, and replaying the approval pair is idempotent.
       v2RunRef.current = {
         ...persistedRun,
-        sequence_cursor: next.sequenceCursor,
-        pending_approval: next.pendingApproval,
+        sequence_cursor:
+          next.status === 'paused'
+            ? persistedRun.sequence_cursor
+            : Math.max(next.sequenceCursor, snapshot?.sequence_cursor ?? 0),
+        pending_approval: next.pendingApproval ?? persistedRun.pending_approval,
         v2_status: next.status === 'idle' ? undefined : next.status,
       }
       saveV2PersistedRun(v2RunRef.current)
@@ -1024,7 +1300,10 @@ function SuperAgent() {
 
     const showApprovalPrompt = (next: V2ConversationState) => {
       setV2ApprovalState('idle')
-      setPendingApproval(next.pendingApproval)
+      // AC6: the approval survives refresh via three sources in order —
+      // replayed ``approval.required``, snapshot ``pending_approvals``
+      // (folded in by reconcileV2Snapshot), and the persisted run mirror.
+      setPendingApproval(next.pendingApproval ?? persistedRun.pending_approval ?? null)
     }
 
     const startPolling = () => {
@@ -1057,13 +1336,13 @@ function SuperAgent() {
           if (snapshot === null) {
             // Run row vanished mid-poll (server reaped it) — render
             // whatever the event log still holds and stop.
-            await applyReplay()
+            await applyReplay(null)
             if (cancelled) return
             clearPersisted()
             return
           }
           if (V2_TERMINAL_RUN_STATUSES.has(snapshot.status)) {
-            await applyReplay()
+            await applyReplay(snapshot)
             if (cancelled) return
             clearPersisted()
             return
@@ -1071,7 +1350,7 @@ function SuperAgent() {
           if (snapshot.status === 'paused') {
             // Approval became necessary while polling — re-show the
             // prompt; the persisted run stays for handleV2Approval.
-            const next = await applyReplay()
+            const next = await applyReplay(snapshot)
             if (cancelled) return
             showApprovalPrompt(next)
             return
@@ -1102,12 +1381,12 @@ function SuperAgent() {
           return
         }
         if (plan.kind === 'replay-terminal') {
-          await applyReplay()
+          await applyReplay(snapshot)
           if (cancelled) return
           clearPersisted()
           return
         }
-        const next = await applyReplay()
+        const next = await applyReplay(snapshot)
         if (cancelled) return
         if (isV2Terminal(next)) {
           clearPersisted()
@@ -1360,7 +1639,17 @@ function SuperAgent() {
           onOpen: () => setConnectionStatus('connected'),
           onEvent: handleV2Event,
           onTerminal: handleV2Terminal,
+          onDuplicateTerminal: countDuplicateTerminal,
+          onDroppedFrame: countDroppedFrame,
           onError: (error) => {
+            // BCDEF ticket 11: transport closure without a terminal is a
+            // RECOVERY trigger, not a connection error. Reconcile against
+            // the authoritative snapshot + replay instead of appending a
+            // fake [连接错误] and clearing the persisted run.
+            if (error === 'stream_closed_without_terminal') {
+              void reconcileAfterStreamLoss()
+              return
+            }
             setConnectionStatus('error')
             setMessages(prev => {
               const updated = [...prev]
@@ -1399,7 +1688,7 @@ function SuperAgent() {
         setIsSending(false)
       }
     }
-  }, [input, isSending, activeSessionId, selectedScenario, messages, handleV2Event, handleV2Terminal])
+  }, [input, isSending, activeSessionId, selectedScenario, messages, handleV2Event, handleV2Terminal, reconcileAfterStreamLoss, countDuplicateTerminal, countDroppedFrame])
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -1454,18 +1743,28 @@ function SuperAgent() {
       // never stays in a "thinking" state.
       if (v2RunRef.current) {
         const persisted = v2RunRef.current
+        let serverConfirmed = false
         try {
           await cancelV2Run(persisted.run_id || persisted.request_id, `cancel-${Date.now()}`)
+          serverConfirmed = true
         } catch {
-          // Best-effort: if the cancel API is unreachable, we still
-          // finalize the UI locally. The server-side run will eventually
-          // time out or be observed via /snapshot on next refresh.
+          // Best-effort: if the cancel API is unreachable we still
+          // finalize the UI locally — but BCDEF ticket 11 no longer
+          // discards the recovery context on an UNCONFIRMED cancel. The
+          // persisted run stays (canonical run/request id + cursor), so
+          // the next refresh reconciles against snapshot/replay — the
+          // authoritative source after cancel — instead of leaving a
+          // server-side run nobody can find.
         }
         // Update v2 state to cancelled locally so the UI shows the right
         // status even if the terminal event never arrives.
         v2StateRef.current = { ...v2StateRef.current, status: 'cancelled' }
-        v2RunRef.current = null
-        saveV2PersistedRun(null)
+        if (serverConfirmed) {
+          // The server holds the cancelled terminal and it replays (AC4:
+          // cancelled is a replayable terminal) — safe to clear locally.
+          v2RunRef.current = null
+          saveV2PersistedRun(null)
+        }
         setPendingApproval(null)
         appendCancellationNotice()
       }
