@@ -344,7 +344,75 @@ def repair_effect(
 
     The original ``effect_key``/``run_id``/approval identity is reused;
     nothing is re-created and no external effect or model turn runs.
+
+    agent-lifecycle-repair ticket 02: repair is a WRITER of the run
+    (repair-state CAS + replayable events), so it enters through the same
+    per-run execution ownership as the first stream and the resume. The
+    claim is non-blocking: while an execution owner holds the run, the
+    repair returns the existing ``repair_conflict`` semantics with the
+    effect state and the event cursor unchanged; once the owner released,
+    the repair proceeds per its existing policy below.
     """
+    effect = runs_repo.get_effect_by_effect_id(effect_id)
+    if effect is None:
+        return RepairOutcome(
+            status="not_found",
+            payload={"code": REPAIR_NOT_FOUND, "effect_id": effect_id},
+        )
+
+    if action not in (
+        EffectRepairAction.CONFIRM.value,
+        EffectRepairAction.ABANDON.value,
+    ):
+        return RepairOutcome(
+            status="invalid_result",
+            effect=effect,
+            payload={"code": "repair_action_invalid", "effect_id": effect_id},
+        )
+
+    owner = runs_repo.try_acquire_run_execution(effect.run_id)
+    if owner is None:
+        logger.warning(
+            "effect_repair: run_id=%s has an active execution owner; repair "
+            "of %s returns repair_conflict with state unchanged",
+            effect.run_id,
+            effect_id,
+        )
+        return RepairOutcome(
+            status="conflict",
+            effect=effect,
+            payload=_public_payload(
+                effect,
+                status="conflict",
+                action=action,
+                code=REPAIR_CONFLICT,
+            ),
+        )
+    try:
+        return _apply_repair_decision(
+            runs_repo,
+            effect_id,
+            action=action,
+            result=result,
+            idempotency_key=idempotency_key,
+            actor=actor,
+            reason=reason,
+        )
+    finally:
+        runs_repo.release_run_execution(effect.run_id, owner)
+
+
+def _apply_repair_decision(
+    runs_repo: "RunRepository",
+    effect_id: str,
+    *,
+    action: str,
+    result: dict[str, Any] | None = None,
+    idempotency_key: str,
+    actor: str = "operator",
+    reason: str = "",
+) -> RepairOutcome:
+    """The repair state machine, executed while holding the run token."""
     effect = runs_repo.get_effect_by_effect_id(effect_id)
     if effect is None:
         return RepairOutcome(
@@ -517,7 +585,10 @@ def repair_effect(
                 current is not None
                 and current.status == EffectStatus.COMMITTED.value
             ):
-                return repair_effect(
+                # Ticket 02: the caller already holds the run token; the
+                # CAS loser re-reads the winner's row through the internal
+                # decision path instead of re-entering the gate.
+                return _apply_repair_decision(
                     runs_repo,
                     effect_id,
                     action=action,
@@ -609,7 +680,9 @@ def repair_effect(
             current is not None
             and current.repair_status == EffectRepairStatus.ABANDONED.value
         ):
-            return repair_effect(
+            # Ticket 02: the token is held by this caller; recurse through
+            # the internal decision path.
+            return _apply_repair_decision(
                 runs_repo,
                 effect_id,
                 action=action,

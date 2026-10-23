@@ -21,8 +21,10 @@ Responsibilities:
 from __future__ import annotations
 
 import functools
+import itertools
 import json
 import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -303,6 +305,26 @@ def _observe_admission_outcome(admit):
     return wrapper
 
 
+@dataclass(frozen=True, slots=True)
+class RunExecutionToken:
+    """Per-run in-process execution ownership (agent-lifecycle-repair 02).
+
+    The token is the single proof that a connection may WRITE to one run.
+    It lives on the shared :class:`RunRepository` — not on an orchestrator
+    instance — so every entry point (first stream, resume, effect repair,
+    janitor repair claim) competes for the SAME per-run token even when
+    they run in different orchestrator instances of one process.
+
+    Premises (contract): the startup OS writer.lock guarantees a single
+    runtime, and all writers share one Repository. The serial is unique
+    per acquisition, so a stale token can never release a successor's
+    ownership (double-release safety).
+    """
+
+    run_id: str
+    serial: int
+
+
 class RunRepository:
     """Facade over ControlStore + CheckpointsStore.
 
@@ -318,10 +340,56 @@ class RunRepository:
     def __init__(self, control: ControlStore, checkpoints: CheckpointsStore) -> None:
         self.control = control
         self.checkpoints = checkpoints
+        # agent-lifecycle-repair ticket 02: process-wide per-run execution
+        # ownership. The dict maps run_id → the owning token's serial; the
+        # guard protects ONLY these tiny in-memory ops and is never held
+        # across an await, a model call, a physical cleanup or an SSE send.
+        self._execution_owners: dict[str, int] = {}
+        self._execution_serial = itertools.count(1)
+        self._execution_guard = threading.Lock()
 
     def close(self) -> None:
         self.control.close()
         self.checkpoints.close()
+
+    # -- per-run execution ownership (agent-lifecycle-repair ticket 02) ------
+
+    def try_acquire_run_execution(self, run_id: str) -> RunExecutionToken | None:
+        """Claim the execution right for ONE run, non-blocking.
+
+        Returns the token when this caller is now the sole writer of the
+        run, or ``None`` when another owner is active — the loser NEVER
+        waits (there is no queue by design) and must degrade to a
+        read-only observer. Cross-instance safe: the token table lives
+        on this shared Repository, so two orchestrator instances over
+        one Repository still yield exactly one executor.
+        """
+        with self._execution_guard:
+            if run_id in self._execution_owners:
+                return None
+            serial = next(self._execution_serial)
+            self._execution_owners[run_id] = serial
+            return RunExecutionToken(run_id=run_id, serial=serial)
+
+    def release_run_execution(self, run_id: str, token: RunExecutionToken) -> bool:
+        """Release the run's token, matching the exact token serial.
+
+        An old token can never release a successor owner: after a genuine
+        release the entry is either gone (a later acquire mints a NEW
+        serial) or already owned by someone else. Returns whether THIS
+        token was still the owner and has been removed.
+        """
+        with self._execution_guard:
+            current = self._execution_owners.get(run_id)
+            if current is None or current != token.serial:
+                return False
+            del self._execution_owners[run_id]
+            return True
+
+    def run_execution_owner_active(self, run_id: str) -> bool:
+        """Whether an execution owner currently holds ``run_id`` (read-only)."""
+        with self._execution_guard:
+            return run_id in self._execution_owners
 
     # -- create + status ------------------------------------------------
 

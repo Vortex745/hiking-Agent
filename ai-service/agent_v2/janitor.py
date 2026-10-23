@@ -110,7 +110,10 @@ def _default_repair(
 
     if isinstance(known_result, dict) and known_result:
         # No ``result`` payload: the repair seam reads the durable row, so
-        # the janitor publishes exactly what the ledger recorded.
+        # the janitor publishes exactly what the ledger recorded. The
+        # seam itself carries the per-run execution ownership gate
+        # (agent-lifecycle-repair ticket 02): an actively owned run makes
+        # this a retryable failure, never a concurrent write.
         outcome = repair_effect(
             runs_repo,
             effect_id,
@@ -118,6 +121,10 @@ def _default_repair(
             idempotency_key=f"janitor:{task.task_id}",
             actor=f"janitor:{task.task_id}",
         )
+        if outcome.status == "conflict":
+            # Active execution owns the run — do not touch the effect; the
+            # task is retried after the owner releases.
+            raise RuntimeError("repair_conflict: run execution in progress")
         if outcome.status not in ("repaired", "idempotent"):
             raise RuntimeError(
                 f"janitor repair failed: {outcome.payload.get('code') or outcome.status}"
@@ -128,9 +135,20 @@ def _default_repair(
             "status": outcome.status,
         }
 
-    record, won = runs_repo.claim_effect_repair(
-        effect.effect_key, owner=f"janitor:{task.task_id}"
-    )
+    # agent-lifecycle-repair ticket 02: the repair CLAIM is also a write
+    # into the run's repair state, so it enters through the SAME per-run
+    # execution ownership. While an execution owner holds the run the
+    # claim is refused (retryable after release); the state and cursor
+    # stay unchanged.
+    owner = runs_repo.try_acquire_run_execution(effect.run_id)
+    if owner is None:
+        raise RuntimeError("repair_conflict: run execution in progress")
+    try:
+        record, won = runs_repo.claim_effect_repair(
+            effect.effect_key, owner=f"janitor:{task.task_id}"
+        )
+    finally:
+        runs_repo.release_run_execution(effect.run_id, owner)
     if record is None:
         raise LookupError(f"effect {effect_id!r} not found")
     return {
