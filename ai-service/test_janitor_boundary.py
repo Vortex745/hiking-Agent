@@ -801,8 +801,15 @@ def test_resume_rejects_outcome_unknown_status_before_work(tmp_path):
         )
         items = _resume(orch, run_id)
 
+        # BCDEF review S3: ``outcome_unknown`` is terminal in the shared
+        # contract, so ``run.is_terminal`` now stops the resume at the
+        # replay boundary and the stream ends with the replay's stable
+        # synthetic terminal — the same ``effect_outcome_unknown`` code the
+        # live effect driver and the snapshot use — instead of the generic
+        # ``run_not_resumable`` that only the late ticket-06 revalidation
+        # used to reach. Either way, NOTHING continues.
         assert items[-1].type == "error"
-        assert items[-1].payload["code"] == "run_not_resumable"
+        assert items[-1].payload["code"] == "effect_outcome_unknown"
         assert factory_calls == []
         assert kernel_calls == []
         assert repo.list_effects_for_run(run_id) == []

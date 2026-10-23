@@ -55,9 +55,12 @@ def _default_repair(
 ) -> dict[str, Any]:
     """Reconcile one unknown-outcome effect WITHOUT executing anything.
 
-    A known result (e.g. a publication failure) is confirmed through the
-    ticket-05 repair seam. When no result is known the janitor only
-    claims the repair so an operator can confirm/abandon it.
+    BCDEF review S5: the ledger row is the only source of a repairable
+    result. A known result (a lost success-event publication) is confirmed
+    through the ticket-05 repair seam FROM THE DURABLE ROW — the janitor
+    asserts nothing from its own evidence payload. When no result was
+    recorded the janitor only CLAIMS the repair so an operator can
+    confirm/abandon it. No model turn and no external effect is executed.
     """
     evidence = task.evidence
     run_id = task.run_id or str(evidence.get("run_id") or "")
@@ -85,8 +88,8 @@ def _default_repair(
             "already_repaired": True,
         }
 
-    known_result = evidence.get("known_result")
-    if known_result is None and effect.result_json:
+    known_result: dict[str, Any] | None = None
+    if effect.result_json:
         try:
             parsed = json.loads(effect.result_json)
         except (TypeError, ValueError):
@@ -95,11 +98,12 @@ def _default_repair(
             known_result = parsed
 
     if isinstance(known_result, dict) and known_result:
+        # No ``result`` payload: the repair seam reads the durable row, so
+        # the janitor publishes exactly what the ledger recorded.
         outcome = repair_effect(
             runs_repo,
             effect_id,
             action="confirm",
-            result=known_result,
             idempotency_key=f"janitor:{task.task_id}",
             actor=f"janitor:{task.task_id}",
         )

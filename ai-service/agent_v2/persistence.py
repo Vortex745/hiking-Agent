@@ -31,6 +31,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from agent_v2.execution_contract import (
+    # ``RunStatus`` here is the contract's lifecycle ENUM; this module keeps
+    # its own historical ``RunStatus`` Literal alias for stored strings.
+    RunStatus as RunLifecycleStatus,
+    TERMINAL_STATUSES,
+)
+
 logger = logging.getLogger("ai-service.agent_v2.persistence")
 
 
@@ -84,22 +91,19 @@ RunStatus = Literal[
     "cancelled",          # cancel requested + accepted
     "paused",             # Ticket 11: awaiting user approval; NOT terminal
     "admission_failed",   # fence failed; repairable by admission repair only
+    "outcome_unknown",    # effect outcome indeterminate; NOT resumable
 ]
 
 TerminalType = Literal["done", "error", "cancelled", "admission_failed"]
 
+# BCDEF review S3: the run-status vocabulary has ONE source — the shared
+# execution contract. ``_VALID_STATUSES`` used to spell its own list and
+# left ``outcome_unknown`` out, so a run row in that state read as
+# non-terminal (resumable, CAS-able) to every guard below.
 _VALID_STATUSES: frozenset[str] = frozenset(
-    {
-        "admission_pending",
-        "admitted",
-        "running",
-        "done",
-        "error",
-        "cancelled",
-        "paused",
-        "admission_failed",
-    }
+    status.value for status in RunLifecycleStatus
 )
+
 # ``paused`` is NOT terminal — the run is awaiting a user decision and
 # will resume on ``POST /approvals/{approval_id}/decision``. The
 # RunAlreadyTerminal guard therefore allows ``running`` → ``paused`` and
@@ -110,9 +114,27 @@ _VALID_STATUSES: frozenset[str] = frozenset(
 # (``admission_failed`` → ``admitted``) used only by admission repair; it
 # is not a resume and can never start a second model call for a run that
 # already executed.
+#
+# ``outcome_unknown`` is terminal too (ticket 04/05): repairing it is a
+# reconciliation/janitor action, never a resume.
 _TERMINAL_STATUSES: frozenset[str] = frozenset(
-    {"done", "error", "cancelled", "admission_failed"}
+    status.value for status in TERMINAL_STATUSES
 )
+
+# Sorted so the generated SQL fragment is byte-stable across processes
+# (frozenset iteration order is not).
+_TERMINAL_GUARD_PARAMS: tuple[str, ...] = tuple(sorted(_TERMINAL_STATUSES))
+
+
+def _terminal_guard_sql(column: str = "status") -> str:
+    """``<column> NOT IN (...)`` for every terminal run status.
+
+    The paired bound parameters are :data:`_TERMINAL_GUARD_PARAMS`. Used by
+    every terminal CAS UPDATE so no inline SQL keeps its own — drifting —
+    copy of the terminal vocabulary (BCDEF review S3).
+    """
+    placeholders = ", ".join("?" for _ in _TERMINAL_GUARD_PARAMS)
+    return f"{column} NOT IN ({placeholders})"
 
 
 # ---- Control store: runs + cancel + writer lock --------------------------
@@ -948,9 +970,9 @@ class ControlStore:
             cursor = self._conn.execute(
                 "UPDATE runs SET status = ?, terminal_type = ?, updated_at = ?, "
                 "terminal_at = ?, terminal_persist_failed = 0 "
-                "WHERE run_id = ? AND status NOT IN "
-                "('done', 'error', 'cancelled', 'admission_failed')",
-                (terminal_type, terminal_type, now, now, run_id),
+                f"WHERE run_id = ? AND {_terminal_guard_sql()}",
+                (terminal_type, terminal_type, now, now, run_id,
+                 *_TERMINAL_GUARD_PARAMS),
             )
             self._conn.execute("COMMIT")
         except Exception:
@@ -996,9 +1018,8 @@ class ControlStore:
             self._conn.execute(
                 "UPDATE runs SET status = 'error', terminal_type = 'error', "
                 "updated_at = ?, terminal_at = ?, terminal_persist_failed = 1 "
-                "WHERE run_id = ? AND status NOT IN "
-                "('done', 'error', 'cancelled', 'admission_failed')",
-                (now, now, run_id),
+                f"WHERE run_id = ? AND {_terminal_guard_sql()}",
+                (now, now, run_id, *_TERMINAL_GUARD_PARAMS),
             )
             self._conn.execute("COMMIT")
         except Exception:

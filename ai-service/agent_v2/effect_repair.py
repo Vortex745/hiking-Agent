@@ -7,10 +7,13 @@ success result may be published until the outcome is reconciled.
 
 This module owns the reconciliation decisions:
 
-* ``confirm`` — an operator (or the janitor, from a known result) supplies
-  the result. The effect row commits to the SAME effect/run identity and
-  exactly one replayable ``tool_result`` plus one ``effect.repaired``
-  progress event are published.
+* ``confirm`` — republishes the result the LEDGER ALREADY RECORDS. A repair
+  decision carries no result authority (BCDEF review S5): the endpoint is
+  guarded by conversation ownership alone, so a payload that was never
+  durably recorded — or that disagrees with the recorded row — is refused
+  with a stable code. On a durable known result the effect commits to the
+  SAME effect/run identity and exactly one replayable ``tool_result`` plus
+  one ``effect.repaired`` progress event are published.
 * ``abandon`` — fail closed. The effect stays ``outcome_unknown``; only
   the repair state becomes ``abandoned``. No success result is published.
 
@@ -51,6 +54,10 @@ REPAIR_NOT_NEEDED = "repair_not_needed"
 REPAIR_CONFLICT = "repair_conflict"
 REPAIR_FAILED = "repair_failed"
 REPAIR_INVALID_RESULT = "repair_result_invalid"
+# BCDEF review S5: the caller's payload is not a source of truth. A confirm
+# decision that disagrees with the durably recorded result — or that has no
+# recorded result to confirm — is refused with this stable code.
+REPAIR_RESULT_NOT_DURABLE = "repair_result_not_durable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,8 +66,8 @@ class RepairOutcome:
 
     ``status`` is one of ``repaired`` / ``abandoned`` / ``idempotent`` /
     ``conflict`` / ``not_repairable`` / ``not_found`` / ``invalid_result``
-    / ``failed``. ``payload`` is the stable public body shared by the HTTP
-    adapter and the janitor.
+    / ``unverified_result`` / ``failed``. ``payload`` is the stable public
+    body shared by the HTTP adapter and the janitor.
     """
 
     status: str
@@ -288,6 +295,41 @@ def _stored_result(effect: "EffectRecord") -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def _unverified_result(
+    effect: "EffectRecord",
+    action: str,
+    *,
+    supplied: "dict[str, Any] | None",
+    stored: "dict[str, Any] | None",
+) -> RepairOutcome:
+    """Refuse a confirm decision that the ledger cannot vouch for.
+
+    BCDEF review S5: ``POST /effects/{effect_id}/repair`` is guarded by
+    conversation ownership only, so an ordinary subject could otherwise
+    hand the ledger an authoritative replayable success result that was
+    never recorded. A confirm therefore publishes EXCLUSIVELY the stored
+    ``result_json``; a supplied payload is accepted only as an assertion
+    that equals it.
+    """
+    logger.warning(
+        "effect_repair: confirm refused for %s — result is not durable "
+        "(stored=%s, supplied=%s)",
+        effect.resolved_effect_id,
+        bool(stored),
+        supplied is not None,
+    )
+    return RepairOutcome(
+        status="unverified_result",
+        effect=effect,
+        payload=_public_payload(
+            effect,
+            status="unverified_result",
+            action=action,
+            code=REPAIR_RESULT_NOT_DURABLE,
+        ),
+    )
+
+
 def repair_effect(
     runs_repo: "RunRepository",
     effect_id: str,
@@ -334,6 +376,12 @@ def repair_effect(
                 ),
             )
         stored = _stored_result(effect)
+        if result is not None and result != stored:
+            # An already-committed row keeps its recorded result; a
+            # disagreeing payload is the same forgery attempt (S5).
+            return _unverified_result(
+                effect, action, supplied=result, stored=stored
+            )
         if stored is not None:
             try:
                 _publish_confirmed(
@@ -429,22 +477,19 @@ def repair_effect(
         )
 
     if action == EffectRepairAction.CONFIRM.value:
-        # A confirmed repair must supply an operator-known result. When a
-        # result is already durable (publication failure) the caller may
-        # reuse it by passing the stored payload.
-        effective_result = result
-        if effective_result is None:
-            effective_result = _stored_result(effect)
+        # BCDEF review S5: confirm has NO result authority. What gets
+        # published is the result the ledger already recorded (a lost
+        # success-event publication keeps it); when nothing was recorded
+        # there is nothing to confirm and the caller must ``abandon``
+        # instead. A supplied payload only asserts the recorded one.
+        effective_result = _stored_result(effect)
+        if result is not None and result != effective_result:
+            return _unverified_result(
+                effect, action, supplied=result, stored=effective_result
+            )
         if not isinstance(effective_result, dict) or not effective_result:
-            return RepairOutcome(
-                status="invalid_result",
-                effect=effect,
-                payload=_public_payload(
-                    effect,
-                    status="invalid_result",
-                    action=action,
-                    code=REPAIR_INVALID_RESULT,
-                ),
+            return _unverified_result(
+                effect, action, supplied=result, stored=effective_result
             )
         try:
             serialized = serialize_result(effective_result)
@@ -476,7 +521,8 @@ def repair_effect(
                     runs_repo,
                     effect_id,
                     action=action,
-                    result=effective_result,
+                    # S5: re-read the row the winner committed instead of
+                    # re-asserting a payload this caller never owned.
                     idempotency_key=idempotency_key,
                     actor=actor,
                     reason=reason,
@@ -632,6 +678,7 @@ __all__ = [
     "REPAIR_INVALID_RESULT",
     "REPAIR_NOT_FOUND",
     "REPAIR_NOT_NEEDED",
+    "REPAIR_RESULT_NOT_DURABLE",
     "RepairAction",
     "RepairOutcome",
     "effect_known_facts",

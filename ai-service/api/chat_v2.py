@@ -623,8 +623,10 @@ class EffectRepairRequest(BaseModel):
     """Body for ``POST /effects/{effect_id}/repair`` (BCDEF ticket 05).
 
     ``action`` is the operator decision for an ``outcome_unknown`` effect:
-    ``confirm`` commits the supplied ``result`` as the single replayable
-    final result; ``abandon`` fails closed and keeps the effect unknown.
+    ``confirm`` republishes the result the LEDGER ALREADY RECORDS (BCDEF
+    review S5 — this endpoint is guarded by conversation ownership alone,
+    so a payload the system never recorded is refused rather than trusted);
+    ``abandon`` fails closed and keeps the effect unknown.
     ``idempotency_key`` makes retries safe (a repeated decision returns
     the original outcome). ``extra="forbid"`` keeps the client surface
     minimal — no model, sandbox or lease parameters are accepted.
@@ -656,9 +658,11 @@ async def chat_v2_repair_effect(
     * 200 — repaired / abandoned / idempotent retry (``status``)
     * 404 — unknown ``effect_id`` (``effect_not_found``) or the caller
       does not own the effect's conversation
-    * 409 — ``repair_not_needed`` (effect is not unknown) or
-      ``repair_conflict`` (opposite decision already recorded)
-    * 422 — invalid action / missing or non-object result
+    * 409 — ``repair_not_needed`` (effect is not unknown),
+      ``repair_conflict`` (opposite decision already recorded) or
+      ``repair_result_not_durable`` (the supplied result is not what the
+      ledger recorded — BCDEF review S5)
+    * 422 — invalid action / non-object result
     * 503 — v2 persistence not assembled, or the repair result could not
       be made durable (``repair_failed``, retryable)
     """
@@ -688,7 +692,7 @@ async def chat_v2_repair_effect(
         )
     if outcome.status == "invalid_result":
         return JSONResponse(status_code=422, content=outcome.payload)
-    if outcome.status == "conflict":
+    if outcome.status in ("conflict", "unverified_result"):
         return JSONResponse(status_code=409, content=outcome.payload)
     if outcome.status == "not_repairable":
         return JSONResponse(status_code=409, content=outcome.payload)

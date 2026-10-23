@@ -802,6 +802,11 @@ class ExecutionErrorCode(str, Enum):
     # BCDEF ticket 10: a second executor attempted an effect that a live
     # claim already owns. Stable and retryable; never re-execute.
     DUPLICATE_EFFECT = "duplicate_effect"
+    # BCDEF review S1: the durable ``authorized`` ledger row itself could
+    # not be written, so no execution right exists. Distinct from
+    # ``duplicate_effect``/``effect_in_flight`` (a live claim DOES own the
+    # row) and from ``outcome_unknown`` (nothing was executed here).
+    EFFECT_PERSIST_FAILED = "effect_persist_failed"
 
 
 # Whether a failure can be repaired without re-running the model or
@@ -830,6 +835,10 @@ ERROR_RECOVERABLE: dict[ExecutionErrorCode, bool] = {
     # A duplicate in-flight effect is resolvable by waiting for the
     # owner's durable outcome; it is never resolved by re-execution.
     ExecutionErrorCode.DUPLICATE_EFFECT: True,
+    # Nothing executed when the ledger row itself could not be written, so
+    # a later request (with a fresh admission) may retry it safely; the
+    # CURRENT run still stops, because no execution right was ever granted.
+    ExecutionErrorCode.EFFECT_PERSIST_FAILED: True,
 }
 
 

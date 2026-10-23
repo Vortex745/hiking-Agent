@@ -533,7 +533,9 @@ class EffectDriveResult:
     ``recovered`` (result came from a committed effect), ``already_ok``
     (a successful tool_result was already persisted), ``in_flight``
     (another executor is live — sandbox must be preserved), ``failed``
-    / ``outcome_unknown`` (terminal; run status already marked).
+    / ``outcome_unknown`` (terminal; run status already marked), and
+    ``persist_failed`` (BCDEF review S1: the durable ledger row itself
+    could not be written, so nothing was claimed or executed).
     """
 
     status: str = "skipped"
@@ -612,6 +614,15 @@ EFFECT_COPY_GENERATE_PDF = EffectCopy(
 _SANDBOX_UNAVAILABLE_CODE = SandboxUnavailableError.code
 _SANDBOX_UNAVAILABLE_REASON_PREFIX = f"{_SANDBOX_UNAVAILABLE_CODE}: "
 _SANDBOX_UNAVAILABLE_MESSAGE_PREFIX = "沙箱不可用："
+
+# BCDEF review S1: the durable ``authorized`` ledger row could not be
+# written, so no execution right exists. Distinct from ``effect_in_flight``
+# (a live claim DOES own a row) and from ``effect_outcome_unknown``
+# (something MAY have run). Nothing executed here, so this is retryable.
+_EFFECT_PERSIST_FAILED = ExecutionErrorCode.EFFECT_PERSIST_FAILED.value
+_EFFECT_PERSIST_FAILED_MESSAGE = (
+    "效果账本写入失败，未能建立执行权，已停止执行（未调用外部工具）。"
+)
 
 
 def _record_sandbox_refusal(
@@ -806,7 +817,10 @@ async def drive_effect(
 
     This is the single authority for the ledger transitions:
 
-    * spec AC1 — insert the row in ``authorized`` BEFORE execution;
+    * spec AC1 — insert the row in ``authorized`` BEFORE execution; when
+      that durable write fails there is no execution right, so the driver
+      logs it and stops with the stable ``effect_persist_failed`` code and
+      NEVER claims or executes (BCDEF review S1);
     * ticket 04 — CAS ``authorized/pending → executing/claimed`` with a
       fenced claim token; exactly one executor wins, the loser must not
       re-execute;
@@ -979,7 +993,45 @@ async def drive_effect(
                     external_idempotency_key=external_idempotency_key,
                 )
             except Exception:
-                existing_effect = runs_repo.get_effect(effect_key)
+                logger.exception(
+                    "run_orchestration: effect ledger insert (spec AC1 durable "
+                    "write) failed for %s run_id=%s effect_key=%s",
+                    copy.tool_name,
+                    run_id,
+                    effect_key,
+                )
+                try:
+                    # A duplicate-key conflict on the SAME logical effect is
+                    # the one benign reason: a concurrent writer owns the
+                    # row and the CAS below decides who executes.
+                    existing_effect = runs_repo.get_effect(effect_key)
+                except Exception:
+                    logger.exception(
+                        "run_orchestration: effect ledger read-after-insert "
+                        "also failed for %s run_id=%s effect_key=%s",
+                        copy.tool_name,
+                        run_id,
+                        effect_key,
+                    )
+                    existing_effect = None
+                if existing_effect is None:
+                    # BCDEF review S1: no durable row means NO execution
+                    # right. Claiming a missing row used to fall through to
+                    # ``effect_in_flight`` — a stable-sounding lie that also
+                    # left the external side effect about to run. Fail
+                    # closed with the persist-failure code instead.
+                    outcome.status = "persist_failed"
+                    yield emit("error", {
+                        "code": _EFFECT_PERSIST_FAILED,
+                        "boundary_code": _EFFECT_PERSIST_FAILED,
+                        "tool": copy.tool_name,
+                        "effect_id": effect_key,
+                        "idempotency_key": external_idempotency_key,
+                        "recoverable": True,
+                        "message": _EFFECT_PERSIST_FAILED_MESSAGE,
+                    })
+                    mark_terminal_safe(runs_repo, run_id, "error")
+                    return
 
         # CAS claim ``authorized/pending → executing/claimed`` with a
         # fenced claim token (BCDEF ticket 04). Exactly one caller wins;
@@ -3812,7 +3864,9 @@ class RunOrchestrator:
                 approval_granted=True,
             ):
                 yield envelope
-            if outcome.status in ("failed", "outcome_unknown", "in_flight", "denied"):
+            if outcome.status in (
+                "failed", "outcome_unknown", "in_flight", "denied", "persist_failed"
+            ):
                 if outcome.preserve_sandbox:
                     preserve_sandbox = True
                 return

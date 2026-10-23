@@ -9,6 +9,7 @@ executor is a counting fake. No network, no sandbox.
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -365,6 +366,25 @@ def _ok_executor(calls: list[int], result: dict[str, Any] | None = None):
     return execute
 
 
+def _durable_emit(repo: RunRepository, run_id: str):
+    """A ``emit_required`` stand-in that really persists the event."""
+    sequence = {"n": 0}
+
+    def emit(event_type: str, payload: dict[str, Any]) -> SimpleNamespace:
+        sequence["n"] += 1
+        repo.persist_event(
+            run_id=run_id,
+            sequence=sequence["n"],
+            event_type=event_type,
+            payload=payload,
+            request_id=run_id,
+            conversation_id="conv-effect",
+        )
+        return SimpleNamespace(type=event_type, payload=payload)
+
+    return emit
+
+
 def test_success_result_published_only_after_commit_and_durable_event(tmp_path):
     repo = _repo(tmp_path)
     try:
@@ -509,6 +529,103 @@ def test_committed_result_is_returned_on_retry_without_execution(tmp_path):
         row = repo.get_effect(identity.effect_id)
         assert row is not None and row.status == "committed"
         assert row.result_json == '{"path":"p.pdf"}'
+    finally:
+        repo.close()
+
+
+# ---- durable ledger write failure (review S1) --------------------------------
+
+
+def test_effect_row_write_failure_is_a_stable_persist_failure_not_in_flight(
+    tmp_path, monkeypatch, caplog
+):
+    """A lost ``authorized`` row is a persist failure, and nothing executes.
+
+    Spec AC1's durable write is what grants execution rights. When it fails
+    there is no row to claim, so the old bare ``except`` walked into
+    ``claim_effect`` on a missing row and reported ``effect_in_flight`` —
+    a lie that also left the external side effect about to run.
+    """
+    repo = _repo(tmp_path)
+    try:
+        run_id = _make_run(repo, "req-insert-failure")
+        identity = compute_effect_identity(
+            run_id=run_id, tool_name="generate_pdf", args={"filename": "p.pdf"}
+        )
+        calls: list[int] = []
+
+        def boom(**_kwargs: Any) -> None:
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(repo, "insert_effect", boom)
+
+        with caplog.at_level(
+            logging.ERROR, logger="ai-service.run_orchestration"
+        ):
+            outcome, events = _drive(
+                repo,
+                run_id,
+                identity,
+                executor=_ok_executor(calls),
+                emit_required=_durable_emit(repo, run_id),
+            )
+
+        assert calls == []  # the external effect never ran
+        assert outcome.status == "persist_failed"
+        errors = [payload for event_type, payload in events if event_type == "error"]
+        assert errors, events
+        assert errors[-1]["code"] == "effect_persist_failed"
+        assert errors[-1]["boundary_code"] == "effect_persist_failed"
+        assert "effect_in_flight" not in str(events)
+        # No phantom row and no tool_call either.
+        assert repo.get_effect(identity.effect_id) is None
+        assert [event_type for event_type, _payload in events] == ["error"]
+        # The run stops terminally.
+        run = repo.get_run(run_id)
+        assert run is not None and run.status == "error"
+
+        # The durable write failure is in the log WITH its traceback.
+        records = [
+            record
+            for record in caplog.records
+            if record.levelno >= logging.ERROR and record.exc_info
+        ]
+        assert records, caplog.text
+    finally:
+        repo.close()
+
+
+def test_duplicate_effect_row_insert_still_falls_back_to_the_existing_row(
+    tmp_path, monkeypatch
+):
+    """The one benign insert failure keeps its old (non-fatal) behaviour.
+
+    A concurrent resume may have written the SAME row first; that is a
+    duplicate-key conflict with a readable row behind it, not a persist
+    failure, and the CAS claim decides the single executor.
+    """
+    repo = _repo(tmp_path)
+    try:
+        run_id = _make_run(repo, "req-insert-duplicate")
+        identity = _insert_effect(repo, run_id, {"filename": "p.pdf"})
+        calls: list[int] = []
+
+        def duplicate(*_a: Any, **_k: Any) -> Any:
+            raise sqlite3.IntegrityError("UNIQUE constraint failed: effects.effect_key")
+
+        monkeypatch.setattr(repo, "insert_effect", duplicate)
+
+        outcome, events = _drive(
+            repo,
+            run_id,
+            identity,
+            executor=_ok_executor(calls),
+            emit_required=_durable_emit(repo, run_id),
+        )
+        # The existing authorized row is claimed by this caller, exactly as
+        # before the S1 change: a duplicate insert is not a persist failure.
+        assert outcome.status == "executed"
+        assert calls == [1]
     finally:
         repo.close()
 
