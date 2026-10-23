@@ -28,6 +28,7 @@ import { API, API_ORIGIN } from './config'
 export type V2EventType =
   | 'run_started'
   | 'progress'
+  | 'progress.gap'
   | 'text'
   | 'thought'
   | 'tool_call'
@@ -118,6 +119,20 @@ export interface V2StreamOptions {
   onError: (error: string) => void
   onOpen?: () => void
   onTerminal?: (event: V2EventEnvelope) => void
+  /**
+   * BCDEF ticket 11: fired when a SECOND stream-terminal frame arrives for
+   * the same run. Contract says one terminal per run; the loop suppresses
+   * the duplicate (it never reaches onEvent/onTerminal) and counts it here
+   * so the UI can observe the anomaly instead of silently re-rendering.
+   */
+  onDuplicateTerminal?: (event: V2EventEnvelope) => void
+  /**
+   * BCDEF ticket 11: frames the parser dropped (invalid JSON / unknown
+   * type / non-envelope) are surfaced so the caller can count them —
+   * previously ``parseV2Frame`` was called without ``onDropped`` and the
+   * drops were invisible.
+   */
+  onDroppedFrame?: (reason: 'invalid_json' | 'unknown_type' | 'not_envelope', raw: string) => void
 }
 
 // ---- Parser -------------------------------------------------------------
@@ -205,6 +220,7 @@ function isV2EventType(value: unknown): value is V2EventType {
   return (
     value === 'run_started' ||
     value === 'progress' ||
+    value === 'progress.gap' ||
     value === 'text' ||
     value === 'thought' ||
     value === 'tool_call' ||
@@ -242,6 +258,12 @@ export function createV2StreamConnection(
   const controller = new AbortController()
   const seenSequences = new Set<number>()
   let terminalSeen = false
+  // BCDEF ticket 11: connection-local sequence tracking. Live frames are
+  // contiguous by contract; a forward jump means the server skipped
+  // sequences (dropped progress that never reached the wire). The loop
+  // synthesizes the same ``progress.gap`` envelope the server's replay
+  // emits, so the client shows the hole instead of silently accepting it.
+  let lastLiveSequence: number | null = null
 
   const cleanup = () => {
     aborted = true
@@ -256,7 +278,42 @@ export function createV2StreamConnection(
     if (seenSequences.has(event.sequence)) {
       return false
     }
+    // BCDEF ticket 11: after the one legitimate stream terminal, nothing
+    // else may render. A second stream-terminal frame is SUPPRESSED and
+    // counted (never delivered to onEvent/onTerminal); other late frames are
+    // ignored too. This is what keeps "at most one terminal per run" true
+    // even when a buggy or replaying server emits more.
+    if (terminalSeen) {
+      if (STREAM_TERMINAL_V2_EVENT_TYPES.has(event.type)) {
+        options.onDuplicateTerminal?.(event)
+      }
+      return false
+    }
+    // Live gap detection — skip the very first frame (a resume connection
+    // legitimately starts mid-sequence at the client's cursor).
+    if (lastLiveSequence !== null && event.sequence > lastLiveSequence + 1) {
+      const fromSequence = lastLiveSequence
+      const gapEvent: V2EventEnvelope = {
+        version: '2',
+        sequence: event.sequence - 1,
+        type: 'progress.gap',
+        payload: {
+          from_sequence: fromSequence,
+          to_sequence: event.sequence,
+          dropped: event.sequence - fromSequence - 1,
+        },
+        request_id: event.request_id,
+        conversation_id: event.conversation_id,
+        run_id: event.run_id,
+        event_id: `${event.run_id || 'run'}:live-gap:${fromSequence}:${event.sequence}`,
+        timestamp: event.timestamp,
+      }
+      seenSequences.add(gapEvent.sequence)
+      options.onEvent(gapEvent)
+      lastLiveSequence = gapEvent.sequence
+    }
     seenSequences.add(event.sequence)
+    lastLiveSequence = event.sequence
 
     options.onEvent(event)
 
@@ -268,10 +325,6 @@ export function createV2StreamConnection(
     // stream-only-terminal (run.paused) by inspecting ``event.type``.
     if (STREAM_TERMINAL_V2_EVENT_TYPES.has(event.type)) {
       // Spec AC6: exactly one terminal event ends the stream.
-      if (terminalSeen) {
-        // Programmer error on the server side; ignore the second terminal.
-        return true
-      }
       terminalSeen = true
       options.onTerminal?.(event)
       return true
@@ -321,7 +374,7 @@ export function createV2StreamConnection(
 
         for (const frame of frames) {
           if (!frame.trim()) continue
-          const event = parseV2Frame(frame)
+          const event = parseV2Frame(frame, options.onDroppedFrame)
           if (event && dispatch(event) && terminalSeen) {
             // Terminal reached: stop reading.
             cleanup()
@@ -333,7 +386,7 @@ export function createV2StreamConnection(
       // Flush any trailing frame (e.g. terminal without final blank line).
       const remaining = `${buffer}${decoder.decode()}`
       if (remaining.trim() && !aborted && !terminalSeen) {
-        const event = parseV2Frame(remaining)
+        const event = parseV2Frame(remaining, options.onDroppedFrame)
         if (event) dispatch(event)
       }
 
@@ -378,17 +431,44 @@ export interface V2RunSnapshot {
   request_id: string
   conversation_id: string
   profile_id: string
-  // Ticket 11: ``paused`` is a non-terminal run state — the run is
-  // awaiting user approval and will resume on
-  // POST /api/v2/approvals/{approval_id}/decision.
-  status: 'running' | 'paused' | 'done' | 'error' | 'cancelled'
+  // BCDEF ticket 11: ``outcome_unknown`` and ``admission_failed`` join the
+  // client-visible status vocabulary (they are terminal and
+  // NON-continuable — repairing them is reconciliation, never an automatic
+  // model re-run). ``paused`` remains non-terminal: the run is awaiting
+  // user approval and resumes via POST /approvals/{id}/decision.
+  status: 'running' | 'paused' | 'done' | 'error' | 'cancelled' | 'outcome_unknown' | 'admission_failed'
   terminal_type: string | null
   created_at: string
   updated_at: string
   terminal_at: string | null
   sequence_cursor: number
-  messages: Array<{ role: 'user' | 'assistant'; content: string }>
+  messages: Array<{
+    role: 'user' | 'assistant'
+    content: string
+    sequence?: number
+    run_id?: string
+    created_at?: string
+  }>
   pending_actions: unknown[]
+  // ---- BCDEF ticket 03/11 additive terminal-persistence fields ----
+  // A client MUST NOT render ``done`` when the terminal never became
+  // durable: ``terminal_persist_failed`` (or a terminal-looking status with
+  // ``terminal_persisted === false``) means "stable error, not complete".
+  control_status?: string
+  terminal_event_type?: string | null
+  terminal_event_id?: string
+  terminal_event_sequence?: number
+  terminal_persisted?: boolean
+  terminal_persist_failed?: boolean
+  terminal_error_code?: string | null
+  error_code?: string | null
+  recoverable?: boolean
+  state_reconciled?: boolean
+  // BCDEF ticket 11: pending approvals projected into the
+  // ``approval.required`` payload shape so a paused run's approval prompt
+  // survives refresh even when the replay cursor moved past the
+  // ``approval.required`` frame.
+  pending_approvals?: V2ApprovalRequest[]
 }
 
 export interface V2ReplayResponse {
@@ -409,11 +489,19 @@ export interface V2ReplayResponse {
 
 // ---- Recovery planning (A06) ----------------------------------------------
 
-/** Run-level terminal statuses, as returned by /snapshot and persisted as v2_status. */
+/**
+ * Run-level terminal statuses, as returned by /snapshot and persisted as
+ * v2_status. BCDEF ticket 11: ``outcome_unknown`` and ``admission_failed``
+ * are first-class terminal statuses — rendering apart from a generic
+ * error where the contract demands it, but never continuable and never
+ * triggering an automatic model call.
+ */
 export const V2_TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set([
   'done',
   'error',
   'cancelled',
+  'outcome_unknown',
+  'admission_failed',
 ])
 
 export type V2RecoveryPlan =

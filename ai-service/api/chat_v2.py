@@ -593,6 +593,11 @@ async def chat_v2_snapshot(
         # cannot be adapted, the stable failure reason + next action.
         "policy_provenance": snapshot.policy_provenance,
         "policy_failure": snapshot.policy_failure,
+        # BCDEF ticket 11: pending approvals in the ``approval.required``
+        # payload shape, so a refresh while paused can restore the approval
+        # prompt even when the replay cursor already moved past the
+        # approval frame. Additive — existing clients ignore it.
+        "pending_approvals": snapshot.pending_approvals,
         # BCDEF ticket 05: replay-visible effect rows, including the
         # unknown-outcome repair state (status/attempts/last error/age/
         # next action/known facts/unknown part). Additive.

@@ -33,8 +33,9 @@ import type {
   V2ApprovalRequest,
   V2MemoryCandidate,
   V2Artifact,
+  V2RunSnapshot,
 } from './chatV2'
-import { TERMINAL_V2_EVENT_TYPES } from './chatV2'
+import { TERMINAL_V2_EVENT_TYPES, STREAM_TERMINAL_V2_EVENT_TYPES, V2_TERMINAL_RUN_STATUSES } from './chatV2'
 
 export interface V2ToolTrace {
   type: 'tool_call' | 'tool_result' | 'artifact_progress'
@@ -53,6 +54,29 @@ export type V2RunStatus =
   | 'done'
   | 'error'
   | 'cancelled'
+  // BCDEF ticket 11: first-class client run status for runs whose
+  // external effect outcome is unknown. Terminal and NON-continuable —
+  // distinct from a generic ``error`` (the UI shows "awaiting background
+  // reconciliation" and never offers resume/auto-retry), and repairing it
+  // is ledger reconciliation, not a model call.
+  | 'outcome_unknown'
+
+// Run statuses after which the sticky guard locks the reducer — no
+// further event may resurrect the run (spec: done / error / cancelled /
+// outcome_unknown must not continue execution).
+const STICKY_TERMINAL_STATUSES: ReadonlySet<V2RunStatus> = new Set<V2RunStatus>([
+  'done',
+  'error',
+  'cancelled',
+  'outcome_unknown',
+])
+
+/** One observed progress-sequence hole (BCDEF ticket 11). */
+export interface V2ProgressGap {
+  from_sequence: number
+  to_sequence: number
+  dropped: number
+}
 
 export interface V2ConversationState {
   /** Accumulated assistant text deltas (concatenated in arrival order). */
@@ -104,9 +128,24 @@ export interface V2ConversationState {
   /**
    * A02: human-review notices from ``effect.outcome_unknown`` — the
    * server emits these before the terminal error so the client can show
-   * "需要人工核查" context beyond the bare error text.
+   * "需要人工核查" context beyond the bare error text. BCDEF ticket 11
+   * reuses this surface for ``progress.gap`` notices ("dropped progress
+   * is visible, never mistaken for completion").
    */
   reviewNotices: string[]
+  /**
+   * BCDEF ticket 11: progress-sequence holes observed from
+   * ``progress.gap`` events (server-replayed) or live stream jumps
+   * (client-synthesized). ``droppedCount`` aggregates their totals.
+   */
+  progressGaps: V2ProgressGap[]
+  /**
+   * BCDEF ticket 11: how many stream-terminal frames arrived AFTER the
+   * run already reached its one legitimate terminal. Contract says one
+   * terminal per run; duplicates are ignored for rendering and counted
+   * here so the anomaly stays observable.
+   */
+  duplicateTerminalCount: number
 }
 
 export const initialV2State: V2ConversationState = {
@@ -124,6 +163,8 @@ export const initialV2State: V2ConversationState = {
   pendingMemoryConsent: null,
   artifacts: [],
   reviewNotices: [],
+  progressGaps: [],
+  duplicateTerminalCount: 0,
 }
 
 /**
@@ -143,7 +184,15 @@ export function reduceV2Event(
   // but the reducer defends in depth so a buggy server cannot resurrect a
   // dead run in the UI. ``paused`` is deliberately excluded so the resume
   // stream can move the run back to ``running``.
-  if (state.status === 'done' || state.status === 'error' || state.status === 'cancelled') {
+  // BCDEF ticket 11: ``outcome_unknown`` joins the sticky set (terminal and
+  // NON-continuable), and a stream-terminal frame arriving after the run's
+  // one legitimate terminal is COUNTED — duplicates are ignored for
+  // rendering but never silently invisible (spec: at most one terminal
+  // rendered per run; duplicates from replay are ignored and counted).
+  if (STICKY_TERMINAL_STATUSES.has(state.status)) {
+    if (STREAM_TERMINAL_V2_EVENT_TYPES.has(event.type)) {
+      return { ...state, duplicateTerminalCount: state.duplicateTerminalCount + 1 }
+    }
     return state
   }
 
@@ -179,6 +228,29 @@ export function reduceV2Event(
         status: 'running',
         progressMessage: readString(event.payload, 'message') || base.progressMessage,
       }
+
+    case 'progress.gap': {
+      // BCDEF ticket 11: droppable progress left a hole in the durable
+      // sequence — the server's replay (or the live stream loop's local
+      // detection) surfaced it as this event. Render it as a visible
+      // notice + dropped count, never as silence: a gap must not be
+      // mistaken for stalled progress or completion. Progress-class: it
+      // does NOT change the terminal semantics of the run.
+      const from = readNumber(event.payload, 'from_sequence')
+      const to = readNumber(event.payload, 'to_sequence')
+      const declared = readNumber(event.payload, 'dropped')
+      const dropped = Math.max(declared, to > from ? to - from - 1 : 0)
+      const notice =
+        readString(event.payload, 'message') ||
+        `部分进度更新丢失（序列 ${from} → ${to}，共 ${dropped} 条）`
+      return {
+        ...base,
+        status: 'running',
+        droppedCount: base.droppedCount + dropped,
+        progressGaps: [...base.progressGaps, { from_sequence: from, to_sequence: to, dropped }],
+        reviewNotices: [...base.reviewNotices, notice],
+      }
+    }
 
     case 'text':
       return {
@@ -332,16 +404,28 @@ export function reduceV2Event(
         pendingApproval: null,
       }
 
-    case 'error':
+    case 'error': {
+      // BCDEF ticket 11: an error terminal whose stable code marks an
+      // unknown external-effect outcome maps onto the first-class
+      // ``outcome_unknown`` run status — rendered apart from a generic
+      // error and never continuable (no resume affordance, no automatic
+      // model call; repairing it is ledger reconciliation).
+      const code = readString(event.payload, 'code')
+      const unknownOutcome =
+        code === 'effect_outcome_unknown' ||
+        code === 'outcome_unknown' ||
+        readString(event.payload, 'run_status') === 'outcome_unknown'
       return {
         ...base,
-        status: 'error',
+        status: unknownOutcome ? 'outcome_unknown' : 'error',
         errorMessage:
           readString(event.payload, 'message') ||
-          readString(event.payload, 'code') ||
-          '运行出错',
+          code ||
+          (unknownOutcome ? '操作结果未知，等待后台对账修复' : '运行出错'),
+        progressMessage: '',
         pendingApproval: null,
       }
+    }
 
     case 'cancelled':
       return {
@@ -386,16 +470,175 @@ export function reduceV2Events(
 
 /** True when the run has reached a terminal state. */
 export function isV2Terminal(state: V2ConversationState): boolean {
-  return (
-    state.status === 'done' ||
-    state.status === 'error' ||
-    state.status === 'cancelled'
-  )
+  return STICKY_TERMINAL_STATUSES.has(state.status)
+}
+
+/**
+ * True when the run is terminal AND continuable-free: done, error and
+ * outcome_unknown must never offer or trigger continued execution —
+ * only ``paused`` may resume and ``cancelled`` is a replayable terminal
+ * that likewise never re-executes (BCDEF ticket 11).
+ */
+export function isV2NonContinuable(state: V2ConversationState): boolean {
+  return STICKY_TERMINAL_STATUSES.has(state.status)
 }
 
 /** True when the run is paused awaiting user approval (Ticket 11). */
 export function isV2Paused(state: V2ConversationState): boolean {
   return state.status === 'paused'
+}
+
+/**
+ * BCDEF ticket 11 — authoritative snapshot reconciliation.
+ *
+ * The run snapshot (plus the durable replay) is THE recovery source
+ * after stream close, refresh, cancel and resume. This pure step folds a
+ * fetched ``/snapshot`` into the replayed reducer state:
+ *
+ * * a terminal-looking snapshot that never became durable
+ *   (``terminal_persist_failed`` — or the server's fallback of the same
+ *   name for a terminal control status with no persisted event) renders
+ *   the stable error, never ``done``;
+ * * ``outcome_unknown`` maps onto the first-class client status (distinct
+ *   from a generic error, non-continuable, no automatic model call);
+ * * a terminal snapshot NEVER leaves the UI "streaming" — even when the
+ *   replay contains no terminal frame, the snapshot finalizes the status;
+ * * ``paused`` stays non-terminal, rehydrates the pending approval from
+ *   ``pending_approvals`` when the replay could not deliver it;
+ * * a replayed run terminal wins over the snapshot status (it is the more
+ *   specific durable fact), except that a replayed ``done`` contradicted
+ *   by ``terminal_persist_failed`` is downgraded to the stable error.
+ */
+export function reconcileV2Snapshot(
+  state: V2ConversationState,
+  snapshot: V2RunSnapshot | null,
+): V2ConversationState {
+  if (!snapshot) return state
+
+  const terminalPersistFailed = snapshot.terminal_persist_failed === true
+  const snapshotStatus = snapshot.status
+  const snapshotTerminal = V2_TERMINAL_RUN_STATUSES.has(snapshotStatus)
+
+  if (snapshotTerminal) {
+    // A replayed sticky terminal already finalized the run.
+    if (STICKY_TERMINAL_STATUSES.has(state.status)) {
+      // …except the AC7 contradiction: never keep a ``done`` the server
+      // cannot prove is durable.
+      if (state.status === 'done' && terminalPersistFailed) {
+        return {
+          ...state,
+          status: 'error',
+          errorMessage: snapshot.error_code || 'terminal_persist_failed',
+        }
+      }
+      return state
+    }
+    if (terminalPersistFailed) {
+      return {
+        ...state,
+        status: 'error',
+        errorMessage: snapshot.error_code || 'terminal_persist_failed',
+        progressMessage: '',
+        pendingApproval: null,
+        started: true,
+      }
+    }
+    if (snapshotStatus === 'outcome_unknown') {
+      return {
+        ...state,
+        status: 'outcome_unknown',
+        errorMessage: '操作结果未知（outcome_unknown），等待后台对账修复，不会自动重放。',
+        progressMessage: '',
+        pendingApproval: null,
+        started: true,
+      }
+    }
+    if (snapshotStatus === 'admission_failed') {
+      return {
+        ...state,
+        status: 'error',
+        errorMessage: snapshot.error_code || 'admission_failed',
+        progressMessage: '',
+        pendingApproval: null,
+        started: true,
+      }
+    }
+    if (snapshotStatus === 'done') {
+      return {
+        ...state,
+        status: 'done',
+        progressMessage: '',
+        pendingApproval: null,
+        started: true,
+      }
+    }
+    // error / cancelled — mirror the server terminal.
+    return {
+      ...state,
+      status: snapshotStatus === 'cancelled' ? 'cancelled' : 'error',
+      errorMessage:
+        snapshotStatus === 'error'
+          ? snapshot.terminal_error_code || snapshot.error_code || '运行出错'
+          : state.errorMessage,
+      progressMessage: '',
+      pendingApproval: null,
+      started: true,
+    }
+  }
+
+  if (snapshotStatus === 'paused') {
+    // Non-terminal: the run awaits approval. Do NOT resurrect a sticky
+    // local terminal (the server status could lag a durably emitted one).
+    if (STICKY_TERMINAL_STATUSES.has(state.status)) return state
+    const approval =
+      state.pendingApproval ?? readSnapshotApproval(snapshot) ?? null
+    return {
+      ...state,
+      status: 'paused',
+      pendingApproval: approval,
+      started: true,
+    }
+  }
+
+  // Snapshot still ``running``/``admitted``: nothing to add — the caller
+  // keeps polling; never force a terminal from a non-terminal snapshot.
+  return state
+}
+
+/** Map snapshot ``pending_approvals`` into the ``approval.required`` shape. */
+function readSnapshotApproval(snapshot: V2RunSnapshot): V2ApprovalRequest | null {
+  const raw = snapshot.pending_approvals?.[0]
+  if (!raw || typeof raw.approval_id !== 'string' || typeof raw.tool !== 'string') {
+    return null
+  }
+  return {
+    approval_id: raw.approval_id,
+    tool: raw.tool,
+    args: (raw.args ?? {}) as Record<string, unknown>,
+    risk_level:
+      raw.risk_level === 'low' || raw.risk_level === 'medium' || raw.risk_level === 'high'
+        ? raw.risk_level
+        : 'high',
+    impact: typeof raw.impact === 'string' ? raw.impact : '',
+    expires_at: typeof raw.expires_at === 'string' ? raw.expires_at : '',
+    message: typeof raw.message === 'string' ? raw.message : undefined,
+  }
+}
+
+/**
+ * BCDEF ticket 11: the assistant text authoritative in the snapshot for
+ * this run — the fallback when the event replay cannot complete the
+ * picture (e.g. the assistant frame was written to the conversation DB
+ * but the SSE event row was lost).
+ */
+export function assistantTextFromSnapshot(
+  snapshot: V2RunSnapshot,
+  runId?: string,
+): string {
+  const candidates = snapshot.messages.filter(m => m.role === 'assistant')
+  const scoped = runId ? candidates.filter(m => !m.run_id || m.run_id === runId) : candidates
+  const last = scoped[scoped.length - 1]
+  return last ? last.content : ''
 }
 
 /** Map a v2 status to a user-visible Chinese label. */
@@ -414,6 +657,11 @@ export function v2StatusLabel(state: V2ConversationState): string {
       return '已完成'
     case 'error':
       return state.errorMessage || '运行出错'
+    case 'outcome_unknown':
+      // BCDEF ticket 11: rendered distinctly from a generic error — the
+      // user is told the outcome is unknown and awaiting background
+      // reconciliation, not that the run "failed with a retryable error".
+      return state.errorMessage || '结果未知，等待后台对账修复（outcome_unknown）'
     case 'cancelled':
       return '已取消'
     default:
@@ -425,6 +673,12 @@ export function v2StatusLabel(state: V2ConversationState): string {
 function readString(payload: Record<string, unknown>, key: string): string {
   const value = payload[key]
   return typeof value === 'string' ? value : ''
+}
+
+/** Helper: read a numeric field from the payload, undefined/NaN → 0. */
+function readNumber(payload: Record<string, unknown>, key: string): number {
+  const value = payload[key]
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
 }
 
 /** Helper: read an object field, undefined → undefined. */

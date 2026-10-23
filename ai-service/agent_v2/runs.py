@@ -31,6 +31,8 @@ from agent_v2.execution_contract import (
     SUPPORTED_SCHEMA_VERSIONS,
     BoundaryError,
     ExecutionErrorCode,
+    ProgressGap,
+    compute_gap,
     policy_hash,
 )
 from agent_v2.effect_repair import effect_known_facts, effect_unknown_part
@@ -125,6 +127,11 @@ class RunSnapshot:
     # stable failure reason + next action. Both are additive.
     policy_provenance: dict[str, Any] | None = None
     policy_failure: dict[str, Any] | None = None
+    # BCDEF ticket 11: pending approval rows projected into the
+    # ``approval.required`` payload shape, so a refresh while paused can
+    # restore the approval prompt even when the event replay starts
+    # after the approval frame. Additive — old clients ignore it.
+    pending_approvals: list[dict[str, Any]] = field(default_factory=list)
     # BCDEF ticket 10: additive projection summary of the frozen policy —
     # policy hash, capability ids/count, MCP services, risk/approval
     # policy. None when the run has no projectable frozen snapshot.
@@ -223,9 +230,12 @@ _NON_REPAIRABLE_STATUSES = frozenset(
 _RUN_TERMINAL_TYPES = frozenset({"done", "error", "cancelled"})
 
 # Terminal control statuses whose replay may need a synthetic terminal
-# when the durable event write never happened.
+# when the durable event write never happened. ``outcome_unknown`` (BCDEF
+# ticket 11 surface for ticket 05's reconciliation statuses) is terminal
+# and non-continuable, so its replay carries a stable synthetic terminal
+# instead of reading as an endless running stream.
 _REPLAY_TERMINAL_STATUSES = frozenset(
-    {"done", "error", "cancelled", "admission_failed"}
+    {"done", "error", "cancelled", "admission_failed", "outcome_unknown"}
 )
 
 
@@ -1489,7 +1499,7 @@ class RunRepository:
         run_id: str,
         from_seq: int = 0,
     ) -> list[dict[str, Any]]:
-        """Replay events plus a stable synthetic terminal when needed.
+        """Replay events, surfaced progress gaps, and a stable synthetic terminal.
 
         A terminal run whose terminal event was never persisted (write
         failure, hard crash) must not replay as an endless running stream.
@@ -1497,17 +1507,31 @@ class RunRepository:
         and sequence derived from the run row) with a stable
         ``terminal_persist_failed`` (or ``cancelled``/``admission_failed``)
         explanation. Nothing is written, so repeated reads agree.
+
+        BCDEF ticket 11: ordinary progress is droppable, but a dropped
+        progress must never be a silent hole. When the durable event rows
+        reveal a gap in the per-run sequence, replay synthesizes a
+        ``progress.gap`` envelope (via
+        :func:`agent_v2.execution_contract.compute_gap`, payload
+        ``from_sequence``/``to_sequence``/``dropped``) positioned exactly
+        where the hole occurred. The synthesis is deterministic per
+        ``(run, from_seq)`` — repeated reads agree — never reorders or
+        duplicates the terminal, and never emits a gap after it.
         """
         events = self.get_events_since(run_id=run_id, from_seq=from_seq)
         run = self.control.get_run(run_id)
-        if run is None or run.status not in _REPLAY_TERMINAL_STATUSES:
-            return events
-        all_events = (
+        full_events = (
             events
             if from_seq == 0
             else self.get_events_since(run_id=run_id, from_seq=0)
         )
-        if any(event["type"] in _RUN_TERMINAL_TYPES for event in all_events):
+        events = _replay_with_progress_gaps(run_id, run, events, full_events, from_seq)
+        if run is None or run.status not in _REPLAY_TERMINAL_STATUSES:
+            return events
+        has_terminal = any(
+            event["type"] in _RUN_TERMINAL_TYPES for event in full_events
+        )
+        if has_terminal:
             return events
         synthetic = self._synthetic_terminal_event(run)
         if synthetic["sequence"] > from_seq:
@@ -1522,6 +1546,22 @@ class RunRepository:
             payload: dict[str, Any] = {
                 "code": "cancelled",
                 "message": "运行已取消。",
+                "recoverable": False,
+            }
+        elif run.status == "outcome_unknown":
+            # BCDEF ticket 11: an outcome-unknown run is terminal and
+            # NON-continuable. The stable code is the same one the live
+            # effect driver puts on its error terminal, so clients map
+            # both paths onto their first-class ``outcome_unknown``
+            # status — rendered apart from a generic error, never
+            # auto-replayed (spec: repairing it is reconciliation, not a
+            # model re-run).
+            event_type = "error"
+            marker = "outcome-unknown"
+            payload = {
+                "code": "effect_outcome_unknown",
+                "run_status": "outcome_unknown",
+                "message": "外部操作结果未知，等待后台对账修复；不会自动重放。",
                 "recoverable": False,
             }
         elif run.status == "admission_failed":
@@ -1779,6 +1819,15 @@ class RunRepository:
         )
         effects = self.control.list_effects_for_run(run_id)
         lease = self.control.get_sandbox_lease(run_id)
+        # BCDEF ticket 11: pending approvals ride the snapshot so a
+        # refresh while paused can restore the approval prompt even when
+        # the replay cursor already advanced past the ``approval.required``
+        # frame. Projected into the ``approval.required`` payload shape —
+        # additive; old clients ignore the field.
+        pending_approvals = [
+            _approval_snapshot_payload(approval)
+            for approval in self.control.list_pending_approvals_for_run(run_id)
+        ]
         if policy_snapshot is None:
             policy_provenance = None
             policy_failure = missing_snapshot_failure(run_id)
@@ -1916,6 +1965,7 @@ class RunRepository:
             ),
             policy_provenance=policy_provenance,
             policy_failure=policy_failure,
+            pending_approvals=pending_approvals,
             capability_projection=capability_projection,
         )
 
@@ -1953,6 +2003,101 @@ class RunRepository:
         if run is None:
             return False
         return run.status == "cancelled"
+
+
+def _approval_snapshot_payload(approval: ApprovalRecord) -> dict[str, Any]:
+    """Project a pending approval row into the ``approval.required`` shape."""
+    try:
+        args = json.loads(approval.args_canonical) if approval.args_canonical else {}
+    except (TypeError, ValueError):
+        args = {}
+    return {
+        "approval_id": approval.approval_id,
+        "run_id": approval.run_id,
+        "tool": approval.tool_name,
+        "args": args if isinstance(args, dict) else {},
+        "risk_level": approval.risk_level,
+        "impact": approval.impact,
+        "expires_at": approval.expires_at,
+        "status": approval.status,
+        "message": "需要您的批准才能继续。",
+    }
+
+
+def _replay_with_progress_gaps(
+    run_id: str,
+    run: RunRecord | None,
+    replay_events: list[dict[str, Any]],
+    full_events: list[dict[str, Any]],
+    from_seq: int,
+) -> list[dict[str, Any]]:
+    """Insert deterministic ``progress.gap`` envelopes at durable-sequence holes.
+
+    BCDEF ticket 11, spec 07: droppable progress may leave the durable
+    event log non-contiguous; replay must surface that hole as a visible
+    ``progress.gap`` instead of letting clients read a silent skip as
+    stalled progress or completion. Rules:
+
+    * one gap per observed hole, computed with
+      :func:`agent_v2.execution_contract.compute_gap` — payload is
+      exactly ``from_sequence`` / ``to_sequence`` / ``dropped``;
+    * the gap envelope is inserted immediately BEFORE the first persisted
+      event after the hole, so ascending order is kept and terminals are
+      never reordered, duplicated, or followed by a gap;
+    * the synthesized sequence is the first MISSING sequence of the hole —
+      never a sequence a real event already occupies;
+    * ``event_id`` is deterministic from the hole boundaries, so repeated
+      reads return byte-identical replay lists.
+    """
+    gaps: list[tuple[ProgressGap, dict[str, Any]]] = []
+    previous: dict[str, Any] | None = None
+    for event in full_events:
+        if previous is not None:
+            last_sequence = previous["sequence"]
+            next_sequence = event["sequence"]
+            if next_sequence > last_sequence + 1 and next_sequence > from_seq:
+                gap = compute_gap(run_id, max(last_sequence, from_seq), next_sequence)
+                if gap is not None:
+                    gaps.append((gap, event))
+        previous = event
+    if not gaps:
+        return replay_events
+
+    conversation_id = run.conversation_id if run is not None else ""
+    request_id = run.request_id if run is not None else ""
+    out: list[dict[str, Any]] = []
+    pending = list(gaps)
+    for event in replay_events:
+        while pending and pending[0][0].to_sequence <= event["sequence"]:
+            gap, anchor = pending.pop(0)
+            out.append(_progress_gap_envelope(gap, anchor, conversation_id, request_id))
+        out.append(event)
+    # A gap whose anchor event sits at/below from_seq cannot happen here
+    # (to_sequence > from_seq by construction), but keep the tail flush for
+    # defensive completeness.
+    for gap, anchor in pending:
+        out.append(_progress_gap_envelope(gap, anchor, conversation_id, request_id))
+    return out
+
+
+def _progress_gap_envelope(
+    gap: ProgressGap,
+    anchor: dict[str, Any],
+    conversation_id: str,
+    request_id: str,
+) -> dict[str, Any]:
+    """Build the replay-facing ``progress.gap`` envelope for one hole."""
+    return {
+        "version": "2",
+        "event_id": f"{gap.run_id}:gap:{gap.from_sequence}:{gap.to_sequence}",
+        "sequence": gap.from_sequence + 1,
+        "run_id": gap.run_id,
+        "conversation_id": conversation_id or anchor.get("conversation_id", ""),
+        "timestamp": anchor.get("timestamp", ""),
+        "type": "progress.gap",
+        "request_id": request_id or anchor.get("request_id", ""),
+        "payload": gap.to_payload(),
+    }
 
 
 def _effect_result_payload(result_json: str | None) -> dict[str, Any]:
