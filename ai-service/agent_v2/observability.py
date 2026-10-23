@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 import threading
 import uuid
 from dataclasses import dataclass
@@ -13,9 +14,40 @@ from typing import Any, Literal
 from agent_v2.persistence import ControlStore
 
 
+logger = logging.getLogger("ai-service.agent_v2.observability")
+
 _RUN_TERMINALS = {"done", "error", "cancelled"}
 _RAW_SAMPLING_MINIMUM = timedelta(0)
 _MIGRATION_THRESHOLD_WINDOW = timedelta(minutes=15)
+
+# BCDEF spec 07 / ticket 12: the seven boundary metrics an operator must be
+# able to see while the unified execution boundary is rolled out. Six are
+# :class:`agent_v2.execution_contract.ExecutionErrorCode` values; the last
+# one (``repair_age``) is the age of an open unknown-outcome repair, so it
+# is reported as a seconds gauge (see :meth:`BoundaryMetrics.snapshot`).
+BOUNDARY_METRIC_NAMES: tuple[str, ...] = (
+    "admission_failed",
+    "outcome_unknown",
+    "terminal_persist_failed",
+    "lease_expired",
+    "cleanup_pending",
+    "replay_gap",
+    "repair_age",
+)
+
+# Alert thresholds for the same seven (BCDEF ticket 12 rollout gate). They
+# are deliberately blunt process-lifetime counters: one breach is noise, a
+# sustained breach for ``_MIGRATION_THRESHOLD_WINDOW`` escalates through
+# :class:`MigrationThresholdMonitor`. ``repair_age`` is in seconds.
+BOUNDARY_ALERT_THRESHOLDS: dict[str, float] = {
+    "admission_failed": 10.0,
+    "outcome_unknown": 5.0,
+    "terminal_persist_failed": 1.0,
+    "lease_expired": 5.0,
+    "cleanup_pending": 5.0,
+    "replay_gap": 20.0,
+    "repair_age": 900.0,
+}
 
 
 def _now_iso(now: datetime | None = None) -> str:
@@ -496,6 +528,10 @@ class MigrationThresholdMonitor:
                 True,
                 bool(metrics.get("second_writer_required", False)),
             ),
+            # BCDEF ticket 12: the seven boundary metrics ride the same
+            # sustained-breach rule. A key that is absent from the input
+            # never alerts, so existing callers keep their behaviour.
+            *self._boundary_observations(metrics),
         ]
 
         evidence: list[dict[str, Any]] = []
@@ -526,13 +562,176 @@ class MigrationThresholdMonitor:
             return 0.0
         return busy / total
 
+    @staticmethod
+    def _boundary_observations(
+        metrics: dict[str, Any],
+    ) -> list[tuple[str, float, float, bool]]:
+        """Boundary-metric observations for the sustained-breach rule."""
+        observations: list[tuple[str, float, float, bool]] = []
+        for name in BOUNDARY_METRIC_NAMES:
+            if name not in metrics:
+                continue
+            threshold = BOUNDARY_ALERT_THRESHOLDS[name]
+            value = float(metrics.get(name, 0) or 0)
+            observations.append((name, value, threshold, value > threshold))
+        return observations
+
+
+class BoundaryMetrics:
+    """Process-local counters for the seven BCDEF boundary metrics.
+
+    Spec 07 requires metrics AND alerts for
+    ``admission_failed``/``outcome_unknown``/``terminal_persist_failed``/
+    ``lease_expired``/``cleanup_pending``/``replay_gap``/``repair_age``.
+    Counters here are the emission surface; the durable facts they were
+    derived from stay in ``agent_control.sqlite`` (runs, effects,
+    sandbox_leases, janitor_tasks), so a restart loses the counts but never
+    the evidence — an operator can still reconcile from a snapshot.
+
+    Only metric names, counts, ISO timestamps and opaque run ids are kept:
+    no message text, no user content (spec Further Notes).
+    """
+
+    def __init__(self, *, thresholds: dict[str, float] | None = None) -> None:
+        self._lock = threading.RLock()
+        self._counts: dict[str, int] = {name: 0 for name in BOUNDARY_METRIC_NAMES}
+        self._last_seen: dict[str, str] = {}
+        self._repair_age_max_seconds = 0.0
+        self._repair_age_last_seconds = 0.0
+        self._repair_age_last_run_id = ""
+        self.alert_thresholds: dict[str, float] = dict(
+            thresholds or BOUNDARY_ALERT_THRESHOLDS
+        )
+        self._monitor = MigrationThresholdMonitor()
+
+    def observe(
+        self,
+        name: str,
+        *,
+        count: int = 1,
+    ) -> int:
+        """Add ``count`` observations of one named boundary metric."""
+        # ``ExecutionErrorCode`` is a str-Enum: accept the member or its
+        # value so emission sites never depend on which one they were given.
+        key = str(getattr(name, "value", name))
+        if key not in self._counts:
+            raise ValueError(f"unknown boundary metric: {name!r}")
+        if count < 1:
+            raise ValueError("count must be positive")
+        with self._lock:
+            self._counts[key] += count
+            self._last_seen[key] = _now_iso()
+            return self._counts[key]
+
+    def observe_repair_age(self, age_seconds: float, *, run_id: str = "") -> float:
+        """Record how long an open unknown-outcome repair has been open."""
+        with self._lock:
+            age = max(0.0, float(age_seconds))
+            self._counts["repair_age"] += 1
+            self._last_seen["repair_age"] = _now_iso()
+            self._repair_age_last_seconds = age
+            self._repair_age_last_run_id = run_id
+            if age > self._repair_age_max_seconds:
+                self._repair_age_max_seconds = age
+            return self._repair_age_max_seconds
+
+    def snapshot(self) -> dict[str, Any]:
+        """The health/metrics payload: counters, gauges, thresholds, alerts."""
+        with self._lock:
+            payload: dict[str, Any] = dict(self._counts)
+            payload["repair_age_max_seconds"] = round(
+                self._repair_age_max_seconds, 3
+            )
+            payload["repair_age_last_seconds"] = round(
+                self._repair_age_last_seconds, 3
+            )
+            payload["repair_age_last_run_id"] = self._repair_age_last_run_id
+            payload["last_seen_at"] = dict(self._last_seen)
+            payload["alert_thresholds"] = dict(self.alert_thresholds)
+            return payload
+
+    def alerting_metrics(self) -> dict[str, float]:
+        """The value set fed to :class:`MigrationThresholdMonitor`.
+
+        ``repair_age`` alerts on the AGE (seconds) of the oldest open
+        repair, not on how many times a snapshot was read.
+        """
+        with self._lock:
+            values = {name: float(self._counts[name]) for name in BOUNDARY_METRIC_NAMES}
+        values["repair_age"] = self._repair_age_max_seconds
+        return values
+
+    def alerts(self, *, now: datetime | None = None) -> list[dict[str, Any]]:
+        """Sustained boundary breaches (empty while everything is healthy)."""
+        return self._monitor.observe(self.alerting_metrics(), now=now)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._counts = {name: 0 for name in BOUNDARY_METRIC_NAMES}
+            self._last_seen.clear()
+            self._repair_age_max_seconds = 0.0
+            self._repair_age_last_seconds = 0.0
+            self._repair_age_last_run_id = ""
+            self._monitor = MigrationThresholdMonitor()
+
+
+_boundary_metrics = BoundaryMetrics()
+
+
+def get_boundary_metrics() -> BoundaryMetrics:
+    """The process-wide boundary metric registry (emission target)."""
+    return _boundary_metrics
+
+
+def reset_boundary_metrics() -> BoundaryMetrics:
+    """Zero the process-wide counters (tests, and a deliberate re-rollout)."""
+    _boundary_metrics.reset()
+    return _boundary_metrics
+
+
+def observe_boundary_metric(name: str, *, count: int = 1) -> int:
+    """Emit one boundary-metric observation; NEVER raises.
+
+    Every call site here sits on a durable write path (admission, effect
+    settle, terminal fence, lease CAS, janitor enqueue, replay, snapshot).
+    Observability must not turn a successful write into a failed request,
+    so a registry problem is logged and swallowed.
+    """
+    try:
+        return _boundary_metrics.observe(name, count=count)
+    except Exception:  # pragma: no cover - defensive
+        logger.warning("boundary metrics: observation failed for %r", name)
+        return 0
+
+
+def observe_boundary_repair_age(age_seconds: float, *, run_id: str = "") -> float:
+    """Emit one open-repair age observation; NEVER raises."""
+    try:
+        return _boundary_metrics.observe_repair_age(age_seconds, run_id=run_id)
+    except Exception:  # pragma: no cover - defensive
+        logger.warning("boundary metrics: repair age observation failed")
+        return 0.0
+
+
+def boundary_metrics_snapshot() -> dict[str, Any]:
+    """The seven counters + gauges for the health surfaces."""
+    return _boundary_metrics.snapshot()
+
 
 __all__ = [
+    "BOUNDARY_ALERT_THRESHOLDS",
+    "BOUNDARY_METRIC_NAMES",
+    "BoundaryMetrics",
     "CapacityExceeded",
     "CapacityGuard",
     "MigrationThresholdMonitor",
     "TelemetryStore",
     "TelemetryService",
+    "boundary_metrics_snapshot",
+    "get_boundary_metrics",
+    "observe_boundary_metric",
+    "observe_boundary_repair_age",
+    "reset_boundary_metrics",
 ]
 
 
