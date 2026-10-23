@@ -4116,7 +4116,19 @@ class RunOrchestrator:
             approval_granted=True,
         ):
             yield envelope
-        if outcome.status in ("failed", "outcome_unknown", "in_flight", "denied"):
+        if outcome.status in (
+            "failed",
+            "outcome_unknown",
+            "in_flight",
+            "denied",
+            # BCDEF review S1: a lost durable ``authorized`` row means there
+            # is no execution right, so the bash resume stops here exactly
+            # like the artifact resume. Without this the caller fell through
+            # to the result-recovery step and was only rescued by the
+            # resume catch-all (an internal error masking the stable
+            # ``effect_persist_failed`` contract).
+            "persist_failed",
+        ):
             return
 
         recovered_result = outcome.stored_result
