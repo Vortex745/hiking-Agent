@@ -3009,12 +3009,6 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_messages_run ON messages(run_id);
 CREATE INDEX IF NOT EXISTS idx_messages_seq ON messages(run_id, sequence);
--- BCDEF ticket 02: one request_id may produce at most one user message.
--- The admission fence relies on this UNIQUE constraint for concurrent
--- duplicates; a racing loser re-reads the winner's row instead of
--- appending a second copy.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_run_user
-    ON messages(run_id) WHERE role = 'user';
 
 CREATE TABLE IF NOT EXISTS run_events (
     event_id TEXT PRIMARY KEY,
@@ -3102,7 +3096,32 @@ class CheckpointsStore:
         self.db_path = db_path
         self._conn = _connect(db_path)
         self._conn.executescript(_CHECKPOINTS_SCHEMA)
+        self._migrate_unique_user_message_index()
         logger.info("CheckpointsStore ready at %s", db_path)
+
+    def _migrate_unique_user_message_index(self) -> None:
+        """BCDEF ticket 02: dedupe legacy user messages, then make them unique.
+
+        The UNIQUE index must NOT live in the schema script: a database
+        written before ticket 02 already holds duplicate user messages per
+        run, so ``executescript`` would raise during ``__init__`` and the
+        store — and with it every admission — could never open.
+        """
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute(
+                "DELETE FROM messages WHERE role = 'user' AND rowid NOT IN ("
+                "SELECT MIN(rowid) FROM messages WHERE role = 'user'"
+                " GROUP BY run_id)"
+            )
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_run_user"
+                " ON messages(run_id) WHERE role = 'user'"
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     def close(self) -> None:
         self._conn.close()
