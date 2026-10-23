@@ -659,7 +659,13 @@ class CoworkBashTool(BoundedDomainTool):
         }
         if exit_code == 0:
             committed = self._effects.commit_effect(
-                effect_key, serialize_result(result_dict), claim_token=claim_token
+                effect_key,
+                serialize_result(result_dict),
+                claim_token=claim_token,
+                # BCDEF review B1: settle under the lease generation the
+                # claim was stamped with — a mismatch is refused, not
+                # skipped because it is 0.
+                fencing_token=claim.fencing_token,
             )
             if committed is None or canonical_effect_status(committed.status) != "committed":
                 self._record({"phase": "result", "ok": False, "code": "outcome_unknown", "duration_ms": duration_ms})

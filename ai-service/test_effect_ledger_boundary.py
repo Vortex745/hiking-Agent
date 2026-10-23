@@ -248,6 +248,72 @@ def test_claim_is_fenced_by_token_and_lease_metadata(tmp_path):
         repo.close()
 
 
+def test_zero_token_effect_claim_cannot_commit_over_a_tokened_row(tmp_path):
+    """BCDEF review B1: ``fencing_token = 0`` is a generation, not "unset".
+
+    The effect CAS must reject a token mismatch instead of skipping the
+    check, so a claim that carries no lease generation can never settle a
+    row owned by a fenced lease generation.
+    """
+    repo = _repo(tmp_path)
+    try:
+        run_id = _make_run(repo, request_id="req-fence-commit")
+        identity = _insert_effect(repo, run_id, {"filename": "p.pdf"})
+        row, won = repo.claim_effect(
+            identity.effect_id,
+            owner="lease-worker",
+            claim_token="claim-1",
+            ttl_seconds=60,
+            lease_id="lease-1",
+            fencing_token=1,
+        )
+        assert won and row is not None
+        assert row.fencing_token == 1
+
+        # A zero-generation claim (an unleased/stale worker) cannot commit
+        # over the tokened row: the CAS matches nothing.
+        stale = repo.commit_effect(
+            identity.effect_id,
+            '{"x": 1}',
+            claim_token="claim-1",
+            fencing_token=0,
+        )
+        assert stale is not None
+        assert stale.phase == EffectStatus.CLAIMED.value
+
+        # A different, non-zero generation is refused too.
+        other = repo.commit_effect(
+            identity.effect_id,
+            '{"x": 1}',
+            claim_token="claim-1",
+            fencing_token=2,
+        )
+        assert other is not None and other.phase == EffectStatus.CLAIMED.value
+
+        # Only the owning generation settles the ledger.
+        settled = repo.commit_effect(
+            identity.effect_id,
+            '{"x": 1}',
+            claim_token="claim-1",
+            fencing_token=1,
+        )
+        assert settled is not None and settled.phase == "committed"
+    finally:
+        repo.close()
+
+
+def test_lease_bound_effect_claim_requires_a_generation(tmp_path):
+    """BCDEF review B1: a claim bound to a lease without a generation is
+    a contradiction, so construction fails instead of defaulting to 0."""
+    with pytest.raises(ValueError):
+        EffectClaim(
+            effect_id="e-1", claim_token="t-1", lease_id="lease-1", fencing_token=0
+        )
+    # An unleased claim keeps its (generation-less) shape.
+    claim = EffectClaim(effect_id="e-1", claim_token="t-1")
+    assert claim.fencing_token == 0
+
+
 # ---- drive_effect publication gate -----------------------------------------
 
 

@@ -1188,7 +1188,15 @@ async def drive_effect(
         try:
             serialized = serialize_result(result)
             committed = runs_repo.commit_effect(
-                effect_key, serialized, claim_token=claim_token
+                effect_key,
+                serialized,
+                claim_token=claim_token,
+                # BCDEF review B1: the ledger settles only under the lease
+                # generation the claim carried. A stale (or generation-less)
+                # worker's commit matches nothing, so the row stays
+                # ``executing`` and falls into outcome_unknown below instead
+                # of publishing a success it no longer owns.
+                fencing_token=fencing_token,
             )
         except Exception:
             logger.exception(

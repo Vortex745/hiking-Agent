@@ -755,6 +755,7 @@ class ControlStore:
         self._conn.executescript(_CONTROL_SCHEMA)
         self._migrate_terminal_persist_failed()
         self._migrate_additive_columns()
+        self._migrate_legacy_fencing_tokens()
         logger.info("ControlStore ready at %s", db_path)
 
     def _migrate_terminal_persist_failed(self) -> None:
@@ -819,6 +820,28 @@ class ControlStore:
                     self._conn.execute(
                         f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"
                     )
+
+    def _migrate_legacy_fencing_tokens(self) -> None:
+        """BCDEF review B1: move pre-ticket-06 lease rows off generation 0.
+
+        ``sandbox_leases.fencing_token`` was added with ``DEFAULT 0``, so
+        every legacy active lease carried 0 — the same value a
+        generation-less in-memory handle carried. Read side, 0 is a real
+        generation: the guard refuses it as soon as a newer generation
+        owns the lease (see :meth:`agent_v2.leases.SandboxLeaseGuard.assert_active`).
+        Normalizing here makes that read side sound without having to know
+        which rows predate the ticket: every lease written by
+        :meth:`create_sandbox_lease` already carries an explicit generation
+        of 1 or more, so a 0 row can only be legacy.
+
+        ``effects.fencing_token`` is deliberately NOT normalized: an
+        unclaimed ledger row legitimately carries 0 until a claim stamps
+        the lease generation that owns it.
+        """
+        self._conn.execute(
+            "UPDATE sandbox_leases SET fencing_token = 1 "
+            "WHERE fencing_token IS NULL OR fencing_token = 0"
+        )
 
     def close(self) -> None:
         self._conn.close()
@@ -2362,6 +2385,11 @@ class ControlStore:
         The claim token is the fencing credential checked by commit /
         outcome transitions, so a stale worker cannot settle a row that
         a newer claim generation owns.
+
+        BCDEF review B1: the generation written here is compared, not
+        trusted as "unset". A claim carrying a LOWER lease generation than
+        the row already records cannot win, so a generation-0 (stale or
+        unleased) worker cannot re-stamp a row a fenced generation claimed.
         """
         now = _now_iso()
         claim_expires = _now_plus_seconds(ttl_seconds)
@@ -2372,7 +2400,8 @@ class ControlStore:
                 "claim_token = ?, claim_owner = ?, claimed_at = ?, "
                 "claim_expires_at = ?, lease_id = ?, fencing_token = ?, "
                 "updated_at = ? "
-                "WHERE effect_key = ? AND status IN ('authorized', 'pending')",
+                "WHERE effect_key = ? AND status IN ('authorized', 'pending') "
+                "AND fencing_token <= ?",
                 (
                     claim_token,
                     owner,
@@ -2382,6 +2411,7 @@ class ControlStore:
                     int(fencing_token or 0),
                     now,
                     effect_key,
+                    int(fencing_token or 0),
                 ),
             )
             won = cur.rowcount == 1
@@ -2420,6 +2450,7 @@ class ControlStore:
         result_json: str,
         *,
         claim_token: str | None = None,
+        fencing_token: int | None = None,
     ) -> EffectRecord | None:
         """Transition ``executing`` → ``committed`` with the durable result.
 
@@ -2438,6 +2469,12 @@ class ControlStore:
         matches the claim generation. A worker whose claim was fenced
         (or never existed) cannot commit; the caller observes the
         unchanged row and must treat the outcome as unknown.
+
+        BCDEF review B1: when ``fencing_token`` is supplied the UPDATE also
+        matches the lease generation stamped on the claim. The comparison
+        is unconditional — ``0`` is a generation, not "unset" — so a
+        zero-token (unleased/stale) worker can never settle a row owned by
+        a fenced lease generation.
         """
         now = _now_iso()
         sql = (
@@ -2449,6 +2486,9 @@ class ControlStore:
         if claim_token is not None:
             sql += " AND claim_token = ?"
             params = params + (claim_token,)
+        if fencing_token is not None:
+            sql += " AND fencing_token = ?"
+            params = params + (int(fencing_token),)
         self._conn.execute("BEGIN")
         try:
             self._conn.execute(sql, params)

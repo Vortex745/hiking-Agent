@@ -372,17 +372,126 @@ def test_pre_ticket_schema_rows_stay_readable(tmp_path):
         lease = store.get_sandbox_lease("run-old")
         assert lease is not None
         assert lease.status == "active"
-        assert lease.fencing_token == 0
+        # BCDEF review B1: the stored pre-ticket-06 default of 0 is not a
+        # fenceable generation. The additive migration normalizes legacy
+        # lease rows to generation 1 so an unupgraded worker (which can
+        # only ever hold 0) is fenced instead of waved through.
+        assert lease.fencing_token == 1
         assert lease.expires_at is None
         assert lease.is_expired() is False
-        # Legacy lease renews under generation 0 and gains an expiry.
+        # Legacy lease renews under the normalized generation and gains an
+        # expiry.
         renewed, ok = store.renew_sandbox_lease(
-            run_id="run-old", fencing_token=0, owner_id="worker"
+            run_id="run-old", fencing_token=1, owner_id="worker"
         )
         assert ok is True and renewed is not None
         assert renewed.expires_at is not None
     finally:
         store.close()
+
+
+_LEGACY_LEASE_DDL = """
+CREATE TABLE runs (
+    run_id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL UNIQUE,
+    conversation_id TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    terminal_type TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    terminal_at TEXT
+);
+CREATE TABLE sandbox_leases (
+    lease_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL UNIQUE,
+    sandbox_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    workspace_path TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    destroyed_at TEXT,
+    resource_usage_json TEXT,
+    failure_reason TEXT
+);
+"""
+
+
+def _seed_legacy_lease_db(db_path) -> None:
+    """A pre-ticket-06 database: one active lease, no fencing column."""
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(_LEGACY_LEASE_DDL)
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO runs VALUES (?, ?, ?, ?, 'running', NULL, ?, ?, NULL)",
+        ("run-legacy", "req-legacy", "conv-legacy", "cowork", now, now),
+    )
+    conn.execute(
+        "INSERT INTO sandbox_leases "
+        "(lease_id, run_id, sandbox_type, status, workspace_path, created_at) "
+        "VALUES ('lease-legacy', 'run-legacy', 'local_native', 'active', "
+        "'/ws/legacy', ?)",
+        (now,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_legacy_generation_zero_lease_cannot_execute_after_takeover(tmp_path):
+    """BCDEF review B1: ``fencing_token == 0`` is a real token, not "unset".
+
+    A worker that read the lease before the upgrade holds generation 0. Once
+    a newer generation owns the lease, its guard must be refused — not
+    silently waved through because ``0`` is falsy.
+    """
+    db_path = tmp_path / "legacy-fencing.sqlite"
+    _seed_legacy_lease_db(db_path)
+    repo = RunRepository(
+        control=ControlStore(str(db_path)),
+        checkpoints=CheckpointsStore(str(tmp_path / "ckpt.sqlite")),
+    )
+    try:
+        lease = repo.get_sandbox_lease("run-legacy")
+        assert lease is not None
+        assert lease.fencing_token == 1  # normalized by the migration
+
+        # The unupgraded worker still holds generation 0.
+        zero_guard = SandboxLeaseGuard(
+            repo, run_id="run-legacy", fencing_token=0, lease_id=lease.lease_id
+        )
+        with pytest.raises(SandboxLeaseLostError) as excinfo:
+            zero_guard.assert_active()
+        assert excinfo.value.code == "lease_fencing_rejected"
+
+        # The current generation runs.
+        current_guard = SandboxLeaseGuard(
+            repo, run_id="run-legacy", fencing_token=1, lease_id=lease.lease_id
+        )
+        assert current_guard.assert_active() is not None
+
+        # Expire + takeover: generation 2 owns the lease, so BOTH stale
+        # generations are fenced.
+        _expire_by_sql(repo, "run-legacy")
+        repo.expire_sandbox_lease("run-legacy")
+        takeover, acquired = repo.acquire_sandbox_lease(
+            run_id="run-legacy",
+            owner_id="worker-2",
+            sandbox_type="local_native",
+            workspace_path="/ws/takeover",
+        )
+        assert acquired is True
+        assert takeover is not None and takeover.fencing_token == 2
+
+        for guard in (zero_guard, current_guard):
+            with pytest.raises(SandboxLeaseLostError) as excinfo:
+                guard.assert_active()
+            assert excinfo.value.code == "lease_fencing_rejected"
+
+        # A stale generation can never revive its lease either.
+        with pytest.raises(SandboxLeaseLostError) as excinfo:
+            current_guard.renew()
+        assert excinfo.value.code == "lease_fencing_rejected"
+    finally:
+        repo.close()
 
 
 # ---- sandbox execution bridge ------------------------------------------------
