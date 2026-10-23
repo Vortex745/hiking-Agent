@@ -44,6 +44,7 @@ from typing import Any
 
 import pytest
 
+from agent_v2 import leases as leases_module
 from agent_v2 import persistence as persistence_module
 from agent_v2.approvals import compute_approval_id, compute_expiry
 from agent_v2.effect_repair import repair_effect
@@ -96,14 +97,31 @@ class _Clock:
 def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
     """Freeze + advance the store clock instead of waiting 600 s.
 
-    These are persistence's two timestamp writers: ``_now_iso`` stamps every
-    row, ``_now_plus_seconds`` the lease expiries. The janitor deadline is
-    derived from the same single ``_now_iso()`` read its claim makes, so the
-    asserted 600 s is read back off the durable row, not from a constant.
+    These are persistence's two timestamp writers (``_now_iso`` stamps every
+    row, ``_now_plus_seconds`` the lease expiries) plus the lease-expiry
+    READER. The reader used to fall through to the wall clock, so a lease
+    minted by this fixture was only "unexpired" during the ten minutes after
+    the frozen instant — the suite passed or failed by time of day. Feeding
+    the same frozen instant into ``lease_is_expired`` makes expiry a
+    function of the controlled clock alone: ``clock.advance`` expires a
+    lease, wall time never does.
+
+    The fixture starts at the REAL current instant (not a fixed calendar
+    date) because the persistence write paths still compare a real
+    ``datetime.now`` on their own CAS boundaries; freezing in the past made
+    a fresh lease look overdue to them. Starting "now" keeps those
+    comparisons honest while leaving every assertion relative to the
+    controlled clock.
     """
-    frozen = _Clock(datetime(2026, 10, 23, 12, 0, 0, tzinfo=timezone.utc))
+    frozen = _Clock(datetime.now(timezone.utc))
     monkeypatch.setattr(persistence_module, "_now_iso", frozen.iso)
     monkeypatch.setattr(persistence_module, "_now_plus_seconds", frozen.plus)
+    real_lease_is_expired = leases_module.lease_is_expired
+
+    def frozen_lease_is_expired(expires_at: str | None, now: Any = None) -> bool:
+        return real_lease_is_expired(expires_at, now=now or frozen.now)
+
+    monkeypatch.setattr(leases_module, "lease_is_expired", frozen_lease_is_expired)
     return frozen
 
 
