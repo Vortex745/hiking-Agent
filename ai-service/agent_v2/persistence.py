@@ -3044,7 +3044,103 @@ CREATE TABLE IF NOT EXISTS run_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_run_seq ON run_events(run_id, sequence);
+
+-- S2: conflict terminals removed by the one-terminal-per-run upgrade.
+-- Every original ``run_events`` column is preserved verbatim next to the
+-- canonical event the run kept, so an audit can still read what the
+-- database held before the constraint existed. ``event_id`` is the primary
+-- key: one terminal can be archived exactly once, so a repeated upgrade can
+-- never duplicate archive rows.
+CREATE TABLE IF NOT EXISTS run_event_terminal_archive (
+    event_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    canonical_event_id TEXT NOT NULL,
+    archived_at TEXT NOT NULL,
+    archive_reason TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_event_terminal_archive_run
+    ON run_event_terminal_archive(run_id);
 """
+
+
+# ---- S2: one durable terminal per run --------------------------------------
+
+
+# The run-lifecycle terminal event types, sorted so the generated SQL
+# fragment is byte-stable across processes. ``run.paused`` is a STREAM
+# terminal only, and ``progress.gap`` / ``tool_result`` are ordinary events:
+# none of them may be limited by this constraint.
+_RUN_LIFECYCLE_EVENT_TYPES: frozenset[str] = frozenset({"done", "error", "cancelled"})
+_TERMINAL_EVENT_TYPES: tuple[str, ...] = tuple(sorted(_RUN_LIFECYCLE_EVENT_TYPES))
+
+# Name of the partial unique index that owns the invariant. It is created by
+# a migration, NOT by ``_CHECKPOINTS_SCHEMA``: a database written before S2
+# legitimately holds contradicting terminals, and an index in the schema
+# script would raise inside ``CheckpointsStore.__init__`` so the store — and
+# with it every run, snapshot and replay — could never open.
+TERMINAL_UNIQUENESS_INDEX = "idx_run_events_one_terminal"
+
+_TERMINAL_ARCHIVE_REASON = "duplicate_terminal_on_legacy_upgrade"
+
+# ``CREATE INDEX`` does not accept bound parameters in its WHERE clause, so
+# the predicate is built from the sorted literal tuple above.
+_TERMINAL_TYPE_SQL_LIST = ", ".join(
+    f"'{event_type}'" for event_type in _TERMINAL_EVENT_TYPES
+)
+
+# Surplus terminals of a legacy database: everything but the row with the
+# smallest sequence of its run (ties break on insertion order). The
+# canonical keeps its ``event_id``/``payload_json``/``sequence`` untouched —
+# this migration only moves conflicts to another table.
+_TERMINAL_CONFLICTS_SQL = f"""
+WITH terminals AS (
+    SELECT event_id, run_id, sequence, event_type, payload_json, request_id,
+           conversation_id, created_at,
+           FIRST_VALUE(event_id) OVER (PARTITION BY run_id
+               ORDER BY sequence ASC, rowid ASC) AS canonical_event_id,
+           ROW_NUMBER() OVER (PARTITION BY run_id
+               ORDER BY sequence ASC, rowid ASC) AS rn
+    FROM run_events
+    WHERE event_type IN ({_TERMINAL_TYPE_SQL_LIST})
+)
+SELECT event_id, run_id, sequence, event_type, payload_json, request_id,
+       conversation_id, created_at, canonical_event_id
+FROM terminals
+WHERE rn > 1
+ORDER BY run_id, rn
+"""
+
+# One archive row per conflict, then ONE set-based delete of everything the
+# archive holds: an event an earlier (successful) upgrade already archived is
+# skipped by the per-row ``NOT EXISTS`` guard and removed by the same delete,
+# which makes the whole migration idempotent even if the constraint was
+# dropped by hand.
+_TERMINAL_ARCHIVE_INSERT_SQL = """
+INSERT INTO run_event_terminal_archive
+    (event_id, run_id, sequence, event_type, payload_json, request_id,
+     conversation_id, created_at, canonical_event_id, archived_at,
+     archive_reason)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+_TERMINAL_SURPLUS_DELETE_SQL = f"""
+DELETE FROM run_events
+WHERE event_id IN (SELECT event_id FROM run_event_terminal_archive)
+  AND event_type IN ({_TERMINAL_TYPE_SQL_LIST})
+"""
+
+_TERMINAL_UNIQUENESS_INDEX_SQL = (
+    f"CREATE UNIQUE INDEX IF NOT EXISTS {TERMINAL_UNIQUENESS_INDEX}"
+    " ON run_events(run_id)"
+    f" WHERE event_type IN ({_TERMINAL_TYPE_SQL_LIST})"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -3117,7 +3213,15 @@ class CheckpointsStore:
         self.db_path = db_path
         self._conn = _connect(db_path)
         self._conn.executescript(_CHECKPOINTS_SCHEMA)
-        self._migrate_unique_user_message_index()
+        try:
+            self._migrate_unique_user_message_index()
+            self._migrate_one_terminal_per_run_index()
+        except Exception:
+            # A failed upgrade must not leave the file handle behind: the
+            # caller retries the upgrade on the next boot (or restores the
+            # pre-upgrade backup), so the connection has to be released.
+            self._conn.close()
+            raise
         logger.info("CheckpointsStore ready at %s", db_path)
 
     def _migrate_unique_user_message_index(self) -> None:
@@ -3143,6 +3247,78 @@ class CheckpointsStore:
         except Exception:
             self._conn.execute("ROLLBACK")
             raise
+
+    def _terminal_uniqueness_index_installed(self) -> bool:
+        """Is the one-terminal-per-run constraint already in place?"""
+        row = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index'"
+            " AND tbl_name = 'run_events' AND name = ?",
+            (TERMINAL_UNIQUENESS_INDEX,),
+        ).fetchone()
+        return row is not None
+
+    def _migrate_one_terminal_per_run_index(self) -> None:
+        """S2: archive legacy terminal conflicts, then constrain the table.
+
+        Order matters twice over:
+
+        * the conflicts are removed BEFORE the index exists, otherwise
+          ``CREATE UNIQUE INDEX`` fails on an old database and no store can
+          open;
+        * once the index is installed the historical dedupe is never run
+          again — the constraint itself guarantees the invariant, so a
+          repeated start does no repeated archiving work and no scan of the
+          event history. Migration work stays out of the request path.
+
+        Archiving, deleting and index creation are ONE ``BEGIN IMMEDIATE``
+        transaction: any step failing rolls the whole upgrade back, so the
+        database is left exactly as it was and the retry is safe.
+        """
+        if self._terminal_uniqueness_index_installed():
+            return
+
+        now = _now_iso()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            conflicts = self._conn.execute(_TERMINAL_CONFLICTS_SQL).fetchall()
+            for row in conflicts:
+                already_archived = self._conn.execute(
+                    "SELECT 1 FROM run_event_terminal_archive WHERE event_id = ?",
+                    (row["event_id"],),
+                ).fetchone()
+                if already_archived is not None:
+                    continue
+                self._conn.execute(
+                    _TERMINAL_ARCHIVE_INSERT_SQL,
+                    (
+                        row["event_id"],
+                        row["run_id"],
+                        row["sequence"],
+                        row["event_type"],
+                        row["payload_json"],
+                        row["request_id"],
+                        row["conversation_id"],
+                        row["created_at"],
+                        row["canonical_event_id"],
+                        now,
+                        _TERMINAL_ARCHIVE_REASON,
+                    ),
+                )
+            self._conn.execute(_TERMINAL_SURPLUS_DELETE_SQL)
+            self._conn.execute(_TERMINAL_UNIQUENESS_INDEX_SQL)
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        if conflicts:
+            logger.warning(
+                "checkpoints: archived %d duplicate terminal event(s) of %d run(s)"
+                " while installing %s at %s",
+                len(conflicts),
+                len({row["run_id"] for row in conflicts}),
+                TERMINAL_UNIQUENESS_INDEX,
+                self.db_path,
+            )
 
     def close(self) -> None:
         self._conn.close()
@@ -3308,13 +3484,16 @@ class CheckpointsStore:
         """The persisted run-lifecycle terminal of ``run_id``, if any.
 
         ``run.paused`` is a stream terminal, not a run terminal, so it is
-        deliberately excluded.
+        deliberately excluded. S2 makes this read return AT MOST one row per
+        run: the partial unique index ``idx_run_events_one_terminal`` holds
+        the same ``_TERMINAL_EVENT_TYPES`` set, so the smallest sequence is
+        the only terminal the database can contain.
         """
         row = self._conn.execute(
             "SELECT * FROM run_events WHERE run_id = ? "
-            "AND event_type IN ('done', 'error', 'cancelled') "
+            f"AND event_type IN ({', '.join('?' for _ in _TERMINAL_EVENT_TYPES)}) "
             "ORDER BY sequence ASC LIMIT 1",
-            (run_id,),
+            (run_id, *_TERMINAL_EVENT_TYPES),
         ).fetchone()
         return self._row_to_stored_event(row) if row is not None else None
 
@@ -3343,6 +3522,13 @@ class CheckpointsStore:
         row is returned unchanged (``terminal_created=False``) and only a
         missing assistant row is backfilled. Duplicate finalizes therefore
         cannot create a second terminal.
+
+        S2 race: the constraint lives in the database, so a writer that
+        skipped this read (another connection, process or a direct insert)
+        still cannot land a second terminal. Such a write is rolled back in
+        full and the durable canonical terminal is reused — only when it is
+        genuinely there. Any other write failure stays a persistence
+        failure.
         """
         if terminal_type not in ("done", "error", "cancelled"):
             raise ValueError(f"invalid terminal type: {terminal_type!r}")
@@ -3350,94 +3536,119 @@ class CheckpointsStore:
         now = timestamp or _now_iso()
         payload_json = json.dumps(payload, ensure_ascii=False)
 
-        self._conn.execute("BEGIN")
-        try:
-            existing = self.get_terminal_event(run_id)
-        except Exception:
-            self._conn.execute("ROLLBACK")
-            raise
-
-        assistant_id: str | None = None
-        assistant_sequence: int | None = None
-        assistant_text = ""
-        try:
-            if assistant_content:
-                existing_assistant = self.get_assistant_message(run_id)
-                if existing_assistant is not None:
-                    assistant_id = existing_assistant.message_id
-                    assistant_sequence = existing_assistant.sequence
-                    assistant_text = existing_assistant.content
-                else:
-                    assistant_sequence = self.get_next_message_sequence(
-                        conversation_id
-                    )
-                    assistant_id = str(uuid.uuid4())
-                    self._conn.execute(
-                        "INSERT INTO messages "
-                        "(message_id, conversation_id, run_id, role, content, "
-                        " sequence, created_at) "
-                        "VALUES (?, ?, ?, 'assistant', ?, ?, ?)",
-                        (
-                            assistant_id,
-                            conversation_id,
-                            run_id,
-                            assistant_content,
-                            assistant_sequence,
-                            now,
-                        ),
-                    )
-                    self._conn.execute(
-                        "UPDATE conversations SET last_active_at = ? "
-                        "WHERE conversation_id = ?",
-                        (now, conversation_id),
-                    )
-                    assistant_text = assistant_content
-        except Exception as exc:
-            self._conn.execute("ROLLBACK")
-            raise AssistantMessagePersistenceError(
-                f"assistant message write failed for run_id={run_id}"
-            ) from exc
-
-        if existing is not None:
+        # ``BEGIN IMMEDIATE`` takes the write lock before the first read, so
+        # two connections racing to finalize ONE run cannot both read "no
+        # terminal yet": the loser waits (busy_timeout), then reads the
+        # winner's committed canonical. S2 review: a deferred transaction
+        # here produced stale-snapshot write failures instead of reuse.
+        attempts = 0
+        while True:
+            attempts += 1
+            self._conn.execute("BEGIN IMMEDIATE")
             try:
+                existing = self.get_terminal_event(run_id)
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
+            assistant_id: str | None = None
+            assistant_sequence: int | None = None
+            assistant_text = ""
+            try:
+                if assistant_content:
+                    existing_assistant = self.get_assistant_message(run_id)
+                    if existing_assistant is not None:
+                        assistant_id = existing_assistant.message_id
+                        assistant_sequence = existing_assistant.sequence
+                        assistant_text = existing_assistant.content
+                    else:
+                        assistant_sequence = self.get_next_message_sequence(
+                            conversation_id
+                        )
+                        assistant_id = str(uuid.uuid4())
+                        self._conn.execute(
+                            "INSERT INTO messages "
+                            "(message_id, conversation_id, run_id, role, content, "
+                            " sequence, created_at) "
+                            "VALUES (?, ?, ?, 'assistant', ?, ?, ?)",
+                            (
+                                assistant_id,
+                                conversation_id,
+                                run_id,
+                                assistant_content,
+                                assistant_sequence,
+                                now,
+                            ),
+                        )
+                        self._conn.execute(
+                            "UPDATE conversations SET last_active_at = ? "
+                            "WHERE conversation_id = ?",
+                            (now, conversation_id),
+                        )
+                        assistant_text = assistant_content
+            except Exception as exc:
+                self._conn.execute("ROLLBACK")
+                raise AssistantMessagePersistenceError(
+                    f"assistant message write failed for run_id={run_id}"
+                ) from exc
+
+            if existing is not None:
+                try:
+                    self._conn.execute("COMMIT")
+                except Exception as exc:
+                    self._conn.execute("ROLLBACK")
+                    raise TerminalEventPersistenceError(
+                        f"could not commit finalize for run_id={run_id}"
+                    ) from exc
+                return FinalizeRecord(
+                    terminal=existing,
+                    terminal_created=False,
+                    assistant_message_id=assistant_id,
+                    assistant_sequence=assistant_sequence,
+                    assistant_content=assistant_text,
+                )
+
+            try:
+                inserted = self._insert_terminal_event(
+                    event_id=eid,
+                    run_id=run_id,
+                    sequence=sequence,
+                    event_type=terminal_type,
+                    payload_json=payload_json,
+                    request_id=request_id,
+                    conversation_id=conversation_id,
+                    created_at=now,
+                )
                 self._conn.execute("COMMIT")
+            except sqlite3.IntegrityError as exc:
+                # The database rejected this write. Roll the whole attempt
+                # back — this attempt's assistant row included, so a losing
+                # side can never leave a half-committed answer — and look at
+                # the durable facts before reporting anything.
+                self._conn.execute("ROLLBACK")
+                if self.get_terminal_event(run_id) is None or attempts >= 2:
+                    # No canonical terminal to reuse: a real write failure
+                    # (or a sequence collision with a non-terminal event),
+                    # never a success to pretend.
+                    raise TerminalEventPersistenceError(
+                        f"terminal event write failed for run_id={run_id}"
+                    ) from exc
+                # A terminal IS durable and it was not written by this
+                # attempt: a terminal race. Retry — the read inside the next
+                # transaction returns that canonical terminal unchanged.
+                continue
             except Exception as exc:
                 self._conn.execute("ROLLBACK")
                 raise TerminalEventPersistenceError(
-                    f"could not commit finalize for run_id={run_id}"
+                    f"terminal event write failed for run_id={run_id}"
                 ) from exc
             return FinalizeRecord(
-                terminal=existing,
-                terminal_created=False,
+                terminal=inserted,
+                terminal_created=True,
                 assistant_message_id=assistant_id,
                 assistant_sequence=assistant_sequence,
                 assistant_content=assistant_text,
             )
-
-        try:
-            inserted = self._insert_terminal_event(
-                event_id=eid,
-                run_id=run_id,
-                sequence=sequence,
-                event_type=terminal_type,
-                payload_json=payload_json,
-                request_id=request_id,
-                conversation_id=conversation_id,
-                created_at=now,
-            )
-            self._conn.execute("COMMIT")
-        except Exception as exc:
-            self._conn.execute("ROLLBACK")
-            raise TerminalEventPersistenceError(
-                f"terminal event write failed for run_id={run_id}"
-            ) from exc
-        return FinalizeRecord(
-            terminal=inserted,
-            terminal_created=True,
-            assistant_message_id=assistant_id,
-            assistant_sequence=assistant_sequence,
-            assistant_content=assistant_text,
-        )
 
     def _insert_terminal_event(
         self,
