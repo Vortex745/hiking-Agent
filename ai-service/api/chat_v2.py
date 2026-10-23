@@ -609,6 +609,13 @@ async def chat_v2_snapshot(
         # frozen policy (policy hash, capability ids/count, MCP services,
         # risk/approval policy). Existing clients ignore the new key.
         "capability_projection": snapshot.capability_projection,
+        # BCDEF ticket 12: the sandbox lease is part of what a client and an
+        # operator must be able to READ after the fact — ``lease_expired``
+        # and ``cleanup_pending`` are only explainable from the snapshot if
+        # the lease identity, fencing generation, expiry, cleanup status and
+        # janitor task id survive it. Additive, already-redacted shape
+        # (opaque ids and paths owned by the run, no user content).
+        "sandbox_lease": snapshot.sandbox_lease,
     }
 
 
