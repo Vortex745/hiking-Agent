@@ -925,7 +925,12 @@ def test_effect_repair_and_janitor_claim_pass_through_ownership_gate(
         evidence={"run_id": run_id, "effect_id": claimable_id},
     )
     assert created2
-    results = run_pending_janitor_tasks(harness.repo)
+    # Later tickets may legitimately enqueue additional settlement tasks
+    # (e.g. sandbox cleanup); judge ONLY the two repair tasks above.
+    results = [
+        r for r in run_pending_janitor_tasks(harness.repo)
+        if r.task_id in (task.task_id, _task2.task_id)
+    ]
     assert len(results) == 2
     by_task = {r.task_id: r for r in results}
     statuses = sorted(r.status for r in results)
