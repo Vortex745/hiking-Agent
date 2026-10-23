@@ -48,6 +48,7 @@ from agent_v2.observability import (
 from agent_v2.persistence import CheckpointsStore, ControlStore
 from agent_v2.run_orchestration import RunOrchestrator
 from agent_v2.runs import RunRepository
+from agent_v2.sandbox_lifecycle import run_sandbox_cleanup
 
 RUN_TERMINALS = {"done", "error", "cancelled"}
 ENVELOPE_KEYS = {
@@ -161,13 +162,15 @@ class Harness:
                 "expires_at": _iso(days=7),
             }
 
-        def cleanup(computer, workspace_path, runs_repo, run_id) -> None:
+        def cleanup(computer, workspace_path, runs_repo, run_id) -> Any:
+            # ALR ticket 03: cleanup hooks return the explicit typed
+            # result; the lifecycle settlement (not the hook) mutates the
+            # lease. Failures raise — an equally explicit outcome the
+            # orchestrator translates to a failed result.
             self.cleanup_calls.append(workspace_path)
             if self.cleanup_fails:
                 raise RuntimeError("sandbox teardown timed out")
-            computer.cleanup(workspace_path)
-            if runs_repo is not None and run_id is not None:
-                runs_repo.destroy_sandbox_lease(run_id=run_id)
+            return run_sandbox_cleanup(computer, workspace_path)
 
         self.orchestrator = RunOrchestrator(
             settings=_settings(),
@@ -1164,5 +1167,758 @@ def test_a_clean_request_moves_no_boundary_counter(harness: Harness):
         name: snapshot[name] for name in BOUNDARY_METRIC_NAMES
     } == {name: 0 for name in BOUNDARY_METRIC_NAMES}
     assert snapshot["repair_age_max_seconds"] == 0.0
+
+
+# ---- ALR ticket 03: real production assembly cleanup outcomes -----------------
+#
+# The harness above replaces ``_build_run_orchestrator``, so its cleanup
+# fake stands IN FRONT of the production adapter. Ticket 03's regression is
+# about the REAL HTTP adapter chain: the production ``_build_run_orchestrator``
+# wiring, the real ``_cleanup_sandbox`` adapter, the real artifact export and
+# approval gate, over a tmp SQLite repository. Only the model kernel turn,
+# the sandbox Computer and the subject cookie are controlled — the same
+# seams production tests always use. Cleanup outcomes must be EXPLICIT:
+# a physical cleanup failure or an ambiguous (``None``) adapter return is
+# registered as a failed lease + pending_janitor cleanup + exactly one
+# active janitor task for the ORIGINAL target, and the run's terminal
+# never moves.
+
+
+class _RealAssembly:
+    """The un-replaced production wiring over one tmp repository."""
+
+    def __init__(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        computer: Any,
+    ) -> None:
+        from agent_v2.computer import LocalNativeComputer  # noqa: F401
+
+        self.repo = RunRepository(
+            control=ControlStore(str(tmp_path / "control.sqlite")),
+            checkpoints=CheckpointsStore(str(tmp_path / "ckpt.sqlite")),
+        )
+        self.computer = computer
+        self.kernel_calls: list[dict[str, Any]] = []
+
+        async def fake_turn(**kwargs: Any) -> tuple[str, list[dict[str, Any]]]:
+            self.kernel_calls.append(kwargs)
+            return ("# 杭州两日徒步计划\n占位正文，注意天气与补给。", [])
+
+        import agent_v2.kernel as kernel_module
+
+        monkeypatch.setattr(kernel_module, "run_chat_turn", fake_turn)
+        monkeypatch.setattr(
+            chat_v2_module, "_build_artifact_computer", lambda *a, **k: computer
+        )
+        monkeypatch.setattr(chat_v2_module.settings, "agent_v2_enabled", True)
+        monkeypatch.setattr(
+            chat_v2_module.settings,
+            "agent_v2_state_dir",
+            str(tmp_path / "state"),
+        )
+        monkeypatch.setattr(
+            chat_v2_module,
+            "resolve_request_subject",
+            lambda request: (
+                _FakeMemory(),
+                setattr(request.state, "subject_id", SUBJECT_ID)
+                or SimpleNamespace(issued=False, token="tok", subject_id=SUBJECT_ID),
+            ),
+        )
+
+        self.app = FastAPI()
+        self.app.include_router(chat_v2_module.chat_v2_router, prefix="/api/v2")
+        self.app.include_router(
+            chat_v2_module.approvals_v2_router, prefix="/api/v2"
+        )
+        self.app.state.agent_v2_runtime = SimpleNamespace(
+            runs=self.repo, memory=None, telemetry=None, capacity=None,
+            kernel_checkpoints=None,
+        )
+
+    def close(self) -> None:
+        self.repo.close()
+
+    def stream(
+        self, request_id: str, *, message: str = "规划杭州两日徒步并出 PDF 计划"
+    ) -> list[dict[str, Any]]:
+        body = {
+            "message": message,
+            "request_id": request_id,
+            "profile_id": "artifact",
+        }
+        response = self._call("POST", "/api/v2/chat/sse", body)
+        assert response.status_code == 200, response.text
+        return _frames(response.text)
+
+    def resume(self, run_id: str, *, from_seq: int = 0) -> list[dict[str, Any]]:
+        response = self._call(
+            "POST", f"/api/v2/chat/resume/{run_id}?from_seq={from_seq}"
+        )
+        assert response.status_code == 200, response.text
+        return _frames(response.text)
+
+    def _call(self, method: str, path: str, body: dict[str, Any] | None = None):
+        async def run():
+            transport = ASGITransport(app=self.app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                return await client.request(method, path, json=body)
+
+        return asyncio.run(run())
+
+    def paused_approval(self, request_id: str) -> tuple[str, str]:
+        run = self.repo.control.get_run_by_request(request_id)
+        assert run is not None and run.status == "paused", run
+        pending = self.repo.list_pending_approvals_for_run(run.run_id)
+        assert len(pending) == 1, pending
+        return run.run_id, pending[0].approval_id
+
+    def decide(self, approval_id: str, *, request_id: str) -> None:
+        response = self._call(
+            "POST",
+            f"/api/v2/approvals/{approval_id}/decision",
+            {"decision": "approve", "decision_request_id": request_id},
+        )
+        assert response.status_code == 200, response.text
+
+
+class _CountingCleanupFailureComputer:
+    """A real production Computer whose physical teardown always fails.
+
+    Wraps :class:`LocalNativeComputer` with ``failure_mode="cleanup"`` so
+    ``cleanup()`` raises :class:`SandboxCleanupError` carrying the REAL
+    partial usage gathered before the failure — the exact shape the
+    production adapter must translate, not hide.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.cleanup_calls: list[str] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def cleanup(self, workspace_path: str) -> Any:
+        self.cleanup_calls.append(workspace_path)
+        return self._inner.cleanup(workspace_path)
+
+
+def _drive_real_pdf_run(assembly: _RealAssembly, request_id: str) -> tuple[str, list[dict[str, Any]]]:
+    """First stream → approval pause → approve → resume → terminal."""
+    frames = assembly.stream(request_id)
+    assert _types(frames)[-1] == "run.paused", _types(frames)
+    run_id, approval_id = assembly.paused_approval(request_id)
+    assembly.decide(approval_id, request_id=f"dec-{request_id}")
+    resumed = assembly.resume(run_id)
+    return run_id, resumed
+
+
+def test_real_adapter_cleanup_failure_registers_recovery_not_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """T03-01: a REAL ``SandboxCleanupError`` (with partial usage) through
+    the REAL HTTP adapter must be registered honestly — never ``succeeded``.
+
+    The user keeps the original answer and the downloadable artifact; the
+    database keeps a ``failed`` lease, a ``pending_janitor`` cleanup with
+    the failure reason and the preserved partial usage, and exactly one
+    active janitor task for the ORIGINAL workspace."""
+    from agent_v2.computer import LocalNativeComputer
+
+    reset_boundary_metrics()
+    computer = _CountingCleanupFailureComputer(
+        LocalNativeComputer(failure_mode="cleanup")
+    )
+    assembly = _RealAssembly(tmp_path, monkeypatch, computer=computer)
+    try:
+        run_id, resumed = _drive_real_pdf_run(assembly, "alr03-cleanup-failed")
+
+        # The original terminal stands: the answer is durable and the
+        # artifact was exported for download.
+        assert _types(resumed)[-1] == "done", _types(resumed)
+        run = assembly.repo.get_run(run_id)
+        assert run is not None and run.status == "done"
+        available = next(f for f in resumed if f["type"] == "artifact.available")
+        artifact = assembly.repo.get_artifact(available["payload"]["artifact_id"])
+        assert artifact is not None and artifact.status == "available"
+        assert Path(artifact.storage_path).read_bytes().startswith(b"%PDF")
+
+        # The physical teardown ran exactly once, against the leased
+        # workspace, and failed.
+        lease_for_ws = assembly.repo.get_sandbox_lease(run_id)
+        assert lease_for_ws is not None
+        assert computer.cleanup_calls == [lease_for_ws.workspace_path]
+
+        # Honest failure registration on the CURRENT lease.
+        lease = lease_for_ws
+        assert lease.status == "failed"
+        assert lease.cleanup_status == "pending_janitor"
+        assert lease.failure_reason and "cleanup failed" in lease.failure_reason
+        assert lease.cleanup_error == lease.failure_reason
+        # The partial usage gathered before the failure survives.
+        assert lease.resource_usage is not None
+        assert set(lease.resource_usage) >= {
+            "duration_ms", "files_written", "bytes_written"
+        }
+
+        # Exactly ONE active janitor task for the original target.
+        tasks = assembly.repo.list_janitor_tasks(kind="cleanup")
+        assert len(tasks) == 1
+        task = tasks[0]
+        assert task.status == "pending"
+        assert task.dedupe_key == f"cleanup:{run_id}"
+        evidence = task.evidence
+        assert evidence["run_id"] == run_id
+        assert evidence["lease_id"] == lease.lease_id
+        assert evidence["workspace_path"] == lease.workspace_path
+        assert evidence["sandbox_identity"] == lease.sandbox_identity
+        assert evidence["fencing_token"] == lease.fencing_token
+        assert evidence["failure_reason"]
+        assert get_boundary_metrics().snapshot()["cleanup_pending"] == 1
+    finally:
+        assembly.close()
+        reset_boundary_metrics()
+
+
+def test_real_adapter_unexpected_cleanup_exception_registers_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """T03-01: an unexpected (non-SandboxCleanupError) exception raised by
+    the Computer and absorbed by the REAL adapter is still a failure."""
+    from agent_v2.computer import LocalNativeComputer
+
+    class _CrashingCleanupComputer(LocalNativeComputer):
+        cleanup_calls: list[str] = []
+
+        def cleanup(self, workspace_path: str) -> Any:
+            _CrashingCleanupComputer.cleanup_calls.append(workspace_path)
+            raise RuntimeError("teardown crashed unexpectedly")
+
+    reset_boundary_metrics()
+    computer = _CrashingCleanupComputer()
+    assembly = _RealAssembly(tmp_path, monkeypatch, computer=computer)
+    try:
+        run_id, resumed = _drive_real_pdf_run(assembly, "alr03-cleanup-crash")
+
+        assert _types(resumed)[-1] == "done", _types(resumed)
+        assert assembly.repo.get_run(run_id).status == "done"
+        assert _CrashingCleanupComputer.cleanup_calls
+
+        lease = assembly.repo.get_sandbox_lease(run_id)
+        assert lease is not None
+        assert lease.status == "failed"
+        assert lease.cleanup_status == "pending_janitor"
+        assert lease.cleanup_error and "cleanup" in lease.cleanup_error
+
+        tasks = assembly.repo.list_janitor_tasks(kind="cleanup")
+        assert len(tasks) == 1
+        assert tasks[0].status == "pending"
+        assert tasks[0].dedupe_key == f"cleanup:{run_id}"
+        assert tasks[0].evidence["workspace_path"] == lease.workspace_path
+    finally:
+        assembly.close()
+        reset_boundary_metrics()
+
+
+@pytest.mark.parametrize(
+    "legacy_return",
+    [
+        pytest.param(None, id="none-return"),
+        pytest.param(
+            {"status": "succeeded", "usage": {"files_deleted": 0}},
+            id="legacy-dict-shape",
+        ),
+    ],
+)
+def test_ambiguous_adapter_return_is_protocol_failure_never_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_return: Any
+):
+    """T03-02: a legacy/ambiguous adapter that returns ``None`` or an
+    untyped dict is a PROTOCOL failure — it must never be recorded as a
+    successful cleanup, and the resource must still be settled and
+    retried, not left ``active``."""
+    from agent_v2.computer import LocalNativeComputer
+
+    reset_boundary_metrics()
+    computer = LocalNativeComputer()
+    assembly = _RealAssembly(tmp_path, monkeypatch, computer=computer)
+    monkeypatch.setattr(
+        chat_v2_module,
+        "_cleanup_sandbox",
+        lambda *a, **k: legacy_return,
+    )
+    try:
+        run_id, resumed = _drive_real_pdf_run(assembly, "alr03-protocol")
+
+        assert _types(resumed)[-1] == "done", _types(resumed)
+        assert assembly.repo.get_run(run_id).status == "done"
+
+        lease = assembly.repo.get_sandbox_lease(run_id)
+        assert lease is not None
+        assert lease.status != "active"
+        assert lease.status == "failed"
+        assert lease.cleanup_status != "succeeded"
+        assert lease.cleanup_status == "pending_janitor"
+        assert lease.cleanup_error
+
+        tasks = assembly.repo.list_janitor_tasks(kind="cleanup")
+        assert len(tasks) == 1
+        assert tasks[0].status == "pending"
+        assert tasks[0].dedupe_key == f"cleanup:{run_id}"
+    finally:
+        assembly.close()
+        reset_boundary_metrics()
+
+
+def test_real_adapter_success_path_settles_lease_with_real_usage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """T03-03 positive control: the normal PDF approval/resume run through
+    the REAL adapter ends ``done``, exports a downloadable artifact,
+    cleans up exactly once, persists the REAL usage on a ``destroyed``
+    lease, and creates ZERO janitor work."""
+    from agent_v2.computer import LocalNativeComputer
+
+    class _CountingComputer(LocalNativeComputer):
+        cleanup_calls: list[str] = []
+
+        def cleanup(self, workspace_path: str) -> Any:
+            _CountingComputer.cleanup_calls.append(workspace_path)
+            return super().cleanup(workspace_path)
+
+    reset_boundary_metrics()
+    computer = _CountingComputer()
+    assembly = _RealAssembly(tmp_path, monkeypatch, computer=computer)
+    try:
+        run_id, resumed = _drive_real_pdf_run(assembly, "alr03-success")
+
+        assert _types(resumed)[-1] == "done", _types(resumed)
+        available = next(f for f in resumed if f["type"] == "artifact.available")
+        artifact = assembly.repo.get_artifact(available["payload"]["artifact_id"])
+        assert artifact is not None and artifact.status == "available"
+        assert Path(artifact.storage_path).read_bytes().startswith(b"%PDF")
+
+        assert len(_CountingComputer.cleanup_calls) == 1
+
+        lease = assembly.repo.get_sandbox_lease(run_id)
+        assert lease is not None
+        assert lease.status == "destroyed"
+        assert lease.cleanup_status == "succeeded"
+        assert lease.resource_usage is not None
+        assert set(lease.resource_usage) >= {
+            "duration_ms", "files_written", "bytes_written"
+        }
+
+        assert assembly.repo.list_janitor_tasks(kind="cleanup") == []
+        assert get_boundary_metrics().snapshot()["cleanup_pending"] == 0
+    finally:
+        assembly.close()
+        reset_boundary_metrics()
+
+
+# ---- ALR ticket 04: atomic cleanup settlement under write faults -------------
+#
+# Ticket 03 made the failure settlement honest; ticket 04 makes it ATOMIC.
+# The durable facts of a failed terminal cleanup — the failed lease with
+# the preserved partial usage and failure reason, the ``pending_janitor``
+# cleanup record, and exactly one deduped janitor retry task carrying the
+# ORIGINAL target evidence — must commit TOGETHER in one control
+# transaction, or not at all. A write fault anywhere between those writes
+# must roll the whole settlement back, and a retry must then produce ONE
+# complete settlement for the original target.
+#
+# The fault enters through the REAL production HTTP cleanup-failure path
+# (real ASGI request → real ``_build_run_orchestrator`` wiring → real
+# ``_cleanup_sandbox`` adapter → real RunRepository over tmp SQLite) with
+# a controlled Computer whose physical teardown fails. The injection is
+# statement-level on the REAL connection: one actual SQL write raises
+# ``sqlite3.OperationalError`` at the chosen write point, which is
+# baseline-agnostic — the pre-fix code (one transaction per repository
+# call) keeps the earlier writes committed, the atomic settlement rolls
+# everything back together.
+
+
+class _SettlementWriteFault:
+    """Fail ONE real SQL write statement at a chosen settlement write point.
+
+    Wraps the REAL control connection of a real repository: every
+    statement is delegated to SQLite untouched until, after a statement
+    containing ``arm`` has executed, the first statement containing
+    ``fire`` raises ``sqlite3.OperationalError`` — the shape a real
+    mid-write disk failure produces. ``arm=None`` fires on the first
+    ``fire`` statement outright.
+    """
+
+    def __init__(self, store: ControlStore, arm: str, fire: str, message: str) -> None:
+        self._store = store
+        self._real = store._conn
+        self._arm = arm
+        self._fire = fire
+        self._message = message
+        self.armed = arm is None
+        self.fired = False
+        store._conn = self
+
+    def execute(self, sql: str, params: Any = ()) -> Any:
+        if not self.fired:
+            if self._arm is not None and self._arm in sql:
+                self.armed = True
+            if self.armed and self._fire in sql:
+                self.fired = True
+                raise sqlite3.OperationalError(self._message)
+        return self._real.execute(sql, params)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+    def restore(self) -> None:
+        self._store._conn = self._real
+
+
+def _settlement_facts(db_path: Path, run_id: str) -> dict[str, Any]:
+    """Every durable settlement fact, read through a SEPARATE connection.
+
+    A second connection only ever sees COMMITTED state — the external
+    view any other process would get, never the settling connection's
+    private transaction view.
+    """
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        lease = conn.execute(
+            "SELECT lease_id, status, cleanup_status, cleanup_error, "
+            "janitor_task_id, failure_reason, resource_usage_json, "
+            "fencing_token, workspace_path, sandbox_identity "
+            "FROM sandbox_leases WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        tasks = conn.execute(
+            "SELECT task_id, status, dedupe_key, evidence_json "
+            "FROM janitor_tasks WHERE dedupe_key = ?",
+            (f"cleanup:{run_id}",),
+        ).fetchall()
+    finally:
+        conn.close()
+    return {"lease": lease, "tasks": tasks}
+
+
+def _complete_failure_settlement_problems(facts: dict[str, Any], run_id: str) -> list[str]:
+    """Why ``facts`` is NOT the complete failure settlement (empty = it is)."""
+    problems: list[str] = []
+    lease, tasks = facts["lease"], facts["tasks"]
+    if lease is None:
+        return ["no lease row"]
+    if len(tasks) != 1:
+        problems.append(f"expected exactly 1 cleanup task, found {len(tasks)}")
+        return problems
+    task = tasks[0]
+    if task["status"] != "pending":
+        problems.append(f"task status {task['status']!r} != 'pending'")
+    evidence = json.loads(task["evidence_json"])
+    if lease["status"] != "failed":
+        problems.append(f"lease status {lease['status']!r} != 'failed'")
+    if lease["cleanup_status"] != "pending_janitor":
+        problems.append(f"cleanup_status {lease['cleanup_status']!r} != 'pending_janitor'")
+    if lease["janitor_task_id"] != task["task_id"]:
+        problems.append("lease is not associated with the janitor task")
+    if not lease["failure_reason"]:
+        problems.append("lease carries no failure reason")
+    if not lease["resource_usage_json"]:
+        problems.append("lease carries no preserved partial usage")
+    if evidence.get("run_id") != run_id:
+        problems.append("task evidence lost the run id")
+    if evidence.get("lease_id") != lease["lease_id"]:
+        problems.append("task evidence lost the ORIGINAL lease id")
+    if evidence.get("workspace_path") != lease["workspace_path"]:
+        problems.append("task evidence lost the ORIGINAL workspace")
+    if evidence.get("fencing_token") != lease["fencing_token"]:
+        problems.append("task evidence lost the ORIGINAL fencing token")
+    if not evidence.get("failure_reason"):
+        problems.append("task evidence lost the failure reason")
+    return problems
+
+
+def _untouched_state_problems(facts: dict[str, Any]) -> list[str]:
+    """Why ``facts`` is NOT the untouched pre-settlement state (empty = it is)."""
+    problems: list[str] = []
+    lease, tasks = facts["lease"], facts["tasks"]
+    if tasks:
+        problems.append(f"{len(tasks)} durable janitor task(s) exist")
+    if lease is None:
+        problems.append("no lease row")
+        return problems
+    if lease["status"] != "active":
+        problems.append(f"lease status {lease['status']!r} != 'active'")
+    if lease["cleanup_status"] is not None:
+        problems.append(f"cleanup_status {lease['cleanup_status']!r} is set")
+    if lease["janitor_task_id"] is not None:
+        problems.append("janitor_task_id is set")
+    if lease["failure_reason"] is not None:
+        problems.append("failure_reason is set")
+    if lease["resource_usage_json"] is not None:
+        problems.append("resource_usage is set")
+    return problems
+
+
+def _assert_all_or_nothing(facts: dict[str, Any], run_id: str) -> None:
+    """The atomicity invariant (T04-02): the durable facts are either the
+    COMPLETE failure settlement or the untouched pre-settlement state —
+    anything else is a half-settled bug (orphan task / unrecorded
+    failure)."""
+    settled = _complete_failure_settlement_problems(facts, run_id)
+    untouched = _untouched_state_problems(facts)
+    if settled and untouched:
+        pytest.fail(
+            "half-settled cleanup settlement — durable facts match neither "
+            f"the complete state ({settled}) nor the untouched state ({untouched})"
+        )
+
+
+def _retry_terminal_cleanup_through_production_entry(
+    assembly: "_RealAssembly", computer: Any, run_id: str
+) -> None:
+    """Re-enter the production settlement the HTTP finally block uses.
+
+    The run is already terminal (resume is replay-only), so the retry is
+    the same production entry the finally block calls — the real cleanup
+    adapter over the controlled Computer, then the durable settlement.
+    """
+    lease = assembly.repo.get_sandbox_lease(run_id)
+    assert lease is not None
+    orch = RunOrchestrator(
+        settings=chat_v2_module.settings,
+        runs_repo=assembly.repo,
+        computer_factory=lambda *a, **k: computer,
+        sandbox_cleanup=chat_v2_module._cleanup_sandbox,
+        gate_factory=None,
+    )
+    orch._run_terminal_cleanup(computer, lease.workspace_path, assembly.repo, run_id)
+
+
+def _drive_to_approved_resume(assembly: "_RealAssembly", request_id: str) -> tuple[str, list[dict[str, Any]]]:
+    """First stream → pause → approve; the RESUME is the caller's to drive."""
+    frames = assembly.stream(request_id)
+    assert _types(frames)[-1] == "run.paused", _types(frames)
+    run_id, approval_id = assembly.paused_approval(request_id)
+    assembly.decide(approval_id, request_id=f"dec-{request_id}")
+    return run_id, []
+
+
+def _faulted_cleanup_failure_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    request_id: str,
+    arm: str | None,
+    fire: str,
+    message: str,
+) -> tuple[Any, "_RealAssembly", str, "_SettlementWriteFault"]:
+    """Drive the REAL HTTP cleanup-failure path with one injected write fault.
+
+    Returns ``(computer, assembly, run_id, fault)`` — the fault has fired
+    and been restored by the time the HTTP resume returns.
+    """
+    from agent_v2.computer import LocalNativeComputer
+
+    computer = _CountingCleanupFailureComputer(
+        LocalNativeComputer(failure_mode="cleanup")
+    )
+    assembly = _RealAssembly(tmp_path, monkeypatch, computer=computer)
+    run_id, _ = _drive_to_approved_resume(assembly, request_id)
+    fault = _SettlementWriteFault(assembly.repo.control, arm, fire, message)
+    return computer, assembly, run_id, fault
+
+
+def test_cleanup_failure_between_task_and_lease_writes_settles_all_or_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """T04-02 (the ticket demo): a write fault BETWEEN the janitor task
+    insert and the failed-lease write must roll the whole settlement back
+    — never a durable orphan task for a lease that was never marked
+    failed. A retry then produces exactly ONE complete settlement for the
+    ORIGINAL target."""
+    reset_boundary_metrics()
+    computer, assembly, run_id, fault = _faulted_cleanup_failure_run(
+        tmp_path,
+        monkeypatch,
+        request_id="alr04-between-task-lease",
+        arm="INSERT INTO janitor_tasks",
+        fire="UPDATE sandbox_leases SET status = ?",
+        message="injected disk failure: between janitor task insert and "
+        "failed lease write",
+    )
+    try:
+        resumed = assembly.resume(run_id)
+        fault.restore()
+
+        # The physical teardown really ran and failed, and the original
+        # terminal stands — a settlement fault never rewrites it.
+        assert _types(resumed)[-1] == "done", _types(resumed)
+        assert assembly.repo.get_run(run_id).status == "done"
+        assert computer.cleanup_calls
+
+        _assert_all_or_nothing(_settlement_facts(tmp_path / "control.sqlite", run_id), run_id)
+        # The rolled-back settlement claimed no durable backlog either.
+        assert get_boundary_metrics().snapshot()["cleanup_pending"] == 0
+
+        # Retry through the production entry: exactly ONE complete
+        # settlement for the ORIGINAL target.
+        _retry_terminal_cleanup_through_production_entry(assembly, computer, run_id)
+        facts = _settlement_facts(tmp_path / "control.sqlite", run_id)
+        assert _complete_failure_settlement_problems(facts, run_id) == []
+        assert get_boundary_metrics().snapshot()["cleanup_pending"] == 1
+    finally:
+        fault.restore()
+        assembly.close()
+        reset_boundary_metrics()
+
+
+def test_cleanup_failure_between_lease_and_cleanup_writes_settles_all_or_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """T04-02: a write fault BETWEEN the failed-lease write and the
+    ``pending_janitor`` cleanup record must roll the whole settlement
+    back — never a failed lease without its pending_janitor record and
+    task association."""
+    reset_boundary_metrics()
+    computer, assembly, run_id, fault = _faulted_cleanup_failure_run(
+        tmp_path,
+        monkeypatch,
+        request_id="alr04-between-lease-cleanup",
+        arm="UPDATE sandbox_leases SET status = ?",
+        fire="UPDATE sandbox_leases SET cleanup_status = ?",
+        message="injected disk failure: between failed lease write and "
+        "pending_janitor cleanup record",
+    )
+    try:
+        resumed = assembly.resume(run_id)
+        fault.restore()
+
+        assert _types(resumed)[-1] == "done", _types(resumed)
+        assert assembly.repo.get_run(run_id).status == "done"
+
+        _assert_all_or_nothing(_settlement_facts(tmp_path / "control.sqlite", run_id), run_id)
+        assert get_boundary_metrics().snapshot()["cleanup_pending"] == 0
+
+        _retry_terminal_cleanup_through_production_entry(assembly, computer, run_id)
+        facts = _settlement_facts(tmp_path / "control.sqlite", run_id)
+        assert _complete_failure_settlement_problems(facts, run_id) == []
+        assert get_boundary_metrics().snapshot()["cleanup_pending"] == 1
+    finally:
+        fault.restore()
+        assembly.close()
+        reset_boundary_metrics()
+
+
+def test_cleanup_failure_during_task_insert_leaves_nothing_and_retry_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """T04-02 (first-write control): a fault ON the janitor task insert
+    itself must leave NOTHING durable — and the retry still produces the
+    one complete original-target settlement."""
+    reset_boundary_metrics()
+    computer, assembly, run_id, fault = _faulted_cleanup_failure_run(
+        tmp_path,
+        monkeypatch,
+        request_id="alr04-on-task-insert",
+        arm=None,
+        fire="INSERT INTO janitor_tasks",
+        message="injected disk failure: on janitor task insert",
+    )
+    try:
+        resumed = assembly.resume(run_id)
+        fault.restore()
+
+        assert _types(resumed)[-1] == "done", _types(resumed)
+        assert assembly.repo.get_run(run_id).status == "done"
+
+        _assert_all_or_nothing(_settlement_facts(tmp_path / "control.sqlite", run_id), run_id)
+        assert get_boundary_metrics().snapshot()["cleanup_pending"] == 0
+
+        _retry_terminal_cleanup_through_production_entry(assembly, computer, run_id)
+        facts = _settlement_facts(tmp_path / "control.sqlite", run_id)
+        assert _complete_failure_settlement_problems(facts, run_id) == []
+        assert get_boundary_metrics().snapshot()["cleanup_pending"] == 1
+    finally:
+        fault.restore()
+        assembly.close()
+        reset_boundary_metrics()
+
+
+def test_unwritable_database_claims_no_durable_settlement_and_keeps_signals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """T04-05: with the control database COMPLETELY unwritable, the
+    settlement claims no durable success and no enqueue — the original
+    run terminal and the pre-settlement lease facts stand untouched,
+    while the existing cleanup-failure log signal survives for later
+    explicit handling (which then completes once writes return)."""
+    import logging
+
+    from agent_v2.computer import LocalNativeComputer
+
+    class _UnwritableAtCleanupComputer(LocalNativeComputer):
+        """A controlled Computer whose teardown failure also turns the
+        REAL control connection fully unwritable (``PRAGMA query_only``),
+        so the production settlement that follows hits a read-only DB."""
+
+        cleanup_calls: list[str] = []
+        arm_conn: Any = None
+
+        def __init__(self) -> None:
+            super().__init__(failure_mode="cleanup")
+            self.unwritable = True
+
+        def cleanup(self, workspace_path: str) -> Any:
+            _UnwritableAtCleanupComputer.cleanup_calls.append(workspace_path)
+            if self.unwritable and _UnwritableAtCleanupComputer.arm_conn is not None:
+                _UnwritableAtCleanupComputer.arm_conn.execute("PRAGMA query_only = ON")
+            return super().cleanup(workspace_path)
+
+    reset_boundary_metrics()
+    computer = _UnwritableAtCleanupComputer()
+    assembly = _RealAssembly(tmp_path, monkeypatch, computer=computer)
+    _UnwritableAtCleanupComputer.arm_conn = assembly.repo.control._conn
+    try:
+        run_id, _ = _drive_to_approved_resume(assembly, "alr04-unwritable")
+        with caplog.at_level(logging.ERROR, logger="agent_v2.sandbox_lifecycle"):
+            resumed = assembly.resume(run_id)
+
+        # The original terminal stands: the run is done, the answer and
+        # the artifact were already durable.
+        assert _types(resumed)[-1] == "done", _types(resumed)
+        assert assembly.repo.get_run(run_id).status == "done"
+        assert _UnwritableAtCleanupComputer.cleanup_calls
+
+        # No durable claims of any kind: no janitor task, no failed
+        # lease, no pending_janitor record, no enqueue signal.
+        facts = _settlement_facts(tmp_path / "control.sqlite", run_id)
+        assert _untouched_state_problems(facts) == [], dict(facts["lease"] or {})
+        assert get_boundary_metrics().snapshot()["cleanup_pending"] == 0
+
+        # The existing cleanup-failure log signal is preserved for
+        # operators (later explicit handling — no silent swallow).
+        assert any(
+            record.name == "agent_v2.sandbox_lifecycle"
+            and record.levelno >= logging.ERROR
+            for record in caplog.records
+        ), [r.message for r in caplog.records]
+
+        # Once writes return, the SAME explicit retry completes the one
+        # original-target settlement — the preserved signal was actionable.
+        computer.unwritable = False
+        _UnwritableAtCleanupComputer.arm_conn.execute("PRAGMA query_only = OFF")
+        _retry_terminal_cleanup_through_production_entry(assembly, computer, run_id)
+        facts = _settlement_facts(tmp_path / "control.sqlite", run_id)
+        assert _complete_failure_settlement_problems(facts, run_id) == []
+        assert assembly.repo.get_run(run_id).status == "done"
+        assert get_boundary_metrics().snapshot()["cleanup_pending"] == 1
+    finally:
+        _UnwritableAtCleanupComputer.arm_conn = None
+        assembly.close()
+        reset_boundary_metrics()
 
 

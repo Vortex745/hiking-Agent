@@ -72,6 +72,7 @@ from agent_v2.persistence import (
 from agent_v2.profiles import resolve_profile
 from agent_v2.run_orchestration import ChatFlowRequest, RunOrchestrator
 from agent_v2.runs import RunRepository
+from agent_v2.sandbox_lifecycle import run_sandbox_cleanup
 
 
 # ---- seams / fixtures -------------------------------------------------------
@@ -211,15 +212,18 @@ def _orchestrator(
             export_calls.append(kwargs)
         return _fake_export(**kwargs)
 
+    def cleanup(comp, workspace_path, runs, run_id):
+        # ALR ticket 03: explicit typed result via the production helper —
+        # the lifecycle settlement destroys the lease (the hook does not).
+        return run_sandbox_cleanup(comp, workspace_path)
+
     return RunOrchestrator(
         settings=_settings(),
         runs_repo=repo,
         kernel_turn=kernel or default_kernel,
         artifact_export=export,
         computer_factory=factory,
-        sandbox_cleanup=lambda comp, workspace_path, runs, run_id: (
-            runs.destroy_sandbox_lease(run_id=run_id) if runs and run_id else None
-        ),
+        sandbox_cleanup=cleanup,
         gate_factory=None,
     )
 

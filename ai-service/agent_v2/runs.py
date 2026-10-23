@@ -983,6 +983,57 @@ class RunRepository:
             janitor_task_id=janitor_task_id,
         )
 
+    # -- atomic cleanup settlement (ALR ticket 04) -----------------------
+
+    def settle_cleanup_failure(
+        self,
+        *,
+        run_id: str,
+        lease_id: str = "",
+        evidence: dict[str, Any] | None = None,
+        dedupe_key: str | None = None,
+        resource_usage: dict[str, Any] | None = None,
+        failure_reason: str | None = None,
+    ) -> tuple[JanitorTaskRecord | None, bool, SandboxLeaseRecord | None]:
+        """One-transaction failure settlement (see ControlStore, ALR 04).
+
+        Delegates to the control store's atomic settlement; the
+        ``cleanup_pending`` signal fires ONLY after the transaction
+        committed and only for a NEWLY created work item — an unwritable
+        database claims no durable backlog.
+        """
+        task, created, lease = self.control.settle_cleanup_failure(
+            run_id=run_id,
+            lease_id=lease_id,
+            evidence=evidence,
+            dedupe_key=dedupe_key,
+            resource_usage=resource_usage,
+            failure_reason=failure_reason,
+        )
+        if created:
+            observe_boundary_metric(ExecutionErrorCode.CLEANUP_PENDING)
+        return task, created, lease
+
+    def settle_cleanup_success(
+        self,
+        *,
+        run_id: str,
+        lease_id: str,
+        workspace_path: str,
+        sandbox_identity: str = "",
+        fencing_token: int,
+        resource_usage: dict[str, Any] | None = None,
+    ) -> tuple[SandboxLeaseRecord | None, bool]:
+        """Fenced one-transaction success settlement (see ControlStore)."""
+        return self.control.settle_cleanup_success(
+            run_id=run_id,
+            lease_id=lease_id,
+            workspace_path=workspace_path,
+            sandbox_identity=sandbox_identity,
+            fencing_token=fencing_token,
+            resource_usage=resource_usage,
+        )
+
     # -- janitor work items (BCDEF ticket 07) --------------------------
 
     def enqueue_janitor_task(

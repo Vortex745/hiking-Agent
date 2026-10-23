@@ -224,9 +224,9 @@ def test_artifact_sse_sequence_preserved_and_export_gated(tmp_path: Path, monkey
 
     pdf = _PdfComputer()
     monkeypatch.setattr(chat_v2_module, "_build_artifact_computer", lambda *a, **k: pdf)
-    monkeypatch.setattr(
-        chat_v2_module, "_cleanup_sandbox", lambda *a, **k: None
-    )
+    # ALR ticket 03: the production cleanup adapter runs unpatched — it
+    # translates the fake Computer's dict usage into the typed success
+    # result and no longer performs any lease mutation of its own.
 
     # generate_pdf is HIGH-risk in the product table; the old flow pauses for
     # approval. This ticket keeps that semantics — the SSE test stubs the

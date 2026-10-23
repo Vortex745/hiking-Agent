@@ -106,6 +106,7 @@ from agent_v2.events import (
 )
 from agent_v2.execution_contract import BoundaryError, ExecutionErrorCode
 from agent_v2.execution_policy import build_execution_policy, freeze_settings
+from agent_v2.sandbox_lifecycle import run_terminal_cleanup
 from agent_v2.leases import (
     SANDBOX_LEASE_TTL_SECONDS,
     SandboxLeaseGuard,
@@ -174,9 +175,12 @@ EmitLike = Callable[[str, dict[str, Any]], Any]
 # points keep working (lazy global resolution at call time).
 ComputerFactory = Callable[..., Computer]
 
-# Best-effort sandbox cleanup: ``(computer, workspace_path, runs_repo,
-# run_id) -> None``. Same rationale as ComputerFactory.
-SandboxCleanup = Callable[..., None]
+# Terminal sandbox cleanup hook: ``(computer, workspace_path, runs_repo,
+# run_id) -> SandboxCleanupResult``. Same rationale as ComputerFactory.
+# ALR ticket 03: the hook MUST return the typed result from
+# :mod:`agent_v2.sandbox_lifecycle`; ``None`` (the legacy swallow) or any
+# other shape is treated as a protocol failure, never a success.
+SandboxCleanup = Callable[..., Any]
 
 # Host-side artifact export hook: ``(**kwargs) -> dict``. Injected from
 # the adapter because the export implementation still lives there
@@ -1877,100 +1881,24 @@ class RunOrchestrator:
         runs_repo: RunRepository | None,
         run_id: str | None,
     ) -> None:
-        """Idempotent terminal sandbox cleanup (BCDEF ticket 07).
+        """Idempotent terminal sandbox cleanup (BCDEF ticket 07, ALR 03).
 
-        Runs the injected cleanup hook, records ``cleanup_status`` on the
-        lease, and — when the cleanup fails — creates a durable janitor
-        work item carrying the run/lease/effect/sandbox evidence needed
-        for a retry. The retry MUST reuse the same workspace/lease: no
-        new sandbox is ever created here or by the janitor.
-
-        A repeated call after a successful cleanup is a no-op. Cleanup
-        bookkeeping failures are logged and never change the terminal
-        that was already emitted.
+        Thin delegation to :mod:`agent_v2.sandbox_lifecycle`, which owns
+        the typed outcome and the settlement: the injected hook must
+        return a :class:`~agent_v2.sandbox_lifecycle.SandboxCleanupResult`
+        (``None``/wrong shape = protocol failure, never success); failure
+        settles the lease as ``failed`` + ``pending_janitor`` with exactly
+        one durable janitor task for the ORIGINAL workspace/lease. A
+        repeated call after a successful recorded cleanup is a no-op, and
+        bookkeeping failures never change the terminal already emitted.
         """
-        if runs_repo is not None and run_id is not None:
-            try:
-                existing = runs_repo.get_sandbox_lease(run_id)
-            except Exception:
-                existing = None
-            if (
-                existing is not None
-                and existing.cleanup_status == "succeeded"
-                and existing.status != "active"
-            ):
-                return
-
-        failure_reason: str | None = None
-        try:
-            result = self._sandbox_cleanup(
-                computer, workspace_path, runs_repo, run_id
-            )
-            if isinstance(result, dict) and result.get("status") == "failed":
-                failure_reason = str(
-                    result.get("failure_reason") or "cleanup failed"
-                )
-        except Exception as exc:
-            logger.exception(
-                "run_orchestration: terminal cleanup failed for run_id=%s "
-                "workspace=%s",
-                run_id,
-                workspace_path,
-            )
-            failure_reason = f"cleanup failed: {exc}"
-
-        if runs_repo is None or run_id is None:
-            return
-
-        try:
-            lease = runs_repo.get_sandbox_lease(run_id)
-            if failure_reason is None:
-                runs_repo.record_sandbox_cleanup(run_id, status="succeeded")
-                return
-
-            effect_ids = [
-                effect.resolved_effect_id
-                for effect in runs_repo.list_effects_for_run(run_id)
-            ]
-            evidence = {
-                "run_id": run_id,
-                "lease_id": lease.lease_id if lease is not None else "",
-                "sandbox_type": (
-                    lease.sandbox_type
-                    if lease is not None
-                    else getattr(computer, "sandbox_type", "")
-                ),
-                "workspace_path": workspace_path,
-                "sandbox_identity": (
-                    lease.sandbox_identity if lease is not None else ""
-                ),
-                "fencing_token": lease.fencing_token if lease is not None else 0,
-                "effect_ids": effect_ids,
-                "failure_reason": failure_reason,
-            }
-            task, _created = runs_repo.enqueue_janitor_task(
-                kind="cleanup",
-                run_id=run_id,
-                lease_id=evidence["lease_id"],
-                evidence=evidence,
-                dedupe_key=f"cleanup:{run_id}",
-            )
-            if lease is not None and lease.status == "active":
-                runs_repo.destroy_sandbox_lease(
-                    run_id=run_id, failure_reason=failure_reason
-                )
-            runs_repo.record_sandbox_cleanup(
-                run_id,
-                status="pending_janitor",
-                error=failure_reason,
-                janitor_task_id=task.task_id,
-            )
-        except Exception:
-            logger.exception(
-                "run_orchestration: recording cleanup failure / janitor task "
-                "failed for run_id=%s",
-                run_id,
-            )
+        run_terminal_cleanup(
+            self._sandbox_cleanup,
+            computer,
+            workspace_path,
+            runs_repo,
+            run_id,
+        )
 
     def _acquire_sandbox_lease(
         self,
@@ -2904,6 +2832,13 @@ class RunOrchestrator:
                     "expires_at": expires_at,
                     "message": "需要您的批准才能在沙箱内执行 Bash 命令。",
                 })
+                # ALR ticket 03: set the retention flag BEFORE the pause
+                # event is yielded. A client that disconnects right after
+                # ``run.paused`` closes this generator at that yield
+                # (GeneratorExit), and the finally below must still honor
+                # the approval-wait retention — the sandbox is kept for the
+                # pending decision, never cleaned as a failure.
+                preserve_sandbox = True
                 yield emit("run.paused", {
                     "code": "awaiting_approval",
                     "approval_id": approval_id,
@@ -2918,12 +2853,13 @@ class RunOrchestrator:
                             "run_id=%s: %s",
                             run_id, exc,
                         )
+                        # Cancel beat the pause — clean up after all.
+                        preserve_sandbox = False
                         yield emit("cancelled", {
                             "code": "cancelled",
                             "message": "运行已被取消。",
                         })
                         return
-                preserve_sandbox = True
                 return
 
             # If we reach here, the gate returned ALLOW (unexpected for
@@ -3184,32 +3120,39 @@ class RunOrchestrator:
                     "expires_at": expires_at,
                     "message": "需要您的批准才能继续生成 PDF 并导出。",
                 })
+                # AC3: paused is a stream terminal, not a run terminal. The
+                # run status transitions to ``paused`` so the resume endpoint
+                # can pick it up; the sandbox lease is intentionally kept.
+                # ALR ticket 03: the retention flag is set BEFORE the pause
+                # event is yielded — a client that disconnects right after
+                # ``run.paused`` closes this generator at that yield
+                # (GeneratorExit), and the finally below must still honor
+                # the approval-wait retention instead of destroying the
+                # sandbox the pending decision still needs.
+                preserve_sandbox = True
                 yield emit("run.paused", {
                     "code": "awaiting_approval",
                     "approval_id": approval_id,
                     "message": "运行已暂停，等待用户批准高风险操作。",
                 })
-                # AC3: paused is a stream terminal, not a run terminal. The
-                # run status transitions to ``paused`` so the resume endpoint
-                # can pick it up; the sandbox lease is intentionally kept.
                 if runs_repo is not None and run_id is not None:
                     try:
                         runs_repo.mark_run_paused(run_id)
                     except RunAlreadyTerminal as exc:
                         # Cancel API beat us to a terminal state — emit a
                         # cancelled terminal instead and let the finally
-                        # clean up the sandbox (preserve_sandbox stays False).
+                        # clean up the sandbox (reset preserve_sandbox).
                         logger.warning(
                             "run_orchestration: mark_run_paused failed for "
                             "run_id=%s: %s",
                             run_id, exc,
                         )
+                        preserve_sandbox = False
                         yield emit("cancelled", {
                             "code": "cancelled",
                             "message": "运行已被取消。",
                         })
                         return
-                preserve_sandbox = True
                 return
 
             yield emit("tool_call", {

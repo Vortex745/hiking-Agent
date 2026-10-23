@@ -54,6 +54,7 @@ from agent_v2.kernel_tools import CoworkBashTool
 from agent_v2.kernel_persistence import KernelCheckpointStore
 from agent_v2.persistence import CheckpointsStore, ControlStore
 from agent_v2.runs import RunRepository
+from agent_v2.sandbox_lifecycle import run_sandbox_cleanup
 from agent_v2.uniharness.kernel_identity import (  # noqa: F401  (import side effects)
     VENDORED_UPSTREAM_REVISION,
 )
@@ -863,7 +864,10 @@ def test_disconnect_then_resume_yields_single_terminal(tmp_path: Path):
         memory=_FakeMemory(),
         kernel_turn=fake_kernel,
         computer_factory=lambda *a, **k: LocalNativeComputer(),
-        sandbox_cleanup=lambda *a, **k: None,
+        # ALR ticket 03: explicit typed result via the production helper.
+        sandbox_cleanup=lambda comp, workspace_path, _runs, _rid: (
+            run_sandbox_cleanup(comp, workspace_path)
+        ),
         gate_factory=None,
     )
     req = ChatFlowRequest(
@@ -911,3 +915,130 @@ def test_disconnect_then_resume_yields_single_terminal(tmp_path: Path):
     artifacts = repo.list_artifacts_for_run(run_id)
     assert len(artifacts) <= 1
     assert all(e.run_id == run_id for e in resumed)
+
+
+# ---- ALR ticket 04: one-transaction cleanup failure settlement ----------------
+
+
+def test_cleanup_failure_settlement_is_all_or_nothing_at_the_storage_boundary(
+    tmp_path: Path,
+):
+    """T04-01/T04-02 at the REAL storage seam: the failed lease, the
+    pending_janitor record with its task association, and the deduped
+    janitor task are ONE transaction. A write fault between the lease
+    write and the cleanup record must leave NOTHING durable — verified
+    from a SECOND connection — and a retry then produces the complete
+    settlement (the janitor insert is reused without a nested
+    transaction, so the retry collapses onto the same dedupe key)."""
+    from agent_v2.sandbox_lifecycle import (
+        SandboxCleanupResult,
+        settle_terminal_cleanup,
+    )
+
+    db_path = tmp_path / "control-atomic.sqlite"
+    repo = _repo(tmp_path, suffix="atomic")
+
+    run_id, _ = repo.create_run_idempotent(
+        request_id="req-04-atomic",
+        conversation_id="conv-04-atomic",
+        profile_id="cowork",
+        user_message="m",
+    )
+    lease, _ = repo.acquire_sandbox_lease(
+        run_id=run_id,
+        owner_id="worker-04",
+        sandbox_type="local_native",
+        workspace_path="/ws/atomic",
+        sandbox_identity="local_native:/ws/atomic",
+    )
+    assert lease is not None
+
+    failure = SandboxCleanupResult.failure(
+        "cleanup failed: injected", partial_usage={"files_deleted": 3}
+    )
+
+    class _FaultingConnection:
+        """Delegate to the real connection, but fail the FIRST cleanup
+        record write that follows the failed-lease write."""
+
+        def __init__(self, real: Any) -> None:
+            self._real = real
+            self.armed = False
+            self.fired = False
+
+        def execute(self, sql: str, params: Any = ()) -> Any:
+            if "UPDATE sandbox_leases SET status = ?" in sql:
+                self.armed = True
+            if self.armed and not self.fired and (
+                "UPDATE sandbox_leases SET cleanup_status = ?" in sql
+            ):
+                self.fired = True
+                raise sqlite3.OperationalError(
+                    "injected storage fault: between failed lease write and "
+                    "pending_janitor cleanup record"
+                )
+            return self._real.execute(sql, params)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real, name)
+
+    faulting = _FaultingConnection(repo.control._conn)
+    repo.control._conn = faulting  # type: ignore[assignment]
+    task_id = settle_terminal_cleanup(
+        repo,
+        computer=SimpleNamespace(sandbox_type="local_native"),
+        workspace_path="/ws/atomic",
+        run_id=run_id,
+        outcome=failure,
+    )
+    repo.control._conn = faulting._real  # type: ignore[assignment]
+    # The settlement reported NO durable task — the fault surfaced.
+    assert task_id is None
+
+    # The EXTERNAL view (a second connection) sees nothing: no task, the
+    # lease still active, no failure recorded. All or nothing.
+    external = sqlite3.connect(str(db_path))
+    external.row_factory = sqlite3.Row
+    try:
+        lease_row = external.execute(
+            "SELECT status, cleanup_status, janitor_task_id, failure_reason "
+            "FROM sandbox_leases WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        task_rows = external.execute(
+            "SELECT COUNT(*) FROM janitor_tasks WHERE dedupe_key = ?",
+            (f"cleanup:{run_id}",),
+        ).fetchone()[0]
+    finally:
+        external.close()
+    assert task_rows == 0
+    assert lease_row is not None
+    assert lease_row["status"] == "active"
+    assert lease_row["cleanup_status"] is None
+    assert lease_row["janitor_task_id"] is None
+    assert lease_row["failure_reason"] is None
+
+    # The retry settles COMPLETELY: one task, failed lease, pending_janitor,
+    # association, preserved partial usage — one logical settlement.
+    task_id = settle_terminal_cleanup(
+        repo,
+        computer=SimpleNamespace(sandbox_type="local_native"),
+        workspace_path="/ws/atomic",
+        run_id=run_id,
+        outcome=failure,
+    )
+    assert task_id is not None
+    settled = repo.get_sandbox_lease(run_id)
+    assert settled is not None
+    assert settled.status == "failed"
+    assert settled.cleanup_status == "pending_janitor"
+    assert settled.janitor_task_id == task_id
+    assert settled.failure_reason and "injected" in settled.failure_reason
+    assert settled.resource_usage == {"files_deleted": 3}
+    task = repo.get_janitor_task(task_id)
+    assert task is not None
+    assert task.dedupe_key == f"cleanup:{run_id}"
+    assert task.evidence["workspace_path"] == "/ws/atomic"
+    assert task.evidence["lease_id"] == lease.lease_id
+    assert repo.list_janitor_tasks(kind="cleanup") == [task]
+    repo.close()

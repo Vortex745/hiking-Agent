@@ -61,6 +61,7 @@ from agent_v2.persistence import (
 from agent_v2.profiles import resolve_profile
 from agent_v2.run_orchestration import ChatFlowRequest, RunOrchestrator
 from agent_v2.runs import RunRepository
+from agent_v2.sandbox_lifecycle import SandboxCleanupResult
 
 # The fixed claim deadline this spec chooses for the janitor (ticket 04).
 CLAIM_TTL_SECONDS = 600
@@ -229,9 +230,10 @@ def _orchestrator(
     async def default_kernel(**_kwargs: Any) -> tuple[str, list[dict[str, Any]]]:
         return ("# 计划正文", [])
 
-    def default_cleanup(comp, workspace_path, runs, run_id) -> None:
-        if runs is not None and run_id is not None:
-            runs.destroy_sandbox_lease(run_id=run_id)
+    def default_cleanup(comp, workspace_path, runs, run_id):
+        # ALR ticket 03: explicit typed result; the lifecycle settlement
+        # (not the hook) destroys the lease.
+        return SandboxCleanupResult.success(comp.cleanup(workspace_path))
 
     def factory(*_a: Any, **_k: Any) -> _FakeComputer:
         if factory_calls is not None:
@@ -1589,9 +1591,9 @@ def test_cleanup_success_records_status_and_repeat_is_idempotent(tmp_path):
         computer = _FakeComputer()
         calls: list[int] = []
 
-        def counting_cleanup(comp, workspace_path, runs, rid) -> None:
+        def counting_cleanup(comp, workspace_path, runs, rid):
             calls.append(1)
-            runs.destroy_sandbox_lease(run_id=rid)
+            return SandboxCleanupResult.success(comp.cleanup(workspace_path))
 
         orch = _orchestrator(repo, computer, cleanup=counting_cleanup)
         items = _resume(orch, run_id)
@@ -2276,5 +2278,57 @@ def test_duplicate_resume_and_cleanup_add_no_extra_side_effects(tmp_path):
         assert _count_rows(repo, "effects") == 1
         assert _count_rows(repo, "sandbox_leases") == 1
         assert len(repo.list_artifacts_for_run(run.run_id)) == 1
+    finally:
+        repo.close()
+
+
+# ---- ALR ticket 04: settlement dedupe + claim fencing stay intact -------------
+
+
+def test_duplicate_cleanup_settlement_keeps_one_task_and_the_claim_fence(tmp_path):
+    """T04-03: repeated failure settlement through the production entry
+    keeps EXACTLY ONE active dedupe task across the claim lifecycle, and
+    the settled task remains normally claim-fenceable (existing janitor
+    semantics unchanged by the atomic settlement)."""
+    repo = _repo(tmp_path)
+    try:
+        run_id, _approval = _paused_pdf_run(repo, "req-04-settle-dedupe")
+        computer = _FakeComputer()
+
+        def failing_cleanup(comp, workspace_path, runs, rid) -> None:
+            raise RuntimeError("teardown stuck")
+
+        orch = _orchestrator(repo, computer, cleanup=failing_cleanup)
+        _resume(orch, run_id)
+
+        settled = repo.get_sandbox_lease(run_id)
+        assert settled is not None
+        assert settled.cleanup_status == "pending_janitor"
+        assert settled.janitor_task_id
+        assert len(repo.list_janitor_tasks(kind="cleanup")) == 1
+
+        # Duplicate settlements reuse the SAME active task — claimed or not.
+        orch._run_terminal_cleanup(computer, f"/ws/{run_id}", repo, run_id)
+        orch._run_terminal_cleanup(computer, f"/ws/{run_id}", repo, run_id)
+        tasks = repo.list_janitor_tasks(kind="cleanup")
+        assert len(tasks) == 1
+        assert tasks[0].task_id == settled.janitor_task_id
+
+        # The claim fence on the settled task keeps its exact semantics:
+        # one winner, stale owner refused.
+        claimed, won = repo.claim_janitor_task(
+            settled.janitor_task_id, owner="janitor-a"
+        )
+        assert won is True and claimed is not None
+        _again, stolen = repo.claim_janitor_task(
+            settled.janitor_task_id, owner="janitor-b"
+        )
+        assert stolen is False
+
+        # Even while claimed, the active dedupe key still collapses a
+        # duplicate settlement onto the same row.
+        orch._run_terminal_cleanup(computer, f"/ws/{run_id}", repo, run_id)
+        assert len(repo.list_janitor_tasks(kind="cleanup")) == 1
+        assert repo.get_janitor_task(settled.janitor_task_id).status == "claimed"
     finally:
         repo.close()

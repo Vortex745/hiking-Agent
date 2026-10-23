@@ -43,6 +43,7 @@ from agent_v2.run_orchestration import ChatFlowRequest, RunOrchestrator
 from agent_v2.persistence import CheckpointsStore, ControlStore, PolicySnapshotWrite
 from agent_v2.profiles import resolve_profile
 from agent_v2.runs import RunRepository
+from agent_v2.sandbox_lifecycle import run_sandbox_cleanup
 
 
 TERMINALS = {"error", "done", "cancelled", "run.paused"}
@@ -130,13 +131,19 @@ def _resume_orchestrator(
             "expires_at": "2026-09-03T00:00:00+00:00",
         }
 
+    def cleanup(computer_arg, workspace_path, runs_repo_arg, run_id_arg):
+        # ALR ticket 03: explicit typed result via the production helper —
+        # the settlement, not the hook, owns the durable writes.
+        cleanups.append(workspace_path)
+        return run_sandbox_cleanup(computer_arg, workspace_path)
+
     return RunOrchestrator(
         settings=_settings(),
         runs_repo=repo,
         kernel_turn=fake_kernel,
         artifact_export=fake_export,
         computer_factory=lambda *a, **k: computer,
-        sandbox_cleanup=lambda *a, **k: cleanups.append(k),
+        sandbox_cleanup=cleanup,
         gate_factory=None,  # real gate → generate_pdf is HIGH risk → pause
     )
 
@@ -440,12 +447,17 @@ def test_cowork_bash_resume_executes_approved_command(tmp_path):
         approval_id=approval_id, status="approved", decision_request_id="dec-40bash"
     )
 
+    def cleanup(computer_arg, workspace_path, runs_repo_arg, run_id_arg):
+        # ALR ticket 03: explicit typed result via the production helper.
+        cleanups.append(workspace_path)
+        return run_sandbox_cleanup(computer_arg, workspace_path)
+
     orch = RunOrchestrator(
         settings=_settings(agent_v2_cowork_policy="trusted"),
         runs_repo=repo,
         artifact_export=fake_export,
         computer_factory=lambda *a, **k: computer,
-        sandbox_cleanup=lambda *a, **k: cleanups.append(k),
+        sandbox_cleanup=cleanup,
     )
 
     items = _stream_resume(orch, run_id)
@@ -533,12 +545,18 @@ def test_cowork_bash_resume_stops_when_the_effect_row_cannot_be_persisted(
         return {"artifact_id": "art-bash", "public_filename": "cowork-output.txt"}
 
     run_id = _seed_approved_cowork_bash_run(repo, computer, "req-s1-bash-write")
+
+    def cleanup(computer_arg, workspace_path, runs_repo_arg, run_id_arg):
+        # ALR ticket 03: explicit typed result via the production helper.
+        cleanups.append(workspace_path)
+        return run_sandbox_cleanup(computer_arg, workspace_path)
+
     orch = RunOrchestrator(
         settings=_settings(agent_v2_cowork_policy="trusted"),
         runs_repo=repo,
         artifact_export=fake_export,
         computer_factory=lambda *a, **k: computer,
-        sandbox_cleanup=lambda *a, **k: cleanups.append(k),
+        sandbox_cleanup=cleanup,
     )
     repo.control._conn.execute(_EFFECTS_STORAGE_FAULT_SQL)
 
