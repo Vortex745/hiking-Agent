@@ -333,6 +333,10 @@ def _drive(
         return SimpleNamespace(type=event_type, payload=payload)
 
     outcome = EffectDriveResult()
+    # Production requires a durable publisher (BCDEF review S6). This seam's
+    # default emitter is the test's own recorder; failure-injection tests
+    # override it explicitly.
+    required = emit_required if emit_required is not None else emit
 
     async def run() -> None:
         async for _ in drive_effect(
@@ -350,7 +354,7 @@ def _drive(
             execute=executor,
             emit=emit,
             outcome=outcome,
-            emit_required=emit_required,
+            emit_required=required,
         ):
             pass
 

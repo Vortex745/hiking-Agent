@@ -781,6 +781,16 @@ def _effect_meta(
     return meta
 
 
+def assert_policy_frozen(settings: Any, policy: Mapping[str, Any]) -> None:
+    """Fail closed when the run's frozen policy can no longer be resolved.
+
+    The adapted settings are re-derived here ONLY as a revalidation of policy
+    identity; the result is deliberately discarded so no resume can act on a
+    freshly resolved profile, model or capability (BCDEF review S7).
+    """
+    freeze_settings(settings, policy)
+
+
 async def drive_effect(
     *,
     runs_repo: RunRepository,
@@ -797,7 +807,7 @@ async def drive_effect(
     execute: Callable[[], dict[str, Any]],
     emit: EmitLike,
     outcome: EffectDriveResult,
-    emit_required: EmitLike | None = None,
+    emit_required: EmitLike,
     post_execute_check: Callable[[], None] | None = None,
     lease_id: str = "",
     fencing_token: int = 0,
@@ -846,7 +856,7 @@ async def drive_effect(
     .preserve_sandbox``, whether to continue its flow (export, text,
     done) or stop.
     """
-    publish = emit_required or emit
+    publish = emit_required
     if projection is not None:
         # Ticket 10: authorize BEFORE any ledger mutation. A denied or
         # unapproved tool never reaches the effect row, the claim, or the
@@ -3503,7 +3513,7 @@ class RunOrchestrator:
             # adapted settings are re-derived here only as a fail-closed
             # REVALIDATION of policy identity — never to re-resolve the
             # current default profile, model or capability.
-            freeze_settings(self._settings, resolved_policy.policy)
+            assert_policy_frozen(self._settings, resolved_policy.policy)
         except BoundaryError as exc:
             logger.error(
                 "run_orchestration: policy snapshot unusable during resume "
