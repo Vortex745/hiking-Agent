@@ -633,3 +633,64 @@ def test_approved_pdf_resume_stops_when_the_effect_row_cannot_be_persisted(tmp_p
     ] == [], caplog.text
 
 
+
+
+# ---- full-cycle resource protection (ALR ticket 05) ---------------------------
+
+
+def test_resume_computer_initialization_failure_settles_owned_resources(tmp_path):
+    """T05-02: the resume owns the renewed lease + leased workspace BEFORE
+    the Computer is reconstructed. A factory failure must settle those
+    owned resources — registered for the ORIGINAL target through ticket
+    04's atomic failure settlement — instead of leaking an active lease on
+    an error run; no new workspace is created."""
+    repo = _repo(tmp_path)
+    computer = _FakeComputer()
+    cleanups: list[Any] = []
+    orch = _resume_orchestrator(repo, computer, cleanups)
+    run_id, approval_id = _run_pause_flow(orch, repo, "req-40compinit")
+    repo.resolve_approval(
+        approval_id=approval_id, status="approved", decision_request_id="dec-40ci"
+    )
+    lease_before = repo.get_sandbox_lease(run_id)
+    assert lease_before is not None and lease_before.status == "active"
+
+    def broken_factory(sandbox_type=None, **_kwargs):
+        raise ValueError(f"unknown sandbox type {sandbox_type}")
+
+    failing_orch = RunOrchestrator(
+        settings=_settings(),
+        runs_repo=repo,
+        kernel_turn=orch._kernel_turn,
+        computer_factory=broken_factory,
+        sandbox_cleanup=(
+            lambda computer_arg, workspace_path, runs_repo_arg, run_id_arg:
+            run_sandbox_cleanup(computer_arg, workspace_path)
+        ),
+    )
+
+    items = _stream_resume(failing_orch, run_id)
+
+    types = [e.type for e in items]
+    assert types[-1] == "error", types
+    assert items[-1].payload["code"] == "sandbox_type_invalid"
+    run = repo.get_run(run_id)
+    assert run is not None and run.status == "error"
+    # No physical cleanup could run (no Computer exists), so nothing was
+    # torn down here — the janitor retry owns the physical work.
+    assert cleanups == []
+    # The owned lease is settled for the ORIGINAL target: no active lease
+    # and exactly one cleanup retry task carrying the original identity.
+    lease = repo.get_sandbox_lease(run_id)
+    assert lease is not None
+    assert lease.status != "active"
+    assert lease.status == "failed"
+    assert lease.cleanup_status == "pending_janitor"
+    tasks = repo.list_janitor_tasks(kind="cleanup")
+    assert len(tasks) == 1
+    assert tasks[0].dedupe_key == f"cleanup:{run_id}"
+    evidence = tasks[0].evidence
+    assert evidence["lease_id"] == lease_before.lease_id
+    assert evidence["workspace_path"] == lease_before.workspace_path
+    assert evidence["sandbox_identity"] == lease_before.sandbox_identity
+    assert evidence["fencing_token"] == lease_before.fencing_token

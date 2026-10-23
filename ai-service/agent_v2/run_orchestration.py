@@ -106,7 +106,11 @@ from agent_v2.events import (
 )
 from agent_v2.execution_contract import BoundaryError, ExecutionErrorCode
 from agent_v2.execution_policy import build_execution_policy, freeze_settings
-from agent_v2.sandbox_lifecycle import run_terminal_cleanup
+from agent_v2.sandbox_lifecycle import (
+    SandboxCleanupResult,
+    run_terminal_cleanup,
+    settle_terminal_cleanup,
+)
 from agent_v2.leases import (
     SANDBOX_LEASE_TTL_SECONDS,
     SandboxLeaseGuard,
@@ -2734,42 +2738,48 @@ class RunOrchestrator:
         from agent_v2.kernel import KernelModelFailure
 
         try:
-            command_plan, _ = await self._kernel_turn(
-                system_prompt=compose_cowork_planner_prompt(),
-                message=req.message,
-                settings=settings if settings is not None else self._settings,
-                run_id=run_id,
-                checkpoint_store=self._kernel_checkpoints,
-                extra_tools=(),
-                kernel_gate=None,
-                mcp_servers=None,
-                computer=None,
-            )
-        except KernelModelFailure as exc:
-            yield emit("error", {"code": exc.code, "message": exc.message})
-            mark_terminal_safe(runs_repo, run_id, "error")
-            return
+            # ALR ticket 05: the planner turn and the JSON parse are INSIDE
+            # the protection whose ``finally`` settles the owned resources
+            # (workspace created + lease acquired above), so an early
+            # model/parse failure ends run=error with the sandbox cleaned
+            # exactly once and no active lease left behind — the same shape
+            # the artifact flow already had; the two flows are uniform now.
+            try:
+                command_plan, _ = await self._kernel_turn(
+                    system_prompt=compose_cowork_planner_prompt(),
+                    message=req.message,
+                    settings=settings if settings is not None else self._settings,
+                    run_id=run_id,
+                    checkpoint_store=self._kernel_checkpoints,
+                    extra_tools=(),
+                    kernel_gate=None,
+                    mcp_servers=None,
+                    computer=None,
+                )
+            except KernelModelFailure as exc:
+                yield emit("error", {"code": exc.code, "message": exc.message})
+                mark_terminal_safe(runs_repo, run_id, "error")
+                return
 
-        try:
-            command_plan_obj = json.loads(
-                command_plan.strip().removeprefix("```json").removesuffix("```").strip()
-            )
-            bash_command = str(command_plan_obj["command"])
-            assert isinstance(bash_command, str) and bash_command.strip()
-        except Exception:
-            logger.warning(
-                "run_orchestration: cowork command plan invalid for request_id=%s",
-                req.request_id,
-            )
-            yield emit("error", {
-                "code": "bash_plan_invalid",
-                "message": "无法从内核回合解析出合法命令，任务已终止。",
-            })
-            mark_terminal_safe(runs_repo, run_id, "error")
-            return
-        bash_args = {"command": bash_command}
+            try:
+                command_plan_obj = json.loads(
+                    command_plan.strip().removeprefix("```json").removesuffix("```").strip()
+                )
+                bash_command = str(command_plan_obj["command"])
+                assert isinstance(bash_command, str) and bash_command.strip()
+            except Exception:
+                logger.warning(
+                    "run_orchestration: cowork command plan invalid for request_id=%s",
+                    req.request_id,
+                )
+                yield emit("error", {
+                    "code": "bash_plan_invalid",
+                    "message": "无法从内核回合解析出合法命令，任务已终止。",
+                })
+                mark_terminal_safe(runs_repo, run_id, "error")
+                return
+            bash_args = {"command": bash_command}
 
-        try:
             # Cancel check before the permission gate.
             if is_cancelled(runs_repo, run_id):
                 yield emit("cancelled", {
@@ -3814,6 +3824,23 @@ class RunOrchestrator:
                     "message": f"沙箱类型无效：{exc}",
                 })
                 mark_terminal_safe(runs_repo, run_id, "error")
+                # ALR ticket 05: by this point the resume OWNS resources —
+                # the renewed lease and the leased workspace — so the
+                # failure must settle them instead of leaking an active
+                # lease on an error run. No Computer instance exists to
+                # run the physical cleanup hook, so the SAME lifecycle's
+                # failure settlement registers the original-target janitor
+                # retry (its runner builds its own Computer); this is not
+                # a second resource manager.
+                settle_terminal_cleanup(
+                    runs_repo,
+                    computer=None,
+                    workspace_path=lease.workspace_path,
+                    run_id=run_id,
+                    outcome=SandboxCleanupResult.failure(
+                        f"sandbox computer initialization failed: {exc}"
+                    ),
+                )
                 return
 
             workspace_path = lease.workspace_path
