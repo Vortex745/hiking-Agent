@@ -1134,3 +1134,85 @@ def test_duplicate_failure_settlement_keeps_exactly_one_active_dedupe_task(
     finally:
         repo.close()
 
+
+# ---- ALR ticket 06: the janitor retries only the ORIGINAL lease ----------------
+
+
+def test_janitor_refuses_old_cleanup_task_when_a_successor_owns_the_row(tmp_path):
+    """T06-04 (lease identity): the live lease row belongs to a SUCCESSOR
+    generation — the old cleanup task must not clean, settle, or even
+    build a Computer for the successor's resource. The successor row is
+    untouched field by field and the conflict is durable on the task."""
+    from agent_v2.janitor import run_pending_janitor_tasks
+    from agent_v2.sandbox_lifecycle import (
+        SandboxCleanupResult,
+        settle_terminal_cleanup,
+    )
+
+    repo = _repo(tmp_path)
+    try:
+        run_id, original = _lease_with_run(repo, "req-06-successor-row", "/ws/original-06")
+        # The original generation failed its terminal cleanup; the retry
+        # task carries the ORIGINAL identity.
+        task_id = settle_terminal_cleanup(
+            repo,
+            computer=_FakeComputer(),
+            workspace_path="/ws/original-06",
+            run_id=run_id,
+            outcome=SandboxCleanupResult.failure(
+                "cleanup failed: locked", partial_usage={"files_deleted": 1}
+            ),
+        )
+        assert task_id is not None
+
+        successor, acquired = repo.acquire_sandbox_lease(
+            run_id=run_id,
+            owner_id="worker-successor",
+            sandbox_type="local_native",
+            workspace_path="/ws/successor-06",
+            sandbox_identity="local_native:/ws/successor-06",
+        )
+        assert acquired is True
+        assert successor is not None
+        assert successor.lease_id != original.lease_id
+        assert successor.fencing_token == original.fencing_token + 1
+
+        computer = _FakeComputer()
+        factory_calls: list[int] = []
+
+        def factory(*_a: Any, **_k: Any) -> _FakeComputer:
+            factory_calls.append(1)
+            return computer
+
+        results = run_pending_janitor_tasks(
+            repo, limit=10, claimer="janitor-06-lease", computer_factory=factory
+        )
+        assert [r.status for r in results] == ["failed"], results
+        assert "original_target_conflict" in results[0].error
+
+        stored = repo.get_janitor_task(task_id)
+        assert stored is not None
+        assert stored.status == "failed"
+        # The ORIGINAL evidence stands; the conflict names it.
+        assert stored.evidence["workspace_path"] == "/ws/original-06"
+        assert stored.evidence["fencing_token"] == original.fencing_token
+        assert original.lease_id in (stored.last_error or "")
+
+        # ZERO physical work for the successor's resource.
+        assert factory_calls == []
+        assert computer.cleaned == []
+        assert computer.workspaces == []
+
+        # The successor row is untouched, field by field.
+        after = repo.get_sandbox_lease(run_id)
+        assert after is not None
+        assert after.lease_id == successor.lease_id
+        assert after.fencing_token == successor.fencing_token
+        assert after.workspace_path == "/ws/successor-06"
+        assert after.status == "active"
+        assert after.failure_reason is None
+        assert after.resource_usage is None
+        assert after.destroyed_at is None
+    finally:
+        repo.close()
+

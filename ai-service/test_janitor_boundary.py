@@ -47,6 +47,7 @@ import pytest
 from agent_v2 import leases as leases_module
 from agent_v2 import persistence as persistence_module
 from agent_v2.approvals import compute_approval_id, compute_expiry
+from agent_v2.computer import ResourceUsage, SandboxCleanupError
 from agent_v2.effect_repair import repair_effect
 from agent_v2.effects import EffectStatus, compute_effect_identity
 from agent_v2.execution_contract import policy_hash
@@ -2330,5 +2331,513 @@ def test_duplicate_cleanup_settlement_keeps_one_task_and_the_claim_fence(tmp_pat
         orch._run_terminal_cleanup(computer, f"/ws/{run_id}", repo, run_id)
         assert len(repo.list_janitor_tasks(kind="cleanup")) == 1
         assert repo.get_janitor_task(settled.janitor_task_id).status == "claimed"
+    finally:
+        repo.close()
+
+
+# ---- ALR ticket 06: original-target retry + generation fencing ----------------
+
+
+def _failed_cleanup_with_task(
+    repo: RunRepository, request_id: str
+) -> tuple[str, JanitorTaskRecord, _FakeComputer]:
+    """Durable state after a REAL terminal-cleanup failure: run ``done``,
+    the original lease ``failed`` with its reason, a ``pending_janitor``
+    cleanup record, and exactly ONE retry task carrying the ORIGINAL
+    run/lease/workspace/sandbox/generation identity."""
+    run_id, _approval = _paused_pdf_run(repo, request_id)
+    computer = _FakeComputer()
+
+    def failing_cleanup(comp, workspace_path, runs, rid) -> None:
+        raise RuntimeError("workspace locked (original failure)")
+
+    orch = _orchestrator(repo, computer, cleanup=failing_cleanup)
+    _resume(orch, run_id)
+
+    lease = repo.get_sandbox_lease(run_id)
+    assert lease is not None
+    assert lease.status == "failed"
+    assert lease.cleanup_status == "pending_janitor"
+    tasks = repo.list_janitor_tasks(status="pending")
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert task.kind == "cleanup"
+    assert task.lease_id == lease.lease_id
+    assert task.evidence["lease_id"] == lease.lease_id
+    assert task.evidence["workspace_path"] == lease.workspace_path
+    assert task.evidence["fencing_token"] == lease.fencing_token
+    return run_id, task, computer
+
+
+def _misjudge_cleanup_status(repo: RunRepository, run_id: str) -> None:
+    """Stamp the pre-ALR-03 misjudged footprint durably.
+
+    The old None-swallowing adapter path recorded a cleanup success for
+    a cleanup that physically failed: the lease stays ``failed`` with
+    its reason while ``cleanup_status`` lies ``succeeded``."""
+    repo.record_sandbox_cleanup(run_id, status="succeeded")
+
+
+def test_misjudged_failed_succeeded_row_with_task_is_really_retried(tmp_path):
+    """T06-02/T06-03: an old failed+succeeded misjudged row WITH an
+    explicit task must REALLY retry the original target — never return
+    already_cleaned from the status column alone. The real success then
+    settles the ORIGINAL failed lease through the fenced transition
+    (failed → destroyed, reason cleared), and repeated sweeps are
+    idempotent."""
+    repo = _repo(tmp_path)
+    try:
+        run_id, task, computer = _failed_cleanup_with_task(repo, "req-06-misjudge")
+        _misjudge_cleanup_status(repo, run_id)
+        misjudged = repo.get_sandbox_lease(run_id)
+        assert misjudged is not None
+        assert misjudged.status == "failed"
+        assert misjudged.cleanup_status == "succeeded"
+
+        factory_calls: list[int] = []
+
+        def factory(*_a: Any, **_k: Any) -> _FakeComputer:
+            factory_calls.append(1)
+            return computer
+
+        results = run_pending_janitor_tasks(
+            repo, limit=10, claimer="janitor-06", computer_factory=factory
+        )
+
+        assert len(results) == 1
+        assert results[0].task_id == task.task_id
+        assert results[0].status == "done", results[0]
+        assert results[0].outcome.get("already_cleaned") is not True, (
+            "a misjudged failed+succeeded row must not short-circuit on "
+            "cleanup_status alone"
+        )
+        # The ORIGINAL workspace was physically cleaned exactly once; no
+        # new sandbox was provisioned.
+        assert computer.cleaned == [f"/ws/{run_id}"]
+        assert computer.workspaces == []
+
+        # The fenced success settlement repaired the ORIGINAL failed lease.
+        lease = repo.get_sandbox_lease(run_id)
+        assert lease is not None
+        assert lease.status == "destroyed"
+        assert lease.cleanup_status == "succeeded"
+        assert lease.failure_reason is None
+        assert lease.cleanup_error is None
+        assert lease.lease_id == task.lease_id
+        assert lease.fencing_token == misjudged.fencing_token
+        assert lease.janitor_task_id == task.task_id
+        assert lease.resource_usage == {"files_deleted": 0}
+
+        stored = repo.get_janitor_task(task.task_id)
+        assert stored is not None
+        assert stored.status == "done"
+        assert stored.result["cleanup_status"] == "succeeded"
+
+        # Idempotent: the settled original generation short-circuits the
+        # next sweep with zero further physical work.
+        assert (
+            run_pending_janitor_tasks(
+                repo, limit=10, claimer="janitor-06", computer_factory=factory
+            )
+            == []
+        )
+        assert computer.cleaned == [f"/ws/{run_id}"]
+    finally:
+        repo.close()
+
+
+def test_stale_task_facing_a_successor_generation_refuses_with_zero_physical_calls(
+    tmp_path,
+):
+    """T06-04/T06-01: an old cleanup task whose live lease row belongs to
+    a SUCCESSOR generation must REFUSE before any physical operation —
+    no Computer is even built, the successor's resources and state are
+    untouched, the run's terminal stands, and the conflict is traceable
+    on the task."""
+    repo = _repo(tmp_path)
+    try:
+        run_id, task, computer = _failed_cleanup_with_task(repo, "req-06-successor")
+        run_before = repo.get_run(run_id)
+        assert run_before is not None and run_before.status == "done"
+        effects_before = repo.list_effects_for_run(run_id)
+
+        successor, acquired = repo.acquire_sandbox_lease(
+            run_id=run_id,
+            owner_id="worker-successor",
+            sandbox_type="local_native",
+            workspace_path="/ws/successor",
+            sandbox_identity="local_native:/ws/successor",
+        )
+        assert acquired is True
+        assert successor is not None
+        assert successor.lease_id != task.lease_id
+        assert successor.fencing_token == task.evidence["fencing_token"] + 1
+
+        factory_calls: list[int] = []
+
+        def factory(*_a: Any, **_k: Any) -> _FakeComputer:
+            factory_calls.append(1)
+            return computer
+
+        results = run_pending_janitor_tasks(
+            repo, limit=10, claimer="janitor-06-stale", computer_factory=factory
+        )
+
+        assert len(results) == 1
+        assert results[0].status == "failed", results[0]
+        assert "original_target_conflict" in results[0].error
+
+        # The conflict evidence is durable and names both generations.
+        stored = repo.get_janitor_task(task.task_id)
+        assert stored is not None
+        assert stored.status == "failed"
+        assert "original_target_conflict" in (stored.last_error or "")
+        assert task.lease_id in (stored.last_error or "")
+        assert successor.lease_id in (stored.last_error or "")
+        # The task's ORIGINAL evidence is untouched.
+        assert stored.evidence["lease_id"] == task.lease_id
+        assert stored.evidence["workspace_path"] == f"/ws/{run_id}"
+        assert stored.evidence["fencing_token"] == task.evidence["fencing_token"]
+
+        # ZERO physical work: no Computer built, no cleanup, no workspace.
+        assert factory_calls == []
+        assert computer.cleaned == []
+        assert computer.workspaces == []
+
+        # The successor row is untouched, field by field.
+        after = repo.get_sandbox_lease(run_id)
+        assert after is not None
+        assert after.lease_id == successor.lease_id
+        assert after.fencing_token == successor.fencing_token
+        assert after.workspace_path == "/ws/successor"
+        assert after.status == "active"
+        assert after.failure_reason is None
+        assert after.resource_usage is None
+        assert after.destroyed_at is None
+
+        # The run's own terminal and effects never moved.
+        run_after = repo.get_run(run_id)
+        assert run_after is not None
+        assert run_after.status == "done"
+        assert run_after.updated_at == run_before.updated_at
+        assert repo.list_effects_for_run(run_id) == effects_before
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize(
+    "field,recorded",
+    [
+        ("lease_id", "lease-of-another-generation"),
+        ("workspace_path", "/ws/someone-elses"),
+        ("fencing_token", 999),
+        ("sandbox_identity", "local_native:/ws/someone-elses"),
+    ],
+)
+def test_identity_mismatch_variants_are_refused_before_any_physical_work(
+    tmp_path, field, recorded
+):
+    """T06-01/T06-04 matrix: whichever ORIGINAL identity field the task
+    recorded that no longer matches the live lease, the runner refuses
+    before any physical work and leaves the live row untouched."""
+    repo = _repo(tmp_path)
+    try:
+        run_id, _created = repo.create_run_idempotent(
+            request_id=f"req-06-matrix-{field}",
+            conversation_id=f"conv-req-06-matrix-{field}",
+            profile_id="artifact",
+            user_message="m",
+        )
+        repo.create_sandbox_lease(
+            run_id=run_id,
+            sandbox_type="local_native",
+            workspace_path=f"/ws/{run_id}",
+            owner_id="worker-original",
+            sandbox_identity=f"local_native:/ws/{run_id}",
+        )
+        lease = repo.get_sandbox_lease(run_id)
+        assert lease is not None and lease.status == "active"
+        repo.destroy_sandbox_lease(
+            run_id=run_id, failure_reason="seeded original failure"
+        )
+        lease = repo.get_sandbox_lease(run_id)
+        assert lease is not None and lease.status == "failed"
+
+        evidence = {
+            "run_id": run_id,
+            "lease_id": lease.lease_id,
+            "sandbox_type": "local_native",
+            "workspace_path": lease.workspace_path,
+            "sandbox_identity": lease.sandbox_identity or "",
+            "fencing_token": lease.fencing_token,
+            "effect_ids": [],
+            "failure_reason": "seeded original failure",
+        }
+        task_lease_id = lease.lease_id
+        if field == "lease_id":
+            task_lease_id = recorded
+        evidence[field] = recorded
+        task, created = repo.enqueue_janitor_task(
+            kind="cleanup",
+            run_id=run_id,
+            lease_id=task_lease_id,
+            evidence=evidence,
+            dedupe_key=f"cleanup:{run_id}",
+        )
+        assert created is True
+
+        computer = _FakeComputer()
+        factory_calls: list[int] = []
+
+        def factory(*_a: Any, **_k: Any) -> _FakeComputer:
+            factory_calls.append(1)
+            return computer
+
+        results = run_pending_janitor_tasks(
+            repo, limit=10, claimer="janitor-06-matrix", computer_factory=factory
+        )
+
+        assert [r.status for r in results] == ["failed"], results
+        assert "original_target_conflict" in results[0].error
+        assert factory_calls == []
+        assert computer.cleaned == []
+        # The live row is exactly the pre-sweep failed state: the refusal
+        # performed no durable lease write at all.
+        after = repo.get_sandbox_lease(run_id)
+        assert after is not None
+        assert after.lease_id == lease.lease_id
+        assert after.fencing_token == lease.fencing_token
+        assert after.workspace_path == lease.workspace_path
+        assert after.status == "failed"
+        assert after.cleanup_status == lease.cleanup_status
+        assert after.failure_reason == lease.failure_reason
+        assert after.resource_usage == lease.resource_usage
+        stored = repo.get_janitor_task(task.task_id)
+        assert stored is not None and stored.status == "failed"
+    finally:
+        repo.close()
+
+
+def test_task_without_recorded_identity_is_refused_not_guessed(tmp_path):
+    """T06-01: a task that records NO original identity at all against a
+    live lease cannot be verified — the runner refuses instead of
+    guessing which resource to destroy."""
+    repo = _repo(tmp_path)
+    try:
+        run_id, task, computer = _failed_cleanup_with_task(repo, "req-06-noidentity")
+        # Strip the task down to a bare run pointer the way the oldest
+        # hand-made rows look: no lease/workspace/generation recorded.
+        repo.control._conn.execute(
+            "UPDATE janitor_tasks SET evidence_json = ?, lease_id = '' "
+            "WHERE task_id = ?",
+            (json.dumps({"run_id": run_id}, sort_keys=True), task.task_id),
+        )
+        task = repo.get_janitor_task(task.task_id)
+        assert task is not None
+        assert task.lease_id == ""
+
+        factory_calls: list[int] = []
+
+        def factory(*_a: Any, **_k: Any) -> _FakeComputer:
+            factory_calls.append(1)
+            return computer
+
+        results = run_pending_janitor_tasks(
+            repo, limit=10, claimer="janitor-06-noid", computer_factory=factory
+        )
+        assert [r.status for r in results] == ["failed"], results
+        assert "original_target_conflict" in results[0].error
+        assert factory_calls == []
+        assert computer.cleaned == []
+        lease = repo.get_sandbox_lease(run_id)
+        assert lease is not None and lease.status == "failed"
+    finally:
+        repo.close()
+
+
+def test_settled_original_generation_short_circuits_without_physical_work(tmp_path):
+    """T06-03 positive control: with original identity match, lease
+    destroyed, cleanup succeeded and no failure reason, the runner
+    short-circuits already_cleaned with ZERO physical work."""
+    repo = _repo(tmp_path)
+    try:
+        run_id, task, computer = _failed_cleanup_with_task(repo, "req-06-short")
+        lease = repo.get_sandbox_lease(run_id)
+        assert lease is not None
+        # A worker settled the fenced success but never completed the task.
+        settled_lease, settled = repo.settle_cleanup_success(
+            run_id=run_id,
+            lease_id=lease.lease_id,
+            workspace_path=lease.workspace_path,
+            sandbox_identity=lease.sandbox_identity or "",
+            fencing_token=lease.fencing_token,
+            resource_usage={"files_deleted": 2},
+        )
+        assert settled is True and settled_lease is not None
+
+        factory_calls: list[int] = []
+
+        def factory(*_a: Any, **_k: Any) -> _FakeComputer:
+            factory_calls.append(1)
+            return computer
+
+        results = run_pending_janitor_tasks(
+            repo, limit=10, claimer="janitor-06-short", computer_factory=factory
+        )
+        assert [r.status for r in results] == ["done"], results
+        assert results[0].outcome["already_cleaned"] is True
+        assert results[0].outcome["lease_id"] == lease.lease_id
+        assert factory_calls == []
+        assert computer.cleaned == []
+        after = repo.get_sandbox_lease(run_id)
+        assert after is not None
+        assert after.status == "destroyed"
+        assert after.resource_usage == {"files_deleted": 2}
+    finally:
+        repo.close()
+
+
+class _RetryFailingComputer(_FakeComputer):
+    """Fails cleanup N times with partial usage, then succeeds."""
+
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self._failures = failures
+
+    def cleanup(self, workspace_path: str) -> dict[str, int]:
+        if self._failures > 0:
+            self._failures -= 1
+            raise SandboxCleanupError(
+                "disk still locked",
+                partial_usage=ResourceUsage(
+                    duration_ms=9, files_written=4, bytes_written=4096
+                ),
+            )
+        self.cleaned.append(workspace_path)
+        return {"duration_ms": 3, "files_deleted": 5}
+
+
+def test_retry_failure_records_real_failure_and_partial_usage_without_fake_success(
+    tmp_path,
+):
+    """T06-05: a retry that fails again records the REAL failure and the
+    available partial usage — never a fake success. The task stays
+    retryable under the existing policy, the first release's evidence on
+    the lease is preserved, and the run's terminal stands; the next
+    retry can still succeed."""
+    repo = _repo(tmp_path)
+    try:
+        run_id, task, _computer = _failed_cleanup_with_task(repo, "req-06-refail")
+        first_reason = repo.get_sandbox_lease(run_id).failure_reason
+        assert first_reason is not None
+
+        computer = _RetryFailingComputer(failures=1)
+        first = run_pending_janitor_tasks(
+            repo, limit=10, claimer="janitor-06-refail",
+            computer_factory=lambda *_a, **_k: computer,
+        )
+        assert [r.status for r in first] == ["failed"], first
+        # The real reason AND the partial usage are durably traceable.
+        assert "disk still locked" in first[0].error
+        assert "files_written" in first[0].error
+        stored = repo.get_janitor_task(task.task_id)
+        assert stored is not None
+        assert stored.status == "failed"
+        assert "disk still locked" in (stored.last_error or "")
+        assert "files_written" in (stored.last_error or "")
+
+        # No fake success: the lease keeps the failure state and the
+        # FIRST release's evidence (repository fence), with the fresh
+        # retry reason recorded on the cleanup record.
+        lease = repo.get_sandbox_lease(run_id)
+        assert lease is not None
+        assert lease.status == "failed"
+        assert lease.cleanup_status == "pending_janitor"
+        assert lease.failure_reason == first_reason
+        assert "disk still locked" in (lease.cleanup_error or "")
+
+        # The run's terminal never moved.
+        run = repo.get_run(run_id)
+        assert run is not None and run.status == "done"
+
+        # Existing retry policy: the next sweep retries and now succeeds.
+        second = run_pending_janitor_tasks(
+            repo, limit=10, claimer="janitor-06-refail",
+            computer_factory=lambda *_a, **_k: computer,
+        )
+        assert [r.status for r in second] == ["done"], second
+        settled = repo.get_sandbox_lease(run_id)
+        assert settled is not None
+        assert settled.status == "destroyed"
+        assert settled.cleanup_status == "succeeded"
+        assert settled.failure_reason is None
+        assert settled.resource_usage == {"duration_ms": 3, "files_deleted": 5}
+        done = repo.get_janitor_task(task.task_id)
+        assert done is not None and done.status == "done"
+        assert done.attempts == 2
+        assert computer.cleaned == [f"/ws/{run_id}"]
+    finally:
+        repo.close()
+
+
+def test_duplicate_runs_of_one_task_physically_clean_exactly_once(
+    tmp_path, clock: _Clock
+):
+    """T06-03: a task whose retry settled the lease but lost its task
+    completion CAS is re-run by the takeover sweep — already_cleaned,
+    with the physical cleanup having happened EXACTLY once."""
+    repo = _repo(tmp_path)
+    try:
+        run_id, task, _computer = _failed_cleanup_with_task(repo, "req-06-dup")
+        lease = repo.get_sandbox_lease(run_id)
+        assert lease is not None
+
+        class _SettlingComputer(_FakeComputer):
+            """Does the real cleanup, settles it, then dies before the
+            task-completion CAS (a ghost steals the claim)."""
+
+            def cleanup(self, workspace_path: str) -> dict[str, int]:
+                self.cleaned.append(workspace_path)
+                repo.settle_cleanup_success(
+                    run_id=run_id,
+                    lease_id=lease.lease_id,
+                    workspace_path=lease.workspace_path,
+                    sandbox_identity=lease.sandbox_identity or "",
+                    fencing_token=lease.fencing_token,
+                    resource_usage={"files_deleted": 3},
+                )
+                clock.advance(CLAIM_TTL_SECONDS)
+                _ghost, won = repo.claim_janitor_task(
+                    task.task_id, owner="janitor-ghost"
+                )
+                assert won is True
+                return {"files_deleted": 3}
+
+        computer = _SettlingComputer()
+
+        first = run_pending_janitor_tasks(
+            repo, limit=10, claimer="janitor-06-dup",
+            computer_factory=lambda *_a, **_k: computer,
+        )
+        assert [r.status for r in first] == ["claim_lost"], first
+        assert computer.cleaned == [f"/ws/{run_id}"]
+
+        clock.advance(CLAIM_TTL_SECONDS)
+        second = run_pending_janitor_tasks(
+            repo, limit=10, claimer="janitor-06-dup",
+            computer_factory=lambda *_a, **_k: computer,
+        )
+        assert [r.status for r in second] == ["done"], second
+        assert second[0].outcome["already_cleaned"] is True
+        # Exactly one physical cleanup across both runs of the SAME task.
+        assert computer.cleaned == [f"/ws/{run_id}"]
+        assert computer.workspaces == []
+        settled = repo.get_sandbox_lease(run_id)
+        assert settled is not None
+        assert settled.status == "destroyed"
+        assert settled.cleanup_status == "succeeded"
+        assert settled.resource_usage == {"files_deleted": 3}
+        done = repo.get_janitor_task(task.task_id)
+        assert done is not None and done.status == "done"
     finally:
         repo.close()
