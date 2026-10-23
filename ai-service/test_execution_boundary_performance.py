@@ -160,6 +160,54 @@ def test_replay_gap_detection_is_constant_time(tmp_path):
     assert _median(samples) < 1.0, _median(samples)
 
 
+def test_run_execution_owner_acquire_release_median_under_1ms(tmp_path):
+    """agent-lifecycle-repair ticket 02 (T02-11): the ownership gate's cost.
+
+    Every first stream, resume, effect repair and janitor repair claim now
+    pays one non-blocking acquire/release pair on the shared
+    RunRepository, so the pair must stay far below the other request-path
+    ceilings. 1000 fresh acquire/release samples on a REAL repository; no
+    wait queue is involved (a second acquire while a token is held must
+    return None immediately, not wait — asserted here so the gate can
+    never quietly grow a queue).
+    """
+    repo = _repo(tmp_path)
+    try:
+        samples: list[float] = []
+        for index in range(1000):
+            run_id = f"run-owner-perf-{index}"
+            started = time.perf_counter()
+            token = repo.try_acquire_run_execution(run_id)
+            released = repo.release_run_execution(run_id, token)
+            samples.append((time.perf_counter() - started) * 1000)
+            assert token is not None and released is True
+
+        # Non-blocking, no queue: a held token refuses IMMEDIATELY.
+        held = repo.try_acquire_run_execution("run-owner-held")
+        assert held is not None
+        refused_started = time.perf_counter()
+        refused = repo.try_acquire_run_execution("run-owner-held")
+        refused_ms = (time.perf_counter() - refused_started) * 1000
+        assert refused is None
+        assert refused_ms < 1.0, refused_ms
+        # A stale double release cannot remove the live owner.
+        assert repo.release_run_execution("run-owner-held", held) is True
+        assert repo.try_acquire_run_execution("run-owner-held") is not None
+    finally:
+        repo.control.close()
+        repo.checkpoints.close()
+
+    measured = {
+        "owner_acquire_release_ms": (
+            _median(samples),
+            _worst(samples),
+        ),
+        "owner_refused_acquire_ms": round(refused_ms, 4),
+    }
+    print(f"ticket 02 ownership measured (median, worst) ms: {measured}")
+    assert _median(samples) < 1.0, measured
+
+
 def test_lease_heartbeat_and_janitor_work_stay_within_measured_budget(tmp_path):
     """Lease heartbeat + janitor enqueue/claim ceilings (ticket 12).
 

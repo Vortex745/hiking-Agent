@@ -15,6 +15,10 @@
 //     approval/resume affordance, no automatic model call.
 //  6. snapshot done + terminal_persist_failed → done suppressed, stable
 //     error shown, run marked non-complete (not streaming).
+//  7. observation stream closes without a terminal (server-side a
+//     losing/duplicate connection is read-only) → snapshot stays
+//     RUNNING first, then converges to done — no fabricated recovery
+//     failure, exactly ONE /chat/sse POST (no duplicate model submit).
 const { chromium } = require('playwright');
 const assert = require('node:assert/strict');
 
@@ -68,12 +72,13 @@ const snapshotBase = (over = {}) => ({
   const base = process.env.BASE_URL || 'http://localhost:5173';
   const results = [];
 
-  const openPage = async ({ run, snapshot, eventsFor, sse, extraRoutes = {} }) => {
+  const openPage = async ({ run, snapshot, snapshotFor, eventsFor, sse, extraRoutes = {} }) => {
     const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
     page.setDefaultTimeout(8000);
     const errors = [];
     const calls = { sse: 0, snapshot: 0, events: 0, cancel: 0 };
     const eventsQueries = [];
+    const snapshotStatuses = [];
     page.on('pageerror', error => errors.push(error.stack || String(error)));
     await page.route('**/*', route => {
       const url = new URL(route.request().url());
@@ -84,7 +89,11 @@ const snapshotBase = (over = {}) => ({
       }
       if (p.startsWith('/api/v2/chat/snapshot/')) {
         calls.snapshot += 1;
-        return route.fulfill({ json: snapshot });
+        const body = snapshotFor
+          ? snapshotFor(calls.snapshot)
+          : snapshot;
+        snapshotStatuses.push(body && body.status);
+        return route.fulfill({ json: body });
       }
       if (p.startsWith('/api/v2/chat/events/')) {
         calls.events += 1;
@@ -111,7 +120,7 @@ const snapshotBase = (over = {}) => ({
       { runKey: RUN_KEY, chatKey: CHAT_KEY, chatIdKey: CHAT_ID_KEY, runSeed: run || null },
     );
     await page.goto(base);
-    return { page, errors, calls, eventsQueries };
+    return { page, errors, calls, eventsQueries, snapshotStatuses };
   };
 
   const contentTexts = async page =>
@@ -323,6 +332,84 @@ const snapshotBase = (over = {}) => ({
     assert.deepEqual(errors, [], 'scenario 6: uncaught browser errors');
     await page.close();
     results.push('6 done suppressed on terminal_persist_failed; stable error, run non-complete');
+  }
+
+  // ---- 7. observation-stream close → running snapshot → done convergence --
+  // agent-lifecycle-repair ticket 02 (T02-10): the server keeps exactly
+  // one executor per run; a losing/duplicate connection is a READ-ONLY
+  // observer whose stream replays persisted events and closes WITHOUT a
+  // terminal while the real owner is still executing. The client must
+  // converge via the existing close-without-terminal protocol: snapshot
+  // still RUNNING → keep polling → DONE, with no fabricated recovery
+  // failure and exactly ONE model submit (no duplicate POST /chat/sse).
+  {
+    const runningSnapshot = snapshotBase({
+      status: 'running',
+      sequence_cursor: 3,
+      messages: [
+        { role: 'user', content: '恢复测试问题', sequence: 0, run_id: 'run-fix' },
+        { role: 'assistant', content: '观察期间已产出的回答', sequence: 1, run_id: 'run-fix' },
+      ],
+    });
+    const doneSnapshot = snapshotBase({
+      status: 'done',
+      terminal_type: 'done',
+      terminal_persisted: true,
+      terminal_event_type: 'done',
+      sequence_cursor: 4,
+      messages: [
+        { role: 'user', content: '恢复测试问题', sequence: 0, run_id: 'run-fix' },
+        { role: 'assistant', content: '观察期间已产出的回答', sequence: 1, run_id: 'run-fix' },
+      ],
+    });
+    // While snapshot #1 says running the owner is still executing: replay
+    // has NOTHING new yet. The durable terminal event only exists once
+    // the snapshot converged to done (served on call >= 2).
+    const servedDone = { done: false };
+    const { page, errors, calls, snapshotStatuses } = await openPage({
+      run: null,
+      // The observation stream: replayed persisted events, then the
+      // server closes the read-only connection — no terminal frame.
+      sse: [
+        env('run-fix', 1, 'run_started'),
+        env('run-fix', 2, 'progress', { message: '正在生成回复' }),
+        env('run-fix', 3, 'text', { content: '观察期间已产出的回答' }),
+      ],
+      snapshotFor: call => {
+        if (call === 1) return runningSnapshot;
+        servedDone.done = true;
+        return doneSnapshot;
+      },
+      eventsFor: fromSeq =>
+        servedDone.done && fromSeq < 4 ? [env('run-fix', 4, 'done')] : [],
+    });
+    await page.getByRole('textbox', { name: '输入徒步问题' }).fill('恢复测试问题');
+    await page.getByRole('button', { name: '发送消息' }).click();
+    // Snapshot #1 says running → the client keeps polling (3s interval)
+    // instead of fabricating an error or re-submitting.
+    await page.waitForFunction(
+      key => localStorage.getItem(key) === null,
+      RUN_KEY,
+      { timeout: 15000 },
+    );
+    const texts = await contentTexts(page);
+    const answer = texts.filter(t => t.includes('观察期间已产出的回答'));
+    assert.equal(answer.length, 1, `scenario 7: single recovered assistant turn, got ${JSON.stringify(texts)}`);
+    assert.ok(
+      texts.every(
+        t => !t.includes('[连接错误]') && !t.includes('[恢复失败]') && !t.includes('stream_closed_without_terminal'),
+      ),
+      `scenario 7: no fabricated recovery failure, got ${JSON.stringify(texts)}`,
+    );
+    assert.equal(calls.sse, 1, 'scenario 7: exactly one model submit — the observation close never re-POSTs /chat/sse');
+    assert.ok(
+      snapshotStatuses[0] === 'running' && snapshotStatuses.includes('done'),
+      `scenario 7: running → done snapshot convergence, got ${JSON.stringify(snapshotStatuses)}`,
+    );
+    assert.ok(calls.snapshot >= 2, 'scenario 7: the running snapshot was polled until done');
+    assert.deepEqual(errors, [], 'scenario 7: uncaught browser errors');
+    await page.close();
+    results.push('7 observation-stream close → running snapshot polled to done; single model submit, no fake failure');
   }
 
   await browser.close();
