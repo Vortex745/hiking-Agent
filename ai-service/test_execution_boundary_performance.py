@@ -1,8 +1,10 @@
 """BCDEF ticket 12 — measured ceilings for the new durable writes.
 
-These are the three costs the spec asks to bound: the extra admission
-writes, snapshot assembly and event replay at the endpoint's 1000-event
-page size, plus sandbox lease acquire/renew. Thresholds are set from
+These are the costs the spec asks to bound: the extra admission writes,
+snapshot assembly and event replay at the endpoint's 1000-event page size,
+the sandbox lease acquire AND its heartbeat (renew) plus the read-side
+fence every sandbox command pays, and the janitor enqueue + claim pair that
+cleanup failures and unknown outcomes land in. Thresholds are set from
 measured medians on this machine with generous headroom; they exist to
 catch an order-of-magnitude regression, not to micro-tune.
 """
@@ -17,6 +19,7 @@ from datetime import datetime, timezone
 from agent_v2.effects import compute_effect_key
 from agent_v2.execution_contract import policy_hash
 from agent_v2.execution_policy import build_execution_policy
+from agent_v2.leases import SANDBOX_LEASE_TTL_SECONDS, SandboxLeaseGuard
 from agent_v2.persistence import CheckpointsStore, ControlStore, PolicySnapshotWrite
 from agent_v2.profiles import resolve_profile
 from agent_v2.runs import RunRepository
@@ -155,3 +158,128 @@ def test_replay_gap_detection_is_constant_time(tmp_path):
 
     samples, _ = _time(lambda: compute_gap("run-perf", 1, 900))
     assert _median(samples) < 1.0, _median(samples)
+
+
+def test_lease_heartbeat_and_janitor_work_stay_within_measured_budget(tmp_path):
+    """Lease heartbeat + janitor enqueue/claim ceilings (ticket 12).
+
+    Every sandbox command pays the read-side fence and, on the cowork and
+    artifact paths, a renewal; every cleanup failure or unknown outcome
+    pays an enqueue and later a claim. Both are on the request path or the
+    operator's recovery path, so an unbounded wait here is a production
+    incident — this measures what one call actually costs.
+    """
+    repo = _repo(tmp_path)
+    try:
+        run_id = repo.admit(
+            request_id="perf-lease-1",
+            conversation_id=None,
+            profile_id="artifact",
+            user_message="perf",
+        ).run_id
+        repo.mark_run_running(run_id)
+        lease, acquired = repo.acquire_sandbox_lease(
+            run_id=run_id,
+            owner_id="perf-owner",
+            sandbox_type="local_native",
+            workspace_path="/ws/perf-lease",
+            ttl_seconds=SANDBOX_LEASE_TTL_SECONDS,
+        )
+        assert acquired and lease is not None
+        guard = SandboxLeaseGuard(
+            repo,
+            run_id=run_id,
+            fencing_token=lease.fencing_token,
+            lease_id=lease.lease_id,
+            owner_id="perf-owner",
+        )
+
+        renew_samples, _ = _time(lambda: guard.renew())
+        fence_samples, _ = _time(lambda: guard.assert_active())
+
+        # A frozen lease must be refused promptly, not waited on: the guard
+        # is the fence that keeps a stalled worker from executing.
+        repo.control._conn.execute(
+            "UPDATE sandbox_leases SET expires_at = ? WHERE run_id = ?",
+            ("2000-01-01T00:00:00+00:00", run_id),
+        )
+        from agent_v2.leases import SandboxLeaseLostError
+
+        refusal_started = time.perf_counter()
+        try:
+            guard.assert_active()
+            raise AssertionError("expired lease must not pass the fence")
+        except SandboxLeaseLostError:
+            pass
+        refusal_ms = (time.perf_counter() - refusal_started) * 1000
+
+        # Janitor: one cleanup item per failed cleanup, then one claim each.
+        def enqueue_one() -> None:
+            index = len(enqueued)
+            task, created = repo.enqueue_janitor_task(
+                kind="cleanup",
+                run_id=run_id,
+                evidence={"run_id": run_id, "workspace_path": f"/ws/perf-{index}"},
+                dedupe_key=f"cleanup:perf-{index}",
+            )
+            assert created is True
+            enqueued.append(task.task_id)
+
+        enqueued: list[str] = []
+        enqueue_samples, _ = _time(enqueue_one)
+
+        # Claims are measured against a small standing backlog (10 items is
+        # already far above what one run produces), so the CAS is timed the
+        # way the sweeper hits it rather than on an empty table.
+        backlog_repo = RunRepository(
+            control=ControlStore(str(tmp_path / "janitor-control.sqlite")),
+            checkpoints=CheckpointsStore(str(tmp_path / "janitor-ckpt.sqlite")),
+        )
+        try:
+            task_ids = [
+                backlog_repo.enqueue_janitor_task(
+                    kind="repair",
+                    run_id="run-perf-claim",
+                    evidence={"run_id": "run-perf-claim", "n": index},
+                    dedupe_key=f"repair:perf-{index}",
+                )[0].task_id
+                for index in range(10)
+            ]
+            cursor = {"index": 0}
+
+            def claim_once() -> None:
+                task_id = task_ids[cursor["index"] % len(task_ids)]
+                cursor["index"] += 1
+                backlog_repo.claim_janitor_task(
+                    task_id, owner=f"janitor-{cursor['index']}"
+                )
+
+            claim_samples, _ = _time(claim_once)
+        finally:
+            backlog_repo.control.close()
+            backlog_repo.checkpoints.close()
+    finally:
+        repo.control.close()
+        repo.checkpoints.close()
+
+    measured = {
+        "lease_renew_ms": (_median(renew_samples), _worst(renew_samples)),
+        "lease_fence_ms": (_median(fence_samples), _worst(fence_samples)),
+        "lease_expired_refusal_ms": round(refusal_ms, 4),
+        "janitor_enqueue_ms": (_median(enqueue_samples), _worst(enqueue_samples)),
+        "janitor_claim_ms": (_median(claim_samples), _worst(claim_samples)),
+    }
+    print(f"BCDEF lease/janitor measured (median, worst) ms: {measured}")
+
+    # Same rule as the other ceilings: headroom over the measured median so
+    # the gate fires on an order-of-magnitude regression, not on disk noise.
+    # Measured here (median ms): renew 0.03, fence 0.015, expired refusal
+    # 0.11, janitor enqueue 3.1, claim 0.06.
+    assert _median(renew_samples) < 10.0, measured
+    assert _worst(renew_samples) < 60.0, measured
+    assert _median(fence_samples) < 10.0, measured
+    assert refusal_ms < 10.0, measured
+    assert _median(enqueue_samples) < 30.0, measured
+    assert _worst(enqueue_samples) < 120.0, measured
+    assert _median(claim_samples) < 10.0, measured
+    assert _worst(claim_samples) < 60.0, measured
