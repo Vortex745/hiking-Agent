@@ -365,7 +365,7 @@ def test_publication_failure_snapshot_offers_known_result_repair(
 def test_confirm_repair_commits_one_replayable_result_without_reexecution(
     tmp_path, monkeypatch
 ):
-    repo, run_id, identity, calls = _unknown_effect(
+    repo, run_id, identity, calls = _unknown_effect_with_known_result(
         tmp_path, monkeypatch, "req-confirm"
     )
     try:
@@ -490,7 +490,7 @@ def test_abandon_repair_fails_closed_and_is_idempotent(tmp_path, monkeypatch):
 def test_failed_repair_stays_unknown_and_retry_publishes_once(
     tmp_path, monkeypatch
 ):
-    repo, run_id, identity, _calls = _unknown_effect(
+    repo, run_id, identity, _calls = _unknown_effect_with_known_result(
         tmp_path, monkeypatch, "req-repair-fail"
     )
     try:
@@ -509,7 +509,7 @@ def test_failed_repair_stays_unknown_and_retry_publishes_once(
             repo,
             identity.effect_id,
             action="confirm",
-            result={"path": "p.pdf"},
+            result=_KNOWN_RESULT,
             idempotency_key="rep-fail",
             actor="operator:alice",
         )
@@ -525,7 +525,7 @@ def test_failed_repair_stays_unknown_and_retry_publishes_once(
             repo,
             identity.effect_id,
             action="confirm",
-            result={"path": "p.pdf"},
+            result=_KNOWN_RESULT,
             idempotency_key="rep-fail",
             actor="operator:alice",
         )
@@ -571,7 +571,7 @@ def test_repair_rejects_effects_that_do_not_need_it(tmp_path):
 def test_janitor_claim_repair_preserves_identity_and_does_not_execute(
     tmp_path, monkeypatch
 ):
-    repo, run_id, identity, calls = _unknown_effect(
+    repo, run_id, identity, calls = _unknown_effect_with_known_result(
         tmp_path, monkeypatch, "req-janitor-claim"
     )
     try:
@@ -597,7 +597,7 @@ def test_janitor_claim_repair_preserves_identity_and_does_not_execute(
             repo,
             identity.effect_id,
             action="confirm",
-            result={"path": "p.pdf"},
+            result=_KNOWN_RESULT,
             idempotency_key="rep-janitor",
             actor="operator:alice",
         )
@@ -658,7 +658,7 @@ def _get(app: FastAPI, path: str) -> Any:
 
 
 def test_http_repair_endpoint_confirm_and_stable_codes(tmp_path, monkeypatch):
-    repo, run_id, identity, _calls = _unknown_effect(
+    repo, run_id, identity, _calls = _unknown_effect_with_known_result(
         tmp_path, monkeypatch, "req-http-repair"
     )
     try:
@@ -668,7 +668,7 @@ def test_http_repair_endpoint_confirm_and_stable_codes(tmp_path, monkeypatch):
             f"/api/v2/chat/effects/{identity.effect_id}/repair",
             {
                 "action": "confirm",
-                "result": {"path": "p.pdf"},
+                "result": _KNOWN_RESULT,
                 "idempotency_key": "rep-http-1",
             },
         )
@@ -678,7 +678,7 @@ def test_http_repair_endpoint_confirm_and_stable_codes(tmp_path, monkeypatch):
         assert body["effect_id"] == identity.effect_id
         assert body["run_id"] == run_id
         assert body["repair_status"] == "repaired"
-        assert body["result"] == {"path": "p.pdf"}
+        assert body["result"] == _KNOWN_RESULT
 
         # Retry is idempotent.
         retry = _post(
@@ -686,7 +686,7 @@ def test_http_repair_endpoint_confirm_and_stable_codes(tmp_path, monkeypatch):
             f"/api/v2/chat/effects/{identity.effect_id}/repair",
             {
                 "action": "confirm",
-                "result": {"path": "p.pdf"},
+                "result": _KNOWN_RESULT,
                 "idempotency_key": "rep-http-1",
             },
         )
@@ -708,7 +708,7 @@ def test_http_repair_endpoint_confirm_and_stable_codes(tmp_path, monkeypatch):
             "/api/v2/chat/effects/does-not-exist/repair",
             {
                 "action": "confirm",
-                "result": {"path": "p.pdf"},
+                "result": _KNOWN_RESULT,
                 "idempotency_key": "rep-http-3",
             },
         )

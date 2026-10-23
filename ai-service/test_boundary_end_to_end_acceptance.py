@@ -733,6 +733,20 @@ def test_effect_commit_write_failure_lands_unknown_and_is_repaired_without_reexe
     assert harness.rows("effects", "run_id = ?", run_id) == 1
 
 
+def _fail_when(original, predicate, error):
+    """Call wrapper that raises ``error`` for the first matching kwargs set."""
+
+    state = {"raised": False}
+
+    def wrapper(*args, **kwargs):
+        if not state["raised"] and predicate(kwargs):
+            state["raised"] = True
+            raise error
+        return original(*args, **kwargs)
+
+    return wrapper
+
+
 def test_effect_publication_failure_keeps_the_result_durable_and_is_repaired(
     harness: Harness,
 ):
