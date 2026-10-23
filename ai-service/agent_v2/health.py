@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from agent_v2.observability import get_boundary_metrics
 from agent_v2.startup import V2Runtime
 
 
@@ -49,6 +50,12 @@ def v2_health_status(app_state: Any, settings: Any) -> dict[str, Any]:
         "enabled": enabled,
         "status": status,
         "uniharness_pin": getattr(settings, "agent_v2_uniharness_pin", "unknown"),
+        # BCDEF ticket 12: the seven spec-07 boundary metrics plus any
+        # sustained breach that has escalated to an alert. Additive —
+        # counters are process-local; the durable evidence behind each
+        # observation stays in agent_control.sqlite for reconciliation.
+        "boundary_metrics": get_boundary_metrics().snapshot(),
+        "boundary_alerts": get_boundary_metrics().alerts(),
     }
 
     # Ticket 25: surface the proven kernel identity so health can never be

@@ -23,6 +23,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
+from agent_v2.observability import observe_boundary_metric
+
 # Heartbeat/TTL used when a caller does not supply one. Long enough for a
 # 30s sandbox command plus slack; short enough that a crashed worker's
 # lease eventually surfaces as expired instead of blocking forever.
@@ -147,6 +149,10 @@ class SandboxLeaseGuard:
                 f"run {self.run_id!r} has no active sandbox lease",
             )
         if lease_is_expired(record.expires_at, now=now):
+            # BCDEF ticket 12: a sandbox worker being fenced out by an
+            # elapsed TTL is the ``lease_expired`` signal operators watch
+            # during rollout (spec 07). The refusal itself is unchanged.
+            observe_boundary_metric(SandboxLeaseLostError.LEASE_EXPIRED)
             raise SandboxLeaseLostError(
                 SandboxLeaseLostError.LEASE_EXPIRED,
                 f"sandbox lease for run {self.run_id!r} expired",
@@ -184,6 +190,10 @@ class SandboxLeaseGuard:
                 f"{self.run_id!r}",
             )
         if not renewed:
+            # BCDEF ticket 12: a heartbeat that could not land means the
+            # lease TTL already elapsed — the same ``lease_expired``
+            # incident from the worker's side (spec 07).
+            observe_boundary_metric(SandboxLeaseLostError.LEASE_EXPIRED)
             raise SandboxLeaseLostError(
                 SandboxLeaseLostError.LEASE_EXPIRED,
                 f"sandbox lease for run {self.run_id!r} cannot be renewed",

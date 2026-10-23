@@ -76,7 +76,10 @@ from agent_v2.effect_repair import repair_effect
 from agent_v2.events import (
     EventEnvelope,
 )
-from agent_v2.observability import CapacityExceeded
+from agent_v2.observability import (
+    CapacityExceeded,
+    boundary_metrics_snapshot,
+)
 from agent_v2.permissions import (
     PermissionGate,
 )
@@ -606,6 +609,13 @@ async def chat_v2_snapshot(
         # frozen policy (policy hash, capability ids/count, MCP services,
         # risk/approval policy). Existing clients ignore the new key.
         "capability_projection": snapshot.capability_projection,
+        # BCDEF ticket 12: the sandbox lease is part of what a client and an
+        # operator must be able to READ after the fact — ``lease_expired``
+        # and ``cleanup_pending`` are only explainable from the snapshot if
+        # the lease identity, fencing generation, expiry, cleanup status and
+        # janitor task id survive it. Additive, already-redacted shape
+        # (opaque ids and paths owned by the run, no user content).
+        "sandbox_lease": snapshot.sandbox_lease,
     }
 
 
@@ -825,12 +835,19 @@ async def chat_v2_health():
     Does NOT assemble the runtime or check the LLM key. Use ``/health``
     for full status. This endpoint exists so the Gateway can liveness-check
     the router without triggering a cold start.
+
+    BCDEF ticket 12: the seven boundary counters (spec 07) are exposed here
+    additively — the existing keys and their shapes are untouched, so the
+    Gateway probe keeps parsing the same payload while rollout can watch
+    ``admission_failed``/``outcome_unknown``/``terminal_persist_failed``/
+    ``lease_expired``/``cleanup_pending``/``replay_gap``/``repair_age``.
     """
     return {
         "status": "ok" if settings.agent_v2_enabled else "disabled",
         "module": "chat_v2",
         "service": "ai-service",
         "uniharness_pin": settings.agent_v2_uniharness_pin,
+        "boundary_metrics": boundary_metrics_snapshot(),
     }
 
 

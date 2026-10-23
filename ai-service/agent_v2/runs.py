@@ -20,6 +20,7 @@ Responsibilities:
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 from dataclasses import dataclass, field
@@ -36,7 +37,15 @@ from agent_v2.execution_contract import (
     policy_hash,
 )
 from agent_v2.effect_repair import effect_known_facts, effect_unknown_part
-from agent_v2.effects import repair_age_seconds, repair_next_action
+from agent_v2.effects import (
+    EffectStatus,
+    repair_age_seconds,
+    repair_next_action,
+)
+from agent_v2.observability import (
+    observe_boundary_metric,
+    observe_boundary_repair_age,
+)
 from agent_v2.execution_policy import (
     ResolvedPolicySnapshot,
     profile_from_policy,
@@ -260,6 +269,29 @@ def _admission_payload(
     return {"admission": admission}
 
 
+def _observe_admission_outcome(admit):
+    """BCDEF ticket 12: count every failed admission at the one fence.
+
+    :meth:`RunRepository.admit` is the only production entry that creates a
+    durable run (chat and the memory export both go through it), so this
+    single wrapper covers every caller without touching the failure paths
+    themselves. The counter is observability only: it can never change the
+    returned :class:`AdmissionResult`.
+    """
+
+    @functools.wraps(admit)
+    def wrapper(self, *args: Any, **kwargs: Any) -> Any:
+        result = admit(self, *args, **kwargs)
+        if (
+            isinstance(result, AdmissionResult)
+            and result.status == "admission_failed"
+        ):
+            observe_boundary_metric(ExecutionErrorCode.ADMISSION_FAILED)
+        return result
+
+    return wrapper
+
+
 class RunRepository:
     """Facade over ControlStore + CheckpointsStore.
 
@@ -324,6 +356,7 @@ class RunRepository:
 
     # -- admission fence (BCDEF ticket 02) ------------------------------
 
+    @_observe_admission_outcome
     def admit(
         self,
         *,
@@ -803,8 +836,21 @@ class RunRepository:
     def expire_sandbox_lease(
         self, run_id: str, *, now: Any | None = None
     ) -> SandboxLeaseRecord | None:
-        """Mark an overdue active lease expired (idempotent CAS)."""
-        return self.control.expire_sandbox_lease(run_id, now=now)
+        """Mark an overdue active lease expired (idempotent CAS).
+
+        BCDEF ticket 12: the ``lease_expired`` metric counts real
+        transitions (active → expired). Re-expiring an already expired row
+        is not a new incident, so it is not counted again.
+        """
+        before = self.control.get_sandbox_lease(run_id)
+        record = self.control.expire_sandbox_lease(run_id, now=now)
+        if (
+            record is not None
+            and record.status == "expired"
+            and (before is None or before.status != "expired")
+        ):
+            observe_boundary_metric(ExecutionErrorCode.LEASE_EXPIRED)
+        return record
 
     def release_sandbox_lease(
         self,
@@ -871,7 +917,7 @@ class RunRepository:
         dedupe_key: str | None = None,
         task_id: str | None = None,
     ) -> tuple[JanitorTaskRecord, bool]:
-        return self.control.enqueue_janitor_task(
+        task, created = self.control.enqueue_janitor_task(
             kind=kind,
             evidence=evidence,
             run_id=run_id,
@@ -880,6 +926,13 @@ class RunRepository:
             dedupe_key=dedupe_key,
             task_id=task_id,
         )
+        # BCDEF ticket 12: ``cleanup_pending`` counts sandbox cleanups that
+        # did not finish inline and became durable janitor work. Only a
+        # NEW item counts — the dedupe key means a retry re-observes the
+        # same outstanding backlog item, not a new one.
+        if created and kind == "cleanup":
+            observe_boundary_metric(ExecutionErrorCode.CLEANUP_PENDING)
+        return task, created
 
     def get_janitor_task(self, task_id: str) -> JanitorTaskRecord | None:
         return self.control.get_janitor_task(task_id)
@@ -1212,9 +1265,16 @@ class RunRepository:
         *,
         claim_token: str | None = None,
     ) -> EffectRecord | None:
-        return self.control.mark_effect_outcome_unknown(
+        record = self.control.mark_effect_outcome_unknown(
             effect_key, reason, claim_token=claim_token
         )
+        # BCDEF ticket 12: the ledger settling an effect as unknown is the
+        # durable ``outcome_unknown`` observation (spec 07). A CAS miss
+        # returning an already-unknown row is still one more real
+        # observation of an unresolved external effect.
+        if record is not None and record.status == EffectStatus.OUTCOME_UNKNOWN.value:
+            observe_boundary_metric(ExecutionErrorCode.OUTCOME_UNKNOWN)
+        return record
 
     def mark_effect_failed(
         self,
@@ -1235,9 +1295,14 @@ class RunRepository:
         claim_token: str | None = None,
     ) -> EffectRecord | None:
         """Fence a committed effect whose success event could not persist."""
-        return self.control.mark_effect_publication_failed(
+        record = self.control.mark_effect_publication_failed(
             effect_key, reason, claim_token=claim_token
         )
+        # Same metric as the crash path: from the outside the external
+        # effect ran and its outcome is not durable (ticket 05 semantics).
+        if record is not None and record.status == EffectStatus.OUTCOME_UNKNOWN.value:
+            observe_boundary_metric(ExecutionErrorCode.OUTCOME_UNKNOWN)
+        return record
 
     # -- effect repair (BCDEF ticket 05) -------------------------------
 
@@ -1483,7 +1548,13 @@ class RunRepository:
         Best effort: the stream is already closing, so a failure here is
         logged and the snapshot falls back to "terminal status without a
         persisted terminal event" = ``terminal_persist_failed``.
+
+        BCDEF ticket 12: this is the single durable site for the
+        ``terminal_persist_failed`` metric — both the finalize fence here
+        and the four stream-fence call sites in
+        :mod:`agent_v2.run_orchestration` route through it.
         """
+        observe_boundary_metric(ExecutionErrorCode.TERMINAL_PERSIST_FAILED)
         try:
             self.control.mark_terminal_persist_failed(run_id)
         except Exception:
@@ -1854,7 +1925,7 @@ class RunRepository:
             except Exception:
                 capability_projection = None
 
-        return RunSnapshot(
+        snapshot = RunSnapshot(
             run_id=run.run_id,
             request_id=run.request_id,
             conversation_id=run.conversation_id,
@@ -1969,6 +2040,21 @@ class RunRepository:
             capability_projection=capability_projection,
         )
 
+        # BCDEF ticket 12: ``repair_age`` becomes observable. An
+        # ``outcome_unknown`` effect whose reconciliation is still open is
+        # exactly the backlog the rollout gate watches, and the number is
+        # the SAME age the snapshot just published to the client — no
+        # second source of truth (only the opaque run id travels, per spec
+        # Further Notes on redaction).
+        for effect in snapshot.effects:
+            if effect.get("repair_next_action") not in (None, "", "none"):
+                observe_boundary_repair_age(
+                    float(effect.get("repair_age_seconds") or 0.0),
+                    run_id=snapshot.run_id,
+                )
+
+        return snapshot
+
     # -- cancel ---------------------------------------------------------
 
     def request_cancel(
@@ -2062,6 +2148,15 @@ def _replay_with_progress_gaps(
         previous = event
     if not gaps:
         return replay_events
+
+    # BCDEF ticket 12: ``replay_gap`` counts what a client actually saw.
+    # Ordinary progress is droppable (spec out-of-scope: no delivery
+    # guarantee), but every dropped stretch must become explainable — and
+    # an operator needs to know how often readers hit a hole. This is a
+    # read-side observation, so a reconnect that re-reads the same hole
+    # re-observes it; nothing is written here.
+    for gap, _anchor in gaps:
+        observe_boundary_metric(ExecutionErrorCode.REPLAY_GAP)
 
     conversation_id = run.conversation_id if run is not None else ""
     request_id = run.request_id if run is not None else ""
