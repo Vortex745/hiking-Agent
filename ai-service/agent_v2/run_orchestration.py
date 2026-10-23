@@ -42,6 +42,14 @@ replay reads (:meth:`RunOrchestrator.load_snapshot` /
 :meth:`RunOrchestrator.load_events`). Both the cowork bash and the
 artifact resume paths share the unified effect ledger; concurrent
 resume keeps the sandbox alive when the CAS winner is still executing.
+
+Since agent-lifecycle-repair ticket 01 the first stream AND the resume
+continuation publish through ONE shared internal responsibility
+(:func:`_publish_stream_event`): assistant buffering, envelope
+building, the terminal finalize fence, strict/best-effort persistence
+and event telemetry live only there, assembled by both real entries.
+Replay keeps serving persisted envelopes directly
+(:func:`_replay_envelope`).
 """
 
 from __future__ import annotations
@@ -423,6 +431,151 @@ def _finalize_stream_terminal(
         )
         runs_repo.record_terminal_persist_failure(run_id)
         raise _CloseStreamSilently() from None
+
+
+def _replay_envelope(evt: dict[str, Any], run_id: str) -> EventEnvelope:
+    """Rebuild the wire envelope of one persisted event row, verbatim.
+
+    Shared by the resume replay loop and the first-stream stored replay
+    (agent-lifecycle-repair ticket 01): replay always serves the
+    persisted identity — sequence, ids and timestamps are never
+    regenerated.
+    """
+    return EventEnvelope(
+        version=evt["version"],
+        sequence=evt["sequence"],
+        type=evt["type"],
+        payload=evt["payload"],
+        request_id=evt["request_id"],
+        conversation_id=evt["conversation_id"],
+        run_id=evt.get("run_id", run_id),
+        event_id=evt.get("event_id", ""),
+        timestamp=evt.get("timestamp", ""),
+    )
+
+
+def _publish_stream_event(
+    event_type: str,
+    payload: dict[str, Any],
+    *,
+    stream: EventStream,
+    runs_repo: RunRepository | None,
+    run_id: str | None,
+    request_id: str,
+    conversation_id: str,
+    assistant_parts: list[str],
+    telemetry: Any | None,
+    telemetry_started: float,
+    strict: bool,
+    log_origin: str,
+) -> EventEnvelope:
+    """The ONE internal publication responsibility for run events.
+
+    agent-lifecycle-repair ticket 01: the first stream
+    (``RunOrchestrator.stream_chat``) and the resume continuation
+    (``RunOrchestrator._stream_resume_impl``) previously carried two
+    near-identical emit closures; both now assemble THIS publisher with
+    their own bindings. It owns, in a single place:
+
+    * assistant buffering — every non-empty ``text`` content is appended
+      so the terminal fence can persist the WHOLE reply (including a
+      cancelled partial answer) before any run terminal is released;
+    * envelope building — ``stream.build`` (monotonic sequence, exactly
+      one terminal per stream);
+    * durability — run terminals go through
+      :func:`_finalize_stream_terminal` (assistant + terminal persisted
+      in one transaction before the frame may be released); non-terminal
+      events are persisted best-effort, EXCEPT under ``strict`` where a
+      persist failure raises so the driver can fence the effect to
+      outcome_unknown (a success ``tool_result`` is only published once
+      its event is replayable);
+    * telemetry — ``observe_event`` for the released envelope; telemetry
+      failures are logged and never break the stream.
+
+    Replay is NOT routed through this publisher: reconnects keep
+    reading persisted envelopes directly. Without a runs_repo or a
+    durable run_id nothing is persisted or observed (the pre-admission
+    first stream keeps its historical no-persistence behaviour).
+    """
+    if event_type == "text":
+        content = payload.get("content")
+        if isinstance(content, str) and content:
+            assistant_parts.append(content)
+    envelope = stream.build(event_type, payload)
+    if runs_repo is not None and run_id is not None:
+        if event_type in _RUN_TERMINAL_TYPES:
+            # The fence may replace ``done`` with the stable
+            # assistant_persist_failed error; telemetry and the wire
+            # must both observe the released terminal.
+            envelope = _finalize_stream_terminal(
+                stream=stream,
+                runs_repo=runs_repo,
+                run_id=run_id,
+                request_id=request_id,
+                envelope=envelope,
+                assistant_content="".join(assistant_parts),
+            )
+        else:
+            try:
+                runs_repo.persist_event(
+                    run_id=run_id,
+                    sequence=envelope.sequence,
+                    event_type=envelope.type,
+                    payload=envelope.payload,
+                    request_id=request_id,
+                    conversation_id=conversation_id,
+                    event_id=envelope.event_id,
+                    timestamp=envelope.timestamp,
+                )
+            except Exception:
+                if strict:
+                    # BCDEF ticket 04: a success tool_result may only be
+                    # published once the effect event is replayable; the
+                    # driver turns this raise into outcome_unknown.
+                    raise
+                if log_origin == "run_orchestration":
+                    logger.exception(
+                        "run_orchestration: persist_event failed during "
+                        "resume for run_id=%s seq=%d",
+                        run_id,
+                        envelope.sequence,
+                    )
+                else:
+                    logger.exception(
+                        "chat_v2: persist_event failed for request_id=%s seq=%d; "
+                        "stream continues but reconnect may miss this event",
+                        request_id,
+                        envelope.sequence,
+                    )
+    if telemetry is not None and run_id is not None:
+        try:
+            tool_name = envelope.payload.get("tool")
+            state = envelope.payload.get("status") or envelope.payload.get(
+                "decision"
+            )
+            error_code = (
+                envelope.payload.get("code") if envelope.type == "error" else None
+            )
+            telemetry.observe_event(
+                run_id,
+                event_type=envelope.type,
+                duration_ms=(time.perf_counter() - telemetry_started) * 1000,
+                tool_name=tool_name if isinstance(tool_name, str) else None,
+                state=state if isinstance(state, str) else None,
+                error_code=(error_code if isinstance(error_code, str) else None),
+            )
+        except Exception:
+            if log_origin == "run_orchestration":
+                logger.exception(
+                    "run_orchestration: telemetry update failed during "
+                    "resume for run_id=%s",
+                    run_id,
+                )
+            else:
+                logger.exception(
+                    "chat_v2: telemetry update failed for run_id=%s", run_id
+                )
+    return envelope
 
 
 def synthesize_terminal_type(snapshot: RunSnapshot | None) -> str | None:
@@ -2033,69 +2186,26 @@ class RunOrchestrator:
         assistant_parts: list[str] = []
 
         def _emit(event_type: str, payload: dict[str, Any]) -> EventEnvelope:
-            if event_type == "text":
-                content = payload.get("content")
-                if isinstance(content, str) and content:
-                    assistant_parts.append(content)
-            envelope = stream.build(event_type, payload)
-            if runs_repo is not None and run_id is not None:
-                if event_type in _RUN_TERMINAL_TYPES:
-                    # The fence may replace ``done`` with the stable
-                    # assistant_persist_failed error; telemetry and the
-                    # wire must both observe the released terminal.
-                    envelope = _finalize_stream_terminal(
-                        stream=stream,
-                        runs_repo=runs_repo,
-                        run_id=run_id,
-                        request_id=req.request_id,
-                        envelope=envelope,
-                        assistant_content="".join(assistant_parts),
-                    )
-                else:
-                    try:
-                        runs_repo.persist_event(
-                            run_id=run_id,
-                            sequence=envelope.sequence,
-                            event_type=envelope.type,
-                            payload=envelope.payload,
-                            request_id=req.request_id,
-                            conversation_id=conversation_id,
-                            event_id=envelope.event_id,
-                            timestamp=envelope.timestamp,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "chat_v2: persist_event failed for request_id=%s seq=%d; "
-                            "stream continues but reconnect may miss this event",
-                            req.request_id,
-                            envelope.sequence,
-                        )
-            if telemetry is not None and run_id is not None:
-                try:
-                    tool_name = envelope.payload.get("tool")
-                    state = envelope.payload.get("status") or envelope.payload.get(
-                        "decision"
-                    )
-                    error_code = (
-                        envelope.payload.get("code")
-                        if envelope.type == "error"
-                        else None
-                    )
-                    telemetry.observe_event(
-                        run_id,
-                        event_type=envelope.type,
-                        duration_ms=(time.perf_counter() - telemetry_started) * 1000,
-                        tool_name=tool_name if isinstance(tool_name, str) else None,
-                        state=state if isinstance(state, str) else None,
-                        error_code=(
-                            error_code if isinstance(error_code, str) else None
-                        ),
-                    )
-                except Exception:
-                    logger.exception(
-                        "chat_v2: telemetry update failed for run_id=%s", run_id
-                    )
-            return envelope
+            # agent-lifecycle-repair ticket 01: the first stream and the
+            # resume continuation publish through the ONE shared
+            # responsibility (:func:`_publish_stream_event`). This closure
+            # only binds the CURRENT first-stream state — ``run_id`` and
+            # ``conversation_id`` are rebound by admission below, and the
+            # closure reads them at call time as before.
+            return _publish_stream_event(
+                event_type,
+                payload,
+                stream=stream,
+                runs_repo=runs_repo,
+                run_id=run_id,
+                request_id=req.request_id,
+                conversation_id=conversation_id,
+                assistant_parts=assistant_parts,
+                telemetry=telemetry,
+                telemetry_started=telemetry_started,
+                strict=False,
+                log_origin="chat_v2",
+            )
 
         def _admission_envelope(event: dict[str, Any]) -> EventEnvelope:
             return EventEnvelope(
@@ -3382,17 +3492,7 @@ class RunOrchestrator:
             else runs_repo.get_replay_events(run_id=run_id, from_seq=0)
         )
         for evt in replay_events:
-            yield EventEnvelope(
-                version=evt["version"],
-                sequence=evt["sequence"],
-                type=evt["type"],
-                payload=evt["payload"],
-                request_id=evt["request_id"],
-                conversation_id=evt["conversation_id"],
-                run_id=evt.get("run_id", run_id),
-                event_id=evt.get("event_id", ""),
-                timestamp=evt.get("timestamp", ""),
-            )
+            yield _replay_envelope(evt, run_id)
 
         # If the run is terminal, the replay is all the client gets. The
         # continuation was already emitted by a prior resume (or the run
@@ -3424,71 +3524,24 @@ class RunOrchestrator:
         def _emit_impl(
             event_type: str, payload: dict[str, Any], *, strict: bool
         ) -> EventEnvelope:
-            if event_type == "text":
-                content = payload.get("content")
-                if isinstance(content, str) and content:
-                    assistant_parts.append(content)
-            envelope = stream.build(event_type, payload)
-            if event_type in _RUN_TERMINAL_TYPES:
-                envelope = _finalize_stream_terminal(
-                    stream=stream,
-                    runs_repo=runs_repo,
-                    run_id=run_id,
-                    request_id=run.request_id,
-                    envelope=envelope,
-                    assistant_content="".join(assistant_parts),
-                )
-            else:
-                try:
-                    runs_repo.persist_event(
-                        run_id=run_id,
-                        sequence=envelope.sequence,
-                        event_type=envelope.type,
-                        payload=envelope.payload,
-                        request_id=run.request_id,
-                        conversation_id=run.conversation_id,
-                        event_id=envelope.event_id,
-                        timestamp=envelope.timestamp,
-                    )
-                except Exception:
-                    if strict:
-                        # BCDEF ticket 04: a success tool_result may only be
-                        # published once the effect event is replayable; the
-                        # driver turns this raise into outcome_unknown.
-                        raise
-                    logger.exception(
-                        "run_orchestration: persist_event failed during resume "
-                        "for run_id=%s seq=%d",
-                        run_id, envelope.sequence,
-                    )
-            if telemetry is not None:
-                try:
-                    tool_name = envelope.payload.get("tool")
-                    state = envelope.payload.get("status") or envelope.payload.get(
-                        "decision"
-                    )
-                    error_code = (
-                        envelope.payload.get("code")
-                        if envelope.type == "error"
-                        else None
-                    )
-                    telemetry.observe_event(
-                        run_id,
-                        event_type=envelope.type,
-                        duration_ms=(time.perf_counter() - telemetry_started) * 1000,
-                        tool_name=tool_name if isinstance(tool_name, str) else None,
-                        state=state if isinstance(state, str) else None,
-                        error_code=(
-                            error_code if isinstance(error_code, str) else None
-                        ),
-                    )
-                except Exception:
-                    logger.exception(
-                        "run_orchestration: telemetry update failed during "
-                        "resume for run_id=%s",
-                        run_id,
-                    )
-            return envelope
+            # agent-lifecycle-repair ticket 01: same shared publication
+            # responsibility as the first stream
+            # (:func:`_publish_stream_event`); the continuation only
+            # differs in per-call-site strict durability.
+            return _publish_stream_event(
+                event_type,
+                payload,
+                stream=stream,
+                runs_repo=runs_repo,
+                run_id=run_id,
+                request_id=run.request_id,
+                conversation_id=run.conversation_id,
+                assistant_parts=assistant_parts,
+                telemetry=telemetry,
+                telemetry_started=telemetry_started,
+                strict=strict,
+                log_origin="run_orchestration",
+            )
 
         def emit(event_type: str, payload: dict[str, Any]) -> EventEnvelope:
             return _emit_impl(event_type, payload, strict=False)
@@ -4482,17 +4535,7 @@ class RunOrchestrator:
         has_terminal = False
         max_seq = 0
         for evt in stored:
-            envelope = EventEnvelope(
-                version=evt["version"],
-                sequence=evt["sequence"],
-                type=evt["type"],
-                payload=evt["payload"],
-                request_id=evt["request_id"],
-                conversation_id=evt["conversation_id"],
-                run_id=evt.get("run_id", run_id),
-                event_id=evt.get("event_id", ""),
-                timestamp=evt.get("timestamp", ""),
-            )
+            envelope = _replay_envelope(evt, run_id)
             if envelope.sequence > max_seq:
                 max_seq = envelope.sequence
             if envelope.type in TERMINAL_EVENT_TYPES:
