@@ -193,6 +193,13 @@ CREATE TABLE IF NOT EXISTS sandbox_leases (
     destroyed_at TEXT,
     resource_usage_json TEXT,
     failure_reason TEXT,
+    -- BCDEF ticket 07: terminal cleanup status is recorded separately
+    -- from the lease status (a retried cleanup can succeed after the
+    -- first attempt failed). ``janitor_task_id`` links a failed cleanup
+    -- to its durable work item.
+    cleanup_status TEXT,
+    cleanup_error TEXT,
+    janitor_task_id TEXT,
     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
 );
 
@@ -246,6 +253,10 @@ CREATE TABLE IF NOT EXISTS approvals (
     expires_at TEXT NOT NULL,
     resolved_at TEXT,
     decision_request_id TEXT,
+    -- BCDEF ticket 07: the tool input drafted BEFORE the pause (for
+    -- generate_pdf the plan text). Resume continues the approved effect
+    -- from this durable fact — never by re-running the model.
+    prepared_content TEXT,
     UNIQUE (run_id, tool_name, args_canonical),
     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
 );
@@ -290,6 +301,19 @@ CREATE TABLE IF NOT EXISTS effects (
     claim_expires_at TEXT,
     lease_id TEXT,
     fencing_token INTEGER NOT NULL DEFAULT 0,
+    -- BCDEF ticket 05: reconciliation/repair state for an
+    -- ``outcome_unknown`` effect. ``repair_status`` is one of
+    -- none/repair_pending/repair_claimed/repaired/abandoned; attempts
+    -- counts claims/repair passes; the last error and request id make
+    -- repair retries idempotent and auditable.
+    repair_status TEXT NOT NULL DEFAULT 'none',
+    repair_attempts INTEGER NOT NULL DEFAULT 0,
+    repair_last_error TEXT,
+    repair_request_id TEXT,
+    repair_claimed_by TEXT,
+    repair_claimed_at TEXT,
+    repair_updated_at TEXT,
+    repair_note TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     committed_at TEXT,
@@ -300,6 +324,37 @@ CREATE TABLE IF NOT EXISTS effects (
 CREATE INDEX IF NOT EXISTS idx_effects_run ON effects(run_id);
 CREATE INDEX IF NOT EXISTS idx_effects_status ON effects(status);
 CREATE INDEX IF NOT EXISTS idx_effects_tool ON effects(tool_name);
+
+-- BCDEF ticket 07: durable janitor work items. Cleanup failures and
+-- unknown-outcome repairs that need background reconciliation are
+-- recorded here with the evidence needed to retry WITHOUT re-executing
+-- an external effect or creating a new sandbox. Status transitions:
+--   pending → claimed → done | failed   (failed → claimed on retry)
+-- ``dedupe_key`` (UNIQUE when set) makes enqueue idempotent per logical
+-- work item; attempts and last_error make retries auditable.
+CREATE TABLE IF NOT EXISTS janitor_tasks (
+    task_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    dedupe_key TEXT,
+    run_id TEXT,
+    lease_id TEXT,
+    effect_id TEXT,
+    evidence_json TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    claimed_by TEXT,
+    claimed_at TEXT,
+    result_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    UNIQUE (dedupe_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_janitor_status ON janitor_tasks(status);
+CREATE INDEX IF NOT EXISTS idx_janitor_kind ON janitor_tasks(kind);
+CREATE INDEX IF NOT EXISTS idx_janitor_run ON janitor_tasks(run_id);
 
 -- Ticket 16: redacted, metadata-only run telemetry. This table has no
 -- columns for prompts, messages, memory, file contents, or tool output.
@@ -434,6 +489,12 @@ class SandboxLeaseRecord:
     heartbeat_at: str | None = None
     fencing_token: int = 0
     sandbox_identity: str | None = None
+    # BCDEF ticket 07: durable terminal-cleanup outcome. ``cleanup_status``
+    # is succeeded/pending_janitor; ``janitor_task_id`` links a failed
+    # cleanup retry to its work item.
+    cleanup_status: str | None = None
+    cleanup_error: str | None = None
+    janitor_task_id: str | None = None
 
     @property
     def is_active(self) -> bool:
@@ -523,10 +584,67 @@ class ApprovalRecord:
     expires_at: str
     resolved_at: str | None
     decision_request_id: str | None
+    # BCDEF ticket 07: the tool input drafted before the pause. For
+    # generate_pdf this is the plan text; resume reads it instead of
+    # re-running the model. Additive — old rows read back as None.
+    prepared_content: str | None = None
 
     @property
     def is_terminal(self) -> bool:
         return self.status in _TERMINAL_APPROVAL_STATUSES
+
+
+# ---- Janitor work items (BCDEF ticket 07) ---------------------------------
+
+
+JANITOR_KINDS: frozenset[str] = frozenset({"cleanup", "repair"})
+JANITOR_STATUSES: frozenset[str] = frozenset(
+    {"pending", "claimed", "done", "failed"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class JanitorTaskRecord:
+    """Snapshot of a durable janitor work item.
+
+    ``evidence_json`` carries everything a retry needs (run/lease/effect/
+    sandbox identity and the failure reason) so a cleanup or repair can be
+    resumed without re-running the model, re-executing the external
+    effect, or creating a new sandbox.
+    """
+
+    task_id: str
+    kind: str
+    status: str
+    dedupe_key: str | None
+    run_id: str
+    lease_id: str
+    effect_id: str
+    evidence_json: str
+    attempts: int
+    last_error: str | None
+    claimed_by: str | None
+    claimed_at: str | None
+    result_json: str | None
+    created_at: str
+    updated_at: str
+    completed_at: str | None
+
+    @property
+    def evidence(self) -> dict[str, Any]:
+        try:
+            parsed = json.loads(self.evidence_json) if self.evidence_json else {}
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @property
+    def result(self) -> dict[str, Any]:
+        try:
+            parsed = json.loads(self.result_json) if self.result_json else {}
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
 
 
 # ---- Effect ledger statuses (Ticket 12) -----------------------------------
@@ -597,6 +715,15 @@ class EffectRecord:
     claim_expires_at: str | None = None
     lease_id: str | None = None
     fencing_token: int = 0
+    # BCDEF ticket 05: unknown-outcome reconciliation/repair state.
+    repair_status: str = "none"
+    repair_attempts: int = 0
+    repair_last_error: str | None = None
+    repair_request_id: str | None = None
+    repair_claimed_by: str | None = None
+    repair_claimed_at: str | None = None
+    repair_updated_at: str | None = None
+    repair_note: str | None = None
 
     @property
     def is_terminal(self) -> bool:
@@ -659,6 +786,14 @@ class ControlStore:
                 "claim_expires_at": "TEXT",
                 "lease_id": "TEXT",
                 "fencing_token": "INTEGER NOT NULL DEFAULT 0",
+                "repair_status": "TEXT NOT NULL DEFAULT 'none'",
+                "repair_attempts": "INTEGER NOT NULL DEFAULT 0",
+                "repair_last_error": "TEXT",
+                "repair_request_id": "TEXT",
+                "repair_claimed_by": "TEXT",
+                "repair_claimed_at": "TEXT",
+                "repair_updated_at": "TEXT",
+                "repair_note": "TEXT",
             },
             "sandbox_leases": {
                 "owner_id": "TEXT",
@@ -666,6 +801,12 @@ class ControlStore:
                 "heartbeat_at": "TEXT",
                 "fencing_token": "INTEGER NOT NULL DEFAULT 0",
                 "sandbox_identity": "TEXT",
+                "cleanup_status": "TEXT",
+                "cleanup_error": "TEXT",
+                "janitor_task_id": "TEXT",
+            },
+            "approvals": {
+                "prepared_content": "TEXT",
             },
         }
         for table, columns in additions.items():
@@ -1578,6 +1719,230 @@ class ControlStore:
             heartbeat_at=row["heartbeat_at"],
             fencing_token=int(row["fencing_token"] or 0),
             sandbox_identity=row["sandbox_identity"],
+            cleanup_status=row["cleanup_status"],
+            cleanup_error=row["cleanup_error"],
+            janitor_task_id=row["janitor_task_id"],
+        )
+
+    def record_sandbox_cleanup(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        error: str | None = None,
+        janitor_task_id: str | None = None,
+    ) -> SandboxLeaseRecord | None:
+        """Record the terminal cleanup outcome on the lease.
+
+        Idempotent: a lease already recorded as ``succeeded`` is never
+        downgraded by a later duplicate/retry observation. ``pending_janitor``
+        marks a failure whose retry lives in the janitor store.
+        """
+        existing = self.get_sandbox_lease(run_id)
+        if existing is None:
+            return None
+        if existing.cleanup_status == "succeeded" and status != "succeeded":
+            return existing
+        self._conn.execute(
+            "UPDATE sandbox_leases SET cleanup_status = ?, cleanup_error = ?, "
+            "janitor_task_id = COALESCE(?, janitor_task_id) "
+            "WHERE run_id = ?",
+            (status, error, janitor_task_id, run_id),
+        )
+        return self.get_sandbox_lease(run_id)
+
+    # -- janitor work items (BCDEF ticket 07) --------------------------
+
+    def enqueue_janitor_task(
+        self,
+        *,
+        kind: str,
+        evidence: dict[str, Any] | None = None,
+        run_id: str = "",
+        lease_id: str = "",
+        effect_id: str = "",
+        dedupe_key: str | None = None,
+        task_id: str | None = None,
+    ) -> tuple[JanitorTaskRecord, bool]:
+        """Persist a durable janitor work item (idempotent per dedupe key).
+
+        Returns ``(record, created)``. A repeated enqueue with the same
+        ``dedupe_key`` returns the ORIGINAL row unchanged — retries never
+        create a second work item for the same logical cleanup/repair.
+        """
+        if kind not in JANITOR_KINDS:
+            raise ValueError(f"invalid janitor kind: {kind!r}")
+        now = _now_iso()
+        new_id = task_id or str(uuid.uuid4())
+        evidence_json = json.dumps(evidence or {}, sort_keys=True, ensure_ascii=False)
+        self._conn.execute("BEGIN")
+        try:
+            cur = self._conn.execute(
+                "INSERT INTO janitor_tasks "
+                "(task_id, kind, status, dedupe_key, run_id, lease_id, "
+                " effect_id, evidence_json, attempts, last_error, claimed_by, "
+                " claimed_at, result_json, created_at, updated_at, completed_at) "
+                "VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, "
+                " NULL, ?, ?, NULL) "
+                "ON CONFLICT(dedupe_key) DO NOTHING",
+                (
+                    new_id,
+                    kind,
+                    dedupe_key,
+                    run_id,
+                    lease_id,
+                    effect_id,
+                    evidence_json,
+                    now,
+                    now,
+                ),
+            )
+            created = cur.rowcount == 1
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        if created:
+            record = self.get_janitor_task(new_id)
+        elif dedupe_key is not None:
+            row = self._conn.execute(
+                "SELECT * FROM janitor_tasks WHERE dedupe_key = ?",
+                (dedupe_key,),
+            ).fetchone()
+            record = self._row_to_janitor_task(row) if row is not None else None
+        else:  # pragma: no cover - non-dedupe inserts always succeed
+            record = self.get_janitor_task(new_id)
+        assert record is not None
+        return record, created
+
+    def get_janitor_task(self, task_id: str) -> JanitorTaskRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM janitor_tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        return self._row_to_janitor_task(row) if row is not None else None
+
+    def list_janitor_tasks(
+        self,
+        *,
+        status: str | None = None,
+        kind: str | None = None,
+        limit: int = 100,
+    ) -> list[JanitorTaskRecord]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        if kind is not None:
+            clauses.append("kind = ?")
+            params.append(kind)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"SELECT * FROM janitor_tasks {where} "
+            "ORDER BY created_at ASC, task_id ASC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        return [self._row_to_janitor_task(row) for row in rows]
+
+    def claim_janitor_task(
+        self,
+        task_id: str,
+        *,
+        owner: str,
+    ) -> tuple[JanitorTaskRecord | None, bool]:
+        """CAS claim a pending/failed task; only one worker wins."""
+        now = _now_iso()
+        self._conn.execute("BEGIN")
+        try:
+            cur = self._conn.execute(
+                "UPDATE janitor_tasks SET status = 'claimed', claimed_by = ?, "
+                "claimed_at = ?, attempts = attempts + 1, updated_at = ? "
+                "WHERE task_id = ? AND status IN ('pending', 'failed')",
+                (owner, now, now, task_id),
+            )
+            won = cur.rowcount == 1
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return self.get_janitor_task(task_id), won
+
+    def complete_janitor_task(
+        self,
+        task_id: str,
+        *,
+        owner: str = "",
+        result: dict[str, Any] | None = None,
+    ) -> tuple[JanitorTaskRecord | None, bool]:
+        now = _now_iso()
+        result_json = (
+            json.dumps(result, sort_keys=True, ensure_ascii=False)
+            if result is not None
+            else None
+        )
+        sql = (
+            "UPDATE janitor_tasks SET status = 'done', result_json = ?, "
+            "completed_at = ?, updated_at = ? "
+            "WHERE task_id = ? AND status = 'claimed'"
+        )
+        params: tuple[Any, ...] = (result_json, now, now, task_id)
+        if owner:
+            sql += " AND claimed_by = ?"
+            params = params + (owner,)
+        self._conn.execute("BEGIN")
+        try:
+            cur = self._conn.execute(sql, params)
+            won = cur.rowcount == 1
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return self.get_janitor_task(task_id), won
+
+    def fail_janitor_task(
+        self,
+        task_id: str,
+        error: str,
+        *,
+        owner: str = "",
+    ) -> tuple[JanitorTaskRecord | None, bool]:
+        now = _now_iso()
+        sql = (
+            "UPDATE janitor_tasks SET status = 'failed', last_error = ?, "
+            "updated_at = ? WHERE task_id = ? AND status = 'claimed'"
+        )
+        params: tuple[Any, ...] = (error, now, task_id)
+        if owner:
+            sql += " AND claimed_by = ?"
+            params = params + (owner,)
+        self._conn.execute("BEGIN")
+        try:
+            cur = self._conn.execute(sql, params)
+            won = cur.rowcount == 1
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return self.get_janitor_task(task_id), won
+
+    def _row_to_janitor_task(self, row: sqlite3.Row) -> JanitorTaskRecord:
+        return JanitorTaskRecord(
+            task_id=row["task_id"],
+            kind=row["kind"],
+            status=row["status"],
+            dedupe_key=row["dedupe_key"],
+            run_id=row["run_id"] or "",
+            lease_id=row["lease_id"] or "",
+            effect_id=row["effect_id"] or "",
+            evidence_json=row["evidence_json"] or "{}",
+            attempts=int(row["attempts"] or 0),
+            last_error=row["last_error"],
+            claimed_by=row["claimed_by"],
+            claimed_at=row["claimed_at"],
+            result_json=row["result_json"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            completed_at=row["completed_at"],
         )
 
     # -- artifacts (Ticket 10) -----------------------------------------
@@ -1709,6 +2074,7 @@ class ControlStore:
         impact: str,
         created_at: str,
         expires_at: str,
+        prepared_content: str | None = None,
     ) -> ApprovalRecord:
         """Insert a new approval row in ``pending`` status.
 
@@ -1727,8 +2093,9 @@ class ControlStore:
                 "INSERT INTO approvals "
                 "(approval_id, run_id, conversation_id, tool_name, "
                 " args_canonical, risk_level, impact, status, "
-                " created_at, expires_at, resolved_at, decision_request_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, NULL, NULL)",
+                " created_at, expires_at, resolved_at, decision_request_id, "
+                " prepared_content) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, NULL, NULL, ?)",
                 (
                     approval_id,
                     run_id,
@@ -1739,6 +2106,7 @@ class ControlStore:
                     impact,
                     created_at,
                     expires_at,
+                    prepared_content,
                 ),
             )
             self._conn.execute("COMMIT")
@@ -1878,6 +2246,7 @@ class ControlStore:
             expires_at=row["expires_at"],
             resolved_at=row["resolved_at"],
             decision_request_id=row["decision_request_id"],
+            prepared_content=row["prepared_content"],
         )
 
     # -- effects (Ticket 12) --------------------------------------------
@@ -2117,10 +2486,12 @@ class ControlStore:
         now = _now_iso()
         sql = (
             "UPDATE effects SET status = 'outcome_unknown', "
-            "failure_reason = ?, updated_at = ? "
+            "failure_reason = ?, updated_at = ?, "
+            "repair_status = 'repair_pending', repair_updated_at = ?, "
+            "repair_last_error = ? "
             "WHERE effect_key = ? AND status IN ('executing', 'claimed')"
         )
-        params: tuple[Any, ...] = (reason, now, effect_key)
+        params: tuple[Any, ...] = (reason, now, now, reason, effect_key)
         if claim_token is not None:
             sql += " AND claim_token = ?"
             params = params + (claim_token,)
@@ -2196,10 +2567,12 @@ class ControlStore:
         now = _now_iso()
         sql = (
             "UPDATE effects SET status = 'outcome_unknown', "
-            "failure_reason = ?, updated_at = ? "
+            "failure_reason = ?, updated_at = ?, "
+            "repair_status = 'repair_pending', repair_updated_at = ?, "
+            "repair_last_error = ? "
             "WHERE effect_key = ? AND status = 'committed'"
         )
-        params: tuple[Any, ...] = (reason, now, effect_key)
+        params: tuple[Any, ...] = (reason, now, now, reason, effect_key)
         if claim_token is not None:
             sql += " AND claim_token = ?"
             params = params + (claim_token,)
@@ -2234,7 +2607,198 @@ class ControlStore:
             claim_expires_at=row["claim_expires_at"],
             lease_id=row["lease_id"],
             fencing_token=int(row["fencing_token"] or 0),
+            repair_status=row["repair_status"] or "none",
+            repair_attempts=int(row["repair_attempts"] or 0),
+            repair_last_error=row["repair_last_error"],
+            repair_request_id=row["repair_request_id"],
+            repair_claimed_by=row["repair_claimed_by"],
+            repair_claimed_at=row["repair_claimed_at"],
+            repair_updated_at=row["repair_updated_at"],
+            repair_note=row["repair_note"],
         )
+
+    # -- effect repair (BCDEF ticket 05) ------------------------------
+
+    def get_effect_by_effect_id(self, effect_id: str) -> EffectRecord | None:
+        """Resolve an effect by its public ``effect_id``.
+
+        New rows store ``effect_id`` alongside the legacy ``effect_key``
+        (same value), so the path parameter can be looked up directly.
+        Legacy rows without an ``effect_id`` fall back to the effect key.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM effects WHERE effect_key = ? OR effect_id = ? "
+            "ORDER BY (effect_key = ?) DESC LIMIT 1",
+            (effect_id, effect_id, effect_id),
+        ).fetchone()
+        return self._row_to_effect(row) if row is not None else None
+
+    def claim_effect_repair(
+        self,
+        effect_key: str,
+        *,
+        owner: str,
+        now: str | None = None,
+    ) -> tuple[EffectRecord | None, bool]:
+        """CAS-claim the repair of one ``outcome_unknown`` effect.
+
+        Only ``outcome_unknown`` rows with an open repair can be claimed.
+        A different owner cannot steal a live claim; the same owner may
+        re-claim idempotently (attempts increment for audit). The claim
+        never changes the effect status and never executes anything.
+        """
+        now_iso = now or _now_iso()
+        self._conn.execute("BEGIN")
+        try:
+            cur = self._conn.execute(
+                "UPDATE effects SET repair_status = 'repair_claimed', "
+                "repair_claimed_by = ?, repair_claimed_at = ?, "
+                "repair_attempts = repair_attempts + 1, "
+                "repair_updated_at = ? "
+                "WHERE effect_key = ? AND status = 'outcome_unknown' "
+                "AND (repair_status IN ('repair_pending', 'none') "
+                "     OR (repair_status = 'repair_claimed' "
+                "         AND repair_claimed_by = ?))",
+                (owner, now_iso, now_iso, effect_key, owner),
+            )
+            won = cur.rowcount == 1
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return self.get_effect(effect_key), won
+
+    def complete_effect_repair(
+        self,
+        effect_key: str,
+        result_json: str,
+        *,
+        request_id: str = "",
+        actor: str = "",
+        now: str | None = None,
+    ) -> tuple[EffectRecord | None, bool]:
+        """CAS-complete a repair with the operator-confirmed result.
+
+        ``outcome_unknown`` → ``committed`` in ONE update: the result,
+        the repaired status and the request identity commit together, so
+        a concurrent retry observes either the unknown row or the single
+        repaired result (never a half state). The original effect key,
+        run id and approval identity are untouched.
+        """
+        now_iso = now or _now_iso()
+        note = f"repaired by {actor}" if actor else "repaired"
+        self._conn.execute("BEGIN")
+        try:
+            cur = self._conn.execute(
+                "UPDATE effects SET status = 'committed', result_json = ?, "
+                "committed_at = ?, updated_at = ?, claim_token = NULL, "
+                "repair_status = 'repaired', repair_request_id = ?, "
+                "repair_attempts = repair_attempts + 1, "
+                "repair_claimed_by = NULL, repair_updated_at = ?, "
+                "repair_last_error = NULL, repair_note = ? "
+                "WHERE effect_key = ? AND status = 'outcome_unknown' "
+                "AND repair_status IN ('repair_pending', 'repair_claimed', 'none')",
+                (
+                    result_json,
+                    now_iso,
+                    now_iso,
+                    request_id,
+                    now_iso,
+                    note,
+                    effect_key,
+                ),
+            )
+            won = cur.rowcount == 1
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return self.get_effect(effect_key), won
+
+    def abandon_effect_repair(
+        self,
+        effect_key: str,
+        *,
+        request_id: str = "",
+        actor: str = "",
+        reason: str = "",
+        now: str | None = None,
+    ) -> tuple[EffectRecord | None, bool]:
+        """Fail-closed decision: keep the effect unknown, stop repairing.
+
+        The effect status stays ``outcome_unknown`` (execution remains
+        terminal and unsafe to retry); only the repair state changes to
+        ``abandoned``. No success result is ever published for it.
+        """
+        now_iso = now or _now_iso()
+        note = f"abandoned by {actor}" if actor else "abandoned"
+        self._conn.execute("BEGIN")
+        try:
+            cur = self._conn.execute(
+                "UPDATE effects SET repair_status = 'abandoned', "
+                "repair_request_id = ?, repair_claimed_by = NULL, "
+                "repair_updated_at = ?, repair_note = ? "
+                "WHERE effect_key = ? AND status = 'outcome_unknown' "
+                "AND repair_status IN ('repair_pending', 'repair_claimed', 'none')",
+                (request_id, now_iso, f"{note}: {reason}" if reason else note, effect_key),
+            )
+            won = cur.rowcount == 1
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return self.get_effect(effect_key), won
+
+    def fail_effect_repair(
+        self,
+        effect_key: str,
+        error: str,
+        *,
+        now: str | None = None,
+    ) -> EffectRecord | None:
+        """Record a failed repair attempt; the repair stays pending.
+
+        Used when a repair cannot publish its replayable result. The
+        effect stays ``outcome_unknown``/``repair_pending`` so a retry is
+        allowed, but the failure reason and attempt are durable.
+        """
+        now_iso = now or _now_iso()
+        self._conn.execute(
+            "UPDATE effects SET repair_status = 'repair_pending', "
+            "repair_last_error = ?, repair_claimed_by = NULL, "
+            "repair_updated_at = ? "
+            "WHERE effect_key = ? AND status = 'outcome_unknown' "
+            "AND repair_status IN ('repair_pending', 'repair_claimed', 'none')",
+            (error, now_iso, effect_key),
+        )
+        return self.get_effect(effect_key)
+
+    def revert_effect_repair(
+        self,
+        effect_key: str,
+        error: str,
+        *,
+        request_id: str = "",
+        now: str | None = None,
+    ) -> EffectRecord | None:
+        """Revert a committed repair whose result event was not durable.
+
+        A repair only counts once the final result is replayable. When
+        the event write fails after the ledger commit, the narrow
+        ``committed(repaired) → outcome_unknown(repair_pending)`` edge
+        keeps the known result in ``result_json`` but refuses to present
+        it as the final replayable outcome.
+        """
+        now_iso = now or _now_iso()
+        self._conn.execute(
+            "UPDATE effects SET status = 'outcome_unknown', "
+            "repair_status = 'repair_pending', repair_last_error = ?, "
+            "repair_updated_at = ?, repair_claimed_by = NULL "
+            "WHERE effect_key = ? AND status = 'committed' "
+            "AND repair_status = 'repaired' AND repair_request_id = ?",
+            (error, now_iso, effect_key, request_id),
+        )
+        return self.get_effect(effect_key)
 
     # -- redacted observability (Ticket 16) ---------------------------
 

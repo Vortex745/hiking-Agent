@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_v2.artifacts import compute_sha256, host_storage_path, persist_artifact_bytes
+from agent_v2.events import EventStream
 from agent_v2.memory_service import (
     SUBJECT_COOKIE_NAME,
     MemoryService,
@@ -79,6 +80,49 @@ def set_subject_cookie(
         samesite="lax",
         path="/",
     )
+
+
+def _finish_export_run(
+    runs,
+    *,
+    run_id: str,
+    request_id: str,
+    conversation_id: str,
+    terminal_type: str,
+    payload: dict,
+) -> None:
+    """Close an export run through the shared assistant/terminal fence.
+
+    The export has no model turn, but its run is durable state: the terminal
+    event must be persisted before the status flips, so a partial write can
+    never leave a ``done`` run without a replayable terminal.
+    """
+    snapshot = runs.get_snapshot(run_id)
+    stream = EventStream(
+        request_id=request_id,
+        conversation_id=conversation_id,
+        run_id=run_id,
+    )
+    stream.advance_to(snapshot.sequence_cursor if snapshot else 0)
+    envelope = stream.build(terminal_type, payload)
+    try:
+        runs.finalize_run(
+            run_id=run_id,
+            request_id=request_id,
+            terminal_type=envelope.type,
+            payload=envelope.payload,
+            sequence=envelope.sequence,
+            event_id=envelope.event_id,
+            timestamp=envelope.timestamp,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "terminal_persist_failed",
+                "message": "导出终态未能落库，请稍后重试。",
+            },
+        ) from exc
 
 
 def subject_json(
@@ -215,12 +259,21 @@ async def export_memories(request: Request):
     request_id = f"memory-export-{uuid.uuid4()}"
     if not memory.claim_conversation(subject.subject_id, conversation_id):
         raise HTTPException(status_code=409, detail="Export conversation conflict")
-    run_id, _ = runs.create_run_idempotent(
+    admission = runs.admit(
         request_id=request_id,
         conversation_id=conversation_id,
         profile_id="chat",
         user_message="Export active memories",
     )
+    if not admission.run_id:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": admission.error_code or "admission_failed",
+                "message": "导出运行未完成持久准入，请稍后重试。",
+            },
+        )
+    run_id = admission.run_id
     created_at = datetime.now(timezone.utc).isoformat()
     expires_at = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
     storage_path = host_storage_path(
@@ -228,22 +281,44 @@ async def export_memories(request: Request):
         artifact_id,
         "memories.json",
     )
-    persist_artifact_bytes(storage_path, data)
-    runs.insert_artifact(
-        artifact_id=artifact_id,
+    try:
+        persist_artifact_bytes(storage_path, data)
+        runs.insert_artifact(
+            artifact_id=artifact_id,
+            run_id=run_id,
+            conversation_id=conversation_id,
+            public_filename="memories.json",
+            mime_type="application/json",
+            size_bytes=len(data),
+            sha256=compute_sha256(data),
+            storage_path=storage_path,
+            status="available",
+            failure_reason=None,
+            created_at=created_at,
+            expires_at=expires_at,
+        )
+    except Exception:
+        _finish_export_run(
+            runs,
+            run_id=run_id,
+            request_id=request_id,
+            conversation_id=conversation_id,
+            terminal_type="error",
+            payload={
+                "code": "memory_export_failed",
+                "message": "导出产物未能完整落库。",
+                "recoverable": True,
+            },
+        )
+        raise HTTPException(status_code=503, detail="Export artifact unavailable")
+    _finish_export_run(
+        runs,
         run_id=run_id,
+        request_id=request_id,
         conversation_id=conversation_id,
-        public_filename="memories.json",
-        mime_type="application/json",
-        size_bytes=len(data),
-        sha256=compute_sha256(data),
-        storage_path=storage_path,
-        status="available",
-        failure_reason=None,
-        created_at=created_at,
-        expires_at=expires_at,
+        terminal_type="done",
+        payload={"artifact_id": artifact_id, "expires_at": expires_at},
     )
-    runs.mark_run_done(run_id)
     return subject_json(
         request,
         subject,

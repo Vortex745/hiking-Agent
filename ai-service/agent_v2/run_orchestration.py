@@ -73,6 +73,12 @@ from agent_v2.computer import (
     SandboxTimeoutError,
     SandboxUnavailableError,
 )
+from agent_v2.capability_projection import (
+    CapabilityProjection,
+    CapabilityProjectionError,
+    build_capability_projection,
+    legacy_capability_projection,
+)
 from agent_v2.effects import (
     DEFAULT_EFFECT_CLAIM_TTL_SECONDS,
     EffectClaim,
@@ -90,7 +96,7 @@ from agent_v2.events import (
     EventStream,
     TerminalEventAlreadyEmitted,
 )
-from agent_v2.execution_contract import BoundaryError
+from agent_v2.execution_contract import BoundaryError, ExecutionErrorCode
 from agent_v2.execution_policy import build_execution_policy, freeze_settings
 from agent_v2.leases import (
     SANDBOX_LEASE_TTL_SECONDS,
@@ -100,7 +106,7 @@ from agent_v2.leases import (
 from agent_v2.policy_adapters import policy_error_payload
 from agent_v2.memory_tools import extract_sensitive_memory
 from agent_v2.observability import CapacityExceeded
-from agent_v2.permissions import PermissionDecision, PermissionGate
+from agent_v2.permissions import PermissionDecision
 from agent_v2.profiles import (
     CapabilityProfile,
     ProfileId,
@@ -182,11 +188,14 @@ class ApprovalDecisionOutcome:
 
     * ``recorded`` — decision persisted, run resumed (HTTP 200)
     * ``idempotent`` — duplicate of an already-recorded decision with
-      the same ``decision_request_id`` (HTTP 200)
+      the same ``decision_request_id`` AND the same decision (HTTP 200)
     * ``approval_not_found`` (HTTP 404)
     * ``already_resolved`` / ``expired`` / ``run_not_found`` /
-      ``run_terminal`` / ``run_not_paused`` / ``sandbox_lease_lost``
-      (HTTP 409, ``payload`` carries the public reason + message)
+      ``run_terminal`` / ``run_not_paused`` / ``sandbox_lease_lost`` /
+      ``decision_conflict`` (HTTP 409, ``payload`` carries the public
+      reason + message). ``decision_conflict`` is BCDEF ticket 07: a
+      contradictory decision for an approval key keeps the original
+      result untouched.
 
     The payload is the exact public response body minus the
     ``resume_url``, which is an adapter (HTTP surface) concern.
@@ -669,6 +678,7 @@ async def _kernel_plan_turn(
     message: str,
     run_id: str | None,
     lease_guard: Any | None = None,
+    projection: CapabilityProjection | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Run the plan-writing kernel turn over the run-scoped sandbox bridge.
 
@@ -680,11 +690,16 @@ async def _kernel_plan_turn(
     Ticket 06: when ``lease_guard`` is supplied every sandbox command
     (read/write/run) revalidates the durable active lease + fencing token
     before touching the sandbox.
+
+    BCDEF ticket 10: when ``projection`` is supplied, sandbox_read/write
+    are authorized by the SAME frozen projection gate as every other tool
+    source (no ungated sandbox surface).
     """
     from agent_v2.kernel_tools import (
         ProductSandboxBridge,
         SandboxReadTool,
         SandboxWriteTool,
+        build_chat_kernel_gate,
     )
 
     bridge = ProductSandboxBridge(
@@ -695,6 +710,16 @@ async def _kernel_plan_turn(
         SandboxReadTool(bridge=bridge, run_id=run_id, audit_sink=sandbox_audits.append),
         SandboxWriteTool(bridge=bridge, run_id=run_id, audit_sink=sandbox_audits.append),
     )
+    kernel_gate = (
+        build_chat_kernel_gate(
+            None,
+            run_id=run_id,
+            audit_sink=sandbox_audits.append,
+            projection=projection,
+        )
+        if projection is not None
+        else None
+    )
     plan_text, audits = await kernel_turn(
         system_prompt=_PLAN_SYSTEM_PROMPT,
         message=message,
@@ -702,7 +727,7 @@ async def _kernel_plan_turn(
         run_id=run_id,
         checkpoint_store=checkpoint_store,
         extra_tools=sandbox_tools,
-        kernel_gate=None,
+        kernel_gate=kernel_gate,
         mcp_servers=None,
         computer=bridge,
     )
@@ -725,13 +750,24 @@ def _tool_result_payloads(entries: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 
 def _effect_meta(
-    effect_key: str, external_idempotency_key: str
+    effect_key: str,
+    external_idempotency_key: str,
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Replay-visible effect identity merged into tool/effect events."""
-    return {
+    """Replay-visible effect identity merged into tool/effect events.
+
+    BCDEF ticket 10: ``extra`` carries the additive run/policy/capability
+    binding (``run_id``, ``policy_hash``, ``projection_hash``,
+    ``capability_id``) so MCP/effect execution is auditable and replayable
+    without changing the envelope shape.
+    """
+    meta: dict[str, Any] = {
         "effect_id": effect_key,
         "idempotency_key": external_idempotency_key,
     }
+    if extra:
+        meta.update({key: value for key, value in extra.items() if value is not None})
+    return meta
 
 
 async def drive_effect(
@@ -754,8 +790,19 @@ async def drive_effect(
     post_execute_check: Callable[[], None] | None = None,
     lease_id: str = "",
     fencing_token: int = 0,
+    extra_meta: dict[str, Any] | None = None,
+    projection: CapabilityProjection | None = None,
+    approval_granted: bool = False,
 ) -> AsyncGenerator[Any, None]:
     """Drive ONE tool execution through the effect ledger (Ticket 39/04).
+
+    BCDEF ticket 10: when a frozen ``projection`` is supplied, risk and
+    approval are evaluated BEFORE any ledger mutation. A denied tool
+    creates no effect row, never reaches the executor, and surfaces the
+    stable ``tool_not_authorized`` boundary error (``outcome.status ==
+    "denied"``, run marked error). An authorized effect's events carry
+    the additive run/policy/projection/capability binding, so execution
+    is auditable and replayable from the event log alone.
 
     This is the single authority for the ledger transitions:
 
@@ -786,6 +833,30 @@ async def drive_effect(
     done) or stop.
     """
     publish = emit_required or emit
+    if projection is not None:
+        # Ticket 10: authorize BEFORE any ledger mutation. A denied or
+        # unapproved tool never reaches the effect row, the claim, or the
+        # external side effect.
+        if extra_meta is None:
+            extra_meta = projection.event_meta(copy.tool_name)
+        authorization = projection.authorize(
+            copy.tool_name, tool_args, approval_granted=approval_granted
+        )
+        if authorization.decision is not PermissionDecision.ALLOW:
+            outcome.status = "denied"
+            yield emit("error", {
+                "code": ExecutionErrorCode.TOOL_NOT_AUTHORIZED.value,
+                "reason": authorization.reason,
+                "tool": copy.tool_name,
+                "recoverable": False,
+                "message": (
+                    f"工具 {copy.tool_name} 未获冻结策略授权"
+                    f"（{authorization.reason}），未创建 effect。"
+                ),
+                **(extra_meta or {}),
+            })
+            mark_terminal_safe(runs_repo, run_id, "error")
+            return
     existing_effect = runs_repo.get_effect(effect_key)
 
     # Executing: distinguish a live concurrent executor from a crashed one.
@@ -797,6 +868,10 @@ async def drive_effect(
             outcome.preserve_sandbox = True
             yield emit("error", {
                 "code": "effect_in_flight",
+                # Ticket 10: stable shared-contract code for a duplicate
+                # executor on a live claim (additive, clients keep reading
+                # ``effect_in_flight``).
+                "boundary_code": ExecutionErrorCode.DUPLICATE_EFFECT.value,
                 "message": copy.in_flight_message,
             })
             return
@@ -827,7 +902,7 @@ async def drive_effect(
             yield emit("tool_call", {
                 "tool": copy.tool_name,
                 "args": tool_args,
-                **_effect_meta(effect_key, external_idempotency_key),
+                **_effect_meta(effect_key, external_idempotency_key, extra_meta),
             })
         err_code, err_message = _failed_effect_public_error(copy, reason)
         yield emit("tool_result", {
@@ -867,13 +942,13 @@ async def drive_effect(
                 yield emit("tool_call", {
                     "tool": copy.tool_name,
                     "args": tool_args,
-                    **_effect_meta(effect_key, external_idempotency_key),
+                    **_effect_meta(effect_key, external_idempotency_key, extra_meta),
                 })
             try:
                 yield publish(
                     "tool_result",
                     copy.ok_tool_result(stored, tool_args)
-                    | {"effect_id": effect_key},
+                    | {"effect_id": effect_key, **(extra_meta or {})},
                 )
             except Exception:
                 logger.exception(
@@ -930,7 +1005,7 @@ async def drive_effect(
                     yield publish(
                         "tool_result",
                         copy.ok_tool_result(stored, tool_args)
-                        | {"effect_id": effect_key},
+                        | {"effect_id": effect_key, **(extra_meta or {})},
                     )
                 except Exception:
                     logger.exception(
@@ -980,6 +1055,9 @@ async def drive_effect(
                 outcome.preserve_sandbox = True
                 yield emit("error", {
                     "code": "effect_in_flight",
+                    # Ticket 10: duplicate executor on a live claim keeps
+                    # the stable contract code additively.
+                    "boundary_code": ExecutionErrorCode.DUPLICATE_EFFECT.value,
                     "message": copy.in_flight_message,
                 })
             return
@@ -998,7 +1076,7 @@ async def drive_effect(
         yield emit("tool_call", {
             "tool": copy.tool_name,
             "args": tool_args,
-            **_effect_meta(effect_key, external_idempotency_key),
+            **_effect_meta(effect_key, external_idempotency_key, extra_meta),
         })
         try:
             result = execute_claimed(claim, execute)
@@ -1146,7 +1224,8 @@ async def drive_effect(
         try:
             yield publish(
                 "tool_result",
-                copy.ok_tool_result(result, tool_args) | {"effect_id": effect_key},
+                copy.ok_tool_result(result, tool_args)
+                | {"effect_id": effect_key, **(extra_meta or {})},
             )
         except Exception:
             # External op + ledger committed, but the success event is
@@ -1589,6 +1668,108 @@ class RunOrchestrator:
         self._sandbox_cleanup = sandbox_cleanup
         self._gate_factory = gate_factory
 
+    def _run_terminal_cleanup(
+        self,
+        computer: Computer,
+        workspace_path: str,
+        runs_repo: RunRepository | None,
+        run_id: str | None,
+    ) -> None:
+        """Idempotent terminal sandbox cleanup (BCDEF ticket 07).
+
+        Runs the injected cleanup hook, records ``cleanup_status`` on the
+        lease, and — when the cleanup fails — creates a durable janitor
+        work item carrying the run/lease/effect/sandbox evidence needed
+        for a retry. The retry MUST reuse the same workspace/lease: no
+        new sandbox is ever created here or by the janitor.
+
+        A repeated call after a successful cleanup is a no-op. Cleanup
+        bookkeeping failures are logged and never change the terminal
+        that was already emitted.
+        """
+        if runs_repo is not None and run_id is not None:
+            try:
+                existing = runs_repo.get_sandbox_lease(run_id)
+            except Exception:
+                existing = None
+            if (
+                existing is not None
+                and existing.cleanup_status == "succeeded"
+                and existing.status != "active"
+            ):
+                return
+
+        failure_reason: str | None = None
+        try:
+            result = self._sandbox_cleanup(
+                computer, workspace_path, runs_repo, run_id
+            )
+            if isinstance(result, dict) and result.get("status") == "failed":
+                failure_reason = str(
+                    result.get("failure_reason") or "cleanup failed"
+                )
+        except Exception as exc:
+            logger.exception(
+                "run_orchestration: terminal cleanup failed for run_id=%s "
+                "workspace=%s",
+                run_id,
+                workspace_path,
+            )
+            failure_reason = f"cleanup failed: {exc}"
+
+        if runs_repo is None or run_id is None:
+            return
+
+        try:
+            lease = runs_repo.get_sandbox_lease(run_id)
+            if failure_reason is None:
+                runs_repo.record_sandbox_cleanup(run_id, status="succeeded")
+                return
+
+            effect_ids = [
+                effect.resolved_effect_id
+                for effect in runs_repo.list_effects_for_run(run_id)
+            ]
+            evidence = {
+                "run_id": run_id,
+                "lease_id": lease.lease_id if lease is not None else "",
+                "sandbox_type": (
+                    lease.sandbox_type
+                    if lease is not None
+                    else getattr(computer, "sandbox_type", "")
+                ),
+                "workspace_path": workspace_path,
+                "sandbox_identity": (
+                    lease.sandbox_identity if lease is not None else ""
+                ),
+                "fencing_token": lease.fencing_token if lease is not None else 0,
+                "effect_ids": effect_ids,
+                "failure_reason": failure_reason,
+            }
+            task, _created = runs_repo.enqueue_janitor_task(
+                kind="cleanup",
+                run_id=run_id,
+                lease_id=evidence["lease_id"],
+                evidence=evidence,
+                dedupe_key=f"cleanup:{run_id}",
+            )
+            if lease is not None and lease.status == "active":
+                runs_repo.destroy_sandbox_lease(
+                    run_id=run_id, failure_reason=failure_reason
+                )
+            runs_repo.record_sandbox_cleanup(
+                run_id,
+                status="pending_janitor",
+                error=failure_reason,
+                janitor_task_id=task.task_id,
+            )
+        except Exception:
+            logger.exception(
+                "run_orchestration: recording cleanup failure / janitor task "
+                "failed for run_id=%s",
+                run_id,
+            )
+
     def _acquire_sandbox_lease(
         self,
         *,
@@ -1861,6 +2042,9 @@ class RunOrchestrator:
 
         admission = None
         run_started_emitted = False
+        # BCDEF ticket 10: the admission-frozen capability projection used
+        # by every tool authorization for this run.
+        capability_projection: CapabilityProjection | None = None
         try:
             if conversation_forbidden:
                 yield _emit("error", {
@@ -2029,6 +2213,24 @@ class RunOrchestrator:
                     policy_settings = freeze_settings(
                         self._settings, resolved_policy.policy
                     )
+                    # BCDEF ticket 10: project the capability/risk/effect
+                    # surface from the SAME frozen snapshot. Failure here
+                    # is terminal — no model, tool or sandbox work happens
+                    # under an incomplete projection.
+                    capability_projection = build_capability_projection(
+                        resolved_policy.policy,
+                        run_id=run_id or "",
+                        policy_hash_value=resolved_policy.policy_hash,
+                    )
+                except CapabilityProjectionError as exc:
+                    logger.error(
+                        "chat_v2: capability projection failed for run_id=%s: %s",
+                        run_id,
+                        exc,
+                    )
+                    yield _emit("error", exc.to_payload())
+                    mark_terminal_safe(runs_repo, run_id, "error")
+                    return
                 except BoundaryError as exc:
                     logger.error(
                         "chat_v2: policy snapshot unusable for run_id=%s: %s",
@@ -2058,6 +2260,16 @@ class RunOrchestrator:
                     return
             else:
                 stream.conversation_id = conversation_id
+                # No durable policy exists (v2 persistence disabled).
+                # Authorize against the profile the caller handed us so
+                # tools still pass the same single boundary.
+                try:
+                    capability_projection = legacy_capability_projection(
+                        profile, run_id=run_id or ""
+                    )
+                except CapabilityProjectionError as exc:
+                    yield _emit("error", exc.to_payload())
+                    return
 
             # Model failure scenario: no API key configured. The contract
             # requires this to be a terminal ``error`` event, not an HTTP
@@ -2122,6 +2334,7 @@ class RunOrchestrator:
                 async for envelope in self._stream_kernel_turn(
                     req, profile, run_id=run_id, emit=_emit,
                     settings=policy_settings,
+                    projection=capability_projection,
                 ):
                     if is_cancelled(runs_repo, run_id) and not stream.terminal_emitted:
                         yield _emit("cancelled", {
@@ -2142,6 +2355,7 @@ class RunOrchestrator:
                 async for envelope in self._stream_kernel_turn(
                     req, profile, run_id=run_id, emit=_emit,
                     settings=policy_settings,
+                    projection=capability_projection,
                 ):
                     if is_cancelled(runs_repo, run_id) and not stream.terminal_emitted:
                         yield _emit("cancelled", {
@@ -2169,6 +2383,7 @@ class RunOrchestrator:
                 async for envelope in self._stream_artifact_flow(
                     req, profile, run_id=run_id, emit=_emit,
                     settings=policy_settings,
+                    projection=capability_projection,
                 ):
                     yield envelope
                 return
@@ -2184,6 +2399,7 @@ class RunOrchestrator:
                 async for envelope in self._stream_cowork_flow(
                     req, profile, run_id=run_id, emit=_emit,
                     settings=policy_settings,
+                    projection=capability_projection,
                 ):
                     yield envelope
                 return
@@ -2212,6 +2428,7 @@ class RunOrchestrator:
                     req, profile, run_id=run_id, emit=_emit,
                     memory=memory, subject_id=subject_id,
                     settings=policy_settings,
+                    projection=capability_projection,
                 ):
                     yield envelope
             else:
@@ -2274,6 +2491,7 @@ class RunOrchestrator:
         run_id: str | None,
         emit: EmitEnvelope,
         settings: Any | None = None,
+        projection: CapabilityProjection | None = None,
     ) -> AsyncGenerator[EventEnvelope, None]:
         """cowork profile flow.
 
@@ -2316,6 +2534,11 @@ class RunOrchestrator:
         runs_repo = self._runs_repo
         computer = self._computer_factory()
         preserve_sandbox = False
+        if projection is None:
+            projection = legacy_capability_projection(
+                profile, run_id=run_id or ""
+            )
+        projection_meta = projection.event_meta("sandbox_bash")
 
         # Provision sandbox workspace. Fail-closed: any ComputerError → terminal.
         try:
@@ -2349,7 +2572,9 @@ class RunOrchestrator:
             run_id=run_id, computer=computer, workspace_path=workspace_path
         )
         if lease_error is not None:
-            self._sandbox_cleanup(computer, workspace_path, runs_repo, run_id)
+            self._run_terminal_cleanup(
+                computer, workspace_path, runs_repo, run_id
+            )
             yield emit("error", {"code": lease_error, "message": lease_message})
             mark_terminal_safe(runs_repo, run_id, "error")
             return
@@ -2405,16 +2630,19 @@ class RunOrchestrator:
                 })
                 return
 
-            # Ticket 13 AC3 — PermissionGate check BEFORE the approval.
+            # Ticket 13 AC3 — permission check BEFORE the approval.
+            # BCDEF ticket 10: the frozen capability projection (not the
+            # live risk table) decides risk/approval for ``sandbox_bash``,
+            # so a mid-run global config change cannot alter the ladder.
             # sandbox_bash is HIGH risk → needs_approval. The flow pauses
             # the run and emits run.paused as the stream terminal; the
             # sandbox lease is held until the user decides (spec AC4: the
             # same sandbox must be reused when the user approves).
-            gate = PermissionGate()
-            verdict = gate.evaluate(profile, "sandbox_bash", bash_args)
+            verdict = projection.authorize("sandbox_bash", bash_args)
             if verdict.decision == PermissionDecision.DENY:
                 yield emit("error", {
                     "code": "tool_denied",
+                    "reason": verdict.reason,
                     "message": f"工具 sandbox_bash 被拒绝：{verdict.reason}",
                 })
                 mark_terminal_safe(runs_repo, run_id, "error")
@@ -2503,7 +2731,9 @@ class RunOrchestrator:
                     run_id,
                 )
             else:
-                self._sandbox_cleanup(computer, workspace_path, runs_repo, run_id)
+                self._run_terminal_cleanup(
+                    computer, workspace_path, runs_repo, run_id
+                )
 
     # -- artifact flow (Ticket 39, originally Tickets 09 + 10) --
 
@@ -2515,6 +2745,7 @@ class RunOrchestrator:
         run_id: str | None,
         emit: EmitEnvelope,
         settings: Any | None = None,
+        projection: CapabilityProjection | None = None,
     ) -> AsyncGenerator[EventEnvelope, None]:
         """artifact profile flow.
 
@@ -2553,6 +2784,11 @@ class RunOrchestrator:
         """
         runs_repo = self._runs_repo
         computer = self._computer_factory()
+        if projection is None:
+            projection = legacy_capability_projection(
+                profile, run_id=run_id or ""
+            )
+        projection_meta = projection.event_meta("generate_pdf")
 
         # Spec AC4: when evidence persistence fails inside the host
         # export, the sandbox MUST be preserved so operators can recover
@@ -2593,7 +2829,9 @@ class RunOrchestrator:
             run_id=run_id, computer=computer, workspace_path=workspace_path
         )
         if lease_error is not None:
-            self._sandbox_cleanup(computer, workspace_path, runs_repo, run_id)
+            self._run_terminal_cleanup(
+                computer, workspace_path, runs_repo, run_id
+            )
             yield emit("error", {"code": lease_error, "message": lease_message})
             mark_terminal_safe(runs_repo, run_id, "error")
             return
@@ -2610,28 +2848,85 @@ class RunOrchestrator:
             # Ticket 11 — PermissionGate check BEFORE tool_call.
             # Spec AC3: "approval.required 后 graph 持久 interrupt，并以
             # run.paused 结束当前流；工具在批准前没有副作用".
-            # The gate evaluates ``generate_pdf`` (HIGH risk) → needs_approval.
-            # We persist the approval row, emit ``approval.required`` + the
-            # ``run.paused`` stream terminal, mark the run paused, and return
-            # WITHOUT destroying the sandbox (spec AC4: the same sandbox must
-            # be reused when the user approves).
-            gate = self._gate_factory() if self._gate_factory else PermissionGate()
-            verdict = gate.evaluate(
-                profile, "generate_pdf", {"filename": _ARTIFACT_FILENAME}
-            )
+            # BCDEF ticket 10: the frozen capability projection (not live
+            # config) decides risk/approval for ``generate_pdf``. An
+            # explicitly injected legacy gate factory (test seam) keeps
+            # its override; production wiring no longer supplies one.
+            if self._gate_factory is not None:
+                verdict = self._gate_factory().evaluate(
+                    profile, "generate_pdf", {"filename": _ARTIFACT_FILENAME}
+                )
+            else:
+                verdict = projection.authorize(
+                    "generate_pdf", {"filename": _ARTIFACT_FILENAME}
+                )
             if verdict.decision == PermissionDecision.DENY:
                 yield emit("error", {
                     "code": "tool_denied",
+                    "reason": verdict.reason,
                     "message": f"工具 generate_pdf 被拒绝：{verdict.reason}",
                 })
                 mark_terminal_safe(runs_repo, run_id, "error")
                 return
+
+            # BCDEF ticket 07 — draft BEFORE the pause, resume from the fact.
+            # The approved tool must execute from a DURABLE fact, so the plan
+            # is drafted here, before ``approval.required`` is persisted:
+            # the resume continues the effect from
+            # ``approvals.prepared_content`` and NEVER re-runs the model
+            # (spec 03: the model is not a repair mechanism, and spec 04:
+            # approval only advances the same run). A client reconnecting to
+            # an already-paused run reuses the stored draft instead of
+            # spending a second model turn.
+            approval_id = compute_approval_id(
+                run_id=run_id or req.request_id,
+                tool_name="generate_pdf",
+                args={"filename": _ARTIFACT_FILENAME},
+            )
+            existing_approval = (
+                runs_repo.get_approval(approval_id)
+                if runs_repo is not None
+                and verdict.decision == PermissionDecision.NEEDS_APPROVAL
+                else None
+            )
+            prepared_plan = (
+                existing_approval.prepared_content
+                if existing_approval is not None
+                else None
+            )
+
+            # Ticket 30: the hiking-plan content is generated by the REAL
+            # UniHarness model loop (see the method docstring).
+            from agent_v2.kernel import KernelModelFailure
+
+            if prepared_plan is not None:
+                plan_text, plan_audit_entries = prepared_plan, []
+            else:
+                # In-workspace read/write are kernel-governed self-service ops
+                # (hard boundary = workspace chdir + path guard + env isolation);
+                # the product policy ladder re-enters at generate_pdf/export below.
+                try:
+                    plan_text, plan_audit_entries = await _kernel_plan_turn(
+                        kernel_turn=self._kernel_turn,
+                        settings=settings if settings is not None else self._settings,
+                        checkpoint_store=self._kernel_checkpoints,
+                        computer=computer,
+                        workspace_path=workspace_path,
+                        message=req.message,
+                        run_id=run_id,
+                        lease_guard=lease_guard,
+                        projection=projection,
+                    )
+                except KernelModelFailure as exc:
+                    yield emit("error", {"code": exc.code, "message": exc.message})
+                    mark_terminal_safe(runs_repo, run_id, "error")
+                    return
+            plan_content = plan_text
+
+            for payload in _tool_result_payloads(plan_audit_entries):
+                yield emit("tool_result", payload)
+
             if verdict.decision == PermissionDecision.NEEDS_APPROVAL:
-                approval_id = compute_approval_id(
-                    run_id=run_id or req.request_id,
-                    tool_name="generate_pdf",
-                    args={"filename": _ARTIFACT_FILENAME},
-                )
                 created_at = _now_iso()
                 expires_at = compute_expiry(created_at)
                 impact = "生成徒步计划 PDF 并导出到宿主存储"
@@ -2647,6 +2942,7 @@ class RunOrchestrator:
                             impact=impact,
                             created_at=created_at,
                             expires_at=expires_at,
+                            prepared_content=plan_content,
                         )
                     except Exception:
                         # Duplicate insert (same run/tool/args) is expected
@@ -2696,36 +2992,10 @@ class RunOrchestrator:
                 preserve_sandbox = True
                 return
 
-            # Ticket 30: the hiking-plan content is generated by the REAL
-            # UniHarness model loop (see the method docstring).
-            from agent_v2.kernel import KernelModelFailure
-
-            # In-workspace read/write are kernel-governed self-service ops
-            # (hard boundary = workspace chdir + path guard + env isolation);
-            # the product policy ladder re-enters at generate_pdf/export below.
-            try:
-                plan_text, plan_audit_entries = await _kernel_plan_turn(
-                    kernel_turn=self._kernel_turn,
-                    settings=settings if settings is not None else self._settings,
-                    checkpoint_store=self._kernel_checkpoints,
-                    computer=computer,
-                    workspace_path=workspace_path,
-                    message=req.message,
-                    run_id=run_id,
-                    lease_guard=lease_guard,
-                )
-            except KernelModelFailure as exc:
-                yield emit("error", {"code": exc.code, "message": exc.message})
-                mark_terminal_safe(runs_repo, run_id, "error")
-                return
-
-            for payload in _tool_result_payloads(plan_audit_entries):
-                yield emit("tool_result", payload)
-
-            plan_content = plan_text
             yield emit("tool_call", {
                 "tool": "generate_pdf",
                 "args": {"filename": _ARTIFACT_FILENAME},
+                **projection_meta,
             })
 
             # Generate PDF inside sandbox. Fail-closed: timeout/error → terminal.
@@ -2792,6 +3062,7 @@ class RunOrchestrator:
                 "status": "ok",
                 "content": f"已在沙箱中生成 {relative_path}",
                 "path": relative_path,
+                **projection_meta,
             })
 
             # Cancel check before artifact_candidate.
@@ -2892,7 +3163,9 @@ class RunOrchestrator:
                     run_id,
                 )
             else:
-                self._sandbox_cleanup(computer, workspace_path, runs_repo, run_id)
+                self._run_terminal_cleanup(
+                    computer, workspace_path, runs_repo, run_id
+                )
 
     # -- resume flow (Ticket 40, originally Ticket 11/13 adapter code) --
     #
@@ -3165,7 +3438,12 @@ class RunOrchestrator:
         try:
             resolved_policy = runs_repo.resolve_policy_snapshot(run_id)
             resolved_policy.profile()  # capability reconstruction must succeed
-            policy_settings = freeze_settings(self._settings, resolved_policy.policy)
+            # BCDEF ticket 07: the continuation executes from durable facts
+            # (the drafted plan, the approved args, the ledger), so the
+            # adapted settings are re-derived here only as a fail-closed
+            # REVALIDATION of policy identity — never to re-resolve the
+            # current default profile, model or capability.
+            freeze_settings(self._settings, resolved_policy.policy)
         except BoundaryError as exc:
             logger.error(
                 "run_orchestration: policy snapshot unusable during resume "
@@ -3194,6 +3472,26 @@ class RunOrchestrator:
                 "next_action": "janitor",
                 "message": "运行策略快照读取失败，已停止执行，等待 janitor 处理。",
             })
+            mark_terminal_safe(runs_repo, run_id, "error")
+            return
+
+        # BCDEF ticket 10: the resume authorizes against the SAME frozen
+        # snapshot — never current config. An incomplete projection is
+        # terminal before any effect/lease/sandbox work.
+        try:
+            resume_projection = build_capability_projection(
+                resolved_policy.policy,
+                run_id=run_id,
+                policy_hash_value=resolved_policy.policy_hash,
+            )
+        except CapabilityProjectionError as exc:
+            logger.error(
+                "run_orchestration: capability projection failed during "
+                "resume for run_id=%s: %s",
+                run_id,
+                exc,
+            )
+            yield emit("error", exc.to_payload())
             mark_terminal_safe(runs_repo, run_id, "error")
             return
 
@@ -3417,6 +3715,7 @@ class RunOrchestrator:
                     all_events=all_events,
                     run=run,
                     snapshot=snapshot,
+                    projection=resume_projection,
                 ):
                     yield envelope
                 # 助手因"并发在飞"退出时 effect 仍为 executing —— 保留沙箱与
@@ -3455,36 +3754,22 @@ class RunOrchestrator:
                     user_message = msg.get("content", "")
                     break
 
-            # Ticket 04: the approved export must render the PLAN, not the
-            # raw user message. The first stream pauses at the permission
-            # gate BEFORE the kernel turn, so at pause time no plan exists
-            # yet — generate it here through the same kernel seam as the
-            # first stream. Fail closed on kernel failure; skip the turn
-            # entirely when the tool already executed (idempotent resume).
-            plan_content = user_message
-            if not has_tool_result_ok:
-                from agent_v2.kernel import KernelModelFailure
-
-                try:
-                    plan_text, plan_audit_entries = await _kernel_plan_turn(
-                        kernel_turn=self._kernel_turn,
-                        settings=policy_settings,  # ticket 09: adapted frozen policy
-                        checkpoint_store=self._kernel_checkpoints,
-                        computer=computer,
-                        workspace_path=workspace_path,
-                        message=user_message,
-                        run_id=run_id,
-                        lease_guard=lease_guard,
-                    )
-                except KernelModelFailure as exc:
-                    yield emit("error", {"code": exc.code, "message": exc.message})
-                    mark_terminal_safe(runs_repo, run_id, "error")
-                    return
-
-                for payload in _tool_result_payloads(plan_audit_entries):
-                    yield emit("tool_result", payload)
-
-                plan_content = plan_text
+            # BCDEF ticket 07: the approved export renders the plan drafted
+            # and persisted BEFORE the pause (``approvals.prepared_content``,
+            # written by the artifact flow at admission time). The resume is
+            # a CONTINUATION of durable facts, so the model is never re-run
+            # here (spec 03/04) — a legacy paused row without a draft falls
+            # back to the persisted user turn, deterministically, and still
+            # never calls the kernel. Skip the whole step when the tool
+            # already executed (idempotent resume).
+            plan_content = resolved.prepared_content or user_message
+            if not has_tool_result_ok and resolved.prepared_content is None:
+                logger.warning(
+                    "run_orchestration: paused run %s has no prepared plan "
+                    "draft (legacy row); continuing from the persisted user "
+                    "turn without calling the model",
+                    run_id,
+                )
 
             def _execute_pdf() -> dict[str, Any]:
                 # Ticket 06: heartbeat + revalidate the fenced lease right
@@ -3515,9 +3800,11 @@ class RunOrchestrator:
                 post_execute_check=lease_guard.assert_active,
                 lease_id=lease.lease_id,
                 fencing_token=lease.fencing_token,
+                projection=resume_projection,
+                approval_granted=True,
             ):
                 yield envelope
-            if outcome.status in ("failed", "outcome_unknown", "in_flight"):
+            if outcome.status in ("failed", "outcome_unknown", "in_flight", "denied"):
                 if outcome.preserve_sandbox:
                     preserve_sandbox = True
                 return
@@ -3657,7 +3944,9 @@ class RunOrchestrator:
                     run_id,
                 )
             else:
-                self._sandbox_cleanup(computer, workspace_path, runs_repo, run_id)
+                self._run_terminal_cleanup(
+                    computer, workspace_path, runs_repo, run_id
+                )
 
     async def _resume_cowork_bash_steps(
         self,
@@ -3679,6 +3968,7 @@ class RunOrchestrator:
         all_events: list[dict[str, Any]],
         run: RunSnapshot,
         snapshot: RunSnapshot | None,
+        projection: CapabilityProjection | None = None,
     ) -> AsyncGenerator[EventEnvelope, None]:
         """Resume steps for the cowork ``sandbox_bash`` tool (Ticket 13).
 
@@ -3750,9 +4040,11 @@ class RunOrchestrator:
             post_execute_check=lease_guard.assert_active,
             lease_id=lease.lease_id,
             fencing_token=lease.fencing_token,
+            projection=projection,
+            approval_granted=True,
         ):
             yield envelope
-        if outcome.status in ("failed", "outcome_unknown", "in_flight"):
+        if outcome.status in ("failed", "outcome_unknown", "in_flight", "denied"):
             return
 
         recovered_result = outcome.stored_result
@@ -3863,12 +4155,39 @@ class RunOrchestrator:
         if approval is None:
             return ApprovalDecisionOutcome(status="approval_not_found", payload={})
 
-        # AC5: idempotent duplicate (same decision_request_id) → return existing
+        target_status = "approved" if decision == "approve" else "rejected"
+
+        # AC5: idempotent duplicate (same decision_request_id AND the same
+        # decision) → return the existing outcome without touching anything.
         if (
             approval.decision_request_id is not None
             and approval.decision_request_id == decision_request_id
             and approval.is_terminal
         ):
+            if approval.status != target_status:
+                # BCDEF ticket 07 (spec 06): one approval key admits ONE
+                # decision. A contradictory decision under the same
+                # request id keeps the ORIGINAL result and returns a
+                # stable conflict — no state change, no second transition,
+                # and the run is never advanced twice.
+                return ApprovalDecisionOutcome(
+                    status="decision_conflict",
+                    payload={
+                        "code": "decision_conflict",
+                        "approval_id": approval_id,
+                        "run_id": approval.run_id,
+                        "reason": "decision_conflict",
+                        "requested_decision": (
+                            "approve" if target_status == "approved" else "reject"
+                        ),
+                        "current_status": approval.status,
+                        "decision_request_id": decision_request_id,
+                        "message": (
+                            f"同一审批已记录为 {approval.status}，"
+                            "相反的决定不会被应用；原结果保持不变。"
+                        ),
+                    },
+                )
             return ApprovalDecisionOutcome(
                 status="idempotent",
                 payload=self._decision_payload(approval, idempotent=True),
@@ -4003,7 +4322,6 @@ class RunOrchestrator:
         # Persist the decision. resolve_approval raises RunAlreadyTerminal
         # if the approval was resolved by a concurrent request between our
         # ``get_approval`` and this call — surface as 409 already_resolved.
-        target_status = "approved" if decision == "approve" else "rejected"
         try:
             resolved = runs_repo.resolve_approval(
                 approval_id=approval_id,
@@ -4139,9 +4457,14 @@ class RunOrchestrator:
         memory: Any | None = None,
         subject_id: str | None = None,
         settings: Any | None = None,
+        projection: CapabilityProjection | None = None,
     ) -> AsyncGenerator[EventEnvelope, None]:
         """Shared T26/T28/T29 kernel turn used by chat and route_plan profiles."""
         kernel_settings = settings if settings is not None else self._settings
+        if projection is None:
+            projection = legacy_capability_projection(
+                profile, run_id=run_id or ""
+            )
         from agent_v2.kernel import KernelModelFailure
         from agent_v2.kernel_tools import (
             build_chat_extra_tools,
@@ -4153,8 +4476,10 @@ class RunOrchestrator:
         audit_entries: list[dict[str, Any]] = []
         mcp_servers: dict[str, Any] = {}
         mcp_required = getattr(profile, "allowed_mcp_servers", None)
-        if mcp_required:
-            mcp_servers, mcp_audits = build_profile_mcp_servers(profile, kernel_settings)
+        if mcp_required or projection.mcp_services:
+            mcp_servers, mcp_audits = build_profile_mcp_servers(
+                profile, kernel_settings, projection=projection
+            )
             if not mcp_servers:
                 # Every allowlisted evidence source is unavailable → fail
                 # closed instead of fabricating a plan (Ticket 29 AC5).
@@ -4165,6 +4490,34 @@ class RunOrchestrator:
                 mark_terminal_safe(self._runs_repo, run_id, "error")
                 return
             audit_entries.extend(mcp_audits)
+            # BCDEF ticket 10: replayable discovery/describe evidence for
+            # every frozen MCP service. Lazy discovery may describe these
+            # schemas later, but it can never widen the projected set.
+            for service in projection.mcp_services:
+                if service.server_id not in mcp_servers:
+                    continue
+                discovery = projection.discover_mcp_tools(
+                    service.server_id, service.tools
+                )
+                payload: dict[str, Any] = {
+                    "tool": f"mcp__{service.server_id}__discovery",
+                    "status": "ok",
+                    "source": "mcp",
+                    "server_id": service.server_id,
+                    "discovered_tools": [
+                        entry["tool"] for entry in discovery.discovered
+                    ],
+                    "denied_tools": [
+                        entry["tool"] for entry in discovery.denied
+                    ],
+                    "capability_ids": [
+                        entry["capability_id"] for entry in discovery.discovered
+                    ],
+                    "policy_hash": projection.policy_hash,
+                    "projection_hash": projection.projection_hash,
+                    "run_id": run_id or "",
+                }
+                yield emit("tool_result", payload)
 
         try:
             extra_tools = build_chat_extra_tools(
@@ -4173,11 +4526,13 @@ class RunOrchestrator:
                 audit_sink=audit_entries.append,
                 memory_service=memory,
                 subject_id=subject_id,
+                projection=projection,
             )
             kernel_gate = build_chat_kernel_gate(
                 profile,
                 run_id=run_id,
                 audit_sink=audit_entries.append,
+                projection=projection,
             ) if extra_tools or mcp_servers else None
 
             # Ticket 33: fixed bounded subagent definitions — only roles
@@ -4343,9 +4698,22 @@ class RunOrchestrator:
             elif entry.get("phase") == "denied":
                 payload["status"] = "denied"
                 payload["reason"] = entry.get("code")
+            elif entry.get("phase") == "authorized":
+                payload["status"] = "authorized"
             else:
                 payload["status"] = "ok" if entry.get("ok") else str(entry.get("code") or "error")
                 payload["duration_ms"] = entry.get("duration_ms")
+            # BCDEF ticket 10: MCP execute/authorization evidence carries
+            # the run/policy/projection/capability binding additively.
+            for key in (
+                "capability_id",
+                "policy_hash",
+                "projection_hash",
+                "run_id",
+                "source",
+            ):
+                if entry.get(key):
+                    payload[key] = entry[key]
             # A08: the MCP source keeps its audit field name (server_id).
             # The old ``server`` rename made the field vanish for the
             # frontend, which reads server_id — "which source is down"

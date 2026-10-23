@@ -46,7 +46,7 @@ from agent_v2.persistence import (
     PolicySnapshotWrite,
 )
 from agent_v2.profiles import resolve_profile
-from agent_v2.run_orchestration import RunOrchestrator
+from agent_v2.run_orchestration import ChatFlowRequest, RunOrchestrator
 from agent_v2.runs import RunRepository
 from agent_v2.policy_adapters import (
     NATIVE_POLICY_SCHEMA_VERSION,
@@ -65,6 +65,9 @@ TERMINALS = {"error", "done", "cancelled", "run.paused"}
 LEGACY_VERSION = 0
 ADAPTER_ID = "policy_snapshot_v0_to_v1"
 FIXED_NOW = "2026-10-01T00:00:00+00:00"
+# The durable plan drafted at admission time (BCDEF ticket 07): the resume
+# renders THIS, never a re-run of the model.
+DRAFT = "# 徒步计划\n占位正文。"
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +283,9 @@ class _FakeComputer:
         self.cleaned: list[str] = []
         self.pdfs: list[tuple[str, str, str]] = []
 
+    def create_workspace(self, run_id: str) -> str:
+        return f"/ws/{run_id}"
+
     def generate_pdf(self, workspace_path: str, content: str, filename: str) -> str:
         self.pdfs.append((workspace_path, content, filename))
         return filename
@@ -382,6 +388,7 @@ def _paused_artifact_run(
     row_version: int = EXECUTION_SCHEMA_VERSION,
     stored_hash: str | None = None,
     seed_policy: bool = True,
+    prepared_content: str | None = DRAFT,
 ) -> str:
     run_id, _created = repo.create_run_idempotent(
         request_id=request_id,
@@ -415,6 +422,7 @@ def _paused_artifact_run(
         impact="生成徒步计划 PDF 并导出到宿主存储",
         created_at=_now_iso(),
         expires_at=compute_expiry(_now_iso()),
+        prepared_content=prepared_content,
     )
     repo.resolve_approval(
         approval_id=approval_id,
@@ -448,12 +456,20 @@ def test_native_resume_uses_frozen_policy_not_current_config(tmp_path):
     items = _stream_resume(orch, run_id)
 
     assert items[-1].type == "done"
-    assert counters["kernel"] == 1
+    # BCDEF ticket 07: the resume is a continuation of durable facts. The
+    # model ran once, at admission, under the frozen policy; the resume
+    # calls it ZERO times, so a mutated current config cannot leak into
+    # the approved effect at all.
+    assert counters["kernel"] == 0
     assert counters["sandbox"] == 1
     assert counters["export"] == 1
     assert counters["cleanup"] == 1
-    assert counters["kernel_settings"][0].openai_model == "frozen-model"
     assert len(computer.pdfs) == 1
+    # The exported PDF renders the durable draft, not the current config.
+    assert computer.pdfs[0][1] == DRAFT
+    assert "mutated-model" not in json.dumps(
+        [e.payload for e in items], ensure_ascii=False
+    )
     assert all(e.run_id == run_id for e in items)
     assert all(e.conversation_id == "conv-req-native" for e in items)
 
@@ -470,7 +486,67 @@ def test_native_resume_uses_frozen_policy_not_current_config(tmp_path):
     )
 
 
-# ---- legacy snapshot resume through the adapter ---------------------------
+# ---- admission draft runs under the frozen policy; resume never re-runs it --
+
+
+def test_model_runs_under_frozen_policy_at_admission_only(tmp_path):
+    """End-to-end form of "current config cannot reach the resumed run".
+
+    The only model turn is the admission draft, and it receives the
+    settings frozen from the admission-time policy. A second orchestrator
+    built on MUTATED current config then advances the same run through the
+    decision + resume: zero model calls, and the approved effect still
+    renders the durable draft.
+    """
+    repo = _repo(tmp_path)
+    counters = _counters()
+    admitting, _computer = _orchestrator(repo, counters, openai_model="frozen-model")
+
+    req = ChatFlowRequest(
+        message="规划杭州两日徒步并出 PDF 计划",
+        request_id="req-draft-at-admission",
+        profile_id="artifact",
+    )
+
+    async def drive() -> list[Any]:
+        return [item async for item in admitting.stream_chat(req)]
+
+    paused = asyncio.run(drive())
+    assert paused[-1].type == "run.paused"
+
+    # The plan was drafted BEFORE the pause, under the frozen policy.
+    assert counters["kernel"] == 1
+    assert counters["kernel_settings"][0].openai_model == "frozen-model"
+
+    run_row = repo.control.get_run_by_request("req-draft-at-admission")
+    assert run_row is not None
+    approval = repo.list_pending_approvals_for_run(run_row.run_id)[0]
+    assert approval.prepared_content == DRAFT
+
+    # Current config mutates after admission; the resume sees neither it
+    # nor any model call at all.
+    later_counters = _counters()
+    resumed, computer = _orchestrator(
+        repo, later_counters, openai_model="mutated-model"
+    )
+    decision = resumed.resolve_approval_decision(
+        approval.approval_id, decision="approve", decision_request_id="dec-draft"
+    )
+    assert decision.status == "recorded"
+    items = _stream_resume(resumed, run_row.run_id)
+
+    assert items[-1].type == "done"
+    assert later_counters["kernel"] == 0
+    assert len(computer.pdfs) == 1
+    assert computer.pdfs[0][1] == DRAFT
+    assert "mutated-model" not in json.dumps(
+        [e.payload for e in items], ensure_ascii=False
+    )
+    # Still ONE run, ONE lease, ONE approval, ONE effect.
+    assert repo.control.get_run_by_request("req-draft-at-admission").run_id == (
+        run_row.run_id
+    )
+    assert len(repo.list_effects_for_run(run_row.run_id)) == 1
 
 
 def test_legacy_snapshot_resume_adapts_and_preserves_original_mapping(tmp_path):
@@ -504,12 +580,20 @@ def test_legacy_snapshot_resume_adapts_and_preserves_original_mapping(tmp_path):
     ]
     assert types[-1] == "done"
 
-    # Resume executed with the ADAPTED frozen values, never current config.
-    assert counters["kernel"] == 1
+    # BCDEF ticket 07: the adaptation revalidates the frozen policy IDENTITY
+    # before any continuation, and the continuation itself runs from durable
+    # facts — the model is never re-run, so no current value can be read.
+    assert counters["kernel"] == 0
     assert counters["sandbox"] == 1
-    frozen_settings = counters["kernel_settings"][0]
-    assert frozen_settings.openai_model == "legacy-model"
-    assert frozen_settings.agent_v2_thoughts_enabled is False
+    assert len(computer.pdfs) == 1
+    assert computer.pdfs[0][1] == DRAFT
+    assert "current-model" not in json.dumps(
+        [e.payload for e in items], ensure_ascii=False
+    )
+    adapted = repo.resolve_policy_snapshot(run_id)
+    assert adapted.policy["model"]["main_model"] == "legacy-main"
+    assert adapted.policy["model"]["provider_model"] == "legacy-model"
+    assert adapted.policy["lifecycle"]["thoughts_enabled"] is False
     assert len(computer.pdfs) == 1
     assert all(e.run_id == run_id for e in items)
 
@@ -694,7 +778,9 @@ def test_repeated_legacy_resume_does_not_repeat_model_effect_or_sandbox(tmp_path
     assert second[-1].type == "done"
     assert [e.sequence for e in second] == [e.sequence for e in first]
     assert len(events_after_second) == len(events_after_first)
-    assert counters["kernel"] == counters_after_first["kernel"] == 1
+    # Ticket 07: the model is not part of a resume at all, so a repeated
+    # resume cannot repeat it either; sandbox/export/cleanup stay at one.
+    assert counters["kernel"] == counters_after_first["kernel"] == 0
     assert counters["sandbox"] == counters_after_first["sandbox"] == 1
     assert counters["export"] == counters_after_first["export"] == 1
     assert counters["cleanup"] == counters_after_first["cleanup"] == 1

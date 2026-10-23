@@ -35,6 +35,8 @@ from agent_v2.execution_contract import (
     compute_gap,
     policy_hash,
 )
+from agent_v2.effect_repair import effect_known_facts, effect_unknown_part
+from agent_v2.effects import repair_age_seconds, repair_next_action
 from agent_v2.execution_policy import (
     ResolvedPolicySnapshot,
     profile_from_policy,
@@ -53,6 +55,7 @@ from agent_v2.persistence import (
     ControlStore,
     EffectRecord,
     FinalizeRecord,
+    JanitorTaskRecord,
     PolicySnapshotRecord,
     PolicySnapshotWrite,
     RunAlreadyTerminal,
@@ -129,6 +132,10 @@ class RunSnapshot:
     # restore the approval prompt even when the event replay starts
     # after the approval frame. Additive — old clients ignore it.
     pending_approvals: list[dict[str, Any]] = field(default_factory=list)
+    # BCDEF ticket 10: additive projection summary of the frozen policy —
+    # policy hash, capability ids/count, MCP services, risk/approval
+    # policy. None when the run has no projectable frozen snapshot.
+    capability_projection: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -835,6 +842,80 @@ class RunRepository:
             failure_reason=failure_reason,
         )
 
+    def record_sandbox_cleanup(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        error: str | None = None,
+        janitor_task_id: str | None = None,
+    ) -> SandboxLeaseRecord | None:
+        """Record the terminal cleanup outcome (BCDEF ticket 07)."""
+        return self.control.record_sandbox_cleanup(
+            run_id,
+            status=status,
+            error=error,
+            janitor_task_id=janitor_task_id,
+        )
+
+    # -- janitor work items (BCDEF ticket 07) --------------------------
+
+    def enqueue_janitor_task(
+        self,
+        *,
+        kind: str,
+        evidence: dict[str, Any] | None = None,
+        run_id: str = "",
+        lease_id: str = "",
+        effect_id: str = "",
+        dedupe_key: str | None = None,
+        task_id: str | None = None,
+    ) -> tuple[JanitorTaskRecord, bool]:
+        return self.control.enqueue_janitor_task(
+            kind=kind,
+            evidence=evidence,
+            run_id=run_id,
+            lease_id=lease_id,
+            effect_id=effect_id,
+            dedupe_key=dedupe_key,
+            task_id=task_id,
+        )
+
+    def get_janitor_task(self, task_id: str) -> JanitorTaskRecord | None:
+        return self.control.get_janitor_task(task_id)
+
+    def list_janitor_tasks(
+        self,
+        *,
+        status: str | None = None,
+        kind: str | None = None,
+        limit: int = 100,
+    ) -> list[JanitorTaskRecord]:
+        return self.control.list_janitor_tasks(
+            status=status, kind=kind, limit=limit
+        )
+
+    def claim_janitor_task(
+        self, task_id: str, *, owner: str
+    ) -> tuple[JanitorTaskRecord | None, bool]:
+        return self.control.claim_janitor_task(task_id, owner=owner)
+
+    def complete_janitor_task(
+        self,
+        task_id: str,
+        *,
+        owner: str = "",
+        result: dict[str, Any] | None = None,
+    ) -> tuple[JanitorTaskRecord | None, bool]:
+        return self.control.complete_janitor_task(
+            task_id, owner=owner, result=result
+        )
+
+    def fail_janitor_task(
+        self, task_id: str, error: str, *, owner: str = ""
+    ) -> tuple[JanitorTaskRecord | None, bool]:
+        return self.control.fail_janitor_task(task_id, error, owner=owner)
+
     # -- artifacts (Ticket 10) -----------------------------------------
 
     def insert_artifact(
@@ -969,12 +1050,17 @@ class RunRepository:
         impact: str,
         created_at: str,
         expires_at: str,
+        prepared_content: str | None = None,
     ) -> ApprovalRecord:
         """Persist a new approval row in ``pending`` status (spec AC2).
 
         Delegates to :class:`ControlStore`. The approval id is computed
         deterministically in :mod:`agent_v2.approvals`; the DB UNIQUE
         constraint catches duplicate inserts at the layer of truth.
+
+        BCDEF ticket 07: ``prepared_content`` is the tool input drafted
+        BEFORE the pause (the plan text for ``generate_pdf``). Resume
+        reads it instead of re-running the model.
         """
         return self.control.insert_approval(
             approval_id=approval_id,
@@ -986,6 +1072,7 @@ class RunRepository:
             impact=impact,
             created_at=created_at,
             expires_at=expires_at,
+            prepared_content=prepared_content,
         )
 
     def get_approval(self, approval_id: str) -> ApprovalRecord | None:
@@ -1150,6 +1237,66 @@ class RunRepository:
         """Fence a committed effect whose success event could not persist."""
         return self.control.mark_effect_publication_failed(
             effect_key, reason, claim_token=claim_token
+        )
+
+    # -- effect repair (BCDEF ticket 05) -------------------------------
+
+    def get_effect_by_effect_id(self, effect_id: str) -> EffectRecord | None:
+        return self.control.get_effect_by_effect_id(effect_id)
+
+    def claim_effect_repair(
+        self,
+        effect_key: str,
+        *,
+        owner: str,
+    ) -> tuple[EffectRecord | None, bool]:
+        """CAS-claim the reconciliation of an ``outcome_unknown`` effect."""
+        return self.control.claim_effect_repair(effect_key, owner=owner)
+
+    def complete_effect_repair(
+        self,
+        effect_key: str,
+        result_json: str,
+        *,
+        request_id: str = "",
+        actor: str = "",
+    ) -> tuple[EffectRecord | None, bool]:
+        """CAS-commit the operator-confirmed result on the original row."""
+        return self.control.complete_effect_repair(
+            effect_key,
+            result_json,
+            request_id=request_id,
+            actor=actor,
+        )
+
+    def abandon_effect_repair(
+        self,
+        effect_key: str,
+        *,
+        request_id: str = "",
+        actor: str = "",
+        reason: str = "",
+    ) -> tuple[EffectRecord | None, bool]:
+        """Fail-closed repair decision; the effect stays ``outcome_unknown``."""
+        return self.control.abandon_effect_repair(
+            effect_key,
+            request_id=request_id,
+            actor=actor,
+            reason=reason,
+        )
+
+    def fail_effect_repair(self, effect_key: str, error: str) -> EffectRecord | None:
+        return self.control.fail_effect_repair(effect_key, error)
+
+    def revert_effect_repair(
+        self,
+        effect_key: str,
+        error: str,
+        *,
+        request_id: str = "",
+    ) -> EffectRecord | None:
+        return self.control.revert_effect_repair(
+            effect_key, error, request_id=request_id
         )
 
     # -- events ---------------------------------------------------------
@@ -1689,6 +1836,24 @@ class RunRepository:
             policy_provenance = description["policy_provenance"]
             policy_failure = description["policy_failure"]
 
+        # BCDEF ticket 10: expose the frozen policy's projection summary
+        # additively for snapshot/replay consumers. A read-only snapshot
+        # must never fail because of a projection problem — the execution
+        # paths fail closed separately; here the summary is simply omitted.
+        capability_projection: dict[str, Any] | None = None
+        if policy_snapshot is not None and policy_failure is None:
+            try:
+                from agent_v2.capability_projection import (
+                    build_capability_projection,
+                )
+
+                resolved = self.resolve_policy_snapshot(run_id)
+                capability_projection = build_capability_projection(
+                    resolved.policy, run_id=run_id
+                ).summary()
+            except Exception:
+                capability_projection = None
+
         return RunSnapshot(
             run_id=run.run_id,
             request_id=run.request_id,
@@ -1753,6 +1918,29 @@ class RunRepository:
                     "result": _effect_result_payload(record.result_json),
                     "failure_reason": record.failure_reason,
                     "committed_at": record.committed_at,
+                    # BCDEF ticket 05: unknown-outcome reconciliation is
+                    # replay-visible — identity, known facts, the unknown
+                    # part, repair state/attempts, last error, age and the
+                    # next operator/janitor action. All additive.
+                    "repair_status": record.repair_status or "none",
+                    "repair_attempts": record.repair_attempts,
+                    "repair_last_error": (
+                        record.repair_last_error or record.failure_reason
+                    ),
+                    "repair_request_id": record.repair_request_id,
+                    "repair_claimed_by": record.repair_claimed_by,
+                    "repair_updated_at": record.repair_updated_at,
+                    "repair_note": record.repair_note,
+                    "repair_age_seconds": repair_age_seconds(
+                        record.repair_updated_at or record.updated_at
+                    ),
+                    "repair_next_action": repair_next_action(
+                        record.status,
+                        record.repair_status,
+                        result_known=bool(record.result_json),
+                    ),
+                    "known_facts": effect_known_facts(record),
+                    "unknown_part": effect_unknown_part(record),
                 }
                 for record in effects
             ],
@@ -1767,6 +1955,10 @@ class RunRepository:
                     "heartbeat_at": lease.heartbeat_at,
                     "destroyed_at": lease.destroyed_at,
                     "failure_reason": lease.failure_reason,
+                    # BCDEF ticket 07: terminal cleanup outcome.
+                    "cleanup_status": lease.cleanup_status,
+                    "cleanup_error": lease.cleanup_error,
+                    "janitor_task_id": lease.janitor_task_id,
                 }
                 if lease is not None
                 else None
@@ -1774,6 +1966,7 @@ class RunRepository:
             policy_provenance=policy_provenance,
             policy_failure=policy_failure,
             pending_approvals=pending_approvals,
+            capability_projection=capability_projection,
         )
 
     # -- cancel ---------------------------------------------------------

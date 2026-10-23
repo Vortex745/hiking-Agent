@@ -50,6 +50,13 @@ def build_execution_policy(
     result and never calls the model.
     """
     model = profile.model
+    # BCDEF ticket 10: freeze the MCP service grant (identity, transport,
+    # bounds, tool allowlist and per-tool risk) so execution never consults
+    # the live registry for authorization. Credential VALUES are never
+    # recorded — only the declarative grant.
+    from agent_v2.capability_projection import frozen_mcp_server_summary
+
+    mcp_summary = frozen_mcp_server_summary(profile.allowed_mcp_servers)
     policy: dict[str, Any] = {
         "schema_version": EXECUTION_SCHEMA_VERSION,
         "source_version": POLICY_SOURCE_VERSION,
@@ -78,6 +85,8 @@ def build_execution_policy(
                 settings, "agent_v2_subagent_enabled", False
             ) else [],
             "skills": [],
+            # Frozen MCP grant; empty when the profile has no MCP surface.
+            "mcp_servers": mcp_summary,
             "subagent_enabled": bool(
                 getattr(settings, "agent_v2_subagent_enabled", False)
             ),

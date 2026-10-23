@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable
 
@@ -120,6 +121,85 @@ def is_claimable_effect_status(status: str) -> bool:
 
 def is_claimed_effect_status(status: str) -> bool:
     return status in CLAIMED_EFFECT_STATUSES
+
+
+# ---- BCDEF ticket 05: unknown-outcome repair state -------------------------
+#
+# An ``outcome_unknown`` effect is NOT retried automatically. It carries a
+# separate repair state so snapshot/replay can explain who is reconciling
+# it and what happens next, without changing the effect status taxonomy:
+#
+#   none → repair_pending → repair_claimed → repaired
+#                        ↘              ↘ → repair_pending (failed attempt)
+#                         → abandoned (fail closed, stays unknown)
+#
+# Repair NEVER re-runs the external effect and NEVER calls the model. A
+# successful confirm commits the operator-supplied result as the single
+# replayable final result; an abandon keeps the effect unknown and the run
+# terminal (error).
+
+
+class EffectRepairStatus(str, Enum):
+    NONE = "none"
+    PENDING = "repair_pending"
+    CLAIMED = "repair_claimed"
+    REPAIRED = "repaired"
+    ABANDONED = "abandoned"
+
+
+class EffectRepairAction(str, Enum):
+    CONFIRM = "confirm"
+    ABANDON = "abandon"
+
+
+# Repair states that still allow a confirm/abandon decision.
+OPEN_REPAIR_STATUSES: frozenset[str] = frozenset(
+    {"none", "repair_pending", "repair_claimed"}
+)
+
+
+def repair_next_action(
+    effect_status: str,
+    repair_status: str,
+    *,
+    result_known: bool,
+) -> str:
+    """The operator/janitor next action for an effect row.
+
+    ``none`` — nothing to repair (committed/failed/abandoned);
+    ``wait_janitor`` — a worker holds the repair claim;
+    ``confirm_known_result`` — the external result is known (publication
+    failed) so confirmation can reuse it; ``manual_confirm`` — the
+    result is unknown and an operator must supply it (or abandon).
+    """
+    if effect_status in ("committed", "failed"):
+        return "none"
+    if repair_status == EffectRepairStatus.ABANDONED.value:
+        return "none"
+    if repair_status == EffectRepairStatus.CLAIMED.value:
+        return "wait_janitor"
+    if effect_status == EffectStatus.OUTCOME_UNKNOWN.value:
+        return "confirm_known_result" if result_known else "manual_confirm"
+    return "none"
+
+
+def repair_age_seconds(timestamp: str | None, *, now: datetime | None = None) -> float:
+    """Seconds since the repair state last changed (0 when unknown).
+
+    Parsing failures surface as 0.0 instead of raising: repair age is
+    observability metadata and must never break a snapshot read.
+    """
+    if not timestamp:
+        return 0.0
+    try:
+        parsed = datetime.fromisoformat(timestamp)
+    except (TypeError, ValueError):
+        return 0.0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    return max(0.0, (current - parsed).total_seconds())
+
 
 
 # Default claim TTL. The claim token is the fencing credential for the
