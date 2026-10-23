@@ -182,11 +182,14 @@ class ApprovalDecisionOutcome:
 
     * ``recorded`` — decision persisted, run resumed (HTTP 200)
     * ``idempotent`` — duplicate of an already-recorded decision with
-      the same ``decision_request_id`` (HTTP 200)
+      the same ``decision_request_id`` AND the same decision (HTTP 200)
     * ``approval_not_found`` (HTTP 404)
     * ``already_resolved`` / ``expired`` / ``run_not_found`` /
-      ``run_terminal`` / ``run_not_paused`` / ``sandbox_lease_lost``
-      (HTTP 409, ``payload`` carries the public reason + message)
+      ``run_terminal`` / ``run_not_paused`` / ``sandbox_lease_lost`` /
+      ``decision_conflict`` (HTTP 409, ``payload`` carries the public
+      reason + message). ``decision_conflict`` is BCDEF ticket 07: a
+      contradictory decision for an approval key keeps the original
+      result untouched.
 
     The payload is the exact public response body minus the
     ``resume_url``, which is an adapter (HTTP surface) concern.
@@ -1589,6 +1592,108 @@ class RunOrchestrator:
         self._sandbox_cleanup = sandbox_cleanup
         self._gate_factory = gate_factory
 
+    def _run_terminal_cleanup(
+        self,
+        computer: Computer,
+        workspace_path: str,
+        runs_repo: RunRepository | None,
+        run_id: str | None,
+    ) -> None:
+        """Idempotent terminal sandbox cleanup (BCDEF ticket 07).
+
+        Runs the injected cleanup hook, records ``cleanup_status`` on the
+        lease, and — when the cleanup fails — creates a durable janitor
+        work item carrying the run/lease/effect/sandbox evidence needed
+        for a retry. The retry MUST reuse the same workspace/lease: no
+        new sandbox is ever created here or by the janitor.
+
+        A repeated call after a successful cleanup is a no-op. Cleanup
+        bookkeeping failures are logged and never change the terminal
+        that was already emitted.
+        """
+        if runs_repo is not None and run_id is not None:
+            try:
+                existing = runs_repo.get_sandbox_lease(run_id)
+            except Exception:
+                existing = None
+            if (
+                existing is not None
+                and existing.cleanup_status == "succeeded"
+                and existing.status != "active"
+            ):
+                return
+
+        failure_reason: str | None = None
+        try:
+            result = self._sandbox_cleanup(
+                computer, workspace_path, runs_repo, run_id
+            )
+            if isinstance(result, dict) and result.get("status") == "failed":
+                failure_reason = str(
+                    result.get("failure_reason") or "cleanup failed"
+                )
+        except Exception as exc:
+            logger.exception(
+                "run_orchestration: terminal cleanup failed for run_id=%s "
+                "workspace=%s",
+                run_id,
+                workspace_path,
+            )
+            failure_reason = f"cleanup failed: {exc}"
+
+        if runs_repo is None or run_id is None:
+            return
+
+        try:
+            lease = runs_repo.get_sandbox_lease(run_id)
+            if failure_reason is None:
+                runs_repo.record_sandbox_cleanup(run_id, status="succeeded")
+                return
+
+            effect_ids = [
+                effect.resolved_effect_id
+                for effect in runs_repo.list_effects_for_run(run_id)
+            ]
+            evidence = {
+                "run_id": run_id,
+                "lease_id": lease.lease_id if lease is not None else "",
+                "sandbox_type": (
+                    lease.sandbox_type
+                    if lease is not None
+                    else getattr(computer, "sandbox_type", "")
+                ),
+                "workspace_path": workspace_path,
+                "sandbox_identity": (
+                    lease.sandbox_identity if lease is not None else ""
+                ),
+                "fencing_token": lease.fencing_token if lease is not None else 0,
+                "effect_ids": effect_ids,
+                "failure_reason": failure_reason,
+            }
+            task, _created = runs_repo.enqueue_janitor_task(
+                kind="cleanup",
+                run_id=run_id,
+                lease_id=evidence["lease_id"],
+                evidence=evidence,
+                dedupe_key=f"cleanup:{run_id}",
+            )
+            if lease is not None and lease.status == "active":
+                runs_repo.destroy_sandbox_lease(
+                    run_id=run_id, failure_reason=failure_reason
+                )
+            runs_repo.record_sandbox_cleanup(
+                run_id,
+                status="pending_janitor",
+                error=failure_reason,
+                janitor_task_id=task.task_id,
+            )
+        except Exception:
+            logger.exception(
+                "run_orchestration: recording cleanup failure / janitor task "
+                "failed for run_id=%s",
+                run_id,
+            )
+
     def _acquire_sandbox_lease(
         self,
         *,
@@ -2349,7 +2454,9 @@ class RunOrchestrator:
             run_id=run_id, computer=computer, workspace_path=workspace_path
         )
         if lease_error is not None:
-            self._sandbox_cleanup(computer, workspace_path, runs_repo, run_id)
+            self._run_terminal_cleanup(
+                computer, workspace_path, runs_repo, run_id
+            )
             yield emit("error", {"code": lease_error, "message": lease_message})
             mark_terminal_safe(runs_repo, run_id, "error")
             return
@@ -2503,7 +2610,9 @@ class RunOrchestrator:
                     run_id,
                 )
             else:
-                self._sandbox_cleanup(computer, workspace_path, runs_repo, run_id)
+                self._run_terminal_cleanup(
+                    computer, workspace_path, runs_repo, run_id
+                )
 
     # -- artifact flow (Ticket 39, originally Tickets 09 + 10) --
 
@@ -2593,7 +2702,9 @@ class RunOrchestrator:
             run_id=run_id, computer=computer, workspace_path=workspace_path
         )
         if lease_error is not None:
-            self._sandbox_cleanup(computer, workspace_path, runs_repo, run_id)
+            self._run_terminal_cleanup(
+                computer, workspace_path, runs_repo, run_id
+            )
             yield emit("error", {"code": lease_error, "message": lease_message})
             mark_terminal_safe(runs_repo, run_id, "error")
             return
@@ -2626,12 +2737,64 @@ class RunOrchestrator:
                 })
                 mark_terminal_safe(runs_repo, run_id, "error")
                 return
+
+            # BCDEF ticket 07 — draft BEFORE the pause, resume from the fact.
+            # The approved tool must execute from a DURABLE fact, so the plan
+            # is drafted here, before ``approval.required`` is persisted:
+            # the resume continues the effect from
+            # ``approvals.prepared_content`` and NEVER re-runs the model
+            # (spec 03: the model is not a repair mechanism, and spec 04:
+            # approval only advances the same run). A client reconnecting to
+            # an already-paused run reuses the stored draft instead of
+            # spending a second model turn.
+            approval_id = compute_approval_id(
+                run_id=run_id or req.request_id,
+                tool_name="generate_pdf",
+                args={"filename": _ARTIFACT_FILENAME},
+            )
+            existing_approval = (
+                runs_repo.get_approval(approval_id)
+                if runs_repo is not None
+                and verdict.decision == PermissionDecision.NEEDS_APPROVAL
+                else None
+            )
+            prepared_plan = (
+                existing_approval.prepared_content
+                if existing_approval is not None
+                else None
+            )
+
+            # Ticket 30: the hiking-plan content is generated by the REAL
+            # UniHarness model loop (see the method docstring).
+            from agent_v2.kernel import KernelModelFailure
+
+            if prepared_plan is not None:
+                plan_text, plan_audit_entries = prepared_plan, []
+            else:
+                # In-workspace read/write are kernel-governed self-service ops
+                # (hard boundary = workspace chdir + path guard + env isolation);
+                # the product policy ladder re-enters at generate_pdf/export below.
+                try:
+                    plan_text, plan_audit_entries = await _kernel_plan_turn(
+                        kernel_turn=self._kernel_turn,
+                        settings=settings if settings is not None else self._settings,
+                        checkpoint_store=self._kernel_checkpoints,
+                        computer=computer,
+                        workspace_path=workspace_path,
+                        message=req.message,
+                        run_id=run_id,
+                        lease_guard=lease_guard,
+                    )
+                except KernelModelFailure as exc:
+                    yield emit("error", {"code": exc.code, "message": exc.message})
+                    mark_terminal_safe(runs_repo, run_id, "error")
+                    return
+            plan_content = plan_text
+
+            for payload in _tool_result_payloads(plan_audit_entries):
+                yield emit("tool_result", payload)
+
             if verdict.decision == PermissionDecision.NEEDS_APPROVAL:
-                approval_id = compute_approval_id(
-                    run_id=run_id or req.request_id,
-                    tool_name="generate_pdf",
-                    args={"filename": _ARTIFACT_FILENAME},
-                )
                 created_at = _now_iso()
                 expires_at = compute_expiry(created_at)
                 impact = "生成徒步计划 PDF 并导出到宿主存储"
@@ -2647,6 +2810,7 @@ class RunOrchestrator:
                             impact=impact,
                             created_at=created_at,
                             expires_at=expires_at,
+                            prepared_content=plan_content,
                         )
                     except Exception:
                         # Duplicate insert (same run/tool/args) is expected
@@ -2696,33 +2860,6 @@ class RunOrchestrator:
                 preserve_sandbox = True
                 return
 
-            # Ticket 30: the hiking-plan content is generated by the REAL
-            # UniHarness model loop (see the method docstring).
-            from agent_v2.kernel import KernelModelFailure
-
-            # In-workspace read/write are kernel-governed self-service ops
-            # (hard boundary = workspace chdir + path guard + env isolation);
-            # the product policy ladder re-enters at generate_pdf/export below.
-            try:
-                plan_text, plan_audit_entries = await _kernel_plan_turn(
-                    kernel_turn=self._kernel_turn,
-                    settings=settings if settings is not None else self._settings,
-                    checkpoint_store=self._kernel_checkpoints,
-                    computer=computer,
-                    workspace_path=workspace_path,
-                    message=req.message,
-                    run_id=run_id,
-                    lease_guard=lease_guard,
-                )
-            except KernelModelFailure as exc:
-                yield emit("error", {"code": exc.code, "message": exc.message})
-                mark_terminal_safe(runs_repo, run_id, "error")
-                return
-
-            for payload in _tool_result_payloads(plan_audit_entries):
-                yield emit("tool_result", payload)
-
-            plan_content = plan_text
             yield emit("tool_call", {
                 "tool": "generate_pdf",
                 "args": {"filename": _ARTIFACT_FILENAME},
@@ -2892,7 +3029,9 @@ class RunOrchestrator:
                     run_id,
                 )
             else:
-                self._sandbox_cleanup(computer, workspace_path, runs_repo, run_id)
+                self._run_terminal_cleanup(
+                    computer, workspace_path, runs_repo, run_id
+                )
 
     # -- resume flow (Ticket 40, originally Ticket 11/13 adapter code) --
     #
@@ -3165,7 +3304,12 @@ class RunOrchestrator:
         try:
             resolved_policy = runs_repo.resolve_policy_snapshot(run_id)
             resolved_policy.profile()  # capability reconstruction must succeed
-            policy_settings = freeze_settings(self._settings, resolved_policy.policy)
+            # BCDEF ticket 07: the continuation executes from durable facts
+            # (the drafted plan, the approved args, the ledger), so the
+            # adapted settings are re-derived here only as a fail-closed
+            # REVALIDATION of policy identity — never to re-resolve the
+            # current default profile, model or capability.
+            freeze_settings(self._settings, resolved_policy.policy)
         except BoundaryError as exc:
             logger.error(
                 "run_orchestration: policy snapshot unusable during resume "
@@ -3455,36 +3599,22 @@ class RunOrchestrator:
                     user_message = msg.get("content", "")
                     break
 
-            # Ticket 04: the approved export must render the PLAN, not the
-            # raw user message. The first stream pauses at the permission
-            # gate BEFORE the kernel turn, so at pause time no plan exists
-            # yet — generate it here through the same kernel seam as the
-            # first stream. Fail closed on kernel failure; skip the turn
-            # entirely when the tool already executed (idempotent resume).
-            plan_content = user_message
-            if not has_tool_result_ok:
-                from agent_v2.kernel import KernelModelFailure
-
-                try:
-                    plan_text, plan_audit_entries = await _kernel_plan_turn(
-                        kernel_turn=self._kernel_turn,
-                        settings=policy_settings,  # ticket 09: adapted frozen policy
-                        checkpoint_store=self._kernel_checkpoints,
-                        computer=computer,
-                        workspace_path=workspace_path,
-                        message=user_message,
-                        run_id=run_id,
-                        lease_guard=lease_guard,
-                    )
-                except KernelModelFailure as exc:
-                    yield emit("error", {"code": exc.code, "message": exc.message})
-                    mark_terminal_safe(runs_repo, run_id, "error")
-                    return
-
-                for payload in _tool_result_payloads(plan_audit_entries):
-                    yield emit("tool_result", payload)
-
-                plan_content = plan_text
+            # BCDEF ticket 07: the approved export renders the plan drafted
+            # and persisted BEFORE the pause (``approvals.prepared_content``,
+            # written by the artifact flow at admission time). The resume is
+            # a CONTINUATION of durable facts, so the model is never re-run
+            # here (spec 03/04) — a legacy paused row without a draft falls
+            # back to the persisted user turn, deterministically, and still
+            # never calls the kernel. Skip the whole step when the tool
+            # already executed (idempotent resume).
+            plan_content = resolved.prepared_content or user_message
+            if not has_tool_result_ok and resolved.prepared_content is None:
+                logger.warning(
+                    "run_orchestration: paused run %s has no prepared plan "
+                    "draft (legacy row); continuing from the persisted user "
+                    "turn without calling the model",
+                    run_id,
+                )
 
             def _execute_pdf() -> dict[str, Any]:
                 # Ticket 06: heartbeat + revalidate the fenced lease right
@@ -3657,7 +3787,9 @@ class RunOrchestrator:
                     run_id,
                 )
             else:
-                self._sandbox_cleanup(computer, workspace_path, runs_repo, run_id)
+                self._run_terminal_cleanup(
+                    computer, workspace_path, runs_repo, run_id
+                )
 
     async def _resume_cowork_bash_steps(
         self,
@@ -3863,12 +3995,39 @@ class RunOrchestrator:
         if approval is None:
             return ApprovalDecisionOutcome(status="approval_not_found", payload={})
 
-        # AC5: idempotent duplicate (same decision_request_id) → return existing
+        target_status = "approved" if decision == "approve" else "rejected"
+
+        # AC5: idempotent duplicate (same decision_request_id AND the same
+        # decision) → return the existing outcome without touching anything.
         if (
             approval.decision_request_id is not None
             and approval.decision_request_id == decision_request_id
             and approval.is_terminal
         ):
+            if approval.status != target_status:
+                # BCDEF ticket 07 (spec 06): one approval key admits ONE
+                # decision. A contradictory decision under the same
+                # request id keeps the ORIGINAL result and returns a
+                # stable conflict — no state change, no second transition,
+                # and the run is never advanced twice.
+                return ApprovalDecisionOutcome(
+                    status="decision_conflict",
+                    payload={
+                        "code": "decision_conflict",
+                        "approval_id": approval_id,
+                        "run_id": approval.run_id,
+                        "reason": "decision_conflict",
+                        "requested_decision": (
+                            "approve" if target_status == "approved" else "reject"
+                        ),
+                        "current_status": approval.status,
+                        "decision_request_id": decision_request_id,
+                        "message": (
+                            f"同一审批已记录为 {approval.status}，"
+                            "相反的决定不会被应用；原结果保持不变。"
+                        ),
+                    },
+                )
             return ApprovalDecisionOutcome(
                 status="idempotent",
                 payload=self._decision_payload(approval, idempotent=True),
@@ -4003,7 +4162,6 @@ class RunOrchestrator:
         # Persist the decision. resolve_approval raises RunAlreadyTerminal
         # if the approval was resolved by a concurrent request between our
         # ``get_approval`` and this call — surface as 409 already_resolved.
-        target_status = "approved" if decision == "approve" else "rejected"
         try:
             resolved = runs_repo.resolve_approval(
                 approval_id=approval_id,

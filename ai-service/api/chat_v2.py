@@ -1054,7 +1054,9 @@ async def approval_decision(
       decision with the same ``decision_request_id``)
     * 404 — ``approval_id`` not found
     * 409 — approval already resolved with a different
-      ``decision_request_id``; OR approval expired; OR run is terminal
+      ``decision_request_id``; OR a contradictory decision for an
+      already-recorded ``decision_request_id`` (``decision_conflict``,
+      the original result stands); OR approval expired; OR run is terminal
       (done/error/cancelled); OR run is not paused (decision already
       recorded); OR sandbox lease is missing/destroyed (spec AC7)
     * 422 — Pydantic rejected the body (unknown ``decision`` value,
