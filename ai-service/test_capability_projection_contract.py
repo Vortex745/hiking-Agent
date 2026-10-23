@@ -469,12 +469,20 @@ def test_approved_effect_carries_policy_bound_replay_metadata(tmp_path):
     repo.close()
 
 
-def test_duplicate_live_claim_reports_stable_boundary_code(tmp_path):
-    """AC: a second executor on a live claim → stable duplicate effect error.
+def test_orphaned_claim_converges_to_outcome_unknown_without_rerun(tmp_path):
+    """AC: a re-drive reaching a CLAIMED row → owner died, converge unknown.
 
-    The public wire code stays ``effect_in_flight`` (client compatible);
-    the additive ``boundary_code`` names the shared contract code
-    ``duplicate_effect``. No re-execution, no ledger mutation.
+    agent-lifecycle-repair ticket 02 removed the 300s recent-tool_call
+    liveness inference: with per-run execution ownership ONLY the owner
+    reaches this driver, so a CLAIMED/executing row found here means the
+    previous executor died between claim and settlement. A duplicate
+    LIVE executor is prevented upstream at admission (read-only observer
+    replay; real-HTTP coverage in
+    ``test_resume_execution_ownership_contract.py``).
+
+    The re-drive converges the effect to ``outcome_unknown`` with no
+    re-execution and no success result; identity and crash evidence are
+    preserved for human review, and the run terminates with ``error``.
     """
     repo = _repo(tmp_path)
     run_id = _make_run(repo)
@@ -531,12 +539,25 @@ def test_duplicate_live_claim_reports_stable_boundary_code(tmp_path):
 
     asyncio.run(run())
     assert executed == []
-    assert outcome.status == "in_flight"
+    assert outcome.status == "outcome_unknown"
+    unknown = next(p for (t, p) in events if t == "effect.outcome_unknown")
+    assert unknown["effect_key"] == identity.effect_id
+    assert unknown["tool"] == "generate_pdf"
     error = next(p for (t, p) in events if t == "error")
-    assert error["code"] == "effect_in_flight"
-    assert error["boundary_code"] == "duplicate_effect"
+    assert error["code"] == "effect_outcome_unknown"
+    # The removed liveness inference must not come back: a CLAIMED row
+    # found by the owner is dead, never a "live duplicate executor".
+    assert "effect_in_flight" not in [p.get("code") for (_t, p) in events]
+    assert "duplicate_effect" not in [p.get("boundary_code") for (_t, p) in events]
     current = repo.get_effect(identity.effect_id)
-    assert current.status == "executing"  # untouched: still the owner's claim
+    assert current is not None
+    assert current.status == "outcome_unknown"
+    assert current.effect_key == identity.effect_id
+    assert current.external_idempotency_key == identity.idempotency_key
+    assert current.result_json is None  # never fabricated a success result
+    assert current.failure_reason  # crash evidence recorded
+    run = repo.get_run(run_id)
+    assert run is not None and run.status == "error"
     repo.close()
 
 
