@@ -452,3 +452,151 @@ def test_cowork_bash_resume_executes_approved_command(tmp_path):
     run = repo.get_run(run_id)
     assert run is not None and run.status == "done"
     assert len(cleanups) == 1
+
+
+# ---- durable effect write failure at the resume entry point (review S1) ------
+#
+# The fault is raised by SQLite inside the REAL ``INSERT INTO effects``
+# (a storage object the write depends on is gone), so the repository write
+# path and both resume callers run unpatched. The durable ``authorized`` row
+# IS the execution right: with that write lost the resume must stop with the
+# stable ``effect_persist_failed`` — no ``tool_call``, no result, no artifact,
+# no ``done``, and no sandbox command.
+
+_EFFECTS_STORAGE_FAULT_SQL = (
+    "CREATE TRIGGER s1_effects_write_failure BEFORE INSERT ON effects BEGIN "
+    "SELECT * FROM s1_missing_storage_object; END"
+)
+
+
+def _seed_approved_cowork_bash_run(
+    repo: RunRepository, computer: _FakeComputer, request_id: str
+) -> str:
+    """Hand-assemble an approved cowork ``sandbox_bash`` paused run."""
+    run_id, _created = repo.create_run_idempotent(
+        request_id=request_id,
+        conversation_id=f"conv-{request_id}",
+        profile_id="cowork",
+        user_message="在沙箱里创建一个文件",
+    )
+    _seed_frozen_policy(repo, run_id, "cowork")
+    repo.create_sandbox_lease(
+        run_id=run_id,
+        sandbox_type=computer.sandbox_type,
+        workspace_path=f"/ws/{run_id}",
+    )
+    approval_id = compute_approval_id(
+        run_id=run_id, tool_name="sandbox_bash", args={"command": "echo hello"}
+    )
+    repo.insert_approval(
+        approval_id=approval_id,
+        run_id=run_id,
+        conversation_id=f"conv-{request_id}",
+        tool_name="sandbox_bash",
+        args_canonical='{"command": "echo hello"}',
+        risk_level="high",
+        impact="sandbox bash",
+        created_at=_now_iso(),
+        expires_at=compute_expiry(_now_iso()),
+    )
+    repo.resolve_approval(
+        approval_id=approval_id, status="approved", decision_request_id=f"dec-{request_id}"
+    )
+    return run_id
+
+
+def test_cowork_bash_resume_stops_when_the_effect_row_cannot_be_persisted(
+    tmp_path, caplog
+):
+    repo = _repo(tmp_path)
+    computer = _FakeComputer()
+    cleanups: list[Any] = []
+    export_calls: list[dict[str, Any]] = []
+
+    def fake_export(**kwargs: Any) -> dict[str, Any]:
+        export_calls.append(kwargs)
+        return {"artifact_id": "art-bash", "public_filename": "cowork-output.txt"}
+
+    run_id = _seed_approved_cowork_bash_run(repo, computer, "req-s1-bash-write")
+    orch = RunOrchestrator(
+        settings=_settings(agent_v2_cowork_policy="trusted"),
+        runs_repo=repo,
+        artifact_export=fake_export,
+        computer_factory=lambda *a, **k: computer,
+        sandbox_cleanup=lambda *a, **k: cleanups.append(k),
+    )
+    repo.control._conn.execute(_EFFECTS_STORAGE_FAULT_SQL)
+
+    with caplog.at_level("ERROR", logger="ai-service.run_orchestration"):
+        items = _stream_resume(orch, run_id)
+    repo.control._conn.execute("DROP TRIGGER IF EXISTS s1_effects_write_failure")
+
+    types = [e.type for e in items]
+    # The run stops at the ledger write: nothing after it is published.
+    assert types == ["approval.resolved", "error"], types
+    assert items[-1].payload["code"] == "effect_persist_failed"
+    # Nothing executed and nothing was exported.
+    assert computer.bash_calls == []
+    assert export_calls == []
+    # No durable effect row and the run is terminal, not "unfinished".
+    assert repo.list_effects_for_run(run_id) == []
+    run = repo.get_run(run_id)
+    assert run is not None and run.status == "error"
+    # The durable replay contains no fabricated tool publication.
+    replay = repo.get_events_since(run_id=run_id, from_seq=0)
+    assert [event["type"] for event in replay] == types
+    assert [
+        event for event in replay
+        if event["type"] in ("tool_call", "tool_result", "artifact_candidate", "done")
+    ] == []
+    # BCDEF review S1 defect fix: the cowork bash caller stops on the
+    # ``persist_failed`` outcome itself. Falling through would only be
+    # rescued by the resume catch-all (an internal error swallowing the
+    # stable contract), so the crash net must stay silent here.
+    assert [
+        record for record in caplog.records
+        if "unexpected error during resume" in record.getMessage()
+    ] == [], caplog.text
+    assert [
+        record for record in caplog.records
+        if "effect ledger insert" in record.getMessage()
+    ], caplog.text
+
+
+def test_approved_pdf_resume_stops_when_the_effect_row_cannot_be_persisted(tmp_path, caplog):
+    repo = _repo(tmp_path)
+    computer = _FakeComputer()
+    cleanups: list[Any] = []
+    export_calls: list[dict[str, Any]] = []
+    orch = _resume_orchestrator(repo, computer, cleanups, export_calls)
+    run_id, approval_id = _run_pause_flow(orch, repo, "req-s1-pdf-write")
+    repo.resolve_approval(
+        approval_id=approval_id, status="approved", decision_request_id="dec-s1-pdf"
+    )
+    repo.control._conn.execute(_EFFECTS_STORAGE_FAULT_SQL)
+
+    with caplog.at_level("ERROR", logger="ai-service.run_orchestration"):
+        items = _stream_resume(orch, run_id)
+    repo.control._conn.execute("DROP TRIGGER IF EXISTS s1_effects_write_failure")
+
+    types = [e.type for e in items]
+    assert types[5:] == ["approval.resolved", "error"], types
+    assert items[-1].payload["code"] == "effect_persist_failed"
+    # The PDF was generated inside the sandbox exactly zero times.
+    assert computer.pdfs == []
+    assert export_calls == []
+    assert repo.list_effects_for_run(run_id) == []
+    run = repo.get_run(run_id)
+    assert run is not None and run.status == "error"
+    replay = repo.get_events_since(run_id=run_id, from_seq=0)
+    assert [
+        event for event in replay
+        if event["type"] in ("tool_result", "artifact_candidate", "text", "done")
+        and event["payload"].get("status") == "ok"
+    ] == []
+    assert [
+        record for record in caplog.records
+        if "unexpected error during resume" in record.getMessage()
+    ] == [], caplog.text
+
+
