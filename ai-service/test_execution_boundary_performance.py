@@ -228,9 +228,12 @@ def test_lease_heartbeat_and_janitor_work_stay_within_measured_budget(tmp_path):
         enqueued: list[str] = []
         enqueue_samples, _ = _time(enqueue_one)
 
-        # Claims are measured against a small standing backlog (10 items is
-        # already far above what one run produces), so the CAS is timed the
-        # way the sweeper hits it rather than on an empty table.
+        # Claims are measured against a standing backlog that mixes the
+        # work a recovering sweeper actually meets: fresh items, taken-over
+        # EXPIRED claims and unexpired claims it must refuse (BCDEF review
+        # S4). 10 items is already far above what one run produces, and the
+        # expiry-aware claim + the candidate scan stay inside the same
+        # ceilings — no separate, looser budget for the recovery path.
         backlog_repo = RunRepository(
             control=ControlStore(str(tmp_path / "janitor-control.sqlite")),
             checkpoints=CheckpointsStore(str(tmp_path / "janitor-ckpt.sqlite")),
@@ -245,6 +248,20 @@ def test_lease_heartbeat_and_janitor_work_stay_within_measured_budget(tmp_path):
                 )[0].task_id
                 for index in range(10)
             ]
+            for task_id in task_ids[:5]:
+                backlog_repo.claim_janitor_task(task_id, owner="janitor-live")
+            # 4 of the 5 claims are already expired (takeover path); the
+            # fifth stays live, so its claim must be refused.
+            backlog_repo.control._conn.execute(
+                "UPDATE janitor_tasks SET claim_expires_at = ? "
+                "WHERE claimed_by = 'janitor-live' "
+                "AND task_id IN (?, ?, ?, ?)",
+                (
+                    "2000-01-01T00:00:00+00:00",
+                    *task_ids[:4],
+                ),
+            )
+
             cursor = {"index": 0}
 
             def claim_once() -> None:
@@ -255,6 +272,22 @@ def test_lease_heartbeat_and_janitor_work_stay_within_measured_budget(tmp_path):
                 )
 
             claim_samples, _ = _time(claim_once)
+
+            def claimable_scan() -> None:
+                backlog_repo.list_janitor_tasks(claimable=True, limit=10)
+
+            scan_samples, _ = _time(claimable_scan)
+
+            def enqueue_duplicate() -> None:
+                """The dedupe hit path: a retry re-observes the open item."""
+                backlog_repo.enqueue_janitor_task(
+                    kind="cleanup",
+                    run_id="run-perf-dedupe",
+                    evidence={"run_id": "run-perf-dedupe"},
+                    dedupe_key="cleanup:run-perf-dedupe",
+                )
+
+            duplicate_samples, _ = _time(enqueue_duplicate)
         finally:
             backlog_repo.control.close()
             backlog_repo.checkpoints.close()
@@ -268,6 +301,11 @@ def test_lease_heartbeat_and_janitor_work_stay_within_measured_budget(tmp_path):
         "lease_expired_refusal_ms": round(refusal_ms, 4),
         "janitor_enqueue_ms": (_median(enqueue_samples), _worst(enqueue_samples)),
         "janitor_claim_ms": (_median(claim_samples), _worst(claim_samples)),
+        "janitor_claimable_scan_ms": (_median(scan_samples), _worst(scan_samples)),
+        "janitor_dedupe_enqueue_ms": (
+            _median(duplicate_samples),
+            _worst(duplicate_samples),
+        ),
     }
     print(f"BCDEF lease/janitor measured (median, worst) ms: {measured}")
 
@@ -283,3 +321,9 @@ def test_lease_heartbeat_and_janitor_work_stay_within_measured_budget(tmp_path):
     assert _worst(enqueue_samples) < 120.0, measured
     assert _median(claim_samples) < 10.0, measured
     assert _worst(claim_samples) < 60.0, measured
+    # BCDEF review S4: the recovery scan and the dedupe retry reuse the
+    # existing janitor ceilings (claim + enqueue), not new looser ones.
+    assert _median(scan_samples) < 10.0, measured
+    assert _worst(scan_samples) < 60.0, measured
+    assert _median(duplicate_samples) < 30.0, measured
+    assert _worst(duplicate_samples) < 120.0, measured

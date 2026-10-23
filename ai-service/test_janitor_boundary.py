@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -53,8 +54,8 @@ from agent_v2.janitor import run_pending_janitor_tasks
 from agent_v2.persistence import (
     CheckpointsStore,
     ControlStore,
+    JanitorTaskRecord,
     PolicySnapshotWrite,
-    _CONTROL_SCHEMA,
 )
 from agent_v2.profiles import resolve_profile
 from agent_v2.run_orchestration import ChatFlowRequest, RunOrchestrator
@@ -407,7 +408,9 @@ def test_janitor_task_claim_complete_and_fail_cas(tmp_path):
 # ---- janitor claim deadline (BCDEF review S4) ------------------------------
 
 
-def _pending_cleanup_task(repo: RunRepository, run_id: str) -> Any:
+def _pending_cleanup_task(
+    repo: RunRepository, run_id: str
+) -> JanitorTaskRecord:
     task, created = repo.enqueue_janitor_task(
         kind="cleanup",
         run_id=run_id,
@@ -559,7 +562,7 @@ def _settled_state_assertions(
     *,
     expected_owner: str,
     expected_attempt: int,
-) -> Any:
+) -> JanitorTaskRecord:
     """Durable row after a REJECTED settlement: nothing the loser wrote."""
     stored = repo.get_janitor_task(task_id)
     assert stored is not None
@@ -774,7 +777,7 @@ def test_completed_task_releases_its_dedupe_key_for_the_next_round(tmp_path):
         assert nxt.status == "pending"
         # ...while the finished row is kept for audit, key recorded inside.
         assert _count_rows(repo, "janitor_tasks") == 2
-        assert _count_rows(repo, "janitor_tasks", f"status = 'done'") == 1
+        assert _count_rows(repo, "janitor_tasks", "status = 'done'") == 1
         historical = repo.get_janitor_task(first.task_id)
         assert historical is not None
         assert historical.status == "done"
@@ -894,7 +897,7 @@ def test_runner_recovers_a_hung_claim_after_a_worker_restart(
 
 def _takeover_during_handler(
     repo: RunRepository, clock: _Clock, *, then_raise: bool
-) -> Any:
+) -> Any:  # returns a cleanup handler callable
     """Cleanup handler that loses the claim before it can settle.
 
     Stands in for "the worker finished the work but its deadline expired
@@ -945,7 +948,7 @@ def test_runner_reports_claim_lost_when_completion_cas_loses(
         assert stored.attempts == 2
         assert stored.result_json is None
         assert stored.completed_at is None
-        assert stored.dedupe_key == f"cleanup:run-claim-lost"
+        assert stored.dedupe_key == "cleanup:run-claim-lost"
         # The work itself did happen once.
         assert handler.calls == ["run-claim-lost"]
     finally:
@@ -1091,6 +1094,463 @@ def test_one_sweep_issues_one_bounded_candidate_query(tmp_path):
         ).fetchone()
         assert indexed is not None
         assert "claim_expires_at" in indexed["sql"]
+    finally:
+        repo.close()
+
+
+# ---- legacy upgrade (BCDEF review S4) --------------------------------------
+
+_LEGACY_JANITOR_COLUMNS = (
+    "task_id",
+    "kind",
+    "status",
+    "dedupe_key",
+    "run_id",
+    "lease_id",
+    "effect_id",
+    "evidence_json",
+    "attempts",
+    "last_error",
+    "claimed_by",
+    "claimed_at",
+    "result_json",
+    "created_at",
+    "updated_at",
+    "completed_at",
+)
+
+
+def _legacy_control_db(tmp_path) -> str:
+    """A control database whose janitor table predates the claim deadline."""
+    path = str(tmp_path / "control.sqlite")
+    store = ControlStore(path)
+    store._conn.execute("BEGIN")
+    store._conn.execute("DROP INDEX IF EXISTS idx_janitor_claim_candidates")
+    store._conn.execute("ALTER TABLE janitor_tasks DROP COLUMN claim_expires_at")
+    store._conn.execute("COMMIT")
+    store.close()
+    return path
+
+
+def _insert_legacy_task(
+    path: str,
+    *,
+    task_id: str,
+    status: str,
+    evidence: dict[str, Any] | None = None,
+    dedupe_key: str | None = None,
+    claimed_by: str | None = None,
+    claimed_at: str | None = None,
+    attempts: int = 0,
+    last_error: str | None = None,
+    result_json: str | None = None,
+    completed_at: str | None = None,
+    created_at: str = "2026-01-01T00:00:00+00:00",
+) -> None:
+    """Write a janitor row the way the pre-ticket-04 code did (raw SQL)."""
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute(
+            "INSERT INTO janitor_tasks (" + ", ".join(_LEGACY_JANITOR_COLUMNS) + ")"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                "cleanup",
+                status,
+                dedupe_key,
+                str((evidence or {}).get("run_id") or ""),
+                "",
+                "",
+                json.dumps(evidence or {}, sort_keys=True),
+                attempts,
+                last_error,
+                claimed_by,
+                claimed_at,
+                result_json,
+                created_at,
+                created_at,
+                completed_at,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _legacy_repo(tmp_path) -> RunRepository:
+    return RunRepository(
+        control=ControlStore(str(tmp_path / "control.sqlite")),
+        checkpoints=CheckpointsStore(str(tmp_path / "ckpt.sqlite")),
+    )
+
+
+def test_legacy_claimed_rows_get_a_deadline_and_are_recovered(
+    tmp_path, clock: _Clock
+):
+    """AC9: normal, missing and corrupt legacy claim stamps all upgrade."""
+    path = _legacy_control_db(tmp_path)
+    long_ago = "2026-01-01T00:00:00+00:00"
+    _insert_legacy_task(
+        path,
+        task_id="legacy-normal",
+        status="claimed",
+        evidence={"run_id": "run-normal", "workspace_path": "/ws/run-normal"},
+        dedupe_key="cleanup:run-normal",
+        claimed_by="janitor-dead",
+        claimed_at=long_ago,
+        attempts=1,
+    )
+    _insert_legacy_task(
+        path,
+        task_id="legacy-missing",
+        status="claimed",
+        evidence={"run_id": "run-missing"},
+        dedupe_key="cleanup:run-missing",
+        claimed_by="janitor-dead",
+        claimed_at=None,
+        attempts=3,
+    )
+    _insert_legacy_task(
+        path,
+        task_id="legacy-corrupt",
+        status="claimed",
+        evidence={"run_id": "run-corrupt"},
+        dedupe_key="cleanup:run-corrupt",
+        claimed_by="janitor-dead",
+        claimed_at="yesterday o'clock",
+        attempts=1,
+    )
+    # A legacy claim that is still inside the window must stay protected.
+    live_at = datetime.fromisoformat(clock.iso()) - timedelta(seconds=60)
+    _insert_legacy_task(
+        path,
+        task_id="legacy-live",
+        status="claimed",
+        evidence={"run_id": "run-live"},
+        dedupe_key="cleanup:run-live",
+        claimed_by="janitor-alive",
+        claimed_at=live_at.isoformat(),
+        attempts=1,
+    )
+
+    repo = _legacy_repo(tmp_path)
+    try:
+        # The upgrade stamps claimed_at + the fixed TTL...
+        normal = repo.get_janitor_task("legacy-normal")
+        assert normal is not None
+        assert normal.claim_expires_at == (
+            datetime.fromisoformat(long_ago) + timedelta(seconds=CLAIM_TTL_SECONDS)
+        ).isoformat()
+        # ...and treats a missing or unparsable stamp as ALREADY expired,
+        # so the next sweep recovers it instead of hanging.
+        for task_id, expected_attempts in (
+            ("legacy-missing", 3),
+            ("legacy-corrupt", 1),
+        ):
+            recovered = repo.get_janitor_task(task_id)
+            assert recovered is not None
+            assert recovered.claim_expires_at is not None
+            assert clock.elapsed_since(recovered.claim_expires_at) > 0
+            # Nothing else about the legacy row was rewritten.
+            assert recovered.attempts == expected_attempts
+            assert recovered.claimed_by == "janitor-dead"
+        live = repo.get_janitor_task("legacy-live")
+        assert live is not None
+        assert live.claim_expires_at == (
+            live_at + timedelta(seconds=CLAIM_TTL_SECONDS)
+        ).isoformat()
+
+        # The recovered work is REAL work: a sweep runs it to completion,
+        # while the live claim is left to its own worker.
+        processed: list[str] = []
+
+        def cleanup(_runs_repo, evidence) -> None:
+            processed.append(str(evidence["run_id"]))
+
+        results = run_pending_janitor_tasks(
+            repo, limit=10, claimer="janitor-upgrade", cleanup=cleanup
+        )
+        assert sorted(r.task_id for r in results) == [
+            "legacy-corrupt",
+            "legacy-missing",
+            "legacy-normal",
+        ]
+        assert [r.status for r in results] == ["done"] * 3
+        assert sorted(processed) == ["run-corrupt", "run-missing", "run-normal"]
+        still_claimed = repo.get_janitor_task("legacy-live")
+        assert still_claimed is not None
+        assert still_claimed.status == "claimed"
+        assert still_claimed.claimed_by == "janitor-alive"
+
+        # Evidence survived the upgrade untouched (only the key release on
+        # completion added the audited dedupe key).
+        done = repo.get_janitor_task("legacy-normal")
+        assert done is not None
+        assert done.evidence["workspace_path"] == "/ws/run-normal"
+        assert done.evidence["dedupe_key"] == "cleanup:run-normal"
+        assert done.attempts == 2
+    finally:
+        repo.close()
+
+
+def test_legacy_done_rows_release_their_key_once_and_history_survives(tmp_path):
+    """AC8: released keys + repeated upgrades never rewrite finished rows."""
+    path = _legacy_control_db(tmp_path)
+    evidence = {"run_id": "run-old", "workspace_path": "/ws/run-old", "note": "第一轮的清理"}
+    _insert_legacy_task(
+        path,
+        task_id="legacy-done",
+        status="done",
+        evidence=evidence,
+        dedupe_key="cleanup:run-old",
+        claimed_by="janitor-old",
+        claimed_at="2026-01-01T00:00:00+00:00",
+        attempts=2,
+        last_error="earlier retry failed",
+        result_json=json.dumps({"cleanup_status": "succeeded"}, sort_keys=True),
+        completed_at="2026-01-01T00:05:00+00:00",
+    )
+
+    first = _legacy_repo(tmp_path)
+    try:
+        released = first.get_janitor_task("legacy-done")
+        assert released is not None
+        assert released.status == "done"
+        assert released.dedupe_key is None
+        assert released.evidence["dedupe_key"] == "cleanup:run-old"
+        # Original evidence, result, error and stamps are all preserved.
+        assert released.evidence["workspace_path"] == "/ws/run-old"
+        assert released.evidence["note"] == "第一轮的清理"
+        assert released.result == {"cleanup_status": "succeeded"}
+        assert released.last_error == "earlier retry failed"
+        assert released.attempts == 2
+        assert released.completed_at == "2026-01-01T00:05:00+00:00"
+        snapshot = released.evidence_json
+
+        # The freed key lets the next round open a NEW task_id.
+        nxt, created = first.enqueue_janitor_task(
+            kind="cleanup",
+            run_id="run-old",
+            evidence={"run_id": "run-old"},
+            dedupe_key="cleanup:run-old",
+        )
+        assert created is True
+        assert nxt.task_id != "legacy-done"
+        assert _count_rows(first, "janitor_tasks") == 2
+    finally:
+        first.close()
+
+    # Repeated starts must not touch the finished row again.
+    for _pass in range(2):
+        reopened = _legacy_repo(tmp_path)
+        try:
+            again = reopened.get_janitor_task("legacy-done")
+            assert again is not None
+            assert again.evidence_json == snapshot
+            assert again.dedupe_key is None
+            assert _count_rows(reopened, "janitor_tasks") == 2
+            assert _count_rows(reopened, "janitor_tasks", "status = 'done'") == 1
+        finally:
+            reopened.close()
+
+
+def test_interrupted_janitor_migration_is_safely_retryable(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    """AC9b: an interrupted pass leaves no half-stamped state to reason about.
+
+    The real migration runs inside one IMMEDIATE transaction, so a worker
+    that dies halfway writes NOTHING: the retry simply stamps the rows the
+    first attempt never got to, and already-finished rows are never
+    touched twice (they no longer match ``claim_expires_at IS NULL``).
+    """
+    path = _legacy_control_db(tmp_path)
+    for task_id in ("legacy-a", "legacy-b", "legacy-c"):
+        _insert_legacy_task(
+            path,
+            task_id=task_id,
+            status="claimed",
+            evidence={"run_id": task_id},
+            claimed_at="2026-01-01T00:00:00+00:00",
+        )
+
+    original_deadline = persistence_module._janitor_legacy_deadline
+    calls = {"n": 0}
+
+    def crash_on_second_row(claimed_at: Any) -> str:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("migration interrupted")
+        return original_deadline(claimed_at)
+
+    monkeypatch.setattr(
+        persistence_module, "_janitor_legacy_deadline", crash_on_second_row
+    )
+    with pytest.raises(RuntimeError, match="migration interrupted"):
+        ControlStore(path)
+    monkeypatch.setattr(
+        persistence_module, "_janitor_legacy_deadline", original_deadline
+    )
+
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        partial = conn.execute(
+            "SELECT task_id FROM janitor_tasks WHERE claim_expires_at IS NOT NULL"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert partial == [], "a rolled-back pass must not stamp anything"
+
+    repo = _legacy_repo(tmp_path)
+    try:
+        expected = (
+            datetime.fromisoformat("2026-01-01T00:00:00+00:00")
+            + timedelta(seconds=CLAIM_TTL_SECONDS)
+        ).isoformat()
+        for task_id in ("legacy-a", "legacy-b", "legacy-c"):
+            row = repo.get_janitor_task(task_id)
+            assert row is not None
+            assert row.claim_expires_at == expected
+        # The retry is convergent: one candidate index, not a rebuilt one.
+        assert (
+            _count_rows(
+                repo,
+                "sqlite_master",
+                "type = 'index' AND name = 'idx_janitor_claim_candidates'",
+            )
+            == 1
+        )
+    finally:
+        repo.close()
+
+
+def test_takeover_recovery_touches_only_the_original_workspace(
+    tmp_path, clock: _Clock
+):
+    """AC10: recovery after a takeover reuses run/lease/workspace identity.
+
+    The first worker DID the cleanup but lost its claim before settling.
+    The take-over sweep must therefore NOT run the cleanup a second time
+    (the durable lease already says succeeded), must not provision a
+    workspace, and must not re-run the model or the effect.
+    """
+    repo = _repo(tmp_path)
+    try:
+        run_id, _approval = _paused_pdf_run(repo, "req-janitor-takeover")
+        computer = _FakeComputer()
+
+        def failing_cleanup(comp, workspace_path, runs, rid) -> None:
+            raise RuntimeError("transient cleanup failure")
+
+        orch = _orchestrator(repo, computer, cleanup=failing_cleanup)
+        _resume(orch, run_id)
+        task = repo.list_janitor_tasks(status="pending")[0]
+        lease_before = repo.get_sandbox_lease(run_id)
+        assert lease_before is not None
+
+        handler_calls: list[str] = []
+
+        def cleanup(runs_repo, evidence) -> None:
+            # Do the ORIGINAL workspace's cleanup, then lose the claim the
+            # way a crashed worker does: the work landed, the settlement
+            # never did.
+            lease = runs_repo.get_sandbox_lease(evidence["run_id"])
+            assert lease is not None
+            handler_calls.append(lease.workspace_path)
+            computer.cleanup(lease.workspace_path)
+            runs_repo.destroy_sandbox_lease(run_id=evidence["run_id"])
+            runs_repo.record_sandbox_cleanup(evidence["run_id"], status="succeeded")
+            clock.advance(CLAIM_TTL_SECONDS)
+            open_claim = runs_repo.list_janitor_tasks(status="claimed", limit=10)[0]
+            _ghost, stolen = runs_repo.claim_janitor_task(
+                open_claim.task_id, owner="janitor-ghost"
+            )
+            assert stolen is True
+
+        results = run_pending_janitor_tasks(
+            repo,
+            limit=10,
+            claimer="janitor-first",
+            cleanup=cleanup,
+        )
+        assert [r.status for r in results] == ["claim_lost"], results
+        assert handler_calls == [f"/ws/{run_id}"]
+
+        mid = repo.get_janitor_task(task.task_id)
+        assert mid is not None
+        assert mid.status == "claimed"
+        assert mid.attempts == 2
+
+        # The take-over sweep sees a succeeded lease: nothing is re-run.
+        clock.advance(CLAIM_TTL_SECONDS)
+        second = run_pending_janitor_tasks(
+            repo, limit=10, claimer="janitor-second", cleanup=cleanup
+        )
+        assert [r.status for r in second] == ["done"], second
+        assert handler_calls == [f"/ws/{run_id}"], "cleanup must not run twice"
+        assert computer.cleaned == [f"/ws/{run_id}"]
+        assert computer.workspaces == [], "no new sandbox may be provisioned"
+
+        settled = repo.get_janitor_task(task.task_id)
+        assert settled is not None
+        assert settled.status == "done"
+        assert settled.attempts == 3
+        assert settled.claimed_by == "janitor-second"
+        assert settled.result["already_cleaned"] is True
+
+        lease = repo.get_sandbox_lease(run_id)
+        assert lease is not None
+        assert lease.lease_id == lease_before.lease_id
+        assert lease.workspace_path == f"/ws/{run_id}"
+        assert lease.cleanup_status == "succeeded"
+        # The run's terminal state and its single effect are untouched.
+        run = repo.get_run(run_id)
+        assert run is not None and run.status == "done"
+        assert _count_rows(repo, "effects", f"run_id = '{run_id}'") == 1
+    finally:
+        repo.close()
+
+
+def test_takeover_repair_never_executes_an_unknown_effect(
+    tmp_path, clock: _Clock
+):
+    """AC10b: a reclaimed repair task still only reconciles, never executes."""
+    repo = _repo(tmp_path)
+    try:
+        run_id, identity = _unknown_effect(repo, "req-janitor-takeover-repair")
+        task, _ = repo.enqueue_janitor_task(
+            kind="repair",
+            run_id=run_id,
+            effect_id=identity.effect_id,
+            evidence={"run_id": run_id, "effect_id": identity.effect_id},
+            dedupe_key=f"repair:{identity.effect_id}",
+        )
+        hung, won = repo.claim_janitor_task(task.task_id, owner="janitor-crashed")
+        assert won is True and hung is not None
+
+        clock.advance(CLAIM_TTL_SECONDS)
+        results = run_pending_janitor_tasks(repo, limit=10, claimer="janitor-new")
+        assert [r.status for r in results] == ["done"], results
+        assert results[0].outcome["repair_status"] == "repair_claimed"
+        assert results[0].outcome["next_action"] == "manual_confirm"
+
+        effect = repo.get_effect(identity.effect_id)
+        assert effect is not None
+        assert effect.status == EffectStatus.OUTCOME_UNKNOWN.value
+        assert effect.result_json is None
+        # Reconciled once by the takeover; no execution, no success frame.
+        assert effect.repair_attempts == 1
+        assert not [
+            event
+            for event in repo.get_events_since(run_id=run_id, from_seq=0)
+            if event["type"] == "tool_result"
+            and event["payload"].get("status") == "ok"
+        ]
+        settled = repo.get_janitor_task(task.task_id)
+        assert settled is not None and settled.status == "done"
+        assert settled.attempts == 2
     finally:
         repo.close()
 

@@ -252,7 +252,7 @@ def run_pending_janitor_tasks(
             logger.exception(
                 "janitor: task %s (%s) failed", claimed.task_id, claimed.kind
             )
-            _settled, persisted = runs_repo.fail_janitor_task(
+            _row, persisted = runs_repo.fail_janitor_task(
                 claimed.task_id, error, owner=owner, expected_attempt=attempt
             )
             results.append(
@@ -272,7 +272,7 @@ def run_pending_janitor_tasks(
                 )
             continue
 
-        _settled, persisted = runs_repo.complete_janitor_task(
+        _row, persisted = runs_repo.complete_janitor_task(
             claimed.task_id,
             owner=owner,
             expected_attempt=attempt,
