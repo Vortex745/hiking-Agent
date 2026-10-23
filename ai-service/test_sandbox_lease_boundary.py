@@ -34,6 +34,7 @@ from agent_v2.persistence import (
 from agent_v2.profiles import resolve_profile
 from agent_v2.run_orchestration import RunOrchestrator
 from agent_v2.runs import RunRepository
+from agent_v2.sandbox_lifecycle import run_sandbox_cleanup
 
 
 def _repo(tmp_path) -> RunRepository:
@@ -627,12 +628,18 @@ def test_cowork_first_stream_fails_closed_when_lease_cannot_be_acquired(
     async def fake_kernel(**_kwargs):
         return ('{"command": "echo hi"}', [])
 
+    def cleanup(computer_arg, workspace_path, runs_repo_arg, run_id_arg):
+        # ALR ticket 03: explicit typed result via the production helper —
+        # the settlement, not the hook, owns the durable writes.
+        cleanups.append(workspace_path)
+        return run_sandbox_cleanup(computer_arg, workspace_path)
+
     orch = RunOrchestrator(
         settings=_settings(),
         runs_repo=repo,
         kernel_turn=fake_kernel,
         computer_factory=lambda *a, **k: computer,
-        sandbox_cleanup=lambda *a, **k: cleanups.append(k),
+        sandbox_cleanup=cleanup,
     )
     try:
         req = ChatFlowRequest(
@@ -739,10 +746,10 @@ def _resume_orchestrator(repo: RunRepository, computer: _FakeComputer):
     def fake_export(**_kwargs: Any) -> dict[str, Any]:
         return {"artifact_id": "art-lease", "public_filename": "out.txt"}
 
-    def cleanup(comp: Any, workspace_path: str, runs: Any, run_id: Any) -> None:
-        comp.cleanup(workspace_path)
-        if runs is not None and run_id is not None:
-            runs.destroy_sandbox_lease(run_id=run_id)
+    def cleanup(comp: Any, workspace_path: str, runs: Any, run_id: Any):
+        # ALR ticket 03: explicit typed result via the production helper —
+        # the lifecycle settlement destroys the lease (the hook does not).
+        return run_sandbox_cleanup(comp, workspace_path)
 
     return RunOrchestrator(
         settings=_settings(),

@@ -48,6 +48,7 @@ from agent_v2.persistence import (
 from agent_v2.profiles import resolve_profile
 from agent_v2.run_orchestration import ChatFlowRequest, RunOrchestrator
 from agent_v2.runs import RunRepository
+from agent_v2.sandbox_lifecycle import run_sandbox_cleanup
 from agent_v2.policy_adapters import (
     NATIVE_POLICY_SCHEMA_VERSION,
     NEXT_ACTION_JANITOR,
@@ -363,8 +364,11 @@ def _orchestrator(
         counters["sandbox"] += 1
         return computer
 
-    def fake_cleanup(*args: Any, **kwargs: Any) -> None:
+    def fake_cleanup(computer_arg, workspace_path, runs_repo_arg, run_id_arg):
+        # ALR ticket 03: explicit typed result via the production helper —
+        # counting injections share the production result semantics.
         counters["cleanup"] += 1
+        return run_sandbox_cleanup(computer_arg, workspace_path)
 
     return (
         RunOrchestrator(

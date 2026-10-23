@@ -55,6 +55,7 @@ from agent_v2.pdf_rendering import (
 )
 from agent_v2.runs import RunRepository
 from agent_v2.persistence import CheckpointsStore, ControlStore
+from agent_v2.sandbox_lifecycle import run_sandbox_cleanup
 
 
 DRAFT = """# 杭州两日徒步计划
@@ -572,6 +573,13 @@ def _orchestrator(tmp_path: Path, repo: RunRepository, computer, cleanups, *, pl
     async def fake_kernel(**kwargs: Any):
         return (plan_text, [])
 
+    def cleanup(computer_arg, workspace_path, runs_repo_arg, run_id_arg):
+        # ALR ticket 03: explicit typed result via the production helper —
+        # for the real LocalNativeComputer this also performs the physical
+        # teardown, so the sandbox workspace is genuinely destroyed.
+        cleanups.append(workspace_path)
+        return run_sandbox_cleanup(computer_arg, workspace_path)
+
     return RunOrchestrator(
         settings=_settings(agent_v2_state_dir=str(tmp_path / "state")),
         runs_repo=repo,
@@ -583,7 +591,7 @@ def _orchestrator(tmp_path: Path, repo: RunRepository, computer, cleanups, *, pl
         ),
         kernel_turn=fake_kernel,
         computer_factory=lambda *a, **k: computer,
-        sandbox_cleanup=lambda *a, **k: cleanups.append(k),
+        sandbox_cleanup=cleanup,
         gate_factory=None,  # real gate → generate_pdf HIGH risk → pause
     )
 

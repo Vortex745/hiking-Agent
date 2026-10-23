@@ -69,7 +69,6 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from agent_v2.computer import (
     Computer,
-    SandboxCleanupError,
     create_computer,
 )
 from agent_v2.effect_repair import repair_effect
@@ -82,6 +81,10 @@ from agent_v2.observability import (
 )
 from agent_v2.permissions import (
     PermissionGate,
+)
+from agent_v2.sandbox_lifecycle import (
+    SandboxCleanupResult,
+    run_sandbox_cleanup,
 )
 from agent_v2.run_orchestration import (
     ChatFlowRequest,
@@ -278,51 +281,17 @@ def _cleanup_sandbox(
     workspace_path: str,
     runs_repo: RunRepository | None,
     run_id: str | None,
-) -> None:
-    """Best-effort sandbox cleanup (spec AC6).
+) -> SandboxCleanupResult:
+    """Thin cleanup adapter (spec AC6, ALR ticket 03).
 
-    Always invoked from a ``finally`` block. Cleanup failure is recorded
-    on the lease as ``failed`` with the error reason; the run's terminal
-    state is NOT changed — the operator must investigate stale sandboxes
-    via the lease record.
+    Always invoked from a ``finally`` block. The lifecycle module owns
+    the typed outcome (:func:`run_sandbox_cleanup`) and the settlement;
+    this adapter only passes the call through — it swallows no failure
+    and never mutates the lease on its own, so an ambiguous ``None``
+    return can no longer be recorded as a successful cleanup.
     """
-    failure_reason: str | None = None
-    resource_usage: dict[str, Any] | None = None
-    try:
-        usage = computer.cleanup(workspace_path)
-        resource_usage = usage.to_dict()
-    except SandboxCleanupError as exc:
-        failure_reason = f"cleanup failed: {exc}"
-        # Preserve partial usage gathered before the cleanup failure so
-        # the lease still records resource metrics (spec AC6: record
-        # success, failure, AND resource usage).
-        if exc.partial_usage is not None:
-            resource_usage = exc.partial_usage.to_dict()
-        logger.warning(
-            "chat_v2: sandbox cleanup failed for run_id=%s workspace=%s: %s",
-            run_id, workspace_path, exc,
-        )
-    except Exception as exc:
-        # Unexpected cleanup error — record as failed but do not raise.
-        failure_reason = f"cleanup unexpected error: {exc}"
-        logger.exception(
-            "chat_v2: sandbox cleanup unexpected error for run_id=%s",
-            run_id,
-        )
-
-    if runs_repo is not None and run_id is not None:
-        try:
-            runs_repo.destroy_sandbox_lease(
-                run_id=run_id,
-                resource_usage=resource_usage,
-                failure_reason=failure_reason,
-            )
-        except Exception:
-            logger.exception(
-                "chat_v2: destroy_sandbox_lease failed for run_id=%s; "
-                "lease record may be stale",
-                run_id,
-            )
+    _ = runs_repo, run_id  # kept for the orchestrator's injection signature
+    return run_sandbox_cleanup(computer, workspace_path)
 
 
 # Ticket 41: ``_persist_failed_artifact`` and ``_export_artifact_to_host``

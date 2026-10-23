@@ -61,6 +61,7 @@ from agent_v2.persistence import (
 from agent_v2.profiles import resolve_profile
 from agent_v2.run_orchestration import ChatFlowRequest, RunOrchestrator
 from agent_v2.runs import RunRepository
+from agent_v2.sandbox_lifecycle import SandboxCleanupResult
 
 # The fixed claim deadline this spec chooses for the janitor (ticket 04).
 CLAIM_TTL_SECONDS = 600
@@ -229,9 +230,10 @@ def _orchestrator(
     async def default_kernel(**_kwargs: Any) -> tuple[str, list[dict[str, Any]]]:
         return ("# 计划正文", [])
 
-    def default_cleanup(comp, workspace_path, runs, run_id) -> None:
-        if runs is not None and run_id is not None:
-            runs.destroy_sandbox_lease(run_id=run_id)
+    def default_cleanup(comp, workspace_path, runs, run_id):
+        # ALR ticket 03: explicit typed result; the lifecycle settlement
+        # (not the hook) destroys the lease.
+        return SandboxCleanupResult.success(comp.cleanup(workspace_path))
 
     def factory(*_a: Any, **_k: Any) -> _FakeComputer:
         if factory_calls is not None:
@@ -1589,9 +1591,9 @@ def test_cleanup_success_records_status_and_repeat_is_idempotent(tmp_path):
         computer = _FakeComputer()
         calls: list[int] = []
 
-        def counting_cleanup(comp, workspace_path, runs, rid) -> None:
+        def counting_cleanup(comp, workspace_path, runs, rid):
             calls.append(1)
-            runs.destroy_sandbox_lease(run_id=rid)
+            return SandboxCleanupResult.success(comp.cleanup(workspace_path))
 
         orch = _orchestrator(repo, computer, cleanup=counting_cleanup)
         items = _resume(orch, run_id)

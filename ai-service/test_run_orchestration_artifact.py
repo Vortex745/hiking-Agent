@@ -35,6 +35,7 @@ from agent_v2.run_orchestration import (
 )
 from agent_v2.persistence import CheckpointsStore, ControlStore
 from agent_v2.runs import RunRepository
+from agent_v2.sandbox_lifecycle import run_sandbox_cleanup
 
 
 TERMINALS = {"error", "done", "cancelled", "run.paused"}
@@ -118,13 +119,20 @@ def _artifact_orchestrator(
 
     comp = computer if computer is not None else _FakeComputer()
     cleanups: list[Any] = []
+
+    def cleanup(computer_arg, workspace_path, runs_repo_arg, run_id_arg):
+        # ALR ticket 03: explicit typed result via the production helper —
+        # the settlement, not the hook, owns the durable writes.
+        cleanups.append(workspace_path)
+        return run_sandbox_cleanup(computer_arg, workspace_path)
+
     orch = RunOrchestrator(
         settings=_settings(),
         runs_repo=runs_repo if runs_repo is not None else _repo(tmp_path),
         kernel_turn=fake_kernel,
         artifact_export=fake_export,
         computer_factory=lambda *a, **k: comp,
-        sandbox_cleanup=lambda *a, **k: cleanups.append(k),
+        sandbox_cleanup=cleanup,
         gate_factory=_allow_gate_factory(),
     )
     return orch, comp, cleanups
