@@ -263,22 +263,27 @@ def _settle_retry_failure(
     lease_id: str,
     evidence: dict[str, Any],
     failure_reason: str,
+    workspace_path: str = "",
+    fencing_token: int = 0,
     resource_usage: dict[str, Any] | None = None,
 ) -> None:
     """Record a REAL retry failure through the atomic settlement (ALR 04).
 
     One control transaction: the idempotent retry task (dedupe reuses
     the row the runner currently owns), the lease's failed release —
-    only an ACTIVE lease transitions, so the FIRST release's evidence
-    on an already-failed lease is never overwritten — and the
-    ``pending_janitor`` cleanup record with the fresh reason. The task
-    row itself is failed separately by the runner's claim CAS. A
-    bookkeeping fault here is logged, never swallowed into a success.
+    fenced to the ORIGINAL identity the janitor validated, so only an
+    ACTIVE lease of that exact generation transitions and the FIRST
+    release's evidence on an already-failed lease is never overwritten
+    — and the ``pending_janitor`` cleanup record with the fresh reason.
+    The task row itself is failed separately by the runner's claim CAS.
+    A bookkeeping fault here is logged, never swallowed into a success.
     """
     try:
         runs_repo.settle_cleanup_failure(
             run_id=run_id,
             lease_id=lease_id,
+            workspace_path=workspace_path,
+            fencing_token=fencing_token,
             evidence=evidence,
             dedupe_key=None,
             resource_usage=resource_usage,
@@ -288,6 +293,28 @@ def _settle_retry_failure(
         logger.exception(
             "janitor: settling retry failure for run %s failed", run_id
         )
+
+
+def _settle_success(
+    runs_repo: "RunRepository",
+    lease: "SandboxLeaseRecord",
+    resource_usage: dict[str, Any] | None = None,
+) -> bool:
+    """Fenced success settlement for the ORIGINAL target (ALR 06).
+
+    One shared call-site core for both retry paths: the validated
+    original lease record is settled ``destroyed``/``succeeded`` in one
+    transaction, matched by its full identity. Returns whether THIS
+    settlement won (``False`` = already settled or superseded).
+    """
+    _record, settled = runs_repo.settle_cleanup_success(
+        run_id=lease.run_id,
+        lease_id=lease.lease_id,
+        workspace_path=lease.workspace_path,
+        fencing_token=lease.fencing_token,
+        resource_usage=resource_usage,
+    )
+    return settled
 
 
 def _run_cleanup(
@@ -331,6 +358,17 @@ def _run_cleanup(
                 "already_cleaned": True,
             }
 
+    # The ORIGINAL target identity the janitor validated (task record
+    # first, evidence second) — every settlement below is fenced to it,
+    # so a successor takeover in the validation → settlement window can
+    # never be settled by this worker.
+    original_lease_id = task.lease_id or str(evidence.get("lease_id") or "")
+    original_workspace = str(evidence.get("workspace_path") or "")
+    try:
+        original_token = int(evidence.get("fencing_token"))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        original_token = 0
+
     if cleanup is not None:
         try:
             cleanup(runs_repo, evidence)
@@ -338,19 +376,15 @@ def _run_cleanup(
             _settle_retry_failure(
                 runs_repo,
                 run_id=run_id,
-                lease_id=task.lease_id or str(evidence.get("lease_id") or ""),
+                lease_id=original_lease_id,
                 evidence=evidence,
                 failure_reason=f"cleanup retry failed: {exc}",
+                workspace_path=original_workspace,
+                fencing_token=original_token,
             )
             raise
         if lease is not None:
-            _record, settled = runs_repo.settle_cleanup_success(
-                run_id=run_id,
-                lease_id=lease.lease_id,
-                workspace_path=lease.workspace_path,
-                sandbox_identity=lease.sandbox_identity or "",
-                fencing_token=lease.fencing_token,
-            )
+            settled = _settle_success(runs_repo, lease)
             if not settled:
                 # The handler settled the row its own way (legacy seam);
                 # keep the cleanup record it may have skipped.
@@ -376,9 +410,11 @@ def _run_cleanup(
             _settle_retry_failure(
                 runs_repo,
                 run_id=run_id,
-                lease_id=task.lease_id or str(evidence.get("lease_id") or ""),
+                lease_id=original_lease_id,
                 evidence=evidence,
                 failure_reason=reason,
+                workspace_path=original_workspace,
+                fencing_token=original_token,
                 resource_usage=outcome.partial_usage,
             )
             detail = f"cleanup retry failed: {reason}"
@@ -387,14 +423,7 @@ def _run_cleanup(
                     json.dumps(outcome.partial_usage, sort_keys=True)
                 )
             raise RuntimeError(detail)
-        _record, settled = runs_repo.settle_cleanup_success(
-            run_id=run_id,
-            lease_id=lease.lease_id,
-            workspace_path=lease.workspace_path,
-            sandbox_identity=lease.sandbox_identity or "",
-            fencing_token=lease.fencing_token,
-            resource_usage=outcome.usage,
-        )
+        settled = _settle_success(runs_repo, lease, outcome.usage)
         if not settled:
             # Idempotent duplicate: this generation was already settled
             # (a previous worker's fenced write, or a takeover between

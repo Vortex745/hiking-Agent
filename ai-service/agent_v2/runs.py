@@ -990,6 +990,8 @@ class RunRepository:
         *,
         run_id: str,
         lease_id: str = "",
+        workspace_path: str = "",
+        fencing_token: int = 0,
         evidence: dict[str, Any] | None = None,
         dedupe_key: str | None = None,
         resource_usage: dict[str, Any] | None = None,
@@ -997,7 +999,8 @@ class RunRepository:
     ) -> tuple[JanitorTaskRecord | None, bool, SandboxLeaseRecord | None]:
         """One-transaction failure settlement (see ControlStore, ALR 04).
 
-        Delegates to the control store's atomic settlement; the
+        Delegates to the control store's atomic settlement — fenced to
+        the original lease identity when one is supplied; the
         ``cleanup_pending`` signal fires ONLY after the transaction
         committed and only for a NEWLY created work item — an unwritable
         database claims no durable backlog.
@@ -1005,6 +1008,8 @@ class RunRepository:
         task, created, lease = self.control.settle_cleanup_failure(
             run_id=run_id,
             lease_id=lease_id,
+            workspace_path=workspace_path,
+            fencing_token=fencing_token,
             evidence=evidence,
             dedupe_key=dedupe_key,
             resource_usage=resource_usage,
@@ -1020,7 +1025,6 @@ class RunRepository:
         run_id: str,
         lease_id: str,
         workspace_path: str,
-        sandbox_identity: str = "",
         fencing_token: int,
         resource_usage: dict[str, Any] | None = None,
     ) -> tuple[SandboxLeaseRecord | None, bool]:
@@ -1029,7 +1033,6 @@ class RunRepository:
             run_id=run_id,
             lease_id=lease_id,
             workspace_path=workspace_path,
-            sandbox_identity=sandbox_identity,
             fencing_token=fencing_token,
             resource_usage=resource_usage,
         )

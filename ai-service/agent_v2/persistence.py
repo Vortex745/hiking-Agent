@@ -1997,6 +1997,8 @@ class ControlStore:
         *,
         run_id: str,
         lease_id: str = "",
+        workspace_path: str = "",
+        fencing_token: int = 0,
         evidence: dict[str, Any] | None = None,
         dedupe_key: str | None = None,
         resource_usage: dict[str, Any] | None = None,
@@ -2011,12 +2013,24 @@ class ControlStore:
           supplies the insert, so no nested transaction) — carrying the
           original-target evidence;
         * the lease's failed release: ``status='failed'`` with the
-          preserved partial usage and the failure reason (only an active
-          lease transitions; an already-settled row keeps the first
-          release's evidence);
-        * the ``pending_janitor`` cleanup record, associated with the
-          task through ``janitor_task_id`` (a recorded ``succeeded`` is
-          never downgraded).
+          preserved partial usage and the failure reason — fenced to the
+          ORIGINAL identity (lease id / workspace / fencing generation,
+          the same terms :meth:`settle_cleanup_success` uses; each term
+          supplied must match). Only an ACTIVE lease of that exact
+          generation transitions; an already-settled row keeps the
+          first release's evidence;
+        * the ``pending_janitor`` cleanup record under the SAME fence,
+          associated with the task through ``janitor_task_id`` (a
+          recorded ``succeeded`` is never downgraded).
+
+        A fence that matches NOTHING — a successor generation took the
+        row over between the janitor's identity validation and this
+        settlement — leaves the successor lease untouched: no failed
+        lease is fabricated for it. The task/evidence records stay
+        truthful for the ORIGINAL target, mirroring how the fenced
+        success settlement behaves on a mismatch. A settlement that
+        records NO original identity at all never claims a live lease
+        (the failure cannot be attributed to any generation).
 
         Any exception rolls EVERYTHING back: a write fault mid-settlement
         can no longer leave an orphan task without a failed lease, or a
@@ -2030,6 +2044,24 @@ class ControlStore:
             if resource_usage is not None
             else None
         )
+        # Original-identity fence (ALR review): every identity term the
+        # caller supplies must match the row; a successor generation
+        # (new lease id / workspace / token) is fenced out.
+        identity_where = ""
+        identity_params: list[Any] = []
+        if lease_id:
+            identity_where += " AND lease_id = ?"
+            identity_params.append(lease_id)
+        if workspace_path:
+            identity_where += " AND workspace_path = ?"
+            identity_params.append(workspace_path)
+        if fencing_token:
+            identity_where += " AND fencing_token = ?"
+            identity_params.append(int(fencing_token))
+        if not identity_params:
+            # No original identity recorded: never guess which live
+            # generation an unidentified failure belongs to.
+            identity_where = " AND 1 = 0"
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             task, created = self._insert_janitor_task_in_transaction(
@@ -2044,8 +2076,15 @@ class ControlStore:
             self._conn.execute(
                 "UPDATE sandbox_leases SET status = ?, destroyed_at = ?, "
                 "resource_usage_json = ?, failure_reason = ? "
-                "WHERE run_id = ? AND status = 'active'",
-                ("failed", now, usage_json, failure_reason, run_id),
+                "WHERE run_id = ? AND status = 'active'" + identity_where,
+                (
+                    "failed",
+                    now,
+                    usage_json,
+                    failure_reason,
+                    run_id,
+                    *identity_params,
+                ),
             )
             if task is not None:
                 self._conn.execute(
@@ -2053,8 +2092,14 @@ class ControlStore:
                     "cleanup_error = ?, "
                     "janitor_task_id = COALESCE(?, janitor_task_id) "
                     "WHERE run_id = ? AND (cleanup_status IS NULL "
-                    "OR cleanup_status <> 'succeeded')",
-                    ("pending_janitor", failure_reason, task.task_id, run_id),
+                    "OR cleanup_status <> 'succeeded')" + identity_where,
+                    (
+                        "pending_janitor",
+                        failure_reason,
+                        task.task_id,
+                        run_id,
+                        *identity_params,
+                    ),
                 )
             lease = self.get_sandbox_lease(run_id)
             self._conn.execute("COMMIT")
@@ -2069,7 +2114,6 @@ class ControlStore:
         run_id: str,
         lease_id: str,
         workspace_path: str,
-        sandbox_identity: str = "",
         fencing_token: int,
         resource_usage: dict[str, Any] | None = None,
     ) -> tuple[SandboxLeaseRecord | None, bool]:
@@ -2089,7 +2133,6 @@ class ControlStore:
         minted. A repeat settlement of the same generation is a no-op
         (``settled=False``), preserving the first release's evidence.
         """
-        _ = sandbox_identity  # identity is pinned by lease_id + generation
         now = _now_iso()
         usage_json = (
             json.dumps(resource_usage, ensure_ascii=False)

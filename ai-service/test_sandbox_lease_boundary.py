@@ -1022,7 +1022,6 @@ def test_success_settlement_for_a_stale_target_never_touches_the_successor(
             run_id=run_id,
             lease_id=original.lease_id,
             workspace_path="/ws/original",
-            sandbox_identity=original.sandbox_identity or "",
             fencing_token=original.fencing_token,
             resource_usage={"duration_ms": 1},
         )
@@ -1053,6 +1052,132 @@ def test_success_settlement_for_a_stale_target_never_touches_the_successor(
         assert after.cleanup_status != "succeeded"
         assert after.failure_reason is None
         assert after.resource_usage is None
+        # No generation was forged and no second row exists.
+        rows = repo.control._conn.execute(
+            "SELECT COUNT(*) FROM sandbox_leases WHERE run_id = ?", (run_id,)
+        ).fetchone()[0]
+        assert rows == 1
+    finally:
+        repo.close()
+
+
+def test_failure_settlement_for_a_stale_target_never_touches_the_successor(
+    tmp_path,
+):
+    """ALR review (fencing gap): a FAILURE settlement for the ORIGINAL
+    target — a successor generation took the row over between the
+    janitor's identity validation and its failure settlement — is
+    fenced to that original identity. The successor lease is never
+    marked failed (no fabricated failed lease), while the deduped
+    janitor task/evidence stay truthful for the ORIGINAL target."""
+    from agent_v2.sandbox_lifecycle import (
+        SandboxCleanupResult,
+        settle_terminal_cleanup,
+    )
+
+    repo = _repo(tmp_path)
+    try:
+        run_id, original = _lease_with_run(
+            repo, "req-04-stale-failure", "/ws/original-f"
+        )
+
+        # The original generation's cleanup fails: failed lease + one
+        # deduped janitor task, all in the one settlement.
+        first = SandboxCleanupResult.failure("cleanup failed: locked")
+        task_id = settle_terminal_cleanup(
+            repo,
+            computer=_FakeComputer(),
+            workspace_path="/ws/original-f",
+            run_id=run_id,
+            outcome=first,
+        )
+        assert task_id is not None
+        failed = repo.get_sandbox_lease(run_id)
+        assert failed is not None
+        assert failed.status == "failed"
+        assert failed.lease_id == original.lease_id
+
+        # A successor generation takes the SAME row over (resume/retry).
+        successor, acquired = repo.acquire_sandbox_lease(
+            run_id=run_id,
+            owner_id="worker-successor-f",
+            sandbox_type="local_native",
+            workspace_path="/ws/successor-f",
+            sandbox_identity="local_native:/ws/successor-f",
+        )
+        assert acquired is True
+        assert successor is not None
+        assert successor.status == "active"
+        assert successor.fencing_token == original.fencing_token + 1
+        assert successor.lease_id != original.lease_id
+        assert successor.failure_reason is None
+        assert successor.resource_usage is None
+
+        # (a) The stale worker settles ITS failure for the ORIGINAL
+        # target (the takeover raced its validation → settlement
+        # window). The successor lease must stay untouched.
+        stale_reason = "stale worker: cleanup retry failed"
+        task, created, _lease = repo.settle_cleanup_failure(
+            run_id=run_id,
+            lease_id=original.lease_id,
+            evidence={
+                "run_id": run_id,
+                "lease_id": original.lease_id,
+                "workspace_path": "/ws/original-f",
+                "sandbox_identity": original.sandbox_identity or "",
+                "fencing_token": original.fencing_token,
+            },
+            dedupe_key=f"cleanup:{run_id}",
+            resource_usage={"duration_ms": 9},
+            failure_reason=stale_reason,
+        )
+        # The task/evidence stay truthful for the ORIGINAL target...
+        assert task is not None
+        assert task.task_id == task_id  # dedupe reuses the ACTIVE row
+        assert created is False
+        assert task.lease_id == original.lease_id
+        # ...and the SUCCESSOR lease is untouched: still active under its
+        # own identity, no fabricated failure/usage, and the inherited
+        # cleanup record is not overwritten with the stale reason.
+        after = repo.get_sandbox_lease(run_id)
+        assert after is not None
+        assert after.status == "active"
+        assert after.lease_id == successor.lease_id
+        assert after.fencing_token == successor.fencing_token
+        assert after.workspace_path == "/ws/successor-f"
+        assert after.destroyed_at is None
+        assert after.failure_reason is None
+        assert after.resource_usage is None
+        assert after.cleanup_error != stale_reason
+
+        # (b) The full original-identity fence (lease id + workspace +
+        # generation, exactly the terms the success settlement uses) is
+        # equally a no-op against the successor row — and a MISMATCHED
+        # generation can never claim the current lease either.
+        repo.settle_cleanup_failure(
+            run_id=run_id,
+            lease_id=original.lease_id,
+            workspace_path="/ws/original-f",
+            fencing_token=original.fencing_token,
+            evidence={"run_id": run_id, "lease_id": original.lease_id},
+            dedupe_key=f"cleanup:{run_id}",
+            failure_reason=stale_reason,
+        )
+        repo.settle_cleanup_failure(
+            run_id=run_id,
+            lease_id=successor.lease_id,
+            workspace_path="/ws/successor-f",
+            fencing_token=original.fencing_token,  # wrong generation
+            evidence={"run_id": run_id, "lease_id": successor.lease_id},
+            dedupe_key=f"cleanup:{run_id}",
+            failure_reason=stale_reason,
+        )
+        final = repo.get_sandbox_lease(run_id)
+        assert final is not None
+        assert final.status == "active"
+        assert final.lease_id == successor.lease_id
+        assert final.fencing_token == successor.fencing_token
+        assert final.failure_reason is None
         # No generation was forged and no second row exists.
         rows = repo.control._conn.execute(
             "SELECT COUNT(*) FROM sandbox_leases WHERE run_id = ?", (run_id,)

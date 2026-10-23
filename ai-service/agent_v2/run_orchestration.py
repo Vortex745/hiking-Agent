@@ -984,10 +984,13 @@ async def drive_effect(
     * spec AC2 — ``committed`` returns the stored result without
       re-execution (and re-emits the tool_call/tool_result pair when
       the event log is missing them);
-    * spec AC3 — ``executing`` on resume with a dead executor →
-      ``outcome_unknown`` + terminal error, NO auto-replay, human
-      review required; a live executor → ``effect_in_flight`` without
-      touching the effect (the caller preserves the sandbox);
+    * spec AC3 — ``executing`` on resume: with per-run execution
+      ownership (ticket 02) ONLY the owner reaches this driver, so a
+      CLAIMED/executing row found here has NO surviving owner — the
+      executor died between claim and settlement. It converges
+      IMMEDIATELY to ``outcome_unknown`` + terminal error (no
+      auto-replay, human review required), with no liveness inference
+      and nothing but the outcome-unknown mark touching the effect;
     * prior ``failed`` / ``outcome_unknown`` → terminal error, no
       re-execution;
     * commit failure after a successful side effect →

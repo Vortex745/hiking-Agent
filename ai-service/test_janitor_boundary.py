@@ -2669,7 +2669,6 @@ def test_settled_original_generation_short_circuits_without_physical_work(tmp_pa
             run_id=run_id,
             lease_id=lease.lease_id,
             workspace_path=lease.workspace_path,
-            sandbox_identity=lease.sandbox_identity or "",
             fencing_token=lease.fencing_token,
             resource_usage={"files_deleted": 2},
         )
@@ -2802,7 +2801,6 @@ def test_duplicate_runs_of_one_task_physically_clean_exactly_once(
                     run_id=run_id,
                     lease_id=lease.lease_id,
                     workspace_path=lease.workspace_path,
-                    sandbox_identity=lease.sandbox_identity or "",
                     fencing_token=lease.fencing_token,
                     resource_usage={"files_deleted": 3},
                 )

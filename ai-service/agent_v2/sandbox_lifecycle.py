@@ -265,7 +265,6 @@ def settle_terminal_cleanup(
                 run_id=run_id,
                 lease_id=lease.lease_id,
                 workspace_path=lease.workspace_path,
-                sandbox_identity=lease.sandbox_identity or "",
                 fencing_token=lease.fencing_token,
                 resource_usage=outcome.usage,
             )
@@ -281,6 +280,8 @@ def settle_terminal_cleanup(
         task, _created, _lease = runs_repo.settle_cleanup_failure(
             run_id=run_id,
             lease_id=evidence["lease_id"],
+            workspace_path=str(evidence.get("workspace_path") or ""),
+            fencing_token=int(evidence.get("fencing_token") or 0),
             evidence=evidence,
             dedupe_key=CLEANUP_TASK_DEDUPE_KEY.format(run_id=run_id),
             resource_usage=outcome.partial_usage,
