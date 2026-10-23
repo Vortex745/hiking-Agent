@@ -352,8 +352,16 @@ CREATE INDEX IF NOT EXISTS idx_effects_tool ON effects(tool_name);
 -- recorded here with the evidence needed to retry WITHOUT re-executing
 -- an external effect or creating a new sandbox. Status transitions:
 --   pending → claimed → done | failed   (failed → claimed on retry)
+--   claimed → claimed (BCDEF review S4: an EXPIRED claim is reclaimable)
 -- ``dedupe_key`` (UNIQUE when set) makes enqueue idempotent per logical
 -- work item; attempts and last_error make retries auditable.
+-- BCDEF review S4: ``attempts`` doubles as the claim GENERATION — every
+-- successful claim increments it, and settlement must present the value
+-- the claim returned. ``claim_expires_at`` is the deadline that makes a
+-- crashed worker's claim reclaimable and its settlement rejectable. The
+-- ACTIVE dedupe key is kept while the item is pending/claimed/failed and
+-- released (NULL) in the same transaction that writes ``done``, so the
+-- next round can open a NEW task_id for the same logical work item.
 CREATE TABLE IF NOT EXISTS janitor_tasks (
     task_id TEXT PRIMARY KEY,
     kind TEXT NOT NULL,
@@ -367,6 +375,7 @@ CREATE TABLE IF NOT EXISTS janitor_tasks (
     last_error TEXT,
     claimed_by TEXT,
     claimed_at TEXT,
+    claim_expires_at TEXT,
     result_json TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -377,6 +386,9 @@ CREATE TABLE IF NOT EXISTS janitor_tasks (
 CREATE INDEX IF NOT EXISTS idx_janitor_status ON janitor_tasks(status);
 CREATE INDEX IF NOT EXISTS idx_janitor_kind ON janitor_tasks(kind);
 CREATE INDEX IF NOT EXISTS idx_janitor_run ON janitor_tasks(run_id);
+-- idx_janitor_claim_candidates ((status, claim_expires_at)) is created by
+-- ``_migrate_janitor_claim_expiry`` AFTER the additive column exists, so a
+-- pre-ticket-04 database is never indexed on a missing column.
 
 -- Ticket 16: redacted, metadata-only run telemetry. This table has no
 -- columns for prompts, messages, memory, file contents, or tool output.
@@ -624,6 +636,73 @@ JANITOR_STATUSES: frozenset[str] = frozenset(
     {"pending", "claimed", "done", "failed"}
 )
 
+# BCDEF review S4: the FIXED lifetime of a janitor claim. A worker that
+# dies mid-task leaves a ``claimed`` row; once this deadline passes the
+# same CAS that takes a ``pending``/``failed`` item takes it over, and the
+# dead worker's settlement is rejected. Deliberately a design value of the
+# janitor, NOT a shared/env-tunable knob: the sandbox lease happens to use
+# the same 600 s and only provides context for the choice.
+JANITOR_CLAIM_TTL_SECONDS: float = 600.0
+
+# A legacy ``claimed`` row whose ``claimed_at`` is missing or unparsable is
+# treated as ALREADY expired, so the next sweep recovers it instead of
+# hanging forever. An explicit epoch beats a NULL: the candidate order is
+# then deterministic and the row sorts ahead of newer work.
+_JANITOR_EXPIRED_EPOCH_ISO = "1970-01-01T00:00:00+00:00"
+
+
+def _parse_store_timestamp(raw: Any) -> datetime | None:
+    """Parse a stored UTC ISO timestamp, or ``None`` when it is not one.
+
+    Tolerates the ``Z`` suffix older writers used and attaches UTC to a
+    naive stamp. Anything unparsable is reported as missing on purpose:
+    the callers treat "unknown" as "already expired", which is the safe
+    direction for a recovery path.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    text = raw.strip()
+    if text.endswith(("Z", "z")):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _janitor_legacy_deadline(claimed_at: Any) -> str:
+    """Deadline of a pre-ticket-04 ``claimed`` row (S4 upgrade)."""
+    parsed = _parse_store_timestamp(claimed_at)
+    if parsed is None:
+        return _JANITOR_EXPIRED_EPOCH_ISO
+    return (parsed + timedelta(seconds=JANITOR_CLAIM_TTL_SECONDS)).isoformat()
+
+
+def _evidence_with_dedupe_key(
+    evidence_json: Any, dedupe_key: str | None
+) -> str:
+    """Evidence payload with the released ACTIVE dedupe key recorded.
+
+    The original evidence fields are preserved verbatim; only the key is
+    added, so a completed round's cleanup history can still be reconstructed
+    after the active key is cleared.
+    """
+    raw = evidence_json if isinstance(evidence_json, str) else (evidence_json or "{}")
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        parsed = None
+    if not isinstance(parsed, dict):
+        # Never drop an unparsable payload: keep it verbatim so the upgrade
+        # cannot destroy the evidence it is meant to preserve.
+        parsed = {"evidence_json_unparsed": raw}
+    merged = dict(parsed)
+    merged["dedupe_key"] = dedupe_key
+    return json.dumps(merged, sort_keys=True, ensure_ascii=False)
+
 
 @dataclass(frozen=True, slots=True)
 class JanitorTaskRecord:
@@ -633,6 +712,12 @@ class JanitorTaskRecord:
     sandbox identity and the failure reason) so a cleanup or repair can be
     resumed without re-running the model, re-executing the external
     effect, or creating a new sandbox.
+
+    BCDEF review S4: ``attempts`` is also the claim GENERATION (one per
+    successful claim) and ``claim_expires_at`` the deadline of the CURRENT
+    claim. Settlement has to present both the owner and the attempt value
+    the claim returned; ``claim_expires_at`` is cleared back to NULL when
+    the item leaves ``claimed`` for ``failed``.
     """
 
     task_id: str
@@ -651,6 +736,7 @@ class JanitorTaskRecord:
     created_at: str
     updated_at: str
     completed_at: str | None
+    claim_expires_at: str | None = None
 
     @property
     def evidence(self) -> dict[str, Any]:
@@ -777,6 +863,8 @@ class ControlStore:
         self._conn.executescript(_CONTROL_SCHEMA)
         self._migrate_terminal_persist_failed()
         self._migrate_additive_columns()
+        self._migrate_janitor_claim_expiry()
+        self._migrate_janitor_release_finished_dedupe_keys()
         self._migrate_legacy_fencing_tokens()
         logger.info("ControlStore ready at %s", db_path)
 
@@ -831,6 +919,10 @@ class ControlStore:
             "approvals": {
                 "prepared_content": "TEXT",
             },
+            # BCDEF review S4: the claim deadline of a janitor work item.
+            "janitor_tasks": {
+                "claim_expires_at": "TEXT",
+            },
         }
         for table, columns in additions.items():
             existing = {
@@ -842,6 +934,95 @@ class ControlStore:
                     self._conn.execute(
                         f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"
                     )
+
+    def _migrate_janitor_claim_expiry(self) -> None:
+        """BCDEF review S4: make legacy ``claimed`` rows recoverable.
+
+        A database written before the claim deadline existed can hold a
+        ``claimed`` row from a worker that died years ago. Without a
+        deadline that row is unclaimable and unrecoverable, so the upgrade
+        stamps one:
+
+        * ``claimed_at + JANITOR_CLAIM_TTL_SECONDS`` when the claim stamp
+          parses — the same fixed lifetime a new claim gets, measured from
+          when the old worker took the task, so a long-dead claim is
+          already expired and the next sweep takes it over;
+        * the epoch when ``claimed_at`` is missing or unparsable, i.e.
+          treated as ALREADY expired rather than left hanging.
+
+        Nothing else is rewritten: ``evidence_json``, owner and attempts
+        stay as they were, so the audit trail of the interrupted run is
+        preserved. Every statement is guarded by ``claim_expires_at IS
+        NULL``, so an interrupted migration simply finishes the remaining
+        rows on the next start; the candidate index is created with
+        ``IF NOT EXISTS`` after the column exists (the schema script cannot
+        index a column a legacy table does not have yet).
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self._conn.execute(
+                "SELECT task_id, claimed_at FROM janitor_tasks "
+                "WHERE status = 'claimed' AND claim_expires_at IS NULL"
+            ).fetchall()
+            for row in rows:
+                self._conn.execute(
+                    "UPDATE janitor_tasks SET claim_expires_at = ? "
+                    "WHERE task_id = ?",
+                    (_janitor_legacy_deadline(row["claimed_at"]), row["task_id"]),
+                )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_janitor_claim_candidates "
+                "ON janitor_tasks(status, claim_expires_at)"
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        if rows:
+            logger.info(
+                "ControlStore: stamped a claim deadline on %d legacy "
+                "janitor task(s)",
+                len(rows),
+            )
+
+    def _migrate_janitor_release_finished_dedupe_keys(self) -> None:
+        """BCDEF review S4: historical ``done`` rows must not hold a key.
+
+        Before the release-on-completion path existed, a completed task
+        kept its UNIQUE ``dedupe_key`` forever, so the next round of the
+        same logical cleanup could never open a work item again — the
+        enqueue silently re-returned the stale done row. This migration
+        applies the SAME rule the completion transaction applies, to the
+        rows that predate it: the key is copied into
+        ``evidence_json.dedupe_key`` (audit) and the active key cleared.
+
+        Re-runnable: the select only matches rows that still hold a key,
+        and clearing it (in the same transaction as the evidence write) is
+        what makes the next pass match nothing. History is never rewritten
+        twice, and no done row is deleted.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self._conn.execute(
+                "SELECT task_id, dedupe_key, evidence_json FROM janitor_tasks "
+                "WHERE status = 'done' AND dedupe_key IS NOT NULL"
+            ).fetchall()
+            for row in rows:
+                self._conn.execute(
+                    "UPDATE janitor_tasks SET dedupe_key = NULL, evidence_json = ? "
+                    "WHERE task_id = ?",
+                    (_evidence_with_dedupe_key(row["evidence_json"], row["dedupe_key"]), row["task_id"]),
+                )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        if rows:
+            logger.info(
+                "ControlStore: released the active dedupe key of %d finished "
+                "janitor task(s)",
+                len(rows),
+            )
 
     def _migrate_legacy_fencing_tokens(self) -> None:
         """BCDEF review B1: move pre-ticket-06 lease rows off generation 0.
@@ -1871,9 +2052,35 @@ class ControlStore:
         status: str | None = None,
         kind: str | None = None,
         limit: int = 100,
+        claimable: bool = False,
     ) -> list[JanitorTaskRecord]:
+        """List work items, optionally restricted to CLAIMABLE ones.
+
+        BCDEF review S4: the runner's candidate scan is this one query —
+        ``claimable=True`` selects ``pending``/``failed`` PLUS the
+        ``claimed`` rows whose deadline has passed, ordered by the moment
+        each item BECAME claimable (``claim_expires_at`` for a taken-over
+        claim, ``created_at`` otherwise). Because a takeover's sort key is
+        frozen at its deadline while newer work carries a newer
+        ``created_at``, an old hung task outranks a stream of fresh
+        ``pending`` items instead of starving behind them. The predicate is
+        bounded by ``LIMIT`` and served by ``idx_janitor_claim_candidates``
+        — no full scan, no per-status loop.
+        """
         clauses: list[str] = []
         params: list[Any] = []
+        order = "created_at ASC, task_id ASC"
+        if claimable:
+            now = _now_iso()
+            clauses.append(
+                "(status IN ('pending', 'failed') "
+                " OR (status = 'claimed' AND ("
+                "     claim_expires_at IS NULL OR claim_expires_at <= ?)))"
+            )
+            params.append(now)
+            order = (
+                "COALESCE(claim_expires_at, created_at) ASC, task_id ASC"
+            )
         if status is not None:
             clauses.append("status = ?")
             params.append(status)
@@ -1883,7 +2090,7 @@ class ControlStore:
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self._conn.execute(
             f"SELECT * FROM janitor_tasks {where} "
-            "ORDER BY created_at ASC, task_id ASC LIMIT ?",
+            f"ORDER BY {order} LIMIT ?",
             (*params, limit),
         ).fetchall()
         return [self._row_to_janitor_task(row) for row in rows]
@@ -1894,15 +2101,33 @@ class ControlStore:
         *,
         owner: str,
     ) -> tuple[JanitorTaskRecord | None, bool]:
-        """CAS claim a pending/failed task; only one worker wins."""
+        """CAS claim a task; only one worker wins.
+
+        BCDEF review S4: besides ``pending``/``failed``, the same CAS takes
+        over a ``claimed`` row whose deadline has passed — that is how a
+        worker that crashed after claiming gets recovered. The deadline
+        boundary is inclusive: a claim is stealable AT ``claim_expires_at``.
+        An unexpired ``claimed`` row is never stealable, so a live worker's
+        task cannot be executed twice concurrently.
+
+        ``attempts`` doubles as the claim generation: a successful claim
+        increments it and stamps a fresh ``claim_expires_at``. The returned
+        record carries both, and settlement must present them
+        (:meth:`complete_janitor_task`, :meth:`fail_janitor_task`).
+        """
         now = _now_iso()
-        self._conn.execute("BEGIN")
+        deadline = _now_plus_seconds(JANITOR_CLAIM_TTL_SECONDS)
+        self._conn.execute("BEGIN IMMEDIATE")
         try:
             cur = self._conn.execute(
                 "UPDATE janitor_tasks SET status = 'claimed', claimed_by = ?, "
-                "claimed_at = ?, attempts = attempts + 1, updated_at = ? "
-                "WHERE task_id = ? AND status IN ('pending', 'failed')",
-                (owner, now, now, task_id),
+                "claimed_at = ?, claim_expires_at = ?, attempts = attempts + 1, "
+                "updated_at = ? "
+                "WHERE task_id = ? AND ("
+                " status IN ('pending', 'failed') "
+                " OR (status = 'claimed' AND ("
+                "      claim_expires_at IS NULL OR claim_expires_at <= ?)))",
+                (owner, now, deadline, now, task_id, now),
             )
             won = cur.rowcount == 1
             self._conn.execute("COMMIT")
@@ -1915,27 +2140,62 @@ class ControlStore:
         self,
         task_id: str,
         *,
-        owner: str = "",
+        owner: str,
+        expected_attempt: int,
         result: dict[str, Any] | None = None,
     ) -> tuple[JanitorTaskRecord | None, bool]:
+        """Settle a claimed task as done, if this worker still owns it.
+
+        BCDEF review S4: the CAS matches on status, ``claimed_by``,
+        ``attempts`` AND an unexpired deadline, so a worker that lost its
+        claim — to a takeover, or simply by running past the deadline —
+        cannot write the outcome. Even the SAME owner id is rejected when
+        the generation is stale, so a reused worker name cannot fence its
+        way back in.
+
+        Winning also releases the ACTIVE dedupe key in the same
+        transaction: the original key is copied into
+        ``evidence_json.dedupe_key`` for audit and ``dedupe_key`` is set to
+        NULL, so the next round of the same logical work item inserts a new
+        task_id instead of being swallowed by this finished row. The done
+        row itself is never deleted or rewritten.
+        """
         now = _now_iso()
         result_json = (
             json.dumps(result, sort_keys=True, ensure_ascii=False)
             if result is not None
             else None
         )
-        sql = (
-            "UPDATE janitor_tasks SET status = 'done', result_json = ?, "
-            "completed_at = ?, updated_at = ? "
-            "WHERE task_id = ? AND status = 'claimed'"
-        )
-        params: tuple[Any, ...] = (result_json, now, now, task_id)
-        if owner:
-            sql += " AND claimed_by = ?"
-            params = params + (owner,)
-        self._conn.execute("BEGIN")
+        self._conn.execute("BEGIN IMMEDIATE")
         try:
-            cur = self._conn.execute(sql, params)
+            row = self._conn.execute(
+                "SELECT evidence_json, dedupe_key FROM janitor_tasks "
+                "WHERE task_id = ? AND status = 'claimed' "
+                " AND claimed_by = ? AND attempts = ? "
+                " AND claim_expires_at IS NOT NULL AND claim_expires_at > ?",
+                (task_id, owner, expected_attempt, now),
+            ).fetchone()
+            if row is None:
+                self._conn.execute("COMMIT")
+                return self.get_janitor_task(task_id), False
+            cur = self._conn.execute(
+                "UPDATE janitor_tasks SET status = 'done', result_json = ?, "
+                "completed_at = ?, updated_at = ?, dedupe_key = NULL, "
+                "evidence_json = ? "
+                "WHERE task_id = ? AND status = 'claimed' "
+                " AND claimed_by = ? AND attempts = ? "
+                " AND claim_expires_at IS NOT NULL AND claim_expires_at > ?",
+                (
+                    result_json,
+                    now,
+                    now,
+                    _evidence_with_dedupe_key(row["evidence_json"], row["dedupe_key"]),
+                    task_id,
+                    owner,
+                    expected_attempt,
+                    now,
+                ),
+            )
             won = cur.rowcount == 1
             self._conn.execute("COMMIT")
         except Exception:
@@ -1948,20 +2208,28 @@ class ControlStore:
         task_id: str,
         error: str,
         *,
-        owner: str = "",
+        owner: str,
+        expected_attempt: int,
     ) -> tuple[JanitorTaskRecord | None, bool]:
+        """Settle a claimed task as failed, if this worker still owns it.
+
+        Same fence as :meth:`complete_janitor_task`. The ACTIVE dedupe key
+        is kept (a failed item is still the round's work item, so a
+        duplicate enqueue must keep collapsing onto it) and the deadline is
+        cleared, so the row is claimable again on the next sweep without
+        waiting for the old deadline to lapse.
+        """
         now = _now_iso()
-        sql = (
-            "UPDATE janitor_tasks SET status = 'failed', last_error = ?, "
-            "updated_at = ? WHERE task_id = ? AND status = 'claimed'"
-        )
-        params: tuple[Any, ...] = (error, now, task_id)
-        if owner:
-            sql += " AND claimed_by = ?"
-            params = params + (owner,)
-        self._conn.execute("BEGIN")
+        self._conn.execute("BEGIN IMMEDIATE")
         try:
-            cur = self._conn.execute(sql, params)
+            cur = self._conn.execute(
+                "UPDATE janitor_tasks SET status = 'failed', last_error = ?, "
+                "claim_expires_at = NULL, updated_at = ? "
+                "WHERE task_id = ? AND status = 'claimed' "
+                " AND claimed_by = ? AND attempts = ? "
+                " AND claim_expires_at IS NOT NULL AND claim_expires_at > ?",
+                (error, now, task_id, owner, expected_attempt, now),
+            )
             won = cur.rowcount == 1
             self._conn.execute("COMMIT")
         except Exception:
@@ -1987,6 +2255,7 @@ class ControlStore:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             completed_at=row["completed_at"],
+            claim_expires_at=row["claim_expires_at"],
         )
 
     # -- artifacts (Ticket 10) -----------------------------------------

@@ -23,7 +23,13 @@ Behavior asserted:
   sandbox to bypass the old lease;
 * the janitor can claim a ticket-05 unknown outcome repair without
   re-executing the external effect;
+* BCDEF review S4: a claim carries a fixed 600 s deadline and a generation
+  (``attempts``), an unexpired claim cannot be stolen, an expired one can,
+  and only the CURRENT owner+generation may settle; a completed task
+  releases its ACTIVE dedupe key while keeping the historical row;
 * duplicate approval/resume/cleanup add no extra side effects.
+
+Expiry is driven by a controlled clock (never a real 600 s wait).
 """
 
 from __future__ import annotations
@@ -31,22 +37,31 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from agent_v2 import persistence as persistence_module
 from agent_v2.approvals import compute_approval_id, compute_expiry
 from agent_v2.effect_repair import repair_effect
 from agent_v2.effects import EffectStatus, compute_effect_identity
 from agent_v2.execution_contract import policy_hash
 from agent_v2.execution_policy import build_execution_policy
 from agent_v2.janitor import run_pending_janitor_tasks
-from agent_v2.persistence import CheckpointsStore, ControlStore, PolicySnapshotWrite
+from agent_v2.persistence import (
+    CheckpointsStore,
+    ControlStore,
+    PolicySnapshotWrite,
+    _CONTROL_SCHEMA,
+)
 from agent_v2.profiles import resolve_profile
 from agent_v2.run_orchestration import ChatFlowRequest, RunOrchestrator
 from agent_v2.runs import RunRepository
+
+# The fixed claim deadline this spec chooses for the janitor (ticket 04).
+CLAIM_TTL_SECONDS = 600
 
 
 def _repo(tmp_path) -> RunRepository:
@@ -54,6 +69,35 @@ def _repo(tmp_path) -> RunRepository:
         control=ControlStore(str(tmp_path / "control.sqlite")),
         checkpoints=CheckpointsStore(str(tmp_path / "ckpt.sqlite")),
     )
+
+
+class _Clock:
+    """Controlled UTC clock: the store's only source of "now"."""
+
+    def __init__(self, start: datetime) -> None:
+        self.now = start
+
+    def iso(self) -> str:
+        return self.now.isoformat()
+
+    def plus(self, seconds: float) -> str:
+        return (self.now + timedelta(seconds=float(seconds))).isoformat()
+
+    def advance(self, seconds: float) -> None:
+        self.now += timedelta(seconds=seconds)
+
+    def elapsed_since(self, timestamp: str | None) -> float:
+        assert timestamp is not None
+        return (self.now - datetime.fromisoformat(timestamp)).total_seconds()
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
+    """Freeze + advance the persistence clock instead of waiting 600 s."""
+    frozen = _Clock(datetime(2026, 10, 23, 12, 0, 0, tzinfo=timezone.utc))
+    monkeypatch.setattr(persistence_module, "_now_iso", frozen.iso)
+    monkeypatch.setattr(persistence_module, "_now_plus_seconds", frozen.plus)
+    return frozen
 
 
 def _settings(**overrides: Any) -> Any:
@@ -309,7 +353,10 @@ def test_janitor_task_claim_complete_and_fail_cas(tmp_path):
         assert won_again is False
 
         done, completed = repo.complete_janitor_task(
-            task.task_id, owner="janitor-a", result={"cleaned": True}
+            task.task_id,
+            owner="janitor-a",
+            expected_attempt=claimed.attempts,
+            result={"cleaned": True},
         )
         assert completed is True
         assert done is not None
@@ -318,16 +365,22 @@ def test_janitor_task_claim_complete_and_fail_cas(tmp_path):
         assert done.completed_at is not None
 
         _dup, completed_again = repo.complete_janitor_task(
-            task.task_id, owner="janitor-a"
+            task.task_id, owner="janitor-a", expected_attempt=claimed.attempts
         )
         assert completed_again is False
 
         failed_task, _ = repo.enqueue_janitor_task(
             kind="repair", run_id="run-cas", effect_id="eff-1", evidence={}
         )
-        repo.claim_janitor_task(failed_task.task_id, owner="janitor-a")
+        first_claim, _ = repo.claim_janitor_task(
+            failed_task.task_id, owner="janitor-a"
+        )
+        assert first_claim is not None
         failed, failed_won = repo.fail_janitor_task(
-            failed_task.task_id, "handler boom", owner="janitor-a"
+            failed_task.task_id,
+            "handler boom",
+            owner="janitor-a",
+            expected_attempt=first_claim.attempts,
         )
         assert failed_won is True
         assert failed is not None
@@ -342,9 +395,702 @@ def test_janitor_task_claim_complete_and_fail_cas(tmp_path):
         assert reclaimed is not None
         assert reclaimed.attempts == 2
         _failed, completed_claimed = repo.complete_janitor_task(
-            failed_task.task_id, owner="janitor-b"
+            failed_task.task_id,
+            owner="janitor-b",
+            expected_attempt=reclaimed.attempts,
         )
         assert completed_claimed is True
+    finally:
+        repo.close()
+
+
+# ---- janitor claim deadline (BCDEF review S4) ------------------------------
+
+
+def _pending_cleanup_task(repo: RunRepository, run_id: str) -> Any:
+    task, created = repo.enqueue_janitor_task(
+        kind="cleanup",
+        run_id=run_id,
+        evidence={"run_id": run_id, "workspace_path": f"/ws/{run_id}"},
+        dedupe_key=f"cleanup:{run_id}",
+    )
+    assert created is True
+    return task
+
+
+def test_claim_stamps_a_fixed_deadline_and_records_the_generation(
+    tmp_path, clock: _Clock
+):
+    """AC1a: a claim carries the spec's fixed 600 s deadline + generation."""
+    repo = _repo(tmp_path)
+    try:
+        task = _pending_cleanup_task(repo, "run-deadline")
+        claimed, won = repo.claim_janitor_task(task.task_id, owner="janitor-a")
+
+        assert won is True
+        assert claimed is not None
+        assert claimed.status == "claimed"
+        assert claimed.claimed_by == "janitor-a"
+        assert claimed.attempts == 1
+        assert claimed.claim_expires_at is not None
+        # The deadline is exactly the fixed claim TTL after the claim stamp.
+        deadline = datetime.fromisoformat(claimed.claim_expires_at)
+        claimed_at = datetime.fromisoformat(claimed.claimed_at)
+        assert (deadline - claimed_at) == timedelta(seconds=CLAIM_TTL_SECONDS)
+        # Durably observable, not just the returned snapshot.
+        stored = repo.get_janitor_task(task.task_id)
+        assert stored is not None and stored.claim_expires_at == claimed.claim_expires_at
+    finally:
+        repo.close()
+
+
+def test_unexpired_claim_cannot_be_stolen_by_another_worker(tmp_path, clock: _Clock):
+    """AC1b: before the deadline, a second worker loses the claim CAS."""
+    repo = _repo(tmp_path)
+    other = RunRepository(
+        control=ControlStore(str(tmp_path / "control.sqlite")),
+        checkpoints=CheckpointsStore(str(tmp_path / "ckpt.sqlite")),
+    )
+    try:
+        task = _pending_cleanup_task(repo, "run-no-steal")
+        claimed, won = repo.claim_janitor_task(task.task_id, owner="janitor-a")
+        assert won is True
+        assert claimed is not None
+        generation = claimed.attempts
+
+        # 599 s in: still the first worker's claim.
+        clock.advance(CLAIM_TTL_SECONDS - 1)
+        _loser, stolen = other.claim_janitor_task(task.task_id, owner="janitor-b")
+        assert stolen is False
+
+        stored = other.get_janitor_task(task.task_id)
+        assert stored is not None
+        assert stored.status == "claimed"
+        assert stored.claimed_by == "janitor-a"
+        assert stored.attempts == generation
+        assert stored.claim_expires_at == claimed.claim_expires_at
+    finally:
+        other.close()
+        repo.close()
+
+
+def test_expired_claim_is_reclaimed_at_the_boundary_and_after(
+    tmp_path, clock: _Clock
+):
+    """AC1c: an expired claim is reclaimable AT the deadline; attempts + 1."""
+    repo = _repo(tmp_path)
+    try:
+        task = _pending_cleanup_task(repo, "run-expire")
+        first, won = repo.claim_janitor_task(task.task_id, owner="janitor-a")
+        assert won is True and first is not None
+        deadline = first.claim_expires_at
+        assert deadline is not None
+
+        # One second short of the deadline: still not reclaimable.
+        clock.advance(CLAIM_TTL_SECONDS - 1)
+        _same, too_early = repo.claim_janitor_task(task.task_id, owner="janitor-b")
+        assert too_early is False
+
+        # AT the deadline the claim is expired, so the takeover wins.
+        clock.advance(1)
+        second, stolen = repo.claim_janitor_task(task.task_id, owner="janitor-b")
+        assert stolen is True
+        assert second is not None
+        assert second.status == "claimed"
+        assert second.claimed_by == "janitor-b"
+        # Exactly one generation per successful claim — no double counting.
+        assert second.attempts == first.attempts + 1
+        assert second.claimed_at is not None
+        assert second.claim_expires_at is not None
+        assert (
+            datetime.fromisoformat(second.claim_expires_at)
+            - datetime.fromisoformat(second.claimed_at)
+        ) == timedelta(seconds=CLAIM_TTL_SECONDS)
+
+        # Well past that deadline too (a second crash is recoverable).
+        clock.advance(CLAIM_TTL_SECONDS + 1)
+        third, stolen_again = repo.claim_janitor_task(task.task_id, owner="janitor-c")
+        assert stolen_again is True
+        assert third is not None
+        assert third.attempts == second.attempts + 1
+        assert third.claimed_by == "janitor-c"
+    finally:
+        repo.close()
+
+
+def test_two_workers_competing_for_one_expired_claim_have_one_winner(
+    tmp_path, clock: _Clock
+):
+    """AC2: two independent connections racing an expired claim, one wins."""
+    repo = _repo(tmp_path)
+    worker_b = RunRepository(
+        control=ControlStore(str(tmp_path / "control.sqlite")),
+        checkpoints=CheckpointsStore(str(tmp_path / "ckpt.sqlite")),
+    )
+    try:
+        task = _pending_cleanup_task(repo, "run-race")
+        first, won = repo.claim_janitor_task(task.task_id, owner="janitor-a")
+        assert won is True and first is not None
+
+        clock.advance(CLAIM_TTL_SECONDS)
+        claims = [
+            repo.claim_janitor_task(task.task_id, owner="janitor-a"),
+            worker_b.claim_janitor_task(task.task_id, owner="janitor-b"),
+        ]
+        assert [ok for (_rec, ok) in claims].count(True) == 1, claims
+
+        stored = worker_b.get_janitor_task(task.task_id)
+        assert stored is not None
+        assert stored.status == "claimed"
+        # The one winning claim bumped the generation by exactly one.
+        assert stored.attempts == first.attempts + 1
+        assert stored.claimed_by in ("janitor-a", "janitor-b")
+    finally:
+        worker_b.close()
+        repo.close()
+
+
+# ---- settlement fence (BCDEF review S4) ------------------------------------
+
+
+def _settled_state_assertions(
+    repo: RunRepository,
+    task_id: str,
+    *,
+    expected_owner: str,
+    expected_attempt: int,
+) -> Any:
+    """Durable row after a REJECTED settlement: nothing the loser wrote."""
+    stored = repo.get_janitor_task(task_id)
+    assert stored is not None
+    assert stored.status == "claimed"
+    assert stored.claimed_by == expected_owner
+    assert stored.attempts == expected_attempt
+    # No done/failed evidence leaked out of the rejected write.
+    assert stored.completed_at is None
+    assert stored.result_json is None
+    assert stored.last_error is None
+    return stored
+
+
+def test_a_taken_over_claim_locks_out_the_old_worker(tmp_path, clock: _Clock):
+    """AC3a: different owner + stale generation cannot write done or failed."""
+    repo = _repo(tmp_path)
+    try:
+        task = _pending_cleanup_task(repo, "run-fence-1")
+        old, won = repo.claim_janitor_task(task.task_id, owner="janitor-a")
+        assert won is True and old is not None
+
+        clock.advance(CLAIM_TTL_SECONDS)
+        new, stolen = repo.claim_janitor_task(task.task_id, owner="janitor-b")
+        assert stolen is True and new is not None
+        assert new.attempts == old.attempts + 1
+
+        # The dead worker finally returns and tries to settle with its OWN
+        # (stale) generation: rejected on both outcomes.
+        _done, completed = repo.complete_janitor_task(
+            task.task_id,
+            owner="janitor-a",
+            expected_attempt=old.attempts,
+            result={"cleaned": True},
+        )
+        assert completed is False
+        _fail, failed = repo.fail_janitor_task(
+            task.task_id,
+            "late error",
+            owner="janitor-a",
+            expected_attempt=old.attempts,
+        )
+        assert failed is False
+        _stale_owner, wrong_owner = repo.complete_janitor_task(
+            task.task_id, owner="janitor-z", expected_attempt=new.attempts
+        )
+        assert wrong_owner is False
+        _settled_state_assertions(
+            repo,
+            task.task_id,
+            expected_owner="janitor-b",
+            expected_attempt=new.attempts,
+        )
+        # The new worker still can, with the generation it was given.
+        done, completed_now = repo.complete_janitor_task(
+            task.task_id,
+            owner="janitor-b",
+            expected_attempt=new.attempts,
+            result={"cleaned": True},
+        )
+        assert completed_now is True
+        assert done is not None and done.status == "done"
+    finally:
+        repo.close()
+
+
+def test_same_owner_stale_generation_cannot_settle(tmp_path, clock: _Clock):
+    """AC3b: a reused worker name is still fenced by the generation."""
+    repo = _repo(tmp_path)
+    try:
+        task = _pending_cleanup_task(repo, "run-fence-2")
+        first, won = repo.claim_janitor_task(task.task_id, owner="janitor-a")
+        assert won is True and first is not None
+
+        # The SAME owner id re-claims after the deadline (its own restart).
+        clock.advance(CLAIM_TTL_SECONDS)
+        second, again = repo.claim_janitor_task(task.task_id, owner="janitor-a")
+        assert again is True and second is not None
+        assert second.attempts == first.attempts + 1
+        assert second.claimed_by == "janitor-a"
+
+        # The first generation of the same owner cannot settle.
+        _done, completed = repo.complete_janitor_task(
+            task.task_id,
+            owner="janitor-a",
+            expected_attempt=first.attempts,
+            result={"cleaned": True},
+        )
+        assert completed is False
+        _fail, failed = repo.fail_janitor_task(
+            task.task_id,
+            "late error",
+            owner="janitor-a",
+            expected_attempt=first.attempts,
+        )
+        assert failed is False
+        _settled_state_assertions(
+            repo,
+            task.task_id,
+            expected_owner="janitor-a",
+            expected_attempt=second.attempts,
+        )
+
+        done, completed_now = repo.complete_janitor_task(
+            task.task_id, owner="janitor-a", expected_attempt=second.attempts
+        )
+        assert completed_now is True
+        assert done is not None and done.status == "done"
+    finally:
+        repo.close()
+
+
+def test_expired_but_unreclaimed_claim_rejects_the_old_worker(
+    tmp_path, clock: _Clock
+):
+    """AC4: past the deadline nobody took over, yet the old worker is out."""
+    repo = _repo(tmp_path)
+    try:
+        task = _pending_cleanup_task(repo, "run-fence-3")
+        claimed, won = repo.claim_janitor_task(task.task_id, owner="janitor-a")
+        assert won is True and claimed is not None
+
+        # No takeover at all — only the deadline elapsed.
+        clock.advance(CLAIM_TTL_SECONDS)
+        _done, completed = repo.complete_janitor_task(
+            task.task_id,
+            owner="janitor-a",
+            expected_attempt=claimed.attempts,
+            result={"cleaned": True},
+        )
+        assert completed is False
+        _fail, failed = repo.fail_janitor_task(
+            task.task_id,
+            "late error",
+            owner="janitor-a",
+            expected_attempt=claimed.attempts,
+        )
+        assert failed is False
+
+        stored = repo.get_janitor_task(task.task_id)
+        assert stored is not None
+        assert stored.status == "claimed"
+        assert stored.claimed_by == "janitor-a"
+        assert stored.attempts == claimed.attempts
+        assert stored.completed_at is None
+        assert stored.result_json is None
+
+        # Control: the same owner/generation settles fine one second BEFORE
+        # its own deadline, so the rejection above is the deadline at work.
+        control = _pending_cleanup_task(repo, "run-fence-3-control")
+        live, live_won = repo.claim_janitor_task(control.task_id, owner="janitor-a")
+        assert live_won is True and live is not None
+        clock.advance(CLAIM_TTL_SECONDS - 1)
+        control_done, in_time = repo.complete_janitor_task(
+            control.task_id, owner="janitor-a", expected_attempt=live.attempts
+        )
+        assert in_time is True
+        assert control_done is not None and control_done.status == "done"
+    finally:
+        repo.close()
+
+
+# ---- active dedupe release (BCDEF review S4) --------------------------------
+
+
+def test_completed_task_releases_its_dedupe_key_for_the_next_round(tmp_path):
+    """AC7: one ACTIVE row per logical key; a new round gets a new task_id."""
+    repo = _repo(tmp_path)
+    try:
+        key = "cleanup:run-dedupe"
+        first, created = repo.enqueue_janitor_task(
+            kind="cleanup",
+            run_id="run-dedupe",
+            evidence={"run_id": "run-dedupe", "workspace_path": "/ws/run-dedupe"},
+            dedupe_key=key,
+        )
+        assert created is True
+
+        # ACTIVE duplicates (pending) still collapse onto the one row.
+        again, created_again = repo.enqueue_janitor_task(
+            kind="cleanup",
+            run_id="run-dedupe",
+            evidence={"run_id": "run-dedupe"},
+            dedupe_key=key,
+        )
+        assert created_again is False
+        assert again.task_id == first.task_id
+        assert _count_rows(repo, "janitor_tasks") == 1
+
+        claimed, won = repo.claim_janitor_task(first.task_id, owner="janitor-a")
+        assert won is True and claimed is not None
+
+        # A claimed item is still ACTIVE: dedupe keeps collapsing on it.
+        during, created_during = repo.enqueue_janitor_task(
+            kind="cleanup", run_id="run-dedupe", evidence={}, dedupe_key=key
+        )
+        assert created_during is False and during.task_id == first.task_id
+
+        done, completed = repo.complete_janitor_task(
+            first.task_id,
+            owner="janitor-a",
+            expected_attempt=claimed.attempts,
+            result={"cleanup_status": "succeeded"},
+        )
+        assert completed is True and done is not None
+
+        # The ACTIVE key is gone, so the next round opens a NEW task_id...
+        nxt, created_next = repo.enqueue_janitor_task(
+            kind="cleanup", run_id="run-dedupe", evidence={}, dedupe_key=key
+        )
+        assert created_next is True
+        assert nxt.task_id != first.task_id
+        assert nxt.status == "pending"
+        # ...while the finished row is kept for audit, key recorded inside.
+        assert _count_rows(repo, "janitor_tasks") == 2
+        assert _count_rows(repo, "janitor_tasks", f"status = 'done'") == 1
+        historical = repo.get_janitor_task(first.task_id)
+        assert historical is not None
+        assert historical.status == "done"
+        assert historical.dedupe_key is None
+        assert historical.evidence["dedupe_key"] == key
+        # The original evidence survived the release, not just the key.
+        assert historical.evidence["workspace_path"] == "/ws/run-dedupe"
+        assert historical.result == {"cleanup_status": "succeeded"}
+        assert historical.completed_at is not None
+        assert historical.attempts == 1
+    finally:
+        repo.close()
+
+
+def test_failed_task_keeps_its_active_dedupe_key(tmp_path):
+    """A failed round is still the same work item: the key stays ACTIVE."""
+    repo = _repo(tmp_path)
+    try:
+        key = "cleanup:run-fail-key"
+        task = _pending_cleanup_task(repo, "run-fail-key")
+        assert task.dedupe_key == key
+        claimed, _won = repo.claim_janitor_task(task.task_id, owner="janitor-a")
+        assert claimed is not None
+
+        failed, ok = repo.fail_janitor_task(
+            task.task_id,
+            "still locked",
+            owner="janitor-a",
+            expected_attempt=claimed.attempts,
+        )
+        assert ok is True and failed is not None
+        assert failed.status == "failed"
+        assert failed.dedupe_key == key
+        assert failed.last_error == "still locked"
+        # The deadline is cleared so the retry does not have to wait for it.
+        assert failed.claim_expires_at is None
+        assert repo.get_janitor_task(task.task_id) is not None
+
+        again, created = repo.enqueue_janitor_task(
+            kind="cleanup", run_id="run-fail-key", evidence={}, dedupe_key=key
+        )
+        assert created is False
+        assert again.task_id == task.task_id
+        assert _count_rows(repo, "janitor_tasks") == 1
+    finally:
+        repo.close()
+
+
+# ---- runner recovery + claim_lost (BCDEF review S4) ------------------------
+
+
+def test_runner_recovers_a_hung_claim_after_a_worker_restart(
+    tmp_path, clock: _Clock
+):
+    """AC5a: a sweep after a crash takes over the hung claim and finishes.
+
+    Worker 1 claims the cleanup item and dies (nothing settles). The next
+    sweep — a restarted process, so a new claimer — reclaims it once the
+    deadline has passed, cleans the ORIGINAL workspace and settles.
+    """
+    repo = _repo(tmp_path)
+    try:
+        run_id, _approval = _paused_pdf_run(repo, "req-janitor-hung")
+        computer = _FakeComputer()
+
+        def failing_cleanup(comp, workspace_path, runs, rid) -> None:
+            raise RuntimeError("transient cleanup failure")
+
+        orch = _orchestrator(repo, computer, cleanup=failing_cleanup)
+        _resume(orch, run_id)
+        task = repo.list_janitor_tasks(status="pending")[0]
+
+        # The crashed worker: it claimed the item and never came back.
+        hung, won = repo.claim_janitor_task(task.task_id, owner="janitor-crashed")
+        assert won is True and hung is not None
+        assert hung.attempts == 1
+
+        # A restarted runner only sees the item once its deadline lapses.
+        assert run_pending_janitor_tasks(
+            repo, limit=10, claimer="janitor-restarted",
+            computer_factory=lambda *_a, **_k: computer,
+        ) == []
+        clock.advance(CLAIM_TTL_SECONDS)
+
+        results = run_pending_janitor_tasks(
+            repo,
+            limit=10,
+            claimer="janitor-restarted",
+            computer_factory=lambda *_a, **_k: computer,
+        )
+        assert [r.status for r in results] == ["done"], results
+        assert results[0].task_id == task.task_id
+
+        settled = repo.get_janitor_task(task.task_id)
+        assert settled is not None
+        assert settled.status == "done"
+        assert settled.claimed_by == "janitor-restarted"
+        assert settled.attempts == 2
+        assert settled.result["cleanup_status"] == "succeeded"
+        # Recovery touched only the original workspace, no new sandbox.
+        assert computer.cleaned == [f"/ws/{run_id}"]
+        assert computer.workspaces == []
+        lease = repo.get_sandbox_lease(run_id)
+        assert lease is not None and lease.cleanup_status == "succeeded"
+        # Nothing left to do on the next sweep.
+        assert (
+            run_pending_janitor_tasks(
+                repo, limit=10, claimer="janitor-restarted",
+                computer_factory=lambda *_a, **_k: computer,
+            )
+            == []
+        )
+        assert computer.cleaned == [f"/ws/{run_id}"]
+    finally:
+        repo.close()
+
+
+def _takeover_during_handler(
+    repo: RunRepository, clock: _Clock, *, then_raise: bool
+) -> Any:
+    """Cleanup handler that loses the claim before it can settle.
+
+    Stands in for "the worker finished the work but its deadline expired
+    and another worker took the item over" — the settlement CAS must then
+    refuse the write, and the runner must not report done/failed.
+    """
+    calls: list[str] = []
+
+    def handler(_runs_repo: RunRepository, evidence: dict[str, Any]) -> None:
+        calls.append(str(evidence["run_id"]))
+        clock.advance(CLAIM_TTL_SECONDS)
+        ghost, won = repo.claim_janitor_task(
+            evidence["task_id"], owner="janitor-ghost"
+        )
+        assert won is True and ghost is not None
+        if then_raise:
+            raise RuntimeError("handler failed after losing the claim")
+
+    handler.calls = calls  # type: ignore[attr-defined]
+    return handler
+
+
+def test_runner_reports_claim_lost_when_completion_cas_loses(
+    tmp_path, clock: _Clock
+):
+    """AC5b: a lost settlement CAS is reported as claim_lost, not done."""
+    repo = _repo(tmp_path)
+    try:
+        task = _pending_cleanup_task(repo, "run-claim-lost")
+        handler = _takeover_during_handler(repo, clock, then_raise=False)
+
+        def cleanup(runs_repo, evidence) -> None:
+            evidence = {**evidence, "task_id": task.task_id}
+            handler(runs_repo, evidence)
+
+        results = run_pending_janitor_tasks(
+            repo, limit=10, claimer="janitor-loser", cleanup=cleanup
+        )
+        assert [r.status for r in results] == ["claim_lost"], results
+        assert results[0].task_id == task.task_id
+        assert results[0].kind == "cleanup"
+
+        # The loser wrote nothing: the ghost's claim is still current.
+        stored = repo.get_janitor_task(task.task_id)
+        assert stored is not None
+        assert stored.status == "claimed"
+        assert stored.claimed_by == "janitor-ghost"
+        assert stored.attempts == 2
+        assert stored.result_json is None
+        assert stored.completed_at is None
+        assert stored.dedupe_key == f"cleanup:run-claim-lost"
+        # The work itself did happen once.
+        assert handler.calls == ["run-claim-lost"]
+    finally:
+        repo.close()
+
+
+def test_runner_reports_claim_lost_when_failure_cas_loses(
+    tmp_path, clock: _Clock
+):
+    """AC5c: a failed handler that lost its claim is not recorded failed."""
+    repo = _repo(tmp_path)
+    try:
+        task = _pending_cleanup_task(repo, "run-claim-lost-fail")
+        handler = _takeover_during_handler(repo, clock, then_raise=True)
+
+        def cleanup(runs_repo, evidence) -> None:
+            handler(runs_repo, {**evidence, "task_id": task.task_id})
+
+        results = run_pending_janitor_tasks(
+            repo, limit=10, claimer="janitor-loser", cleanup=cleanup
+        )
+        assert [r.status for r in results] == ["claim_lost"], results
+        assert results[0].error == "handler failed after losing the claim"
+
+        stored = repo.get_janitor_task(task.task_id)
+        assert stored is not None
+        assert stored.status == "claimed"
+        assert stored.claimed_by == "janitor-ghost"
+        assert stored.last_error is None
+        assert stored.attempts == 2
+    finally:
+        repo.close()
+
+
+def test_sweep_round_is_bounded_and_does_not_starve_an_expired_claim(
+    tmp_path, clock: _Clock
+):
+    """AC6: 10 items max per round, oldest-claimable first, hung claim wins.
+
+    A dead worker's expired claim became claimable BEFORE the fresh pending
+    items, so it is picked in the FIRST round even though twelve newer
+    items are queued behind it — and the round still stops at ``limit``.
+    """
+    repo = _repo(tmp_path)
+    processed: list[str] = []
+
+    def cleanup(_runs_repo, evidence) -> None:
+        processed.append(str(evidence["run_id"]))
+
+    try:
+        hung = _pending_cleanup_task(repo, "run-hung-first")
+        claimed, won = repo.claim_janitor_task(hung.task_id, owner="janitor-dead")
+        assert won is True and claimed is not None
+
+        # The claim lapses, and newer work keeps arriving afterwards.
+        clock.advance(CLAIM_TTL_SECONDS)
+        fresh: list[str] = []
+        for index in range(12):
+            clock.advance(1)
+            fresh.append(f"run-fresh-{index}")
+            _pending_cleanup_task(repo, fresh[-1])
+
+        results = run_pending_janitor_tasks(
+            repo, limit=10, claimer="janitor-sweep", cleanup=cleanup
+        )
+        # Bounded round, and the expired claim is NOT starved: it leads.
+        assert len(results) == 10
+        assert processed[0] == "run-hung-first"
+        assert processed[1:] == fresh[:9]
+        assert [r.status for r in results] == ["done"] * 10
+        assert results[0].task_id == hung.task_id
+
+        # The takeover stamped a fresh deadline and bumped the generation.
+        settled = repo.get_janitor_task(hung.task_id)
+        assert settled is not None
+        assert settled.status == "done"
+        assert settled.attempts == 2
+        assert settled.claimed_by == "janitor-sweep"
+
+        # The nine items the round did not reach are still open work.
+        still_open = repo.list_janitor_tasks(status="pending", limit=100)
+        assert [t.run_id for t in still_open] == fresh[9:]
+
+        second = run_pending_janitor_tasks(
+            repo, limit=10, claimer="janitor-sweep", cleanup=cleanup
+        )
+        assert len(second) == 3
+        assert processed[10:] == fresh[9:]
+        assert repo.list_janitor_tasks(status="pending", limit=100) == []
+    finally:
+        repo.close()
+
+
+def test_one_sweep_issues_one_bounded_candidate_query(tmp_path):
+    """AC6b: the round is a single LIMIT-bounded scan, not a per-status loop."""
+    repo = _repo(tmp_path)
+    statements: list[str] = []
+
+    def cleanup(_runs_repo, evidence) -> None:
+        return None
+
+    try:
+        for index in range(30):
+            repo.enqueue_janitor_task(
+                kind="cleanup",
+                run_id=f"run-scan-{index}",
+                evidence={"run_id": f"run-scan-{index}"},
+                dedupe_key=f"cleanup:run-scan-{index}",
+            )
+        repo.control._conn.set_trace_callback(statements.append)
+        try:
+            results = run_pending_janitor_tasks(
+                repo, limit=10, claimer="janitor-scan", cleanup=cleanup
+            )
+        finally:
+            repo.control._conn.set_trace_callback(None)
+
+        assert len(results) == 10
+        selects = [
+            statement
+            for statement in statements
+            if statement.strip().upper().startswith("SELECT")
+            and "janitor_tasks" in statement
+            and "ORDER BY" in statement.upper()
+            and "LIMIT" in statement.upper()
+        ]
+        assert len(selects) == 1, selects
+        assert "LIMIT" in selects[0].upper()
+
+        # The statement the round actually issued is served by the
+        # (status, claim_expires_at) index — no full table scan.
+        plan = " ".join(
+            row["detail"]
+            for row in repo.control._conn.execute(
+                "EXPLAIN QUERY PLAN " + selects[0]
+            ).fetchall()
+        )
+        assert "idx_janitor_claim_candidates" in plan, plan
+        assert "SCAN janitor_tasks" not in plan, plan
+        indexed = repo.control._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index'"
+            " AND name = 'idx_janitor_claim_candidates'"
+        ).fetchone()
+        assert indexed is not None
+        assert "claim_expires_at" in indexed["sql"]
     finally:
         repo.close()
 

@@ -5,10 +5,13 @@ Cleanup failures and unknown-outcome repairs become durable work items
 the idempotent sweep seam :func:`run_pending_janitor_tasks` that a
 background loop (ticket 12) — or a test — can call:
 
-* claim is a CAS (``pending``/``failed`` → ``claimed``); only one worker
-  processes a task,
+* claim is a CAS (``pending``/``failed``, or an EXPIRED ``claimed``, →
+  ``claimed``); only one worker processes a task, and a worker that crashes
+  is taken over once its claim deadline lapses (BCDEF review S4),
 * completion/failure is a CAS on the claim (``claimed`` → ``done`` /
-  ``failed``) so a task is never completed twice,
+  ``failed``) that also checks the claim owner and its generation, so a
+  task is never completed twice and a stale worker cannot write an outcome
+  — the sweep then reports ``claim_lost`` instead of ``done``/``failed``,
 * cleanup retries use the ORIGINAL recorded workspace and lease — the
   janitor never calls ``create_workspace`` and never mints a new fencing
   generation to bypass the old lease,
@@ -41,11 +44,19 @@ RepairHandler = Callable[["RunRepository", "JanitorTaskRecord"], dict[str, Any]]
 
 @dataclass(frozen=True, slots=True)
 class JanitorRunResult:
-    """Outcome of one claimed janitor task in a sweep."""
+    """Outcome of one claimed janitor task in a sweep.
+
+    ``status`` is ``done`` / ``failed`` ONLY when the settlement CAS was
+    won, i.e. the durable row really carries that outcome. ``claim_lost``
+    means the work ran but this worker no longer owned the claim (another
+    worker took the expired item over, or its own deadline lapsed), so
+    nothing was written and the reported outcome must not be read as
+    persisted (BCDEF review S4).
+    """
 
     task_id: str
     kind: str
-    status: str  # done | failed
+    status: str  # done | failed | claim_lost
     outcome: dict[str, Any] = field(default_factory=dict)
     error: str = ""
 
@@ -196,26 +207,33 @@ def run_pending_janitor_tasks(
     repair: RepairHandler | None = None,
     claimer: str | None = None,
 ) -> list[JanitorRunResult]:
-    """Claim and execute up to ``limit`` open janitor tasks.
+    """Claim and execute up to ``limit`` claimable janitor tasks.
 
     Idempotent: only CAS-claimed tasks are processed, completed tasks are
     never picked again, and failed tasks are retried on a later sweep.
     Returns one result per processed task (skipped CAS losers excluded).
+
+    BCDEF review S4 — crash recovery and fencing:
+
+    * candidates are ONE bounded query over CLAIMABLE items: ``pending``,
+      ``failed`` and ``claimed`` rows whose deadline has passed, ordered by
+      the moment they became claimable. A hung claim therefore outranks a
+      stream of newer ``pending`` work instead of starving behind it, and
+      the round still processes at most ``limit`` items;
+    * settlement presents the claim's owner AND its generation
+      (``attempts``). When that CAS is lost the task is reported as
+      ``claim_lost`` — never as ``done``/``failed`` — because the durable
+      row does not carry this worker's outcome.
     """
     owner = claimer or f"janitor:{uuid.uuid4().hex}"
-    candidates = runs_repo.list_janitor_tasks(status="pending", limit=limit)
-    if len(candidates) < limit:
-        candidates.extend(
-            runs_repo.list_janitor_tasks(
-                status="failed", limit=limit - len(candidates)
-            )
-        )
+    candidates = runs_repo.list_janitor_tasks(claimable=True, limit=limit)
 
     results: list[JanitorRunResult] = []
     for task in candidates:
         claimed, won = runs_repo.claim_janitor_task(task.task_id, owner=owner)
         if not won or claimed is None:
             continue
+        attempt = claimed.attempts
         try:
             if claimed.kind == "cleanup":
                 outcome = _run_cleanup(
@@ -234,20 +252,48 @@ def run_pending_janitor_tasks(
             logger.exception(
                 "janitor: task %s (%s) failed", claimed.task_id, claimed.kind
             )
-            runs_repo.fail_janitor_task(claimed.task_id, error, owner=owner)
+            _settled, persisted = runs_repo.fail_janitor_task(
+                claimed.task_id, error, owner=owner, expected_attempt=attempt
+            )
             results.append(
                 JanitorRunResult(
                     task_id=claimed.task_id,
                     kind=claimed.kind,
-                    status="failed",
+                    status="failed" if persisted else "claim_lost",
                     error=error,
                 )
             )
+            if not persisted:
+                logger.error(
+                    "janitor: settlement for task %s (%s) was refused — the"
+                    " claim was taken over; reporting claim_lost, not failed",
+                    claimed.task_id,
+                    claimed.kind,
+                )
             continue
 
-        runs_repo.complete_janitor_task(
-            claimed.task_id, owner=owner, result=outcome
+        _settled, persisted = runs_repo.complete_janitor_task(
+            claimed.task_id,
+            owner=owner,
+            expected_attempt=attempt,
+            result=outcome,
         )
+        if not persisted:
+            logger.error(
+                "janitor: completion of task %s (%s) was refused — this"
+                " worker no longer owns the claim; nothing was persisted",
+                claimed.task_id,
+                claimed.kind,
+            )
+            results.append(
+                JanitorRunResult(
+                    task_id=claimed.task_id,
+                    kind=claimed.kind,
+                    status="claim_lost",
+                    outcome=outcome,
+                )
+            )
+            continue
         results.append(
             JanitorRunResult(
                 task_id=claimed.task_id,
