@@ -27,7 +27,10 @@ from typing import Any
 from agent_v2.run_orchestration import ChatFlowRequest, RunOrchestrator
 from agent_v2.runs import RunRepository
 from agent_v2.persistence import CheckpointsStore, ControlStore
-from agent_v2.sandbox_lifecycle import run_sandbox_cleanup
+from agent_v2.sandbox_lifecycle import (
+    SandboxCleanupResult,
+    run_sandbox_cleanup,
+)
 
 
 TERMINALS = {"error", "done", "cancelled", "run.paused"}
@@ -188,12 +191,209 @@ def test_cowork_invalid_command_plan_fails_closed(tmp_path: Path):
     assert types[-1] == "error"
     assert items[-1].payload["code"] == "bash_plan_invalid"
     assert "approval.required" not in types
-    # Behavior-unchanged note (Ticket 38): the plan-parse failure path
-    # returns BEFORE the cleanup ``finally`` block is entered, exactly as
-    # the pre-fold adapter code did — no cleanup happens here.
-    assert cleanups == []
     run = repo.control.get_run_by_request("req-38bad")
     assert run is not None and run.status == "error"
+    # ALR ticket 05 (replaces the Ticket-38 assertion that the parse
+    # failure returns BEFORE the cleanup finally and leaks the sandbox):
+    # the protection that starts at workspace creation success covers the
+    # JSON parse too — the created resources settle exactly once and no
+    # active lease is left behind on the error run.
+    assert cleanups == [f"/ws/{run.run_id}"]
+    lease = repo.get_sandbox_lease(run.run_id)
+    assert lease is not None
+    assert lease.status != "active"
+    assert lease.status == "destroyed"
+    assert lease.cleanup_status == "succeeded"
+
+
+def test_cowork_planner_model_failure_settles_resources(tmp_path: Path):
+    """T05-01: a planner model failure after the workspace + lease are
+    owned ends run=error with the resources settled — physical cleanup
+    exactly once and no active lease (the pre-ALR-05 code returned before
+    the cleanup ``finally`` and leaked both)."""
+    from agent_v2.kernel import KernelModelFailure
+
+    async def failing_kernel(**kwargs: Any) -> tuple[str, list[dict[str, Any]]]:
+        raise KernelModelFailure("model_unavailable", "模型暂不可用")
+
+    repo = _repo(tmp_path)
+    cleanups: list[Any] = []
+
+    def cleanup(computer_arg, workspace_path, runs_repo_arg, run_id_arg):
+        cleanups.append(workspace_path)
+        return run_sandbox_cleanup(computer_arg, workspace_path)
+
+    orch = RunOrchestrator(
+        settings=_settings(),
+        runs_repo=repo,
+        kernel_turn=failing_kernel,
+        computer_factory=lambda *a, **k: _FakeComputer(),
+        sandbox_cleanup=cleanup,
+    )
+
+    items = _stream(orch, _flow_req("req-38planner"))
+
+    types = [e.type for e in items]
+    assert types[-1] == "error"
+    assert items[-1].payload["code"] == "model_unavailable"
+    assert "approval.required" not in types
+    run = repo.control.get_run_by_request("req-38planner")
+    assert run is not None and run.status == "error"
+    assert cleanups == [f"/ws/{run.run_id}"]
+    lease = repo.get_sandbox_lease(run.run_id)
+    assert lease is not None
+    assert lease.status != "active"
+    assert lease.status == "destroyed"
+    assert lease.cleanup_status == "succeeded"
+
+
+def test_cowork_planner_failure_when_cleanup_fails_registers_original_target(
+    tmp_path: Path,
+):
+    """T05-01/T05-05: planner failure + physical cleanup failure settles
+    through ticket 04's atomic registration — the lease keeps its original
+    identity with the preserved partial usage, the cleanup record is
+    ``pending_janitor`` with exactly ONE retry task for the ORIGINAL
+    target, and the run's error terminal stands."""
+    from agent_v2.kernel import KernelModelFailure
+
+    async def failing_kernel(**kwargs: Any) -> tuple[str, list[dict[str, Any]]]:
+        raise KernelModelFailure("model_unavailable", "模型暂不可用")
+
+    repo = _repo(tmp_path)
+    cleanups: list[Any] = []
+
+    def failing_cleanup(computer_arg, workspace_path, runs_repo_arg, run_id_arg):
+        cleanups.append(workspace_path)
+        return SandboxCleanupResult.failure(
+            "disk stuck during rmtree", partial_usage={"files_deleted": 3}
+        )
+
+    orch = RunOrchestrator(
+        settings=_settings(),
+        runs_repo=repo,
+        kernel_turn=failing_kernel,
+        computer_factory=lambda *a, **k: _FakeComputer(),
+        sandbox_cleanup=failing_cleanup,
+    )
+
+    items = _stream(orch, _flow_req("req-38pf"))
+
+    assert [e.type for e in items][-1] == "error"
+    run = repo.control.get_run_by_request("req-38pf")
+    assert run is not None and run.status == "error"
+    # Physical cleanup attempted exactly once.
+    assert len(cleanups) == 1
+    lease = repo.get_sandbox_lease(run.run_id)
+    assert lease is not None
+    assert lease.status == "failed"
+    assert lease.cleanup_status == "pending_janitor"
+    assert lease.resource_usage == {"files_deleted": 3}
+    assert lease.failure_reason == "disk stuck during rmtree"
+    tasks = repo.list_janitor_tasks(kind="cleanup")
+    assert len(tasks) == 1
+    assert tasks[0].dedupe_key == f"cleanup:{run.run_id}"
+    evidence = tasks[0].evidence
+    assert evidence["run_id"] == run.run_id
+    assert evidence["lease_id"] == lease.lease_id
+    assert evidence["workspace_path"] == lease.workspace_path
+    assert evidence["sandbox_identity"] == lease.sandbox_identity
+    assert evidence["fencing_token"] == lease.fencing_token
+
+
+def test_cowork_invalid_plan_when_cleanup_fails_registers_original_target(
+    tmp_path: Path,
+):
+    """T05-01: the invalid-JSON variant of the early failure settles the
+    same way when the physical cleanup fails — one original-target janitor
+    task, failed lease with preserved partial usage, run stays error."""
+    repo = _repo(tmp_path)
+    cleanups: list[Any] = []
+
+    def failing_cleanup(computer_arg, workspace_path, runs_repo_arg, run_id_arg):
+        cleanups.append(workspace_path)
+        return SandboxCleanupResult.failure(
+            "rmtree timed out", partial_usage={"files_deleted": 1}
+        )
+
+    async def bad_plan_kernel(**kwargs: Any) -> tuple[str, list[dict[str, Any]]]:
+        return ("not a json blob", [])
+
+    orch = RunOrchestrator(
+        settings=_settings(),
+        runs_repo=repo,
+        kernel_turn=bad_plan_kernel,
+        computer_factory=lambda *a, **k: _FakeComputer(),
+        sandbox_cleanup=failing_cleanup,
+    )
+
+    items = _stream(orch, _flow_req("req-38badfail"))
+
+    assert items[-1].payload["code"] == "bash_plan_invalid"
+    run = repo.control.get_run_by_request("req-38badfail")
+    assert run is not None and run.status == "error"
+    assert len(cleanups) == 1
+    lease = repo.get_sandbox_lease(run.run_id)
+    assert lease is not None
+    assert lease.status == "failed"
+    assert lease.cleanup_status == "pending_janitor"
+    assert lease.resource_usage == {"files_deleted": 1}
+    tasks = repo.list_janitor_tasks(kind="cleanup")
+    assert len(tasks) == 1
+    assert tasks[0].dedupe_key == f"cleanup:{run.run_id}"
+    assert tasks[0].evidence["workspace_path"] == lease.workspace_path
+
+
+def test_cowork_planner_failure_settles_when_client_closes_after_terminal(
+    tmp_path: Path,
+):
+    """T05-03: a client that drops the connection right after the terminal
+    error (the generator is closed while suspended at the terminal yield)
+    still gets exactly one settlement — the protection boundary owns the
+    resources, not the consumer's iteration discipline."""
+    from agent_v2.kernel import KernelModelFailure
+
+    async def failing_kernel(**kwargs: Any) -> tuple[str, list[dict[str, Any]]]:
+        raise KernelModelFailure("model_unavailable", "模型暂不可用")
+
+    repo = _repo(tmp_path)
+    cleanups: list[Any] = []
+
+    def cleanup(computer_arg, workspace_path, runs_repo_arg, run_id_arg):
+        cleanups.append(workspace_path)
+        return run_sandbox_cleanup(computer_arg, workspace_path)
+
+    orch = RunOrchestrator(
+        settings=_settings(),
+        runs_repo=repo,
+        kernel_turn=failing_kernel,
+        computer_factory=lambda *a, **k: _FakeComputer(),
+        sandbox_cleanup=cleanup,
+    )
+
+    async def run_until_terminal_and_close() -> list[Any]:
+        gen = orch.stream_chat(_flow_req("req-38drop"))
+        collected = []
+        try:
+            async for item in gen:
+                collected.append(item)
+                if item.type == "error":
+                    break
+        finally:
+            await gen.aclose()
+        return collected
+
+    items = asyncio.run(run_until_terminal_and_close())
+
+    assert items[-1].payload["code"] == "model_unavailable"
+    run = repo.control.get_run_by_request("req-38drop")
+    assert run is not None and run.status == "error"
+    assert cleanups == [f"/ws/{run.run_id}"]
+    lease = repo.get_sandbox_lease(run.run_id)
+    assert lease is not None
+    assert lease.status != "active"
+    assert lease.status == "destroyed"
+    assert lease.cleanup_status == "succeeded"
 
 
 def test_cowork_sandbox_creation_failure_is_terminal(tmp_path: Path):
@@ -212,6 +412,13 @@ def test_cowork_sandbox_creation_failure_is_terminal(tmp_path: Path):
     assert types[-1] == "error"
     assert items[-1].payload["code"] == "sandbox_creation_failed"
     assert kernel_calls == []  # never reached the planner
+    # T05-02 positive control: a creation failure owns NOTHING — no
+    # fabricated lease row, no workspace to settle, and no other
+    # executor's resource is touched.
+    assert cleanups == []
+    run = repo.control.get_run_by_request("req-38sb")
+    assert run is not None
+    assert repo.get_sandbox_lease(run.run_id) is None
 
 
 # ---- approval decision state machine (four idempotency scenarios) ----------
