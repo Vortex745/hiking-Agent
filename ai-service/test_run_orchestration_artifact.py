@@ -338,10 +338,21 @@ def test_executing_effect_after_crash_becomes_outcome_unknown_and_never_replays(
     assert [t for t, _ in events2] == ["effect.outcome_unknown", "error"]
 
 
-def test_executing_effect_with_live_executor_is_left_alone(tmp_path):
+def test_executing_effect_with_recent_tool_call_converges_unknown(tmp_path):
+    """agent-lifecycle-repair ticket 02 (T02-08).
+
+    The recent-tool_call liveness inference is gone. Only the per-run
+    execution owner reaches :func:`drive_effect`, so an ``executing``
+    row seen here has no surviving owner — even with a brand-new
+    tool_call event the effect converges to ``outcome_unknown`` and the
+    run terminates; it is never reported ``in_flight`` and never
+    re-executed. (A genuinely live executor now keeps the loser OUT of
+    this driver entirely via the ownership token.)
+    """
     repo, run_id, effect_key = _run_with_executing_effect(tmp_path, "generate_pdf")
     executed: list[int] = []
-    # A recent persisted tool_call → the executor is live (CAS loser).
+    # A recent persisted tool_call — the OLD heuristic read this as a
+    # live executor and left the effect alone.
     live_events = [
         {
             "type": "tool_call",
@@ -357,13 +368,15 @@ def test_executing_effect_with_live_executor_is_left_alone(tmp_path):
     )
 
     assert executed == []
-    assert outcome.status == "in_flight"
-    assert outcome.preserve_sandbox is True
-    assert [t for t, _ in events] == ["error"]
-    assert events[0][1]["code"] == "effect_in_flight"
-    # The effect is untouched — the live winner may still commit.
+    assert outcome.status == "outcome_unknown"
+    assert [t for t, _ in events] == ["effect.outcome_unknown", "error"]
+    assert events[1][1]["code"] == "effect_outcome_unknown"
+    # The effect converged with its original identity preserved — no
+    # success result was invented for an unknown outcome.
     effect = repo.get_effect(effect_key)
-    assert effect is not None and effect.status == EffectStatus.EXECUTING.value
+    assert effect is not None and effect.status == EffectStatus.OUTCOME_UNKNOWN.value
+    run = repo.get_run(run_id)
+    assert run is not None and run.status == "error"
 
 
 def test_committed_effect_recovers_result_without_reexecution(tmp_path):

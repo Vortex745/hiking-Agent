@@ -292,7 +292,20 @@ def test_rejected_resume_emits_resolved_and_done_without_execution(tmp_path):
 # ---- concurrent resume: sandbox preservation ----------------------------------
 
 
-def test_concurrent_resume_preserves_sandbox_while_executor_is_live(tmp_path):
+def test_concurrent_resume_with_executing_effect_converges_unknown_without_liveness_inference(
+    tmp_path,
+):
+    """agent-lifecycle-repair ticket 02 (T02-08).
+
+    The 300s recent-tool_call liveness inference is removed: a resume
+    that HOLDS the per-run execution token and finds the effect
+    ``executing`` has no surviving owner by construction (a live
+    executor would still hold the token), so even a fresh tool_call
+    event converges to ``outcome_unknown`` — never ``effect_in_flight``,
+    never a re-execution. The double-click mutual-delete protection now
+    comes from ownership itself: the losing resume never reaches this
+    driver (see test_resume_execution_ownership_contract.py).
+    """
     repo = _repo(tmp_path)
     computer = _FakeComputer()
     cleanups: list[Any] = []
@@ -302,8 +315,8 @@ def test_concurrent_resume_preserves_sandbox_while_executor_is_live(tmp_path):
         approval_id=approval_id, status="approved", decision_request_id="dec-40conc"
     )
 
-    # Simulate the concurrent CAS winner: an effect left EXECUTING plus
-    # a recent persisted tool_call proving the executor is live.
+    # A crashed CAS winner: an effect left EXECUTING plus a persisted
+    # tool_call that is BRAND NEW (the old heuristic called this "live").
     effect_key = compute_effect_key(
         run_id=run_id, tool_name="generate_pdf", args={"filename": "hiking-plan.pdf"}
     )
@@ -330,16 +343,18 @@ def test_concurrent_resume_preserves_sandbox_while_executor_is_live(tmp_path):
     items = _stream_resume(orch, run_id)
 
     types = [e.type for e in items]
-    # The replay includes the winner's tool_call (seq 100); the
-    # continuation is approval.resolved then the in-flight error.
-    assert types[-2:] == ["approval.resolved", "error"]
-    assert items[-1].payload["code"] == "effect_in_flight"
-    # The sandbox is PRESERVED — the live winner may still commit. No
-    # cleanup ran and the effect is untouched.
-    assert cleanups == []
+    # The replay includes the crashed executor's tool_call (seq 100); the
+    # continuation converges to outcome_unknown with NO re-execution.
+    assert types[-3:] == [
+        "approval.resolved", "effect.outcome_unknown", "error",
+    ]
+    assert items[-1].payload["code"] == "effect_outcome_unknown"
+    # No re-execution, no sandbox command.
     assert computer.pdfs == []
+    run = repo.get_run(run_id)
+    assert run is not None and run.status == "error"
     effect = repo.get_effect(effect_key)
-    assert effect is not None and effect.status == EffectStatus.EXECUTING.value
+    assert effect is not None and effect.status == EffectStatus.OUTCOME_UNKNOWN.value
 
 
 def test_crashed_executing_effect_becomes_outcome_unknown_on_resume(tmp_path):

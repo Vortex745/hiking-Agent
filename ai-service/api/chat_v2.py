@@ -378,6 +378,24 @@ def _build_run_orchestrator(runtime: Any) -> RunOrchestrator:
 # ---- Endpoint -------------------------------------------------------------
 
 
+async def _aclose_stream_generator(
+    stream: AsyncGenerator[EventEnvelope | str, None],
+) -> None:
+    """Deterministically close the connection's owned nested generator.
+
+    agent-lifecycle-repair ticket 02: the SSE adapters own the
+    orchestrator generator they iterate. Closing it explicitly on every
+    exit — immediate-terminal close, cancel, client disconnect — makes
+    the orchestrator's ``finally`` blocks (per-run execution token
+    release, sandbox/lease settlement) run at a deterministic point
+    instead of at GC time. Closing an exhausted generator is a no-op.
+    """
+    try:
+        await stream.aclose()
+    except Exception:
+        logger.exception("chat_v2: closing the stream generator failed")
+
+
 @chat_v2_router.post("/sse")
 async def chat_v2_sse(req: ChatV2Request, request: Request):
     """Stream a Chat v2 run as SSE.
@@ -446,6 +464,15 @@ async def chat_v2_sse(req: ChatV2Request, request: Request):
             request.headers.get("traceparent")
         )
         run_id_recorded = False
+        # agent-lifecycle-repair ticket 02: this connection OWNS the
+        # orchestrator generator below; it is closed deterministically on
+        # every exit — normal terminal close, immediate close, cancel and
+        # client disconnect — so the orchestrator's ownership token is
+        # released and its cleanup finallys run instead of leaking to GC.
+        stream = orchestrator.stream_chat(
+            flow_req,
+            subject_id=getattr(request.state, "subject_id", None),
+        )
         try:
             with tracing.start_span(
                 "chat.request",
@@ -464,10 +491,7 @@ async def chat_v2_sse(req: ChatV2Request, request: Request):
                 # state instead.
                 request.state.trace_id = tracing.current_trace_id()
                 try:
-                    async for item in orchestrator.stream_chat(
-                        flow_req,
-                        subject_id=getattr(request.state, "subject_id", None),
-                    ):
+                    async for item in stream:
                         if not run_id_recorded:
                             run_id = getattr(item, "run_id", "")
                             if run_id:
@@ -481,6 +505,7 @@ async def chat_v2_sse(req: ChatV2Request, request: Request):
                     tracing.record_exception(span, exc)
                     raise
         finally:
+            await _aclose_stream_generator(stream)
             tracing.reset_session(session_token)
             leases.release()
 
@@ -1226,6 +1251,10 @@ async def chat_v2_resume(
         session_token = tracing.set_session(
             _session_key(run.conversation_id, run.request_id)
         )
+        # agent-lifecycle-repair ticket 02: the connection owns the resume
+        # generator; close it deterministically on every exit so the
+        # execution token is released and cleanup finallys run.
+        stream = orchestrator.stream_resume(run_id=run_id, from_seq=from_seq)
         try:
             with tracing.start_span(
                 "chat.resume",
@@ -1241,9 +1270,7 @@ async def chat_v2_resume(
             ) as span:
                 request.state.trace_id = tracing.current_trace_id()
                 try:
-                    async for item in orchestrator.stream_resume(
-                        run_id=run_id, from_seq=from_seq
-                    ):
+                    async for item in stream:
                         _observe_stream_event(request, span, item)
                         yield item if isinstance(item, str) else _sse_frame(item)
                     if getattr(request.state, "stream_outcome", None) in (None, "done"):
@@ -1252,6 +1279,7 @@ async def chat_v2_resume(
                     tracing.record_exception(span, exc)
                     raise
         finally:
+            await _aclose_stream_generator(stream)
             tracing.reset_session(session_token)
             leases.release()
 

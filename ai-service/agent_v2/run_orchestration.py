@@ -454,6 +454,26 @@ def _replay_envelope(evt: dict[str, Any], run_id: str) -> EventEnvelope:
     )
 
 
+async def _aclose_quietly(agen: AsyncGenerator[Any, None]) -> None:
+    """Deterministically close an owned nested async generator (ticket 02).
+
+    Every stream that iterates a nested generator (kernel turn, artifact
+    / cowork flow, resume steps, :func:`drive_effect`) owns that
+    generator and closes it on ALL exits — normal exhaustion, cancel,
+    client disconnect and immediate close. Without this, a connection
+    dropped mid-flow would leak the nested generator and skip its
+    ``finally`` blocks (sandbox cleanup, lease settlement). Closing an
+    already-exhausted generator is a no-op; a cleanup error inside the
+    nested generator is logged and never blocks the outer unwind.
+    """
+    try:
+        await agen.aclose()
+    except Exception:
+        logger.exception(
+            "run_orchestration: closing a nested stream generator failed",
+        )
+
+
 def _publish_stream_event(
     event_type: str,
     payload: dict[str, Any],
@@ -616,40 +636,6 @@ _ARTIFACT_FILENAME = "hiking-plan.pdf"
 # cowork resume filenames + caps (were adapter globals; Ticket 40).
 _COWORK_STUB_FILENAME = "cowork-output.txt"
 _COWORK_BASH_MAX_OUTPUT_BYTES = 1_048_576  # 1 MiB per stream
-
-_EFFECT_INFLIGHT_GRACE_SECONDS = 300
-
-
-def _effect_executor_is_live(all_events: list[dict[str, Any]], tool_name: str) -> bool:
-    """判断处于 ``executing`` 状态的 effect 是否仍有存活执行者。
-
-    双击恢复时，后到的请求会在入口看到另一请求留下的 EXECUTING effect。
-    若该工具的 tool_call 事件已持久化且距 now 不足宽限期，认定执行者
-    仍在飞行：不得改动 effect，也不得销毁其沙箱（CAS-loser 语义，
-    Ticket 12 review H1 同源）。tool_call 缺失或已过时则按崩溃处理
-    （spec AC3 outcome_unknown）。
-
-    宽限期 300s 远大于 Bash/PDF 的 30s 沙箱超时，兜住慢执行；
-    过时阈值同时保证崩溃执行者最终仍会被 outcome_unknown 收敛。
-    """
-    latest_call: datetime | None = None
-    for evt in all_events:
-        if evt.get("type") != "tool_call":
-            continue
-        if evt.get("payload", {}).get("tool") != tool_name:
-            continue
-        ts = evt.get("timestamp") or ""
-        try:
-            called_at = datetime.fromisoformat(ts)
-        except ValueError:
-            continue
-        if called_at.tzinfo is None:
-            called_at = called_at.replace(tzinfo=timezone.utc)
-        if latest_call is None or called_at > latest_call:
-            latest_call = called_at
-    if latest_call is None:
-        return False
-    return (datetime.now(timezone.utc) - latest_call).total_seconds() < _EFFECT_INFLIGHT_GRACE_SECONDS
 
 
 @dataclass(frozen=True)
@@ -1036,22 +1022,15 @@ async def drive_effect(
             return
     existing_effect = runs_repo.get_effect(effect_key)
 
-    # Executing: distinguish a live concurrent executor from a crashed one.
+    # Executing: with per-run execution ownership (ticket 02) ONLY the
+    # owner reaches this driver, so a CLAIMED/executing row found here has
+    # NO surviving owner — the executor died (crash or restart) between
+    # claim and settlement. The old 300s recent-tool_call liveness
+    # inference is removed: an unknown outcome converges immediately and
+    # the effect/run identity plus evidence are preserved.
     if existing_effect is not None and canonical_effect_status(
         existing_effect.status
     ) == EffectStatus.CLAIMED.value:
-        if _effect_executor_is_live(all_events, copy.tool_name):
-            outcome.status = "in_flight"
-            outcome.preserve_sandbox = True
-            yield emit("error", {
-                "code": "effect_in_flight",
-                # Ticket 10: stable shared-contract code for a duplicate
-                # executor on a live claim (additive, clients keep reading
-                # ``effect_in_flight``).
-                "boundary_code": ExecutionErrorCode.DUPLICATE_EFFECT.value,
-                "message": copy.in_flight_message,
-            })
-            return
         runs_repo.mark_effect_outcome_unknown(
             effect_key,
             reason="恢复时发现 effect 处于 executing 状态",
@@ -2222,6 +2201,13 @@ class RunOrchestrator:
 
         admission = None
         run_started_emitted = False
+        # agent-lifecycle-repair ticket 02: the per-run execution token
+        # once this stream won ownership (None while observing or before
+        # admission). Released in the ``finally`` below on EVERY exit —
+        # normal return, error, cancel and client disconnect — so the
+        # release always happens AFTER the owned execution (including
+        # the nested flows' cleanup ``finally`` blocks) has settled.
+        owner_token = None
         # BCDEF ticket 10: the admission-frozen capability projection used
         # by every tool authorization for this run.
         capability_projection: CapabilityProjection | None = None
@@ -2375,6 +2361,28 @@ class RunOrchestrator:
                         yield envelope
                     return
 
+                # agent-lifecycle-repair ticket 02: execution ownership.
+                # The admission CAS named ONE executor for this run; claim
+                # the process-wide per-run token BEFORE the first yield or
+                # await of execution. Acquisition is non-blocking and has
+                # NO wait queue: a connection that lost the race (an
+                # earlier first stream still executing, or a resume that
+                # took over the run) NEVER waits — it degrades to a
+                # read-only observer that replays persisted events and
+                # closes without touching run/effect/lease/cleanup state.
+                owner_token = runs_repo.try_acquire_run_execution(run_id)
+                if owner_token is None:
+                    logger.warning(
+                        "chat_v2: run_id=%s already has an active execution "
+                        "owner; this connection observes read-only",
+                        run_id,
+                    )
+                    async for envelope in self._replay_stored_events(
+                        stream, runs_repo, run_id, req
+                    ):
+                        yield envelope
+                    return
+
                 # The persisted admission event IS the first frame. Emit
                 # the exact durable envelope (same id/sequence/payload) so
                 # first stream and replay agree.
@@ -2511,18 +2519,22 @@ class RunOrchestrator:
                 # AMap MCP servers wired per registry allowlist and
                 # evidence-discipline prompt. No product-side direct
                 # route flow exists anymore.
-                async for envelope in self._stream_kernel_turn(
+                route_flow = self._stream_kernel_turn(
                     req, profile, run_id=run_id, emit=_emit,
                     settings=policy_settings,
                     projection=capability_projection,
-                ):
-                    if is_cancelled(runs_repo, run_id) and not stream.terminal_emitted:
-                        yield _emit("cancelled", {
-                            "code": "cancelled",
-                            "message": "运行已被取消。",
-                        })
-                        return
-                    yield envelope
+                )
+                try:
+                    async for envelope in route_flow:
+                        if is_cancelled(runs_repo, run_id) and not stream.terminal_emitted:
+                            yield _emit("cancelled", {
+                                "code": "cancelled",
+                                "message": "运行已被取消。",
+                            })
+                            return
+                        yield envelope
+                finally:
+                    await _aclose_quietly(route_flow)
                 mark_terminal_safe(runs_repo, run_id, "done")
                 return
 
@@ -2532,18 +2544,22 @@ class RunOrchestrator:
                 # the grounding gate. No memory-consent hook (the rag
                 # profile has no memory tools). SSE contract matches
                 # chat exactly: one `done` terminal after `text`.
-                async for envelope in self._stream_kernel_turn(
+                rag_flow = self._stream_kernel_turn(
                     req, profile, run_id=run_id, emit=_emit,
                     settings=policy_settings,
                     projection=capability_projection,
-                ):
-                    if is_cancelled(runs_repo, run_id) and not stream.terminal_emitted:
-                        yield _emit("cancelled", {
-                            "code": "cancelled",
-                            "message": "运行已被取消。",
-                        })
-                        return
-                    yield envelope
+                )
+                try:
+                    async for envelope in rag_flow:
+                        if is_cancelled(runs_repo, run_id) and not stream.terminal_emitted:
+                            yield _emit("cancelled", {
+                                "code": "cancelled",
+                                "message": "运行已被取消。",
+                            })
+                            return
+                        yield envelope
+                finally:
+                    await _aclose_quietly(rag_flow)
                 if not stream.terminal_emitted:
                     if is_cancelled(runs_repo, run_id):
                         yield _emit("cancelled", {
@@ -2560,12 +2576,16 @@ class RunOrchestrator:
                 # Ticket 39. The sandbox is created and cleaned up inside
                 # the flow; cancel/error paths run the cleanup in a
                 # ``finally`` block so the sandbox is never leaked.
-                async for envelope in self._stream_artifact_flow(
+                artifact_flow = self._stream_artifact_flow(
                     req, profile, run_id=run_id, emit=_emit,
                     settings=policy_settings,
                     projection=capability_projection,
-                ):
-                    yield envelope
+                )
+                try:
+                    async for envelope in artifact_flow:
+                        yield envelope
+                finally:
+                    await _aclose_quietly(artifact_flow)
                 return
 
             if profile.profile_id == ProfileId.COWORK:
@@ -2576,12 +2596,16 @@ class RunOrchestrator:
                 # approval; cancel/error paths run cleanup in
                 # ``finally``. (Ticket 38 folded this flow into the
                 # module.)
-                async for envelope in self._stream_cowork_flow(
+                cowork_flow = self._stream_cowork_flow(
                     req, profile, run_id=run_id, emit=_emit,
                     settings=policy_settings,
                     projection=capability_projection,
-                ):
-                    yield envelope
+                )
+                try:
+                    async for envelope in cowork_flow:
+                        yield envelope
+                finally:
+                    await _aclose_quietly(cowork_flow)
                 return
 
             # Ticket 32: sensitive candidates still surface as
@@ -2604,13 +2628,17 @@ class RunOrchestrator:
                 # route_plan + memory tools for the server-resolved
                 # subject). No stub/direct-flow/v1 fallback; kernel
                 # failures are stable terminal errors.
-                async for envelope in self._stream_kernel_turn(
+                chat_flow = self._stream_kernel_turn(
                     req, profile, run_id=run_id, emit=_emit,
                     memory=memory, subject_id=subject_id,
                     settings=policy_settings,
                     projection=capability_projection,
-                ):
-                    yield envelope
+                )
+                try:
+                    async for envelope in chat_flow:
+                        yield envelope
+                finally:
+                    await _aclose_quietly(chat_flow)
             else:
                 # Memory-hook path produced its own response above.
                 yield _emit("text", {"content": response_text})
@@ -2660,6 +2688,18 @@ class RunOrchestrator:
                     return
             mark_terminal_safe(runs_repo, run_id, "error")
             return
+        finally:
+            # agent-lifecycle-repair ticket 02: release the per-run
+            # execution token on every exit — normal return, terminal
+            # fence failure, error, cancel, immediate close and client
+            # disconnect (GeneratorExit unwinds through this block after
+            # the nested flow generators' own cleanup finallys ran).
+            # Release matches the exact token, so a stale double-release
+            # can never remove a successor owner.
+            if owner_token is not None:
+                runs_repo.release_run_execution(
+                    owner_token.run_id, owner_token
+                )
 
     # -- cowork flow (Ticket 38, originally Ticket 13) --
 
@@ -3423,10 +3463,9 @@ class RunOrchestrator:
         the assistant + terminal durability fence. When that fence fails
         the stream closes without a terminal; snapshot/replay explain it.
         """
+        impl = self._stream_resume_impl(run_id=run_id, from_seq=from_seq)
         try:
-            async for envelope in self._stream_resume_impl(
-                run_id=run_id, from_seq=from_seq
-            ):
+            async for envelope in impl:
                 yield envelope
         except _CloseStreamSilently:
             logger.error(
@@ -3435,6 +3474,12 @@ class RunOrchestrator:
                 run_id,
             )
             return
+        finally:
+            # agent-lifecycle-repair ticket 02: this wrapper owns the
+            # continuation generator; close it deterministically on every
+            # exit (including its silent close) so its ownership token is
+            # released and its cleanup finallys run.
+            await _aclose_quietly(impl)
 
     async def _stream_resume_impl(
         self,
@@ -3491,8 +3536,10 @@ class RunOrchestrator:
             replay_events if from_seq == 0
             else runs_repo.get_replay_events(run_id=run_id, from_seq=0)
         )
+        replayed_upto = from_seq
         for evt in replay_events:
             yield _replay_envelope(evt, run_id)
+            replayed_upto = max(replayed_upto, int(evt.get("sequence") or 0))
 
         # If the run is terminal, the replay is all the client gets. The
         # continuation was already emitted by a prior resume (or the run
@@ -3500,578 +3547,632 @@ class RunOrchestrator:
         if run.is_terminal:
             return
 
-        # Set up the EventStream to continue from the last persisted sequence.
-        snapshot = runs_repo.get_snapshot(run_id)
-        last_seq = snapshot.sequence_cursor if snapshot else 0
-        stream = EventStream(
-            request_id=run.request_id,
-            conversation_id=run.conversation_id,
-            run_id=run_id,
-        )
-        stream.advance_to(last_seq)
+        # agent-lifecycle-repair ticket 02: the per-run execution gate.
+        # The replay above is pure read; from here the continuation WOULD
+        # write (events, lease renewal, effect ledger, run status), so the
+        # non-blocking ownership token must be claimed first. A losing
+        # connection NEVER queues: it is a read-only observer — the replay
+        # above already delivered everything durable at read time, and the
+        # stream closes NOW, before the winner's barrier releases, with
+        # no new terminal, no sequence allocation, no tool execution, no
+        # lease/cleanup/run/effect mutation and no sandbox or model work.
+        owner_token = runs_repo.try_acquire_run_execution(run_id)
+        if owner_token is None:
+            logger.warning(
+                "run_orchestration: run_id=%s already has an active "
+                "execution owner; resume degrades to read-only observer "
+                "and closes",
+                run_id,
+            )
+            return
+        try:
+            # Re-read the persisted facts AFTER acquiring (ticket 02): the
+            # previous owner may have persisted more events between the
+            # replay read above and this acquisition, and the continuation
+            # must continue from the RE-READ cursor.
+            run = runs_repo.get_run(run_id)
+            if run is None or run.is_terminal:
+                # The previous owner finished while this connection waited
+                # at the gate. Deliver anything persisted after our replay
+                # read (original identity preserved), then close —
+                # replay-only, no continuation, no second terminal.
+                for evt in runs_repo.get_replay_events(
+                    run_id=run_id, from_seq=replayed_upto
+                ):
+                    yield _replay_envelope(evt, run_id)
+                return
+            all_events = runs_repo.get_replay_events(run_id=run_id, from_seq=0)
 
-        # Ticket 03: the assistant reply of a resumed run is the text
-        # already replayed plus what this continuation emits; the fence
-        # persists it before the terminal.
-        assistant_parts: list[str] = [
-            evt["payload"].get("content", "")
-            for evt in all_events
-            if evt.get("type") == "text"
-            and isinstance(evt.get("payload"), dict)
-            and isinstance(evt["payload"].get("content"), str)
-        ]
-
-        def _emit_impl(
-            event_type: str, payload: dict[str, Any], *, strict: bool
-        ) -> EventEnvelope:
-            # agent-lifecycle-repair ticket 01: same shared publication
-            # responsibility as the first stream
-            # (:func:`_publish_stream_event`); the continuation only
-            # differs in per-call-site strict durability.
-            return _publish_stream_event(
-                event_type,
-                payload,
-                stream=stream,
-                runs_repo=runs_repo,
-                run_id=run_id,
+            # Set up the EventStream to continue from the RE-READ cursor.
+            snapshot = runs_repo.get_snapshot(run_id)
+            last_seq = snapshot.sequence_cursor if snapshot else 0
+            stream = EventStream(
                 request_id=run.request_id,
                 conversation_id=run.conversation_id,
-                assistant_parts=assistant_parts,
-                telemetry=telemetry,
-                telemetry_started=telemetry_started,
-                strict=strict,
-                log_origin="run_orchestration",
-            )
-
-        def emit(event_type: str, payload: dict[str, Any]) -> EventEnvelope:
-            return _emit_impl(event_type, payload, strict=False)
-
-        def emit_required(event_type: str, payload: dict[str, Any]) -> EventEnvelope:
-            """Durable publish gate: raises when the event cannot persist."""
-            return _emit_impl(event_type, payload, strict=True)
-
-        # BCDEF ticket 09: resolve the frozen execution policy through the
-        # versioned adapter chain BEFORE any continuation work. The resume
-        # uses the ADAPTED snapshot — never current config. An unusable
-        # snapshot (unknown version, hash mismatch, missing critical field,
-        # missing snapshot) terminates the run with a stable
-        # ``policy_incompatible``/``policy_snapshot_missing`` error and a
-        # ``next_action`` for janitor/manual handling. No model, effect or
-        # sandbox work happens after a failure here.
-        try:
-            resolved_policy = runs_repo.resolve_policy_snapshot(run_id)
-            resolved_policy.profile()  # capability reconstruction must succeed
-            # BCDEF ticket 07: the continuation executes from durable facts
-            # (the drafted plan, the approved args, the ledger), so the
-            # adapted settings are re-derived here only as a fail-closed
-            # REVALIDATION of policy identity — never to re-resolve the
-            # current default profile, model or capability.
-            assert_policy_frozen(self._settings, resolved_policy.policy)
-        except BoundaryError as exc:
-            logger.error(
-                "run_orchestration: policy snapshot unusable during resume "
-                "for run_id=%s: %s",
-                run_id,
-                exc,
-            )
-            failure = policy_error_payload(exc)
-            failure["message"] = (
-                "运行策略快照无法安全恢复，已停止执行；"
-                "请等待人工或 janitor 处理。"
-            )
-            yield emit("error", failure)
-            mark_terminal_safe(runs_repo, run_id, "error")
-            return
-        except Exception:
-            logger.exception(
-                "run_orchestration: unexpected policy resolution failure "
-                "during resume for run_id=%s",
-                run_id,
-            )
-            yield emit("error", {
-                "code": "policy_incompatible",
-                "reason": "policy_snapshot_unreadable",
-                "recoverable": False,
-                "next_action": "janitor",
-                "message": "运行策略快照读取失败，已停止执行，等待 janitor 处理。",
-            })
-            mark_terminal_safe(runs_repo, run_id, "error")
-            return
-
-        # BCDEF ticket 10: the resume authorizes against the SAME frozen
-        # snapshot — never current config. An incomplete projection is
-        # terminal before any effect/lease/sandbox work.
-        try:
-            resume_projection = build_capability_projection(
-                resolved_policy.policy,
                 run_id=run_id,
-                policy_hash_value=resolved_policy.policy_hash,
             )
-        except CapabilityProjectionError as exc:
-            logger.error(
-                "run_orchestration: capability projection failed during "
-                "resume for run_id=%s: %s",
-                run_id,
-                exc,
-            )
-            yield emit("error", exc.to_payload())
-            mark_terminal_safe(runs_repo, run_id, "error")
-            return
+            stream.advance_to(last_seq)
 
-        if resolved_policy.source_schema_version != resolved_policy.schema_version:
-            # Ticket 09: a legacy snapshot was lifted. Record the provenance
-            # durably (progress is replayable) before the continuation. A
-            # crashed prior resume may already have persisted it — never
-            # duplicate the metadata.
-            already_recorded = any(
-                evt["type"] == "progress"
-                and evt["payload"].get("stage") == "policy.adapted"
+            # Ticket 03: the assistant reply of a resumed run is the text
+            # already replayed plus what this continuation emits; the fence
+            # persists it before the terminal.
+            assistant_parts: list[str] = [
+                evt["payload"].get("content", "")
                 for evt in all_events
-            )
-            if not already_recorded:
-                yield emit("progress", {
-                    "stage": "policy.adapted",
-                    **resolved_policy.provenance_payload(),
-                })
+                if evt.get("type") == "text"
+                and isinstance(evt.get("payload"), dict)
+                and isinstance(evt["payload"].get("content"), str)
+            ]
 
-        # Look up the resolved approval that authorized this resume.
-        approvals = runs_repo.list_approvals_for_run(run_id)
-        resolved = next((a for a in approvals if a.is_terminal), None)
-        if resolved is None:
-            yield emit("error", {
-                "code": "no_resolved_approval",
-                "message": "运行已恢复但未找到已解决的审批。",
-            })
-            mark_terminal_safe(runs_repo, run_id, "error")
-            return
-
-        # BCDEF ticket 06: revalidate the run status BEFORE continuing.
-        # Only a paused run (awaiting the decision) or a running run
-        # (decision recorded) may start sandbox work again.
-        if run.status not in ("paused", "running"):
-            yield emit("error", {
-                "code": "run_not_resumable",
-                "message": f"运行状态 {run.status} 不允许继续执行。",
-            })
-            mark_terminal_safe(runs_repo, run_id, "error")
-            return
-
-        # Scan persisted events to determine which resume steps already ran.
-        # This is the spec AC5 idempotency guard: if a step's event is already
-        # in the log, we skip the step entirely — no tool re-execution.
-        stored_types = {evt["type"] for evt in all_events}
-        has_approval_resolved = "approval.resolved" in stored_types
-        has_tool_call = "tool_call" in stored_types
-        # Ticket 13: ``has_tool_result_ok`` is per-tool — the resume flow
-        # dispatches on ``resolved.tool_name`` (``generate_pdf`` or
-        # ``sandbox_bash``), so the idempotency guard must check the matching
-        # tool_result payload. Without this, a sandbox_bash resume would
-        # incorrectly skip tool execution because no ``generate_pdf``
-        # tool_result exists.
-        has_tool_result_ok = any(
-            evt["type"] == "tool_result"
-            and evt["payload"].get("tool") == resolved.tool_name
-            and evt["payload"].get("status") == "ok"
-            for evt in all_events
-        )
-        has_artifact_available = "artifact.available" in stored_types
-        has_text = "text" in stored_types
-
-        # If the run was rejected, the only valid terminal is ``done``. If a
-        # prior resume already emitted ``approval.resolved`` but the run is
-        # still running (mid-stream crash before ``done``), emit ``done`` now
-        # without re-emitting ``approval.resolved``.
-        if resolved.status == "rejected":
-            if not has_approval_resolved:
-                yield emit("approval.resolved", {
-                    "approval_id": resolved.approval_id,
-                    "tool": resolved.tool_name,
-                    "decision": "reject",
-                    "status": resolved.status,
-                    "message": "用户已拒绝操作，运行将结束。",
-                })
-            yield emit("done", {
-                "code": "rejected",
-                "message": "用户已拒绝操作，运行结束。",
-            })
-            mark_terminal_safe(runs_repo, run_id, "done")
-            return
-
-        # Approved path — the tool may or may not have executed yet.
-        # AC7: reuse the SAME sandbox lease. If the lease is missing or
-        # destroyed, fail closed — do NOT create a new sandbox.
-        lease = runs_repo.get_sandbox_lease(run_id)
-        if lease is None or lease.status != "active":
-            if not has_approval_resolved:
-                yield emit("approval.resolved", {
-                    "approval_id": resolved.approval_id,
-                    "tool": resolved.tool_name,
-                    "decision": "approve",
-                    "status": resolved.status,
-                    "message": "用户已批准操作，继续执行。",
-                })
-            yield emit("error", {
-                "code": "sandbox_lease_lost",
-                "message": (
-                    "沙箱租赁已丢失或销毁，无法安全恢复运行（spec AC7）。"
-                    "请重新发起请求。"
-                ),
-            })
-            mark_terminal_safe(runs_repo, run_id, "error")
-            return
-
-        # BCDEF ticket 06: an expired lease cannot be renewed by the old
-        # worker and must NOT be silently bypassed with a new sandbox.
-        if lease.is_expired():
-            runs_repo.expire_sandbox_lease(run_id)
-            if not has_approval_resolved:
-                yield emit("approval.resolved", {
-                    "approval_id": resolved.approval_id,
-                    "tool": resolved.tool_name,
-                    "decision": "approve",
-                    "status": resolved.status,
-                    "message": "用户已批准操作，继续执行。",
-                })
-            yield emit("error", {
-                "code": "lease_expired",
-                "message": (
-                    "沙箱租约已过期，无法安全恢复运行；请重新发起请求。"
-                ),
-            })
-            mark_terminal_safe(runs_repo, run_id, "error")
-            return
-
-        # Revalidate the lease generation (heartbeat under the CURRENT
-        # fencing token). A stale token or a lost row fails closed.
-        lease_owner = f"resume:{uuid.uuid4().hex}"
-        renewed_lease, lease_renewed = runs_repo.renew_sandbox_lease(
-            run_id=run_id,
-            fencing_token=lease.fencing_token,
-            owner_id=lease_owner,
-            ttl_seconds=SANDBOX_LEASE_TTL_SECONDS,
-        )
-        if not lease_renewed or renewed_lease is None:
-            if not has_approval_resolved:
-                yield emit("approval.resolved", {
-                    "approval_id": resolved.approval_id,
-                    "tool": resolved.tool_name,
-                    "decision": "approve",
-                    "status": resolved.status,
-                    "message": "用户已批准操作，继续执行。",
-                })
-            yield emit("error", {
-                "code": "sandbox_lease_lost",
-                "message": (
-                    "沙箱租约已被其他执行者接管或失效，无法安全恢复运行。"
-                ),
-            })
-            mark_terminal_safe(runs_repo, run_id, "error")
-            return
-        lease = renewed_lease
-        lease_guard = SandboxLeaseGuard(
-            runs_repo,
-            run_id=run_id,
-            fencing_token=lease.fencing_token,
-            lease_id=lease.lease_id,
-            owner_id=lease_owner,
-            ttl_seconds=SANDBOX_LEASE_TTL_SECONDS,
-        )
-
-        # Reconstruct the Computer bound to the leased workspace through
-        # the injected factory (the adapter hook resolves the adapter
-        # global lazily so contract-test monkeypatch points keep working).
-        try:
-            computer = self._computer_factory(lease.sandbox_type)
-        except ValueError as exc:
-            yield emit("error", {
-                "code": "sandbox_type_invalid",
-                "message": f"沙箱类型无效：{exc}",
-            })
-            mark_terminal_safe(runs_repo, run_id, "error")
-            return
-
-        workspace_path = lease.workspace_path
-        preserve_sandbox = False
-
-        # Parse the approved args from the approval record (spec AC5: the
-        # tool must execute with the EXACT args the user approved; hardcoded
-        # args would bypass the canonical-args tampering check).
-        try:
-            approved_args = json.loads(resolved.args_canonical) if resolved.args_canonical else {}
-        except (ValueError, TypeError):
-            approved_args = {}
-        artifact_filename = approved_args.get("filename", _ARTIFACT_FILENAME)
-
-        try:
-            # Step 1: emit approval.resolved (skip if already persisted).
-            if not has_approval_resolved:
-                yield emit("approval.resolved", {
-                    "approval_id": resolved.approval_id,
-                    "tool": resolved.tool_name,
-                    "decision": "approve",
-                    "status": resolved.status,
-                    "message": "用户已批准操作，继续执行。",
-                })
-
-            # Ticket 13: dispatch on the approved tool name. ``sandbox_bash``
-            # (cowork profile) runs a bash command inside the sandbox and
-            # surfaces the captured stdout/stderr/exit_code. ``generate_pdf``
-            # (artifact profile) runs the PDF generation + host export flow.
-            # Both share the effect ledger + CAS + crash-recovery contract
-            # (Ticket 12).
-            if resolved.tool_name == "sandbox_bash":
-                async for envelope in self._resume_cowork_bash_steps(
-                    emit=emit,
-                    emit_required=emit_required,
+            def _emit_impl(
+                event_type: str, payload: dict[str, Any], *, strict: bool
+            ) -> EventEnvelope:
+                # agent-lifecycle-repair ticket 01: same shared publication
+                # responsibility as the first stream
+                # (:func:`_publish_stream_event`); the continuation only
+                # differs in per-call-site strict durability.
+                return _publish_stream_event(
+                    event_type,
+                    payload,
+                    stream=stream,
                     runs_repo=runs_repo,
                     run_id=run_id,
-                    computer=computer,
-                    workspace_path=workspace_path,
-                    lease=lease,
-                    lease_guard=lease_guard,
-                    resolved=resolved,
-                    approved_args=approved_args,
-                    has_tool_call=has_tool_call,
-                    has_tool_result_ok=has_tool_result_ok,
-                    has_artifact_available=has_artifact_available,
-                    has_text=has_text,
-                    all_events=all_events,
-                    run=run,
-                    snapshot=snapshot,
-                    projection=resume_projection,
-                ):
-                    yield envelope
-                # 助手因"并发在飞"退出时 effect 仍为 executing —— 保留沙箱与
-                # 租约，避免销毁胜者正在使用的运行环境（双击恢复互删修复）。
-                _bash_effect = runs_repo.get_effect(
-                    compute_effect_key(
-                        run_id=run_id, tool_name="sandbox_bash", args=approved_args
-                    )
+                    request_id=run.request_id,
+                    conversation_id=run.conversation_id,
+                    assistant_parts=assistant_parts,
+                    telemetry=telemetry,
+                    telemetry_started=telemetry_started,
+                    strict=strict,
+                    log_origin="run_orchestration",
                 )
-                if (
-                    _bash_effect is not None
-                    and _bash_effect.status == EffectStatus.EXECUTING.value
-                ):
-                    preserve_sandbox = True
+
+            def emit(event_type: str, payload: dict[str, Any]) -> EventEnvelope:
+                return _emit_impl(event_type, payload, strict=False)
+
+            def emit_required(event_type: str, payload: dict[str, Any]) -> EventEnvelope:
+                """Durable publish gate: raises when the event cannot persist."""
+                return _emit_impl(event_type, payload, strict=True)
+
+            # BCDEF ticket 09: resolve the frozen execution policy through the
+            # versioned adapter chain BEFORE any continuation work. The resume
+            # uses the ADAPTED snapshot — never current config. An unusable
+            # snapshot (unknown version, hash mismatch, missing critical field,
+            # missing snapshot) terminates the run with a stable
+            # ``policy_incompatible``/``policy_snapshot_missing`` error and a
+            # ``next_action`` for janitor/manual handling. No model, effect or
+            # sandbox work happens after a failure here.
+            try:
+                resolved_policy = runs_repo.resolve_policy_snapshot(run_id)
+                resolved_policy.profile()  # capability reconstruction must succeed
+                # BCDEF ticket 07: the continuation executes from durable facts
+                # (the drafted plan, the approved args, the ledger), so the
+                # adapted settings are re-derived here only as a fail-closed
+                # REVALIDATION of policy identity — never to re-resolve the
+                # current default profile, model or capability.
+                assert_policy_frozen(self._settings, resolved_policy.policy)
+            except BoundaryError as exc:
+                logger.error(
+                    "run_orchestration: policy snapshot unusable during resume "
+                    "for run_id=%s: %s",
+                    run_id,
+                    exc,
+                )
+                failure = policy_error_payload(exc)
+                failure["message"] = (
+                    "运行策略快照无法安全恢复，已停止执行；"
+                    "请等待人工或 janitor 处理。"
+                )
+                yield emit("error", failure)
+                mark_terminal_safe(runs_repo, run_id, "error")
                 return
-
-            # Step 2: execute tool (skip if tool_result ok already persisted).
-            # Ticket 39: the effect CAS ledger is a single implementation
-            # (:func:`drive_effect`); Ticket 12: the effect row is the
-            # authoritative source of truth for tool execution state; the
-            # event log check (``has_tool_result_ok``) is a secondary guard.
-            effect_key = compute_effect_key(
-                run_id=run_id,
-                tool_name="generate_pdf",
-                args=approved_args,
-            )
-            external_idempotency_key = compute_external_idempotency_key(
-                effect_key=effect_key,
-                tool_name="generate_pdf",
-            )
-            outcome = EffectDriveResult()
-
-            user_message = ""
-            for msg in snapshot.messages if snapshot else []:
-                if msg.get("role") == "user":
-                    user_message = msg.get("content", "")
-                    break
-
-            # BCDEF ticket 07: the approved export renders the plan drafted
-            # and persisted BEFORE the pause (``approvals.prepared_content``,
-            # written by the artifact flow at admission time). The resume is
-            # a CONTINUATION of durable facts, so the model is never re-run
-            # here (spec 03/04) — a legacy paused row without a draft falls
-            # back to the persisted user turn, deterministically, and still
-            # never calls the kernel. Skip the whole step when the tool
-            # already executed (idempotent resume).
-            plan_content = resolved.prepared_content or user_message
-            if not has_tool_result_ok and resolved.prepared_content is None:
-                logger.warning(
-                    "run_orchestration: paused run %s has no prepared plan "
-                    "draft (legacy row); continuing from the persisted user "
-                    "turn without calling the model",
+            except Exception:
+                logger.exception(
+                    "run_orchestration: unexpected policy resolution failure "
+                    "during resume for run_id=%s",
                     run_id,
                 )
+                yield emit("error", {
+                    "code": "policy_incompatible",
+                    "reason": "policy_snapshot_unreadable",
+                    "recoverable": False,
+                    "next_action": "janitor",
+                    "message": "运行策略快照读取失败，已停止执行，等待 janitor 处理。",
+                })
+                mark_terminal_safe(runs_repo, run_id, "error")
+                return
 
-            def _execute_pdf() -> dict[str, Any]:
-                # Ticket 06: heartbeat + revalidate the fenced lease right
-                # before the sandbox side effect.
-                lease_guard.renew()
-                lease_guard.assert_active()
-                generated = computer.generate_pdf(
-                    workspace_path, plan_content, artifact_filename
+            # BCDEF ticket 10: the resume authorizes against the SAME frozen
+            # snapshot — never current config. An incomplete projection is
+            # terminal before any effect/lease/sandbox work.
+            try:
+                resume_projection = build_capability_projection(
+                    resolved_policy.policy,
+                    run_id=run_id,
+                    policy_hash_value=resolved_policy.policy_hash,
                 )
-                return {"content": f"已在沙箱中生成 {generated}", "path": generated}
+            except CapabilityProjectionError as exc:
+                logger.error(
+                    "run_orchestration: capability projection failed during "
+                    "resume for run_id=%s: %s",
+                    run_id,
+                    exc,
+                )
+                yield emit("error", exc.to_payload())
+                mark_terminal_safe(runs_repo, run_id, "error")
+                return
 
-            async for envelope in drive_effect(
-                runs_repo=runs_repo,
+            if resolved_policy.source_schema_version != resolved_policy.schema_version:
+                # Ticket 09: a legacy snapshot was lifted. Record the provenance
+                # durably (progress is replayable) before the continuation. A
+                # crashed prior resume may already have persisted it — never
+                # duplicate the metadata.
+                already_recorded = any(
+                    evt["type"] == "progress"
+                    and evt["payload"].get("stage") == "policy.adapted"
+                    for evt in all_events
+                )
+                if not already_recorded:
+                    yield emit("progress", {
+                        "stage": "policy.adapted",
+                        **resolved_policy.provenance_payload(),
+                    })
+
+            # Look up the resolved approval that authorized this resume.
+            approvals = runs_repo.list_approvals_for_run(run_id)
+            resolved = next((a for a in approvals if a.is_terminal), None)
+            if resolved is None:
+                yield emit("error", {
+                    "code": "no_resolved_approval",
+                    "message": "运行已恢复但未找到已解决的审批。",
+                })
+                mark_terminal_safe(runs_repo, run_id, "error")
+                return
+
+            # BCDEF ticket 06: revalidate the run status BEFORE continuing.
+            # Only a paused run (awaiting the decision) or a running run
+            # (decision recorded) may start sandbox work again.
+            if run.status not in ("paused", "running"):
+                yield emit("error", {
+                    "code": "run_not_resumable",
+                    "message": f"运行状态 {run.status} 不允许继续执行。",
+                })
+                mark_terminal_safe(runs_repo, run_id, "error")
+                return
+
+            # Scan persisted events to determine which resume steps already ran.
+            # This is the spec AC5 idempotency guard: if a step's event is already
+            # in the log, we skip the step entirely — no tool re-execution.
+            stored_types = {evt["type"] for evt in all_events}
+            has_approval_resolved = "approval.resolved" in stored_types
+            has_tool_call = "tool_call" in stored_types
+            # Ticket 13: ``has_tool_result_ok`` is per-tool — the resume flow
+            # dispatches on ``resolved.tool_name`` (``generate_pdf`` or
+            # ``sandbox_bash``), so the idempotency guard must check the matching
+            # tool_result payload. Without this, a sandbox_bash resume would
+            # incorrectly skip tool execution because no ``generate_pdf``
+            # tool_result exists.
+            has_tool_result_ok = any(
+                evt["type"] == "tool_result"
+                and evt["payload"].get("tool") == resolved.tool_name
+                and evt["payload"].get("status") == "ok"
+                for evt in all_events
+            )
+            has_artifact_available = "artifact.available" in stored_types
+            has_text = "text" in stored_types
+
+            # If the run was rejected, the only valid terminal is ``done``. If a
+            # prior resume already emitted ``approval.resolved`` but the run is
+            # still running (mid-stream crash before ``done``), emit ``done`` now
+            # without re-emitting ``approval.resolved``.
+            if resolved.status == "rejected":
+                if not has_approval_resolved:
+                    yield emit("approval.resolved", {
+                        "approval_id": resolved.approval_id,
+                        "tool": resolved.tool_name,
+                        "decision": "reject",
+                        "status": resolved.status,
+                        "message": "用户已拒绝操作，运行将结束。",
+                    })
+                yield emit("done", {
+                    "code": "rejected",
+                    "message": "用户已拒绝操作，运行结束。",
+                })
+                mark_terminal_safe(runs_repo, run_id, "done")
+                return
+
+            # Approved path — the tool may or may not have executed yet.
+            # AC7: reuse the SAME sandbox lease. If the lease is missing or
+            # destroyed, fail closed — do NOT create a new sandbox.
+            lease = runs_repo.get_sandbox_lease(run_id)
+            if lease is None or lease.status != "active":
+                if not has_approval_resolved:
+                    yield emit("approval.resolved", {
+                        "approval_id": resolved.approval_id,
+                        "tool": resolved.tool_name,
+                        "decision": "approve",
+                        "status": resolved.status,
+                        "message": "用户已批准操作，继续执行。",
+                    })
+                yield emit("error", {
+                    "code": "sandbox_lease_lost",
+                    "message": (
+                        "沙箱租赁已丢失或销毁，无法安全恢复运行（spec AC7）。"
+                        "请重新发起请求。"
+                    ),
+                })
+                mark_terminal_safe(runs_repo, run_id, "error")
+                return
+
+            # BCDEF ticket 06: an expired lease cannot be renewed by the old
+            # worker and must NOT be silently bypassed with a new sandbox.
+            if lease.is_expired():
+                runs_repo.expire_sandbox_lease(run_id)
+                if not has_approval_resolved:
+                    yield emit("approval.resolved", {
+                        "approval_id": resolved.approval_id,
+                        "tool": resolved.tool_name,
+                        "decision": "approve",
+                        "status": resolved.status,
+                        "message": "用户已批准操作，继续执行。",
+                    })
+                yield emit("error", {
+                    "code": "lease_expired",
+                    "message": (
+                        "沙箱租约已过期，无法安全恢复运行；请重新发起请求。"
+                    ),
+                })
+                mark_terminal_safe(runs_repo, run_id, "error")
+                return
+
+            # Revalidate the lease generation (heartbeat under the CURRENT
+            # fencing token). A stale token or a lost row fails closed.
+            lease_owner = f"resume:{uuid.uuid4().hex}"
+            renewed_lease, lease_renewed = runs_repo.renew_sandbox_lease(
                 run_id=run_id,
-                conversation_id=run.conversation_id,
-                copy=EFFECT_COPY_GENERATE_PDF,
-                effect_key=effect_key,
-                external_idempotency_key=external_idempotency_key,
-                args_canonical=resolved.args_canonical,
-                tool_args={"filename": artifact_filename},
-                all_events=all_events,
-                has_tool_call=has_tool_call,
-                has_tool_result_ok=has_tool_result_ok,
-                execute=_execute_pdf,
-                emit=emit,
-                outcome=outcome,
-                emit_required=emit_required,
-                post_execute_check=lease_guard.assert_active,
-                lease_id=lease.lease_id,
                 fencing_token=lease.fencing_token,
-                projection=resume_projection,
-                approval_granted=True,
-            ):
-                yield envelope
-            if outcome.status in (
-                "failed", "outcome_unknown", "in_flight", "denied", "persist_failed"
-            ):
-                if outcome.preserve_sandbox:
-                    preserve_sandbox = True
+                owner_id=lease_owner,
+                ttl_seconds=SANDBOX_LEASE_TTL_SECONDS,
+            )
+            if not lease_renewed or renewed_lease is None:
+                if not has_approval_resolved:
+                    yield emit("approval.resolved", {
+                        "approval_id": resolved.approval_id,
+                        "tool": resolved.tool_name,
+                        "decision": "approve",
+                        "status": resolved.status,
+                        "message": "用户已批准操作，继续执行。",
+                    })
+                yield emit("error", {
+                    "code": "sandbox_lease_lost",
+                    "message": (
+                        "沙箱租约已被其他执行者接管或失效，无法安全恢复运行。"
+                    ),
+                })
+                mark_terminal_safe(runs_repo, run_id, "error")
+                return
+            lease = renewed_lease
+            lease_guard = SandboxLeaseGuard(
+                runs_repo,
+                run_id=run_id,
+                fencing_token=lease.fencing_token,
+                lease_id=lease.lease_id,
+                owner_id=lease_owner,
+                ttl_seconds=SANDBOX_LEASE_TTL_SECONDS,
+            )
+
+            # Reconstruct the Computer bound to the leased workspace through
+            # the injected factory (the adapter hook resolves the adapter
+            # global lazily so contract-test monkeypatch points keep working).
+            try:
+                computer = self._computer_factory(lease.sandbox_type)
+            except ValueError as exc:
+                yield emit("error", {
+                    "code": "sandbox_type_invalid",
+                    "message": f"沙箱类型无效：{exc}",
+                })
+                mark_terminal_safe(runs_repo, run_id, "error")
                 return
 
-            # Recover the relative_path for artifact_candidate + text from the
-            # committed/executed effect result, falling back to the stored
-            # tool_result event payload.
-            if outcome.stored_result is not None:
-                relative_path = outcome.stored_result.get("path", artifact_filename)
-            else:
-                tool_result_evt = next(
-                    evt for evt in all_events
-                    if evt["type"] == "tool_result"
-                    and evt["payload"].get("tool") == "generate_pdf"
-                    and evt["payload"].get("status") == "ok"
-                )
-                relative_path = tool_result_evt["payload"].get("path", artifact_filename)
+            workspace_path = lease.workspace_path
+            preserve_sandbox = False
 
-            # Step 3: cancel check before artifact_candidate.
-            if is_cancelled(runs_repo, run_id):
-                yield emit("cancelled", {
-                    "code": "cancelled",
-                    "message": "运行已被取消。",
-                })
-                return
+            # Parse the approved args from the approval record (spec AC5: the
+            # tool must execute with the EXACT args the user approved; hardcoded
+            # args would bypass the canonical-args tampering check).
+            try:
+                approved_args = json.loads(resolved.args_canonical) if resolved.args_canonical else {}
+            except (ValueError, TypeError):
+                approved_args = {}
+            artifact_filename = approved_args.get("filename", _ARTIFACT_FILENAME)
 
-            # Step 4: artifact_candidate + host export (skip if
-            # artifact.available already persisted — the export is a side
-            # effect on the host).
-            if not has_artifact_available:
-                yield emit("artifact_candidate", {
-                    "filename": relative_path,
-                    "mime_type": "application/pdf",
-                    "sandbox_type": computer.sandbox_type,
-                    "message": "已生成徒步计划 PDF，等待宿主侧导出。",
-                })
+            try:
+                # Step 1: emit approval.resolved (skip if already persisted).
+                if not has_approval_resolved:
+                    yield emit("approval.resolved", {
+                        "approval_id": resolved.approval_id,
+                        "tool": resolved.tool_name,
+                        "decision": "approve",
+                        "status": resolved.status,
+                        "message": "用户已批准操作，继续执行。",
+                    })
 
-                try:
-                    export = self._export_artifact(
-                        computer=computer,
-                        workspace_path=workspace_path,
-                        relative_path=relative_path,
-                        declared_mime="application/pdf",
+                # Ticket 13: dispatch on the approved tool name. ``sandbox_bash``
+                # (cowork profile) runs a bash command inside the sandbox and
+                # surfaces the captured stdout/stderr/exit_code. ``generate_pdf``
+                # (artifact profile) runs the PDF generation + host export flow.
+                # Both share the effect ledger + CAS + crash-recovery contract
+                # (Ticket 12).
+                if resolved.tool_name == "sandbox_bash":
+                    bash_steps = self._resume_cowork_bash_steps(
+                        emit=emit,
+                        emit_required=emit_required,
                         runs_repo=runs_repo,
                         run_id=run_id,
-                        conversation_id=run.conversation_id,
+                        computer=computer,
+                        workspace_path=workspace_path,
+                        lease=lease,
+                        lease_guard=lease_guard,
+                        resolved=resolved,
+                        approved_args=approved_args,
+                        has_tool_call=has_tool_call,
+                        has_tool_result_ok=has_tool_result_ok,
+                        has_artifact_available=has_artifact_available,
+                        has_text=has_text,
+                        all_events=all_events,
+                        run=run,
+                        snapshot=snapshot,
+                        projection=resume_projection,
                     )
-                except ArtifactEvidencePersistenceError as exc:
-                    preserve_sandbox = True
-                    yield emit("error", {
-                        "code": "artifact_evidence_persistence_failed",
-                        "message": (
-                            f"artifact 证据持久化失败，sandbox 已保留以便排查：{exc}。"
-                            f"请联系运维处理 run_id={run_id} 的沙箱。"
-                        ),
-                    })
-                    mark_terminal_safe(runs_repo, run_id, "error")
+                    try:
+                        async for envelope in bash_steps:
+                            yield envelope
+                    finally:
+                        await _aclose_quietly(bash_steps)
+                    # 助手因"并发在飞"退出时 effect 仍为 executing —— 保留沙箱与
+                    # 租约，避免销毁胜者正在使用的运行环境（双击恢复互删修复）。
+                    _bash_effect = runs_repo.get_effect(
+                        compute_effect_key(
+                            run_id=run_id, tool_name="sandbox_bash", args=approved_args
+                        )
+                    )
+                    if (
+                        _bash_effect is not None
+                        and _bash_effect.status == EffectStatus.EXECUTING.value
+                    ):
+                        preserve_sandbox = True
                     return
-                except ArtifactExportError as exc:
-                    yield emit("error", {
-                        "code": "artifact_export_failed",
-                        "message": f"artifact 导出失败：{exc}",
-                    })
-                    mark_terminal_safe(runs_repo, run_id, "error")
+
+                # Step 2: execute tool (skip if tool_result ok already persisted).
+                # Ticket 39: the effect CAS ledger is a single implementation
+                # (:func:`drive_effect`); Ticket 12: the effect row is the
+                # authoritative source of truth for tool execution state; the
+                # event log check (``has_tool_result_ok``) is a secondary guard.
+                effect_key = compute_effect_key(
+                    run_id=run_id,
+                    tool_name="generate_pdf",
+                    args=approved_args,
+                )
+                external_idempotency_key = compute_external_idempotency_key(
+                    effect_key=effect_key,
+                    tool_name="generate_pdf",
+                )
+                outcome = EffectDriveResult()
+
+                user_message = ""
+                for msg in snapshot.messages if snapshot else []:
+                    if msg.get("role") == "user":
+                        user_message = msg.get("content", "")
+                        break
+
+                # BCDEF ticket 07: the approved export renders the plan drafted
+                # and persisted BEFORE the pause (``approvals.prepared_content``,
+                # written by the artifact flow at admission time). The resume is
+                # a CONTINUATION of durable facts, so the model is never re-run
+                # here (spec 03/04) — a legacy paused row without a draft falls
+                # back to the persisted user turn, deterministically, and still
+                # never calls the kernel. Skip the whole step when the tool
+                # already executed (idempotent resume).
+                plan_content = resolved.prepared_content or user_message
+                if not has_tool_result_ok and resolved.prepared_content is None:
+                    logger.warning(
+                        "run_orchestration: paused run %s has no prepared plan "
+                        "draft (legacy row); continuing from the persisted user "
+                        "turn without calling the model",
+                        run_id,
+                    )
+
+                def _execute_pdf() -> dict[str, Any]:
+                    # Ticket 06: heartbeat + revalidate the fenced lease right
+                    # before the sandbox side effect.
+                    lease_guard.renew()
+                    lease_guard.assert_active()
+                    generated = computer.generate_pdf(
+                        workspace_path, plan_content, artifact_filename
+                    )
+                    return {"content": f"已在沙箱中生成 {generated}", "path": generated}
+
+                pdf_drive = drive_effect(
+                    runs_repo=runs_repo,
+                    run_id=run_id,
+                    conversation_id=run.conversation_id,
+                    copy=EFFECT_COPY_GENERATE_PDF,
+                    effect_key=effect_key,
+                    external_idempotency_key=external_idempotency_key,
+                    args_canonical=resolved.args_canonical,
+                    tool_args={"filename": artifact_filename},
+                    all_events=all_events,
+                    has_tool_call=has_tool_call,
+                    has_tool_result_ok=has_tool_result_ok,
+                    execute=_execute_pdf,
+                    emit=emit,
+                    outcome=outcome,
+                    emit_required=emit_required,
+                    post_execute_check=lease_guard.assert_active,
+                    lease_id=lease.lease_id,
+                    fencing_token=lease.fencing_token,
+                    projection=resume_projection,
+                    approval_granted=True,
+                )
+                try:
+                    async for envelope in pdf_drive:
+                        yield envelope
+                finally:
+                    await _aclose_quietly(pdf_drive)
+                if outcome.status in (
+                    "failed", "outcome_unknown", "in_flight", "denied", "persist_failed"
+                ):
+                    if outcome.preserve_sandbox:
+                        preserve_sandbox = True
                     return
 
-                yield emit("artifact.available", {
-                    "artifact_id": export["artifact_id"],
-                    "public_filename": export["public_filename"],
-                    "mime_type": export["mime_type"],
-                    "size_bytes": export["size_bytes"],
-                    "sha256": export["sha256"],
-                    "expires_at": export["expires_at"],
-                    "message": "artifact 已就绪，可通过 /api/v2/artifacts/{artifact_id} 下载。",
-                })
-            else:
-                # Export already done — recover artifact_id from stored event
-                # so the text event can reference it.
-                avail_evt = next(
-                    evt for evt in all_events
-                    if evt["type"] == "artifact.available"
-                )
-                export = {
-                    "artifact_id": avail_evt["payload"].get("artifact_id", ""),
-                    "public_filename": avail_evt["payload"].get("public_filename", ""),
-                }
+                # Recover the relative_path for artifact_candidate + text from the
+                # committed/executed effect result, falling back to the stored
+                # tool_result event payload.
+                if outcome.stored_result is not None:
+                    relative_path = outcome.stored_result.get("path", artifact_filename)
+                else:
+                    tool_result_evt = next(
+                        evt for evt in all_events
+                        if evt["type"] == "tool_result"
+                        and evt["payload"].get("tool") == "generate_pdf"
+                        and evt["payload"].get("status") == "ok"
+                    )
+                    relative_path = tool_result_evt["payload"].get("path", artifact_filename)
 
-            # Step 5: text response (skip if already persisted).
-            if not has_text:
-                response_text = (
-                    f"已在原沙箱中生成徒步计划 PDF（{relative_path}）。"
-                    f"artifact 已导出，artifact_id={export['artifact_id']}，"
-                    "可通过 /api/v2/artifacts/{artifact_id} 下载。"
-                )
-                yield emit("text", {"content": response_text})
+                # Step 3: cancel check before artifact_candidate.
+                if is_cancelled(runs_repo, run_id):
+                    yield emit("cancelled", {
+                        "code": "cancelled",
+                        "message": "运行已被取消。",
+                    })
+                    return
 
-            # Step 6: done terminal.
-            yield emit("done", {})
-            mark_terminal_safe(runs_repo, run_id, "done")
+                # Step 4: artifact_candidate + host export (skip if
+                # artifact.available already persisted — the export is a side
+                # effect on the host).
+                if not has_artifact_available:
+                    yield emit("artifact_candidate", {
+                        "filename": relative_path,
+                        "mime_type": "application/pdf",
+                        "sandbox_type": computer.sandbox_type,
+                        "message": "已生成徒步计划 PDF，等待宿主侧导出。",
+                    })
 
-        except TerminalEventAlreadyEmitted:
-            logger.error(
-                "run_orchestration: attempted to emit after terminal during "
-                "resume for run_id=%s",
-                run_id,
-            )
-            return
-        except ArtifactEvidencePersistenceError as exc:
-            preserve_sandbox = True
-            yield emit("error", {
-                "code": "artifact_evidence_persistence_failed",
-                "message": (
-                    f"artifact 证据持久化失败，sandbox 已保留以便排查：{exc}。"
-                    f"请联系运维处理 run_id={run_id} 的沙箱。"
-                ),
-            })
-            mark_terminal_safe(runs_repo, run_id, "error")
-            return
-        except Exception as exc:
-            logger.exception(
-                "run_orchestration: unexpected error during resume for run_id=%s",
-                run_id,
-            )
-            if not stream.terminal_emitted:
-                yield emit("error", {
-                    "code": "internal_error",
-                    "message": "恢复运行时发生内部错误。",
-                })
-            mark_terminal_safe(runs_repo, run_id, "error")
-            return
-        finally:
-            if preserve_sandbox:
-                logger.warning(
-                    "run_orchestration: preserving sandbox for run_id=%s "
-                    "during resume (evidence persistence failed); lease is "
-                    "intentionally leaked",
+                    try:
+                        export = self._export_artifact(
+                            computer=computer,
+                            workspace_path=workspace_path,
+                            relative_path=relative_path,
+                            declared_mime="application/pdf",
+                            runs_repo=runs_repo,
+                            run_id=run_id,
+                            conversation_id=run.conversation_id,
+                        )
+                    except ArtifactEvidencePersistenceError as exc:
+                        preserve_sandbox = True
+                        yield emit("error", {
+                            "code": "artifact_evidence_persistence_failed",
+                            "message": (
+                                f"artifact 证据持久化失败，sandbox 已保留以便排查：{exc}。"
+                                f"请联系运维处理 run_id={run_id} 的沙箱。"
+                            ),
+                        })
+                        mark_terminal_safe(runs_repo, run_id, "error")
+                        return
+                    except ArtifactExportError as exc:
+                        yield emit("error", {
+                            "code": "artifact_export_failed",
+                            "message": f"artifact 导出失败：{exc}",
+                        })
+                        mark_terminal_safe(runs_repo, run_id, "error")
+                        return
+
+                    yield emit("artifact.available", {
+                        "artifact_id": export["artifact_id"],
+                        "public_filename": export["public_filename"],
+                        "mime_type": export["mime_type"],
+                        "size_bytes": export["size_bytes"],
+                        "sha256": export["sha256"],
+                        "expires_at": export["expires_at"],
+                        "message": "artifact 已就绪，可通过 /api/v2/artifacts/{artifact_id} 下载。",
+                    })
+                else:
+                    # Export already done — recover artifact_id from stored event
+                    # so the text event can reference it.
+                    avail_evt = next(
+                        evt for evt in all_events
+                        if evt["type"] == "artifact.available"
+                    )
+                    export = {
+                        "artifact_id": avail_evt["payload"].get("artifact_id", ""),
+                        "public_filename": avail_evt["payload"].get("public_filename", ""),
+                    }
+
+                # Step 5: text response (skip if already persisted).
+                if not has_text:
+                    response_text = (
+                        f"已在原沙箱中生成徒步计划 PDF（{relative_path}）。"
+                        f"artifact 已导出，artifact_id={export['artifact_id']}，"
+                        "可通过 /api/v2/artifacts/{artifact_id} 下载。"
+                    )
+                    yield emit("text", {"content": response_text})
+
+                # Step 6: done terminal.
+                yield emit("done", {})
+                mark_terminal_safe(runs_repo, run_id, "done")
+
+            except TerminalEventAlreadyEmitted:
+                logger.error(
+                    "run_orchestration: attempted to emit after terminal during "
+                    "resume for run_id=%s",
                     run_id,
                 )
-            else:
-                self._run_terminal_cleanup(
-                    computer, workspace_path, runs_repo, run_id
+                return
+            except ArtifactEvidencePersistenceError as exc:
+                preserve_sandbox = True
+                yield emit("error", {
+                    "code": "artifact_evidence_persistence_failed",
+                    "message": (
+                        f"artifact 证据持久化失败，sandbox 已保留以便排查：{exc}。"
+                        f"请联系运维处理 run_id={run_id} 的沙箱。"
+                    ),
+                })
+                mark_terminal_safe(runs_repo, run_id, "error")
+                return
+            except Exception as exc:
+                logger.exception(
+                    "run_orchestration: unexpected error during resume for run_id=%s",
+                    run_id,
                 )
+                if not stream.terminal_emitted:
+                    yield emit("error", {
+                        "code": "internal_error",
+                        "message": "恢复运行时发生内部错误。",
+                    })
+                mark_terminal_safe(runs_repo, run_id, "error")
+                return
+            finally:
+                if preserve_sandbox:
+                    logger.warning(
+                        "run_orchestration: preserving sandbox for run_id=%s "
+                        "during resume (evidence persistence failed); lease is "
+                        "intentionally leaked",
+                        run_id,
+                    )
+                else:
+                    self._run_terminal_cleanup(
+                        computer, workspace_path, runs_repo, run_id
+                    )
+
+        finally:
+            # agent-lifecycle-repair ticket 02: release the run's
+            # execution token on EVERY exit of the owned continuation —
+            # normal return, error, cancel, immediate close and client
+            # disconnect. The release runs AFTER the owned execution and
+            # its effect settlement finished (the terminal cleanup above
+            # has already unwound), so a successor only ever takes over a
+            # fully settled run. Release matches the exact token serial.
+            runs_repo.release_run_execution(run_id, owner_token)
 
     async def _resume_cowork_bash_steps(
         self,
@@ -4146,7 +4247,7 @@ class RunOrchestrator:
                 "truncated": bash_result.truncated,
             }
 
-        async for envelope in drive_effect(
+        bash_drive = drive_effect(
             runs_repo=runs_repo,
             run_id=run_id,
             conversation_id=run.conversation_id,
@@ -4167,8 +4268,12 @@ class RunOrchestrator:
             fencing_token=lease.fencing_token,
             projection=projection,
             approval_granted=True,
-        ):
-            yield envelope
+        )
+        try:
+            async for envelope in bash_drive:
+                yield envelope
+        finally:
+            await _aclose_quietly(bash_drive)
         if outcome.status in (
             "failed",
             "outcome_unknown",
