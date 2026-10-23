@@ -764,6 +764,20 @@ def _effect_row_count(repo: RunRepository) -> int:
     )
 
 
+# Run-lifecycle terminals of the v2 wire vocabulary. BCDEF closeout S2
+# (ticket 01) makes the database hold AT MOST ONE of these per run, so the
+# durable write for a terminal is NOT a plain append: it goes through the
+# idempotent finalize fence, exactly as
+# ``agent_v2.run_orchestration._emit_impl`` splits it
+# (``_RUN_TERMINAL_TYPES`` → ``_finalize_stream_terminal`` →
+# ``RunRepository.finalize_run``; everything else → ``persist_event``).
+# Before S2 both routes wrote one row, so the split was invisible here;
+# appending a terminal directly now trips
+# ``idx_run_events_one_terminal`` — a conflict the production caller never
+# reaches because it reuses the durable canonical terminal instead.
+_RUN_TERMINAL_TYPES = frozenset({"done", "error", "cancelled"})
+
+
 def _durable_publisher(
     repo: RunRepository,
     run_id: str,
@@ -771,19 +785,36 @@ def _durable_publisher(
     *,
     seq_start: int = 0,
 ) -> Any:
-    """A frame emitter that REALLY persists every event and records it."""
+    """A frame emitter that REALLY persists every event and records it.
+
+    The durable route mirrors the production caller's: a non-terminal frame
+    is appended to the run's event log, while a run-lifecycle terminal is
+    finalized through the fence that keeps the assistant and the terminal in
+    one transaction and REUSES the canonical terminal when the run already
+    has one. ``sink`` records the frames this driver produced for the client;
+    the durable facts are asserted separately from the replayable log.
+    """
     counter = {"n": seq_start}
 
     def emit(event_type: str, payload: dict[str, Any]) -> SimpleNamespace:
         counter["n"] += 1
-        repo.persist_event(
-            run_id=run_id,
-            sequence=counter["n"],
-            event_type=event_type,
-            payload=payload,
-            request_id=run_id,
-            conversation_id="conv-effect",
-        )
+        if event_type in _RUN_TERMINAL_TYPES:
+            repo.finalize_run(
+                run_id=run_id,
+                request_id=run_id,
+                terminal_type=event_type,
+                payload=dict(payload),
+                sequence=counter["n"],
+            )
+        else:
+            repo.persist_event(
+                run_id=run_id,
+                sequence=counter["n"],
+                event_type=event_type,
+                payload=payload,
+                request_id=run_id,
+                conversation_id="conv-effect",
+            )
         sink.append((event_type, payload))
         return SimpleNamespace(type=event_type, payload=payload)
 
@@ -875,7 +906,10 @@ def test_failed_effect_run_reads_back_through_snapshot_and_reconnect(tmp_path):
     After a reconnect (independent repository over the same SQLite files)
     the snapshot and the replayed event log explain the same stopped run:
     ``error`` + ``effect_persist_failed``, no effect, no tool_call. A retry
-    on the reconnected store executes nothing new.
+    on the reconnected store executes nothing new, keeps producing the same
+    stable error frame for its own client, and — under S2 (ticket 01)'s one
+    durable terminal per run — reuses that canonical terminal rather than
+    appending a second one, so the replayed log never changes.
     """
     first_stream: list[tuple[str, dict[str, Any]]] = []
     repo = _repo(tmp_path)
@@ -917,8 +951,8 @@ def test_failed_effect_run_reads_back_through_snapshot_and_reconnect(tmp_path):
         assert [event["type"] for event in replay] == ["error"]
 
         # Retrying on the reconnected store: the same storage fault is still
-        # there, so still nothing executes — and no new frame besides the
-        # second stable error.
+        # there, so still nothing executes, and the only frame this attempt
+        # yields is its own stable persist failure.
         second_calls: list[int] = []
         second_stream: list[tuple[str, dict[str, Any]]] = []
         republish = _durable_publisher(
@@ -938,7 +972,15 @@ def test_failed_effect_run_reads_back_through_snapshot_and_reconnect(tmp_path):
         assert second_stream[-1][1]["code"] == "effect_persist_failed"
 
         after = reconnected.get_events_since(run_id=run_id, from_seq=0)
-        assert [event["type"] for event in after] == ["error", "error"]
+        # S2 (ticket 01): the run keeps exactly ONE durable terminal, so the
+        # retry reuses the canonical instead of appending a second one. The
+        # replayable log is still byte-for-byte the first stream — and it is
+        # the SAME row (event_id/sequence/payload unchanged), which is what
+        # proves reuse rather than an overwrite or a second append.
+        assert [event["type"] for event in after] == ["error"]
+        assert [(event["type"], event["payload"]) for event in after] == first_stream
+        assert [event["event_id"] for event in after] == [replay[0]["event_id"]]
+        assert [event["sequence"] for event in after] == [replay[0]["sequence"]]
         assert [event for event in after if event["type"] == "tool_call"] == []
         assert reconnected.get_effect(identity.effect_id) is None
         assert reconnected.list_effects_for_run(run_id) == []
