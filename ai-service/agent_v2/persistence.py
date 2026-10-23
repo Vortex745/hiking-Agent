@@ -1990,7 +1990,190 @@ class ControlStore:
         )
         return self.get_sandbox_lease(run_id)
 
+    # -- atomic cleanup settlement (ALR ticket 04) -----------------------
+
+    def settle_cleanup_failure(
+        self,
+        *,
+        run_id: str,
+        lease_id: str = "",
+        evidence: dict[str, Any] | None = None,
+        dedupe_key: str | None = None,
+        resource_usage: dict[str, Any] | None = None,
+        failure_reason: str | None = None,
+    ) -> tuple[JanitorTaskRecord | None, bool, SandboxLeaseRecord | None]:
+        """Settle a FAILED terminal cleanup in ONE transaction (ALR 04).
+
+        A single ``BEGIN IMMEDIATE`` commits, together or not at all:
+
+        * the idempotent cleanup retry task — inserted or reused via its
+          ACTIVE dedupe key (:meth:`_insert_janitor_task_in_transaction`
+          supplies the insert, so no nested transaction) — carrying the
+          original-target evidence;
+        * the lease's failed release: ``status='failed'`` with the
+          preserved partial usage and the failure reason (only an active
+          lease transitions; an already-settled row keeps the first
+          release's evidence);
+        * the ``pending_janitor`` cleanup record, associated with the
+          task through ``janitor_task_id`` (a recorded ``succeeded`` is
+          never downgraded).
+
+        Any exception rolls EVERYTHING back: a write fault mid-settlement
+        can no longer leave an orphan task without a failed lease, or a
+        failed lease without its pending_janitor record and task
+        association. Returns ``(task, created, lease_after)``.
+        """
+        key = dedupe_key or f"cleanup:{run_id}"
+        now = _now_iso()
+        usage_json = (
+            json.dumps(resource_usage, ensure_ascii=False)
+            if resource_usage is not None
+            else None
+        )
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            task, created = self._insert_janitor_task_in_transaction(
+                kind="cleanup",
+                evidence=evidence,
+                run_id=run_id,
+                lease_id=lease_id,
+                effect_id="",
+                dedupe_key=key,
+                task_id=None,
+            )
+            self._conn.execute(
+                "UPDATE sandbox_leases SET status = ?, destroyed_at = ?, "
+                "resource_usage_json = ?, failure_reason = ? "
+                "WHERE run_id = ? AND status = 'active'",
+                ("failed", now, usage_json, failure_reason, run_id),
+            )
+            if task is not None:
+                self._conn.execute(
+                    "UPDATE sandbox_leases SET cleanup_status = ?, "
+                    "cleanup_error = ?, "
+                    "janitor_task_id = COALESCE(?, janitor_task_id) "
+                    "WHERE run_id = ? AND (cleanup_status IS NULL "
+                    "OR cleanup_status <> 'succeeded')",
+                    ("pending_janitor", failure_reason, task.task_id, run_id),
+                )
+            lease = self.get_sandbox_lease(run_id)
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return task, created, lease
+
+    def settle_cleanup_success(
+        self,
+        *,
+        run_id: str,
+        lease_id: str,
+        workspace_path: str,
+        sandbox_identity: str = "",
+        fencing_token: int,
+        resource_usage: dict[str, Any] | None = None,
+    ) -> tuple[SandboxLeaseRecord | None, bool]:
+        """Settle a SUCCESSFUL terminal cleanup in ONE fenced transaction.
+
+        The transition matches the lease by its ORIGINAL identity — run,
+        lease id, workspace and fencing generation — so only the exact
+        generation whose cleanup really succeeded is settled. In that one
+        commit the lease becomes ``destroyed`` with the REAL usage and
+        ``cleanup_status='succeeded'``; a lease this generation had
+        previously settled as FAILED is repaired in the same commit (the
+        failure reason is cleared) — the fenced transition ticket 06's
+        retry builds on.
+
+        A lease whose identity no longer matches — a successor generation
+        took the row over — is NEVER touched, and no new generation is
+        minted. A repeat settlement of the same generation is a no-op
+        (``settled=False``), preserving the first release's evidence.
+        """
+        _ = sandbox_identity  # identity is pinned by lease_id + generation
+        now = _now_iso()
+        usage_json = (
+            json.dumps(resource_usage, ensure_ascii=False)
+            if resource_usage is not None
+            else None
+        )
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._conn.execute(
+                "UPDATE sandbox_leases SET status = 'destroyed', "
+                "destroyed_at = ?, resource_usage_json = ?, "
+                "failure_reason = NULL, cleanup_status = 'succeeded', "
+                "cleanup_error = NULL "
+                "WHERE run_id = ? AND lease_id = ? AND workspace_path = ? "
+                "AND fencing_token = ? "
+                "AND status IN ('active', 'expired', 'failed')",
+                (now, usage_json, run_id, lease_id, workspace_path, int(fencing_token)),
+            )
+            settled = cur.rowcount == 1
+            lease = self.get_sandbox_lease(run_id)
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return lease, settled
+
     # -- janitor work items (BCDEF ticket 07) --------------------------
+
+    def _insert_janitor_task_in_transaction(
+        self,
+        *,
+        kind: str,
+        evidence: dict[str, Any] | None,
+        run_id: str,
+        lease_id: str,
+        effect_id: str,
+        dedupe_key: str | None,
+        task_id: str | None,
+    ) -> tuple[JanitorTaskRecord | None, bool]:
+        """Insert (or dedupe-reuse) a janitor task row WITHOUT a transaction.
+
+        ALR ticket 04: the caller OWNS the surrounding transaction. This
+        is the ONE shared write core of :meth:`enqueue_janitor_task` and
+        :meth:`settle_cleanup_failure` — a single ``INSERT ... ON
+        CONFLICT(dedupe_key) DO NOTHING`` plus the read-back of whichever
+        row won (the fresh row, or the ORIGINAL row an active dedupe key
+        already pins). No ``BEGIN``/``COMMIT`` of its own, so lifting the
+        enqueue into a wider atomic settlement never nests transactions.
+        """
+        now = _now_iso()
+        new_id = task_id or str(uuid.uuid4())
+        evidence_json = json.dumps(evidence or {}, sort_keys=True, ensure_ascii=False)
+        cur = self._conn.execute(
+            "INSERT INTO janitor_tasks "
+            "(task_id, kind, status, dedupe_key, run_id, lease_id, "
+            " effect_id, evidence_json, attempts, last_error, claimed_by, "
+            " claimed_at, result_json, created_at, updated_at, completed_at) "
+            "VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, "
+            " NULL, ?, ?, NULL) "
+            "ON CONFLICT(dedupe_key) DO NOTHING",
+            (
+                new_id,
+                kind,
+                dedupe_key,
+                run_id,
+                lease_id,
+                effect_id,
+                evidence_json,
+                now,
+                now,
+            ),
+        )
+        created = cur.rowcount == 1
+        if created:
+            record = self.get_janitor_task(new_id)
+        elif dedupe_key is not None:
+            row = self._conn.execute(
+                "SELECT * FROM janitor_tasks WHERE dedupe_key = ?",
+                (dedupe_key,),
+            ).fetchone()
+            record = self._row_to_janitor_task(row) if row is not None else None
+        else:  # pragma: no cover - non-dedupe inserts always succeed
+            record = self.get_janitor_task(new_id)
+        return record, created
 
     def enqueue_janitor_task(
         self,
@@ -2011,46 +2194,21 @@ class ControlStore:
         """
         if kind not in JANITOR_KINDS:
             raise ValueError(f"invalid janitor kind: {kind!r}")
-        now = _now_iso()
-        new_id = task_id or str(uuid.uuid4())
-        evidence_json = json.dumps(evidence or {}, sort_keys=True, ensure_ascii=False)
         self._conn.execute("BEGIN")
         try:
-            cur = self._conn.execute(
-                "INSERT INTO janitor_tasks "
-                "(task_id, kind, status, dedupe_key, run_id, lease_id, "
-                " effect_id, evidence_json, attempts, last_error, claimed_by, "
-                " claimed_at, result_json, created_at, updated_at, completed_at) "
-                "VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, "
-                " NULL, ?, ?, NULL) "
-                "ON CONFLICT(dedupe_key) DO NOTHING",
-                (
-                    new_id,
-                    kind,
-                    dedupe_key,
-                    run_id,
-                    lease_id,
-                    effect_id,
-                    evidence_json,
-                    now,
-                    now,
-                ),
+            record, created = self._insert_janitor_task_in_transaction(
+                kind=kind,
+                evidence=evidence,
+                run_id=run_id,
+                lease_id=lease_id,
+                effect_id=effect_id,
+                dedupe_key=dedupe_key,
+                task_id=task_id,
             )
-            created = cur.rowcount == 1
             self._conn.execute("COMMIT")
         except Exception:
             self._conn.execute("ROLLBACK")
             raise
-        if created:
-            record = self.get_janitor_task(new_id)
-        elif dedupe_key is not None:
-            row = self._conn.execute(
-                "SELECT * FROM janitor_tasks WHERE dedupe_key = ?",
-                (dedupe_key,),
-            ).fetchone()
-            record = self._row_to_janitor_task(row) if row is not None else None
-        else:  # pragma: no cover - non-dedupe inserts always succeed
-            record = self.get_janitor_task(new_id)
         assert record is not None
         return record, created
 
