@@ -364,6 +364,7 @@ def _drive_projection(
             has_tool_result_ok=False,
             execute=executor,
             emit=emit,
+            emit_required=emit,
             outcome=outcome,
             projection=projection,
             approval_granted=approval_granted,
@@ -523,6 +524,7 @@ def test_duplicate_live_claim_reports_stable_boundary_code(tmp_path):
             has_tool_result_ok=False,
             execute=lambda: executed.append(1) or {"content": "x", "path": "p.pdf"},
             emit=emit,
+            emit_required=emit,
             outcome=outcome,
         ):
             pass

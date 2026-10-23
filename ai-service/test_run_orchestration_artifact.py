@@ -286,6 +286,8 @@ def _drive(
 
     outcome = EffectDriveResult()
 
+    publish = _collect_emit(events)
+
     async def run() -> None:
         async for _ in drive_effect(
             runs_repo=repo,
@@ -300,7 +302,8 @@ def _drive(
             has_tool_call=has_tool_call,
             has_tool_result_ok=has_tool_result_ok,
             execute=execute,
-            emit=_collect_emit(events),
+            emit=publish,
+            emit_required=publish,
             outcome=outcome,
         ):
             pass
