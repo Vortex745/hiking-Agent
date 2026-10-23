@@ -954,31 +954,49 @@ class RunRepository:
         status: str | None = None,
         kind: str | None = None,
         limit: int = 100,
+        claimable: bool = False,
     ) -> list[JanitorTaskRecord]:
         return self.control.list_janitor_tasks(
-            status=status, kind=kind, limit=limit
+            status=status, kind=kind, limit=limit, claimable=claimable
         )
 
     def claim_janitor_task(
         self, task_id: str, *, owner: str
     ) -> tuple[JanitorTaskRecord | None, bool]:
+        """CAS claim; the returned record carries the generation + deadline.
+
+        BCDEF review S4: the caller MUST pass ``claimed.attempts`` back as
+        ``expected_attempt`` when it settles, otherwise the store rejects
+        the write.
+        """
         return self.control.claim_janitor_task(task_id, owner=owner)
 
     def complete_janitor_task(
         self,
         task_id: str,
         *,
-        owner: str = "",
+        owner: str,
+        expected_attempt: int,
         result: dict[str, Any] | None = None,
     ) -> tuple[JanitorTaskRecord | None, bool]:
         return self.control.complete_janitor_task(
-            task_id, owner=owner, result=result
+            task_id,
+            owner=owner,
+            expected_attempt=expected_attempt,
+            result=result,
         )
 
     def fail_janitor_task(
-        self, task_id: str, error: str, *, owner: str = ""
+        self,
+        task_id: str,
+        error: str,
+        *,
+        owner: str,
+        expected_attempt: int,
     ) -> tuple[JanitorTaskRecord | None, bool]:
-        return self.control.fail_janitor_task(task_id, error, owner=owner)
+        return self.control.fail_janitor_task(
+            task_id, error, owner=owner, expected_attempt=expected_attempt
+        )
 
     # -- artifacts (Ticket 10) -----------------------------------------
 
