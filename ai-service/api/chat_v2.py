@@ -61,7 +61,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -72,6 +72,7 @@ from agent_v2.computer import (
     SandboxCleanupError,
     create_computer,
 )
+from agent_v2.effect_repair import repair_effect
 from agent_v2.events import (
     EventEnvelope,
 )
@@ -592,7 +593,91 @@ async def chat_v2_snapshot(
         # cannot be adapted, the stable failure reason + next action.
         "policy_provenance": snapshot.policy_provenance,
         "policy_failure": snapshot.policy_failure,
+        # BCDEF ticket 05: replay-visible effect rows, including the
+        # unknown-outcome repair state (status/attempts/last error/age/
+        # next action/known facts/unknown part). Additive.
+        "effects": snapshot.effects,
     }
+
+
+class EffectRepairRequest(BaseModel):
+    """Body for ``POST /effects/{effect_id}/repair`` (BCDEF ticket 05).
+
+    ``action`` is the operator decision for an ``outcome_unknown`` effect:
+    ``confirm`` commits the supplied ``result`` as the single replayable
+    final result; ``abandon`` fails closed and keeps the effect unknown.
+    ``idempotency_key`` makes retries safe (a repeated decision returns
+    the original outcome). ``extra="forbid"`` keeps the client surface
+    minimal — no model, sandbox or lease parameters are accepted.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["confirm", "abandon"]
+    result: dict[str, Any] | None = None
+    idempotency_key: str = Field(..., min_length=1)
+    reason: str = ""
+
+
+@chat_v2_router.post("/effects/{effect_id}/repair")
+async def chat_v2_repair_effect(
+    effect_id: str,
+    body: EffectRepairRequest,
+    request: Request,
+):
+    """Idempotent manual repair of one unknown-outcome effect.
+
+    Additive control-plane entry point (BCDEF ticket 05). It reuses the
+    ORIGINAL run/effect identity: no second effect, no second approval,
+    no model re-run and no external re-execution. Ownership is enforced
+    with the same conversation check as snapshot/cancel/resume.
+
+    Stable response codes:
+
+    * 200 — repaired / abandoned / idempotent retry (``status``)
+    * 404 — unknown ``effect_id`` (``effect_not_found``) or the caller
+      does not own the effect's conversation
+    * 409 — ``repair_not_needed`` (effect is not unknown) or
+      ``repair_conflict`` (opposite decision already recorded)
+    * 422 — invalid action / missing or non-object result
+    * 503 — v2 persistence not assembled, or the repair result could not
+      be made durable (``repair_failed``, retryable)
+    """
+    runs_repo = _get_runs_repo(request)
+    effect = runs_repo.get_effect_by_effect_id(effect_id)
+    if effect is None:
+        return JSONResponse(
+            status_code=404,
+            content={"code": "effect_not_found", "effect_id": effect_id},
+        )
+    _require_conversation_owner(request, effect.conversation_id)
+
+    outcome = repair_effect(
+        runs_repo,
+        effect_id,
+        action=body.action,
+        result=body.result,
+        idempotency_key=body.idempotency_key,
+        actor="operator",
+        reason=body.reason,
+    )
+
+    if outcome.status == "not_found":
+        return JSONResponse(
+            status_code=404,
+            content={"code": "effect_not_found", "effect_id": effect_id},
+        )
+    if outcome.status == "invalid_result":
+        return JSONResponse(status_code=422, content=outcome.payload)
+    if outcome.status == "conflict":
+        return JSONResponse(status_code=409, content=outcome.payload)
+    if outcome.status == "not_repairable":
+        return JSONResponse(status_code=409, content=outcome.payload)
+    if outcome.status == "failed":
+        payload = dict(outcome.payload)
+        payload["retryable"] = True
+        return JSONResponse(status_code=503, content=payload)
+    return JSONResponse(status_code=200, content=outcome.payload)
 
 
 class CancelRequest(BaseModel):
@@ -969,7 +1054,9 @@ async def approval_decision(
       decision with the same ``decision_request_id``)
     * 404 — ``approval_id`` not found
     * 409 — approval already resolved with a different
-      ``decision_request_id``; OR approval expired; OR run is terminal
+      ``decision_request_id``; OR a contradictory decision for an
+      already-recorded ``decision_request_id`` (``decision_conflict``,
+      the original result stands); OR approval expired; OR run is terminal
       (done/error/cancelled); OR run is not paused (decision already
       recorded); OR sandbox lease is missing/destroyed (spec AC7)
     * 422 — Pydantic rejected the body (unknown ``decision`` value,
