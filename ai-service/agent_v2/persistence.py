@@ -681,6 +681,20 @@ def _janitor_legacy_deadline(claimed_at: Any) -> str:
     return (parsed + timedelta(seconds=JANITOR_CLAIM_TTL_SECONDS)).isoformat()
 
 
+def _iso_plus_seconds(iso: str, seconds: float) -> str:
+    """``iso`` advanced by ``seconds``, in the same canonical ISO form.
+
+    Used for the claim deadline so a claim reads the clock ONCE and
+    ``claim_expires_at`` is exactly ``claimed_at + JANITOR_CLAIM_TTL_SECONDS``
+    — the takeover ordering and the settlement fence both compare that column,
+    so a second, drifting clock read would only add noise.
+    """
+    parsed = _parse_store_timestamp(iso)
+    if parsed is None:  # pragma: no cover - _now_iso() always parses
+        return _now_plus_seconds(seconds)
+    return (parsed + timedelta(seconds=float(seconds))).isoformat()
+
+
 def _evidence_with_dedupe_key(
     evidence_json: Any, dedupe_key: str | None
 ) -> str:
@@ -2116,7 +2130,7 @@ class ControlStore:
         (:meth:`complete_janitor_task`, :meth:`fail_janitor_task`).
         """
         now = _now_iso()
-        deadline = _now_plus_seconds(JANITOR_CLAIM_TTL_SECONDS)
+        deadline = _iso_plus_seconds(now, JANITOR_CLAIM_TTL_SECONDS)
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             cur = self._conn.execute(

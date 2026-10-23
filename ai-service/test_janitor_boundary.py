@@ -94,7 +94,13 @@ class _Clock:
 
 @pytest.fixture
 def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
-    """Freeze + advance the persistence clock instead of waiting 600 s."""
+    """Freeze + advance the store clock instead of waiting 600 s.
+
+    These are persistence's two timestamp writers: ``_now_iso`` stamps every
+    row, ``_now_plus_seconds`` the lease expiries. The janitor deadline is
+    derived from the same single ``_now_iso()`` read its claim makes, so the
+    asserted 600 s is read back off the durable row, not from a constant.
+    """
     frozen = _Clock(datetime(2026, 10, 23, 12, 0, 0, tzinfo=timezone.utc))
     monkeypatch.setattr(persistence_module, "_now_iso", frozen.iso)
     monkeypatch.setattr(persistence_module, "_now_plus_seconds", frozen.plus)
