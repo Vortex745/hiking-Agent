@@ -30,6 +30,8 @@ from typing import Any, Mapping
 from agent_v2.execution_contract import (
     EXECUTION_SCHEMA_VERSION,
     SUPPORTED_SCHEMA_VERSIONS,
+    # BCDEF review S3: the terminal run-status vocabulary has ONE source.
+    TERMINAL_STATUSES,
     BoundaryError,
     ExecutionErrorCode,
     ProgressGap,
@@ -76,6 +78,15 @@ from agent_v2.persistence import (
 from agent_v2.profiles import CapabilityProfile
 
 logger = logging.getLogger("ai-service.agent_v2.runs")
+
+# BCDEF review S3: the run terminal vocabulary in this module is derived
+# from :data:`agent_v2.execution_contract.TERMINAL_STATUSES`, never
+# re-spelled. Every set below (replay, admission, snapshot) is a view of
+# that one source, so ``outcome_unknown`` — terminal and non-continuable —
+# cannot be forgotten by a single guard again.
+_TERMINAL_STATUSES: frozenset[str] = frozenset(
+    status.value for status in TERMINAL_STATUSES
+)
 
 # Ticket 05 (T07): the bounded window for the model-visible conversation
 # history. The limits apply to the HISTORY only — the current user message
@@ -230,9 +241,11 @@ class AdmissionResult:
 
 
 # Statuses that a retry must replay, never repair or execute again.
-_NON_REPAIRABLE_STATUSES = frozenset(
-    {"done", "error", "cancelled", "outcome_unknown"}
-)
+# BCDEF review S3: derived from the shared contract, so a new terminal
+# status cannot silently become repairable. ``admission_failed`` is the one
+# documented exception — ticket 02's admission repair backfills the missing
+# admission records of the SAME request; it never continues an execution.
+_NON_REPAIRABLE_STATUSES = _TERMINAL_STATUSES - {"admission_failed"}
 
 # Run-lifecycle terminal event types (``run.paused`` is a stream terminal
 # only and deliberately excluded).
@@ -243,9 +256,7 @@ _RUN_TERMINAL_TYPES = frozenset({"done", "error", "cancelled"})
 # ticket 11 surface for ticket 05's reconciliation statuses) is terminal
 # and non-continuable, so its replay carries a stable synthetic terminal
 # instead of reading as an endless running stream.
-_REPLAY_TERMINAL_STATUSES = frozenset(
-    {"done", "error", "cancelled", "admission_failed", "outcome_unknown"}
-)
+_REPLAY_TERMINAL_STATUSES = _TERMINAL_STATUSES
 
 
 def _admission_payload(
@@ -1882,6 +1893,14 @@ class RunRepository:
             error_code = ExecutionErrorCode.TERMINAL_PERSIST_FAILED.value
         elif control_status == "admission_failed" and stored_terminal is None:
             error_code = "admission_failed"
+        elif control_status == "outcome_unknown" and stored_terminal is None:
+            # BCDEF review S3: replay of this run synthesizes the stable
+            # ``effect_outcome_unknown`` terminal (ticket 11), so the
+            # snapshot names the SAME failure instead of leaving an
+            # unexplained terminal status. ``outcome_unknown`` is not a
+            # terminal-persist failure — the terminal was never supposed to
+            # be a plain done/error/cancelled event.
+            error_code = "effect_outcome_unknown"
         elif terminal_error_code:
             error_code = str(terminal_error_code)
         recoverable = bool(

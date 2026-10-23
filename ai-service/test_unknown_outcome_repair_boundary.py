@@ -55,6 +55,11 @@ def _repo(tmp_path) -> RunRepository:
     )
 
 
+# The result the external executor returns; a repair may only ever publish
+# THIS value because this is what the ledger durably records.
+_KNOWN_RESULT = {"path": "p.pdf", "content": "已在沙箱中生成 p.pdf"}
+
+
 def _make_run(repo: RunRepository, request_id: str = "req-repair") -> str:
     run_id, _created = repo.create_run_idempotent(
         request_id=request_id,
@@ -148,6 +153,38 @@ def _unknown_effect(
     assert calls == [1]
     row = repo.get_effect(identity.effect_id)
     assert row is not None and row.status == EffectStatus.OUTCOME_UNKNOWN.value
+    return repo, run_id, identity, calls
+
+
+def _unknown_effect_with_known_result(
+    tmp_path, monkeypatch, request_id: str = "req-unknown-known"
+) -> tuple[RunRepository, str, Any, list[int]]:
+    """Drive one effect into ``outcome_unknown`` AFTER its result was durable.
+
+    This is the publication-failure shape: the ledger committed the external
+    result, only the replayable success event was lost. It is the ONLY shape
+    a ``confirm`` decision can repair — see review S5.
+    """
+    repo = _repo(tmp_path)
+    run_id = _make_run(repo, request_id)
+    identity = _insert_effect(repo, run_id, {"filename": "p.pdf"})
+    calls: list[int] = []
+
+    def fail_result(event_type: str, payload: dict[str, Any]) -> None:
+        if event_type == "tool_result":
+            raise sqlite3.OperationalError("success event not durable")
+
+    outcome, _events = _drive(
+        repo,
+        run_id,
+        identity,
+        executor=_ok_executor(calls, _KNOWN_RESULT),
+        emit_required=fail_result,
+    )
+    assert outcome.status == "outcome_unknown"
+    row = repo.get_effect(identity.effect_id)
+    assert row is not None and row.status == EffectStatus.OUTCOME_UNKNOWN.value
+    assert json.loads(row.result_json or "{}") == _KNOWN_RESULT
     return repo, run_id, identity, calls
 
 
@@ -738,3 +775,155 @@ def test_http_snapshot_exposes_repair_fields(tmp_path, monkeypatch):
 def test_repair_action_enum_is_stable():
     assert RepairAction.CONFIRM.value == "confirm"
     assert RepairAction.ABANDON.value == "abandon"
+
+
+# ---- review S5: confirm is bound to the durably recorded result -----------
+
+
+def test_confirm_cannot_forge_a_result_the_ledger_never_recorded(
+    tmp_path, monkeypatch
+):
+    """A lost ledger write leaves NOTHING to confirm.
+
+    The repair endpoint is guarded only by conversation ownership, so a
+    plain subject must not be able to hand the ledger a success result it
+    never recorded. ``confirm`` therefore has no authority over the result
+    it publishes: it republishes the durable row or it refuses.
+    """
+    repo, run_id, identity, _calls = _unknown_effect(
+        tmp_path, monkeypatch, "req-forge"
+    )
+    try:
+        outcome = repair_effect(
+            repo,
+            identity.effect_id,
+            action="confirm",
+            result={"path": "victim.pdf", "content": "伪造的成功结果"},
+            idempotency_key="forge-1",
+            actor="operator",
+        )
+        assert outcome.status == "unverified_result"
+        assert outcome.payload["code"] == "repair_result_not_durable"
+
+        row = repo.get_effect(identity.effect_id)
+        assert row is not None
+        assert row.status == EffectStatus.OUTCOME_UNKNOWN.value
+        assert row.repair_status in ("repair_pending", "repair_claimed")
+        assert not row.result_json
+        # No authoritative replayable success result reached the event log.
+        assert _success_results(_events(repo, run_id)) == []
+
+        # The fail-closed decision is still available for the same row.
+        abandoned = repair_effect(
+            repo,
+            identity.effect_id,
+            action="abandon",
+            idempotency_key="forge-2",
+            actor="operator",
+            reason="external system cannot confirm",
+        )
+        assert abandoned.status == "abandoned"
+        assert _success_results(_events(repo, run_id)) == []
+    finally:
+        repo.close()
+
+
+def test_confirm_publishes_the_stored_result_not_the_supplied_one(
+    tmp_path, monkeypatch
+):
+    repo, run_id, identity, calls = _unknown_effect_with_known_result(
+        tmp_path, monkeypatch, "req-stored-result"
+    )
+    try:
+        # A payload that disagrees with the ledger is a forgery attempt.
+        forged = repair_effect(
+            repo,
+            identity.effect_id,
+            action="confirm",
+            result={"path": "evil.pdf"},
+            idempotency_key="stored-1",
+            actor="operator",
+        )
+        assert forged.status == "unverified_result"
+        assert forged.payload["code"] == "repair_result_not_durable"
+        row = repo.get_effect(identity.effect_id)
+        assert row is not None
+        assert row.status == EffectStatus.OUTCOME_UNKNOWN.value
+        assert json.loads(row.result_json or "{}") == _KNOWN_RESULT
+        assert _success_results(_events(repo, run_id)) == []
+
+        # The legitimate decision: no payload at all.
+        outcome = repair_effect(
+            repo,
+            identity.effect_id,
+            action="confirm",
+            idempotency_key="stored-2",
+            actor="operator",
+        )
+        assert outcome.status == "repaired", outcome.payload
+        assert outcome.payload["result"] == _KNOWN_RESULT
+
+        row = repo.get_effect(identity.effect_id)
+        assert row is not None
+        assert row.status == EffectStatus.COMMITTED.value
+        assert json.loads(row.result_json or "{}") == _KNOWN_RESULT
+
+        successes = _success_results(_events(repo, run_id))
+        assert len(successes) == 1
+        assert successes[0]["result"] == _KNOWN_RESULT
+        assert "evil.pdf" not in json.dumps(_events(repo, run_id))
+        assert calls == [1]  # the external effect never ran again
+
+        # A payload that MATCHES the durable row stays accepted (retries
+        # written by older clients keep working, idempotently).
+        retry = repair_effect(
+            repo,
+            identity.effect_id,
+            action="confirm",
+            result=dict(_KNOWN_RESULT),
+            idempotency_key="stored-3",
+            actor="operator",
+        )
+        assert retry.status == "idempotent"
+        assert len(_success_results(_events(repo, run_id))) == 1
+    finally:
+        repo.close()
+
+
+def test_http_repair_endpoint_rejects_a_result_that_was_never_recorded(
+    tmp_path, monkeypatch
+):
+    repo, run_id, identity, _calls = _unknown_effect_with_known_result(
+        tmp_path, monkeypatch, "req-http-stored"
+    )
+    try:
+        app = _build_app(repo)
+        forged = _post(
+            app,
+            f"/api/v2/chat/effects/{identity.effect_id}/repair",
+            {
+                "action": "confirm",
+                "result": {"path": "attacker.pdf"},
+                "idempotency_key": "http-forge-1",
+            },
+        )
+        assert forged.status_code == 409, forged.text
+        assert forged.json()["code"] == "repair_result_not_durable"
+        row = repo.get_effect(identity.effect_id)
+        assert row is not None
+        assert row.status == EffectStatus.OUTCOME_UNKNOWN.value
+        assert _success_results(_events(repo, run_id)) == []
+
+        accepted = _post(
+            app,
+            f"/api/v2/chat/effects/{identity.effect_id}/repair",
+            {"action": "confirm", "idempotency_key": "http-forge-2"},
+        )
+        assert accepted.status_code == 200, accepted.text
+        body = accepted.json()
+        assert body["status"] == "repaired"
+        assert body["result"] == _KNOWN_RESULT
+        snapshot = _get(app, f"/api/v2/chat/snapshot/{run_id}")
+        assert snapshot.json()["effects"][0]["status"] == "committed"
+    finally:
+        repo.close()

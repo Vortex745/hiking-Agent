@@ -258,12 +258,20 @@ class Harness:
         assert response.status_code == 200, response.text
         return response.json()
 
-    def repair(self, effect_id: str, *, action: str, result: dict | None, key: str) -> dict:
+    def repair(
+        self,
+        effect_id: str,
+        *,
+        action: str,
+        result: dict | None,
+        key: str,
+        expect_status: int = 200,
+    ) -> dict:
         body: dict[str, Any] = {"action": action, "idempotency_key": key}
         if result is not None:
             body["result"] = result
         response = self._call("POST", f"/api/v2/chat/effects/{effect_id}/repair", body)
-        assert response.status_code == 200, response.text
+        assert response.status_code == expect_status, response.text
         return response.json()
 
     # -- durable reads --
@@ -687,27 +695,119 @@ def test_effect_commit_write_failure_lands_unknown_and_is_repaired_without_reexe
     assert harness.rows("effects", "run_id = ?", run_id) == 1
     assert harness.side_effect_counts["model_calls"] == 1  # only the draft
 
-    # Reconciliation from the durable facts: confirm the known result.
+    # BCDEF review S5: nothing was durably recorded, so NO payload — from
+    # the conversation owner or anybody else — can be confirmed into an
+    # authoritative success. The decision is refused with a stable code and
+    # the ledger keeps its unknown outcome.
     effect = harness.repo.list_effects_for_run(run_id)[0]
-    repaired = harness.repair(
+    forged = harness.repair(
         effect.resolved_effect_id,
         action="confirm",
         result={"path": "hiking-plan.pdf"},
-        key="repair-effect-1",
+        key="repair-effect-forge",
+        expect_status=409,
     )
-    assert repaired["status"] in ("repaired", "idempotent"), repaired
+    assert forged["code"] == "repair_result_not_durable"
+    assert [
+        event
+        for event in harness.events(run_id)
+        if event["type"] == "tool_result" and event["payload"].get("status") == "ok"
+    ] == []
+    assert harness.snapshot(run_id)["effects"][0]["stored_status"] == (
+        "outcome_unknown"
+    )
+
+    # The fail-closed manual decision still works and stays replayable.
+    abandoned = harness.repair(
+        effect.resolved_effect_id,
+        action="abandon",
+        result=None,
+        key="repair-effect-abandon",
+    )
+    assert abandoned["status"] == "abandoned"
+    assert harness.snapshot(run_id)["effects"][0]["stored_status"] == (
+        "outcome_unknown"
+    )
+    assert harness.side_effect_counts["pdf_generations"] == 1
+    assert harness.side_effect_counts["model_calls"] == 1
+    assert harness.rows("effects", "run_id = ?", run_id) == 1
+
+
+def test_effect_publication_failure_keeps_the_result_durable_and_is_repaired(
+    harness: Harness,
+):
+    """A lost success EVENT keeps a durable result the repair may confirm.
+
+    This is the only shape ``confirm`` can repair (BCDEF review S5): the
+    ledger recorded the external result, only its replayable publication
+    was lost. Reconciliation publishes THAT result — once — and never
+    re-executes the PDF.
+    """
+    frames = harness.stream(
+        "bcdef-inject-publication",
+        profile="artifact",
+        message="规划杭州两日徒步并出 PDF 计划",
+    )
+    assert _types(frames)[-1] == "run.paused"
+    run_id, approval_id = harness.paused_approval_id("bcdef-inject-publication")
+    harness.decide(approval_id, "approve", request_id="dec-publication")
+
+    original = harness.repo.persist_event
+    harness.repo.persist_event = _fail_when(
+        original,
+        lambda kwargs: kwargs.get("event_type") == "tool_result",
+        sqlite3.OperationalError("run_events unavailable"),
+    )
+    try:
+        resumed = harness.resume(run_id)
+    finally:
+        harness.repo.persist_event = original
+
+    assert _types(resumed)[-1] == "error"
+    assert resumed[-1]["payload"]["code"] == "effect_outcome_unknown"
+    assert harness.side_effect_counts["pdf_generations"] == 1
+    assert harness.rows("effects", "run_id = ?", run_id) == 1
+
+    stalled = harness.snapshot(run_id)
+    assert stalled["effects"][0]["stored_status"] == "outcome_unknown"
+    # The result IS a durable fact now, so the next action is a confirm.
+    assert stalled["effects"][0]["repair_next_action"] == "confirm_known_result"
+
+    effect = harness.repo.list_effects_for_run(run_id)[0]
+    recorded = json.loads(effect.result_json or "{}")
+    assert recorded.get("path")
+
+    # A payload that disagrees with the recorded result is refused…
+    wrong = harness.repair(
+        effect.resolved_effect_id,
+        action="confirm",
+        result={"path": "other.pdf"},
+        key="repair-wrong",
+        expect_status=409,
+    )
+    assert wrong["code"] == "repair_result_not_durable"
+
+    # …while the honest decision republishes what the ledger recorded.
+    repaired = harness.repair(
+        effect.resolved_effect_id,
+        action="confirm",
+        result=None,
+        key="repair-honest",
+    )
+    assert repaired["status"] == "repaired", repaired
+    assert repaired["result"] == recorded
 
     snapshot = harness.snapshot(run_id)
     assert snapshot["effects"][0]["status"] == "committed"
     assert harness.side_effect_counts["pdf_generations"] == 1
     assert harness.side_effect_counts["model_calls"] == 1
-    # The idempotent repair is replay-visible exactly once.
     ok_results = [
         event
         for event in harness.events(run_id)
         if event["type"] == "tool_result" and event["payload"].get("status") == "ok"
     ]
     assert len(ok_results) == 1
+    assert ok_results[0]["payload"]["result"] == recorded
 
 
 def test_lease_acquire_failure_cleans_the_workspace_and_a_retry_creates_no_second_sandbox(
