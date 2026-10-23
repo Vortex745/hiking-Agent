@@ -254,7 +254,8 @@ def test_cowork_first_stream_plans_command_via_kernel_turn_then_pauses(
     monkeypatch.setattr(chat_v2_module.settings, "agent_v2_enabled", True)
     monkeypatch.setattr(chat_v2_module.settings, "agent_v2_cowork_policy", "trusted")
     monkeypatch.setattr(chat_v2_module, "_build_artifact_computer", lambda *a, **k: _CoworkComputer())
-    monkeypatch.setattr(chat_v2_module, "_cleanup_sandbox", lambda *a, **k: None)
+    # ALR ticket 03: the production cleanup adapter runs unpatched (typed
+    # result, no lease mutation); the pause path preserves the sandbox.
 
     from agent_v2 import kernel as km
 

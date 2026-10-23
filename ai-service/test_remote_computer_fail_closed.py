@@ -69,6 +69,9 @@ from agent_v2.profiles import resolve_profile
 from agent_v2.runs import RunRepository
 from agent_v2.run_orchestration import ChatFlowRequest, RunOrchestrator
 
+# ALR ticket 03: every cleanup hook in this file is the REAL production
+# adapter — the refusal flows share the typed-result semantics with the
+# production assembly instead of a ``None``-returning stub.
 from api.chat_v2 import _cleanup_sandbox
 
 TERMINALS = {"error", "done", "cancelled", "run.paused"}
@@ -505,7 +508,7 @@ def test_resume_replay_after_refusal_does_not_reexecute(
         settings=_settings(),
         runs_repo=repo,
         computer_factory=lambda *a, **k: create_computer("remote_e2b"),
-        sandbox_cleanup=lambda *a, **k: None,
+        sandbox_cleanup=_cleanup_sandbox,
         gate_factory=None,
         kernel_turn=_fake_kernel_turn,
     )
@@ -545,7 +548,7 @@ def test_disconnect_window_after_refusal_keeps_sandbox_unavailable_on_resume(
         settings=_settings(),
         runs_repo=repo,
         computer_factory=lambda *a, **k: create_computer("remote_e2b"),
-        sandbox_cleanup=lambda *a, **k: None,
+        sandbox_cleanup=_cleanup_sandbox,
         gate_factory=None,
         kernel_turn=_fake_kernel_turn,
     )
@@ -603,7 +606,7 @@ def test_concurrent_resume_remote_refusal_single_terminal_each(
         settings=_settings(),
         runs_repo=repo,
         computer_factory=lambda *a, **k: create_computer("remote_e2b"),
-        sandbox_cleanup=lambda *a, **k: None,
+        sandbox_cleanup=_cleanup_sandbox,
         gate_factory=None,
         kernel_turn=_fake_kernel_turn,
     )
@@ -646,7 +649,7 @@ def test_resume_with_destroyed_remote_lease_fails_closed(
         settings=_settings(),
         runs_repo=repo,
         computer_factory=lambda *a, **k: create_computer("remote_e2b"),
-        sandbox_cleanup=lambda *a, **k: None,
+        sandbox_cleanup=_cleanup_sandbox,
         gate_factory=None,
     )
 
@@ -726,7 +729,7 @@ def test_no_local_fallback_bypasses_the_refusal(
         settings=_settings(),
         runs_repo=repo,
         computer_factory=lambda *a, **k: create_computer(a[0] if a else "remote_e2b"),
-        sandbox_cleanup=lambda *a, **k: None,
+        sandbox_cleanup=_cleanup_sandbox,
         gate_factory=None,
         kernel_turn=_fake_kernel_turn,
     )

@@ -48,6 +48,7 @@ from agent_v2.observability import (
 from agent_v2.persistence import CheckpointsStore, ControlStore
 from agent_v2.run_orchestration import RunOrchestrator
 from agent_v2.runs import RunRepository
+from agent_v2.sandbox_lifecycle import run_sandbox_cleanup
 
 RUN_TERMINALS = {"done", "error", "cancelled"}
 ENVELOPE_KEYS = {
@@ -161,13 +162,15 @@ class Harness:
                 "expires_at": _iso(days=7),
             }
 
-        def cleanup(computer, workspace_path, runs_repo, run_id) -> None:
+        def cleanup(computer, workspace_path, runs_repo, run_id) -> Any:
+            # ALR ticket 03: cleanup hooks return the explicit typed
+            # result; the lifecycle settlement (not the hook) mutates the
+            # lease. Failures raise — an equally explicit outcome the
+            # orchestrator translates to a failed result.
             self.cleanup_calls.append(workspace_path)
             if self.cleanup_fails:
                 raise RuntimeError("sandbox teardown timed out")
-            computer.cleanup(workspace_path)
-            if runs_repo is not None and run_id is not None:
-                runs_repo.destroy_sandbox_lease(run_id=run_id)
+            return run_sandbox_cleanup(computer, workspace_path)
 
         self.orchestrator = RunOrchestrator(
             settings=_settings(),
@@ -1164,5 +1167,355 @@ def test_a_clean_request_moves_no_boundary_counter(harness: Harness):
         name: snapshot[name] for name in BOUNDARY_METRIC_NAMES
     } == {name: 0 for name in BOUNDARY_METRIC_NAMES}
     assert snapshot["repair_age_max_seconds"] == 0.0
+
+
+# ---- ALR ticket 03: real production assembly cleanup outcomes -----------------
+#
+# The harness above replaces ``_build_run_orchestrator``, so its cleanup
+# fake stands IN FRONT of the production adapter. Ticket 03's regression is
+# about the REAL HTTP adapter chain: the production ``_build_run_orchestrator``
+# wiring, the real ``_cleanup_sandbox`` adapter, the real artifact export and
+# approval gate, over a tmp SQLite repository. Only the model kernel turn,
+# the sandbox Computer and the subject cookie are controlled — the same
+# seams production tests always use. Cleanup outcomes must be EXPLICIT:
+# a physical cleanup failure or an ambiguous (``None``) adapter return is
+# registered as a failed lease + pending_janitor cleanup + exactly one
+# active janitor task for the ORIGINAL target, and the run's terminal
+# never moves.
+
+
+class _RealAssembly:
+    """The un-replaced production wiring over one tmp repository."""
+
+    def __init__(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        computer: Any,
+    ) -> None:
+        from agent_v2.computer import LocalNativeComputer  # noqa: F401
+
+        self.repo = RunRepository(
+            control=ControlStore(str(tmp_path / "control.sqlite")),
+            checkpoints=CheckpointsStore(str(tmp_path / "ckpt.sqlite")),
+        )
+        self.computer = computer
+        self.kernel_calls: list[dict[str, Any]] = []
+
+        async def fake_turn(**kwargs: Any) -> tuple[str, list[dict[str, Any]]]:
+            self.kernel_calls.append(kwargs)
+            return ("# 杭州两日徒步计划\n占位正文，注意天气与补给。", [])
+
+        import agent_v2.kernel as kernel_module
+
+        monkeypatch.setattr(kernel_module, "run_chat_turn", fake_turn)
+        monkeypatch.setattr(
+            chat_v2_module, "_build_artifact_computer", lambda *a, **k: computer
+        )
+        monkeypatch.setattr(chat_v2_module.settings, "agent_v2_enabled", True)
+        monkeypatch.setattr(
+            chat_v2_module.settings,
+            "agent_v2_state_dir",
+            str(tmp_path / "state"),
+        )
+        monkeypatch.setattr(
+            chat_v2_module,
+            "resolve_request_subject",
+            lambda request: (
+                _FakeMemory(),
+                setattr(request.state, "subject_id", SUBJECT_ID)
+                or SimpleNamespace(issued=False, token="tok", subject_id=SUBJECT_ID),
+            ),
+        )
+
+        self.app = FastAPI()
+        self.app.include_router(chat_v2_module.chat_v2_router, prefix="/api/v2")
+        self.app.include_router(
+            chat_v2_module.approvals_v2_router, prefix="/api/v2"
+        )
+        self.app.state.agent_v2_runtime = SimpleNamespace(
+            runs=self.repo, memory=None, telemetry=None, capacity=None,
+            kernel_checkpoints=None,
+        )
+
+    def close(self) -> None:
+        self.repo.close()
+
+    def stream(
+        self, request_id: str, *, message: str = "规划杭州两日徒步并出 PDF 计划"
+    ) -> list[dict[str, Any]]:
+        body = {
+            "message": message,
+            "request_id": request_id,
+            "profile_id": "artifact",
+        }
+        response = self._call("POST", "/api/v2/chat/sse", body)
+        assert response.status_code == 200, response.text
+        return _frames(response.text)
+
+    def resume(self, run_id: str, *, from_seq: int = 0) -> list[dict[str, Any]]:
+        response = self._call(
+            "POST", f"/api/v2/chat/resume/{run_id}?from_seq={from_seq}"
+        )
+        assert response.status_code == 200, response.text
+        return _frames(response.text)
+
+    def _call(self, method: str, path: str, body: dict[str, Any] | None = None):
+        async def run():
+            transport = ASGITransport(app=self.app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                return await client.request(method, path, json=body)
+
+        return asyncio.run(run())
+
+    def paused_approval(self, request_id: str) -> tuple[str, str]:
+        run = self.repo.control.get_run_by_request(request_id)
+        assert run is not None and run.status == "paused", run
+        pending = self.repo.list_pending_approvals_for_run(run.run_id)
+        assert len(pending) == 1, pending
+        return run.run_id, pending[0].approval_id
+
+    def decide(self, approval_id: str, *, request_id: str) -> None:
+        response = self._call(
+            "POST",
+            f"/api/v2/approvals/{approval_id}/decision",
+            {"decision": "approve", "decision_request_id": request_id},
+        )
+        assert response.status_code == 200, response.text
+
+
+class _CountingCleanupFailureComputer:
+    """A real production Computer whose physical teardown always fails.
+
+    Wraps :class:`LocalNativeComputer` with ``failure_mode="cleanup"`` so
+    ``cleanup()`` raises :class:`SandboxCleanupError` carrying the REAL
+    partial usage gathered before the failure — the exact shape the
+    production adapter must translate, not hide.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.cleanup_calls: list[str] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def cleanup(self, workspace_path: str) -> Any:
+        self.cleanup_calls.append(workspace_path)
+        return self._inner.cleanup(workspace_path)
+
+
+def _drive_real_pdf_run(assembly: _RealAssembly, request_id: str) -> tuple[str, list[dict[str, Any]]]:
+    """First stream → approval pause → approve → resume → terminal."""
+    frames = assembly.stream(request_id)
+    assert _types(frames)[-1] == "run.paused", _types(frames)
+    run_id, approval_id = assembly.paused_approval(request_id)
+    assembly.decide(approval_id, request_id=f"dec-{request_id}")
+    resumed = assembly.resume(run_id)
+    return run_id, resumed
+
+
+def test_real_adapter_cleanup_failure_registers_recovery_not_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """T03-01: a REAL ``SandboxCleanupError`` (with partial usage) through
+    the REAL HTTP adapter must be registered honestly — never ``succeeded``.
+
+    The user keeps the original answer and the downloadable artifact; the
+    database keeps a ``failed`` lease, a ``pending_janitor`` cleanup with
+    the failure reason and the preserved partial usage, and exactly one
+    active janitor task for the ORIGINAL workspace."""
+    from agent_v2.computer import LocalNativeComputer
+
+    reset_boundary_metrics()
+    computer = _CountingCleanupFailureComputer(
+        LocalNativeComputer(failure_mode="cleanup")
+    )
+    assembly = _RealAssembly(tmp_path, monkeypatch, computer=computer)
+    try:
+        run_id, resumed = _drive_real_pdf_run(assembly, "alr03-cleanup-failed")
+
+        # The original terminal stands: the answer is durable and the
+        # artifact was exported for download.
+        assert _types(resumed)[-1] == "done", _types(resumed)
+        run = assembly.repo.get_run(run_id)
+        assert run is not None and run.status == "done"
+        available = next(f for f in resumed if f["type"] == "artifact.available")
+        artifact = assembly.repo.get_artifact(available["payload"]["artifact_id"])
+        assert artifact is not None and artifact.status == "available"
+        assert Path(artifact.storage_path).read_bytes().startswith(b"%PDF")
+
+        # The physical teardown ran exactly once, against the leased
+        # workspace, and failed.
+        lease_for_ws = assembly.repo.get_sandbox_lease(run_id)
+        assert lease_for_ws is not None
+        assert computer.cleanup_calls == [lease_for_ws.workspace_path]
+
+        # Honest failure registration on the CURRENT lease.
+        lease = lease_for_ws
+        assert lease.status == "failed"
+        assert lease.cleanup_status == "pending_janitor"
+        assert lease.failure_reason and "cleanup failed" in lease.failure_reason
+        assert lease.cleanup_error == lease.failure_reason
+        # The partial usage gathered before the failure survives.
+        assert lease.resource_usage is not None
+        assert set(lease.resource_usage) >= {
+            "duration_ms", "files_written", "bytes_written"
+        }
+
+        # Exactly ONE active janitor task for the original target.
+        tasks = assembly.repo.list_janitor_tasks(kind="cleanup")
+        assert len(tasks) == 1
+        task = tasks[0]
+        assert task.status == "pending"
+        assert task.dedupe_key == f"cleanup:{run_id}"
+        evidence = task.evidence
+        assert evidence["run_id"] == run_id
+        assert evidence["lease_id"] == lease.lease_id
+        assert evidence["workspace_path"] == lease.workspace_path
+        assert evidence["sandbox_identity"] == lease.sandbox_identity
+        assert evidence["fencing_token"] == lease.fencing_token
+        assert evidence["failure_reason"]
+        assert get_boundary_metrics().snapshot()["cleanup_pending"] == 1
+    finally:
+        assembly.close()
+        reset_boundary_metrics()
+
+
+def test_real_adapter_unexpected_cleanup_exception_registers_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """T03-01: an unexpected (non-SandboxCleanupError) exception raised by
+    the Computer and absorbed by the REAL adapter is still a failure."""
+    from agent_v2.computer import LocalNativeComputer
+
+    class _CrashingCleanupComputer(LocalNativeComputer):
+        cleanup_calls: list[str] = []
+
+        def cleanup(self, workspace_path: str) -> Any:
+            _CrashingCleanupComputer.cleanup_calls.append(workspace_path)
+            raise RuntimeError("teardown crashed unexpectedly")
+
+    reset_boundary_metrics()
+    computer = _CrashingCleanupComputer()
+    assembly = _RealAssembly(tmp_path, monkeypatch, computer=computer)
+    try:
+        run_id, resumed = _drive_real_pdf_run(assembly, "alr03-cleanup-crash")
+
+        assert _types(resumed)[-1] == "done", _types(resumed)
+        assert assembly.repo.get_run(run_id).status == "done"
+        assert _CrashingCleanupComputer.cleanup_calls
+
+        lease = assembly.repo.get_sandbox_lease(run_id)
+        assert lease is not None
+        assert lease.status == "failed"
+        assert lease.cleanup_status == "pending_janitor"
+        assert lease.cleanup_error and "cleanup" in lease.cleanup_error
+
+        tasks = assembly.repo.list_janitor_tasks(kind="cleanup")
+        assert len(tasks) == 1
+        assert tasks[0].status == "pending"
+        assert tasks[0].dedupe_key == f"cleanup:{run_id}"
+        assert tasks[0].evidence["workspace_path"] == lease.workspace_path
+    finally:
+        assembly.close()
+        reset_boundary_metrics()
+
+
+@pytest.mark.parametrize(
+    "legacy_return",
+    [
+        pytest.param(None, id="none-return"),
+        pytest.param(
+            {"status": "succeeded", "usage": {"files_deleted": 0}},
+            id="legacy-dict-shape",
+        ),
+    ],
+)
+def test_ambiguous_adapter_return_is_protocol_failure_never_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_return: Any
+):
+    """T03-02: a legacy/ambiguous adapter that returns ``None`` or an
+    untyped dict is a PROTOCOL failure — it must never be recorded as a
+    successful cleanup, and the resource must still be settled and
+    retried, not left ``active``."""
+    from agent_v2.computer import LocalNativeComputer
+
+    reset_boundary_metrics()
+    computer = LocalNativeComputer()
+    assembly = _RealAssembly(tmp_path, monkeypatch, computer=computer)
+    monkeypatch.setattr(
+        chat_v2_module,
+        "_cleanup_sandbox",
+        lambda *a, **k: legacy_return,
+    )
+    try:
+        run_id, resumed = _drive_real_pdf_run(assembly, "alr03-protocol")
+
+        assert _types(resumed)[-1] == "done", _types(resumed)
+        assert assembly.repo.get_run(run_id).status == "done"
+
+        lease = assembly.repo.get_sandbox_lease(run_id)
+        assert lease is not None
+        assert lease.status != "active"
+        assert lease.status == "failed"
+        assert lease.cleanup_status != "succeeded"
+        assert lease.cleanup_status == "pending_janitor"
+        assert lease.cleanup_error
+
+        tasks = assembly.repo.list_janitor_tasks(kind="cleanup")
+        assert len(tasks) == 1
+        assert tasks[0].status == "pending"
+        assert tasks[0].dedupe_key == f"cleanup:{run_id}"
+    finally:
+        assembly.close()
+        reset_boundary_metrics()
+
+
+def test_real_adapter_success_path_settles_lease_with_real_usage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """T03-03 positive control: the normal PDF approval/resume run through
+    the REAL adapter ends ``done``, exports a downloadable artifact,
+    cleans up exactly once, persists the REAL usage on a ``destroyed``
+    lease, and creates ZERO janitor work."""
+    from agent_v2.computer import LocalNativeComputer
+
+    class _CountingComputer(LocalNativeComputer):
+        cleanup_calls: list[str] = []
+
+        def cleanup(self, workspace_path: str) -> Any:
+            _CountingComputer.cleanup_calls.append(workspace_path)
+            return super().cleanup(workspace_path)
+
+    reset_boundary_metrics()
+    computer = _CountingComputer()
+    assembly = _RealAssembly(tmp_path, monkeypatch, computer=computer)
+    try:
+        run_id, resumed = _drive_real_pdf_run(assembly, "alr03-success")
+
+        assert _types(resumed)[-1] == "done", _types(resumed)
+        available = next(f for f in resumed if f["type"] == "artifact.available")
+        artifact = assembly.repo.get_artifact(available["payload"]["artifact_id"])
+        assert artifact is not None and artifact.status == "available"
+        assert Path(artifact.storage_path).read_bytes().startswith(b"%PDF")
+
+        assert len(_CountingComputer.cleanup_calls) == 1
+
+        lease = assembly.repo.get_sandbox_lease(run_id)
+        assert lease is not None
+        assert lease.status == "destroyed"
+        assert lease.cleanup_status == "succeeded"
+        assert lease.resource_usage is not None
+        assert set(lease.resource_usage) >= {
+            "duration_ms", "files_written", "bytes_written"
+        }
+
+        assert assembly.repo.list_janitor_tasks(kind="cleanup") == []
+        assert get_boundary_metrics().snapshot()["cleanup_pending"] == 0
+    finally:
+        assembly.close()
+        reset_boundary_metrics()
 
 

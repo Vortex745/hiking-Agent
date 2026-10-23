@@ -54,6 +54,7 @@ from agent_v2.kernel_tools import CoworkBashTool
 from agent_v2.kernel_persistence import KernelCheckpointStore
 from agent_v2.persistence import CheckpointsStore, ControlStore
 from agent_v2.runs import RunRepository
+from agent_v2.sandbox_lifecycle import run_sandbox_cleanup
 from agent_v2.uniharness.kernel_identity import (  # noqa: F401  (import side effects)
     VENDORED_UPSTREAM_REVISION,
 )
@@ -863,7 +864,10 @@ def test_disconnect_then_resume_yields_single_terminal(tmp_path: Path):
         memory=_FakeMemory(),
         kernel_turn=fake_kernel,
         computer_factory=lambda *a, **k: LocalNativeComputer(),
-        sandbox_cleanup=lambda *a, **k: None,
+        # ALR ticket 03: explicit typed result via the production helper.
+        sandbox_cleanup=lambda comp, workspace_path, _runs, _rid: (
+            run_sandbox_cleanup(comp, workspace_path)
+        ),
         gate_factory=None,
     )
     req = ChatFlowRequest(
