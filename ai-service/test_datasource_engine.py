@@ -253,6 +253,62 @@ def test_scheduler_loop_starts_due_source_and_stops(tmp_path):
     service.close()
 
 
+def test_restart_persists_cursor_and_skips(tmp_path):
+    state = _docs(("doc-1", "A", "a"), ("doc-2", "B", "b"))
+    service, store, _ = _build(tmp_path, state)
+    ds = _create(service)
+    service.run_sync_now(ds["id"])
+    fetch_calls = len(state.fetch_calls)
+    service.close()
+
+    restarted, _, _ = _build(tmp_path, state)
+    log = restarted.get_sync_log(ds["id"], restarted.run_sync_now(ds["id"]))
+    assert log["skipped"] == 2
+    assert log["created"] == 0
+    assert len(state.fetch_calls) == fetch_calls
+    assert restarted.get_datasource(ds["id"])["doc_count"] == 2
+    restarted.close()
+
+
+def test_two_sources_queue_on_single_worker(tmp_path):
+    state = _docs(("doc-1", "A", "a"))
+    state.roots.append(ResourceNode(id="root2", title="第二空间", kind="space"))
+    state.docs.append(FakeDoc(external_id="doc-2", title="B", content="b", resource_id="root2"))
+    service, store, _ = _build(tmp_path, state)
+    first = service.create_datasource(
+        type="fake",
+        name="First",
+        credentials={"token": "ok"},
+        settings={},
+        selected_resources=["root"],
+        schedule="* * * * *",
+    )
+    second = service.create_datasource(
+        type="fake",
+        name="Second",
+        credentials={"token": "ok"},
+        settings={},
+        selected_resources=["root2"],
+        schedule="* * * * *",
+    )
+    store.set_next_run(first["id"], "2020-01-01T00:00:00+08:00")
+    store.set_next_run(second["id"], "2020-01-01T00:00:00+08:00")
+    started = service.run_due_once("2026-01-01T00:00:00+08:00")
+    assert len(started) == 2
+    for sync_id in started:
+        for _ in range(100):
+            log = store.get_sync_log(sync_id)
+            if log["status"] != "running":
+                break
+            import time
+
+            time.sleep(0.02)
+        assert store.get_sync_log(sync_id)["status"] == "success"
+    assert service.get_datasource(first["id"])["doc_count"] == 1
+    assert service.get_datasource(second["id"])["doc_count"] == 1
+    service.close()
+
+
 def test_corrupt_schedule_does_not_claim_sync(tmp_path):
     service, store, _ = _build(tmp_path, _docs(("doc-1", "A", "a")))
     ds = _create(service)
