@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -19,7 +20,7 @@ from rag.ingestion import FakeEmbedding
 DIMENSIONS = 8
 
 
-def _build(tmp_path: Path, state: FakeState):
+def _build(tmp_path: Path, state: FakeState, **service_kwargs):
     ds_store = DatasourceStore(tmp_path / "datasource.sqlite")
     ingestor = RagIngestor(
         tmp_path / "rag.sqlite",
@@ -33,6 +34,7 @@ def _build(tmp_path: Path, state: FakeState):
         registry,
         ingestor,
         SecretBox.from_key_bytes(b"k" * 32),
+        **service_kwargs,
     )
     return service, ds_store, ingestor.store
 
@@ -216,6 +218,37 @@ def test_scheduler_starts_due_datasource_and_advances_next_run(tmp_path):
     assert service.store.get_sync_log(started[0])["status"] == "success"
     next_run = service.get_datasource(ds["id"])["next_run_at"]
     assert next_run is not None and next_run > "2026-01-01"
+    service.close()
+
+
+def test_scheduler_loop_starts_due_source_and_stops(tmp_path):
+    state = _docs(("doc-1", "A", "a"))
+    service, store, _ = _build(tmp_path, state, scheduler_interval_seconds=0.05)
+    ds = service.create_datasource(
+        type="fake",
+        name="Loop",
+        credentials={"token": "ok"},
+        settings={},
+        selected_resources=["root"],
+        schedule="* * * * *",
+    )
+    store.set_next_run(ds["id"], "2020-01-01T00:00:00+08:00")
+
+    async def run():
+        service.start_scheduler()
+        logs = []
+        for _ in range(100):
+            logs = store.list_sync_logs(ds["id"])
+            if logs and logs[0]["status"] != "running":
+                break
+            await asyncio.sleep(0.02)
+        await service.stop_scheduler()
+        return logs
+
+    logs = asyncio.run(run())
+    assert len(logs) == 1
+    assert logs[0]["status"] == "success"
+    assert logs[0]["created"] == 1
     service.close()
 
 

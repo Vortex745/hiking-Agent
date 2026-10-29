@@ -265,6 +265,18 @@ def test_engine_media_id_churn_is_update(tmp_path: Path):
     service.close()
 
 
+def test_file_update_time_sets_composite_rev():
+    state = _folders_state()
+    state["folders"][""][1]["update_time"] = "u1"
+    connector = _connector(_handler(state))
+    enumerated = connector.enumerate("kb1")
+    node = next(
+        item for item in enumerated.nodes if item.id == logical_key("kb1", "", "Doc 1")
+    )
+    assert node.rev == "d1:u1"
+    connector.close()
+
+
 def test_note_update_time_triggers_update(tmp_path: Path):
     state = {
         "kbs": [{"kb_id": "kb1", "kb_name": "KB"}],

@@ -57,6 +57,7 @@ class DatasourceService:
         secret_box: SecretBox,
         *,
         executor: ThreadPoolExecutor | None = None,
+        scheduler_interval_seconds: float = 30.0,
     ) -> None:
         self.store = store
         self.registry = registry
@@ -68,6 +69,7 @@ class DatasourceService:
         self._owns_executor = executor is None
         self._scheduler_task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
+        self._scheduler_interval = max(0.01, float(scheduler_interval_seconds))
         self._state_lock = threading.Lock()
         self._sync_running = False
         self.store.recover_interrupted()
@@ -632,7 +634,9 @@ class DatasourceService:
             except Exception:
                 logger.exception("datasource scheduler tick failed")
             try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=30)
+                await asyncio.wait_for(
+                    self._stop_event.wait(), timeout=self._scheduler_interval
+                )
             except asyncio.TimeoutError:
                 continue
 

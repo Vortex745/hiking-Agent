@@ -190,7 +190,7 @@ class ImaConnector:
                 or item.get("modify_time")
             )
             rev = media_id
-            if str(item.get("media_type")) == str(NOTE_MEDIA_TYPE) and update_time:
+            if update_time:
                 rev = f"{media_id}:{update_time}"
             external_id = logical_key(kb_id, parent_folder_id, title)
             by_key[external_id] = ResourceNode(
