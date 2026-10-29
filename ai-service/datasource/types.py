@@ -79,6 +79,7 @@ class FetchOutcome:
     item: FetchedItem | None = None
     skipped: bool = False
     skip_reason: str = ""
+    truncated: bool = False
 
 
 @dataclass(frozen=True)

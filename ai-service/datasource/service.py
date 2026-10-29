@@ -459,6 +459,8 @@ class DatasourceService:
             return
         try:
             outcome = connector.fetch(node)
+            if outcome.truncated:
+                counts.truncated += 1
             if outcome.skipped:
                 counts.skipped += 1
                 counts.skipped_by_type += 1
