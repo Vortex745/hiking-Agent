@@ -221,8 +221,7 @@ def delete_datasource(
 def validate_saved(
     ds_id: str, service: DatasourceService = Depends(get_service)
 ) -> OperationResponse:
-    ds = _call(service.get_datasource, ds_id)
-    _call(service.list_resources_for, ds_id, None)
+    _call(service.validate_saved, ds_id)
     return OperationResponse(ok=True, message="连接成功")
 
 

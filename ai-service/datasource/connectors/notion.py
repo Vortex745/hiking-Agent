@@ -158,13 +158,17 @@ class NotionConnector:
             raise NotFoundError("Notion 搜索失败")
 
     def list_resources(self, parent_id: str | None) -> list[ResourceNode]:
-        if parent_id is not None:
-            return []
         nodes = self._nodes()
         ids = {node.id for node in nodes}
+        if parent_id is None:
+            return [
+                replace(node, parent_id=node.parent_id if node.parent_id in ids else None)
+                for node in nodes
+            ]
         return [
-            replace(node, parent_id=node.parent_id if node.parent_id in ids else None)
+            replace(node, parent_id=parent_id)
             for node in nodes
+            if node.parent_id == parent_id
         ]
 
     def resolve_ancestors(self, ids: Sequence[str]) -> list[ResourceNode]:

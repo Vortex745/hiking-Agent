@@ -52,6 +52,7 @@ const types = [
 ]
 const roots = [
   { id: 'root', title: '测试空间', kind: 'space', parent_id: null, has_children: true, rev: '', url: '' },
+  { id: 'root2', title: '另一个空间', kind: 'space', parent_id: null, has_children: true, rev: '', url: '' },
 ]
 const children = [
   { id: 'doc-1', title: '路线文档', kind: 'document', parent_id: 'root', has_children: false, rev: '1', url: '' },
@@ -178,6 +179,11 @@ const json = (route, body, status = 200) =>
     await page.getByText('连接成功').waitFor()
     await page.getByRole('button', { name: '加载资源' }).click()
     await page.getByText('测试空间', { exact: true }).waitFor()
+    await page.getByPlaceholder('搜索资源名称').fill('测试')
+    await page.getByText('另一个空间', { exact: true }).waitFor({ state: 'hidden' })
+    assert.equal(await page.getByText('测试空间', { exact: true }).count(), 1)
+    await page.getByPlaceholder('搜索资源名称').fill('')
+    await page.getByText('另一个空间', { exact: true }).waitFor()
     await page.getByLabel('选择 测试空间').check()
     await page.getByRole('button', { name: '创建知识源' }).click()
     await page.getByText('测试语雀', { exact: true }).waitFor()

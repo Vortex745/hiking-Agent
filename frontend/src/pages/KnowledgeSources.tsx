@@ -80,7 +80,7 @@ function statusTone(ds: Datasource): string {
 function countsSummary(log: SyncLog | null): string {
   if (!log) return '尚无同步记录'
   const c = log.counts
-  return `新增 ${c.created} · 更新 ${c.updated} · 跳过 ${c.skipped} · 失败 ${c.failed} · 删除 ${c.deleted}`
+  return `发现 ${c.discovered} · 抓取 ${c.fetched} · 新增 ${c.created} · 更新 ${c.updated} · 跳过 ${c.skipped} · 失败 ${c.failed} · 删除 ${c.deleted}`
 }
 
 export default function KnowledgeSourcesDialog({ onClose }: KnowledgeSourcesDialogProps) {
@@ -436,6 +436,7 @@ function SourceForm({ types, editing, onCancel, onSaved, onNotice }: SourceFormP
   const [syncDeletions, setSyncDeletions] = useState(editing?.sync_deletions ?? true)
   const [nodes, setNodes] = useState<Record<string, ResourceNode[]>>({})
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
+  const [resourceQuery, setResourceQuery] = useState('')
   const [treeLoading, setTreeLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
@@ -473,7 +474,7 @@ function SourceForm({ types, editing, onCancel, onSaved, onNotice }: SourceFormP
 
   const credentialsReady = (meta?.auth_fields ?? []).every((field) => {
     if (!field.required) return true
-    if (editing && !changeCredentials && editing.credentials_configured[field.key]) return true
+    if (editing?.credentials_configured[field.key]) return true
     return Boolean(credentials[field.key]?.trim())
   })
 
@@ -741,6 +742,14 @@ function SourceForm({ types, editing, onCancel, onSaved, onNotice }: SourceFormP
             ))}
           </div>
         )}
+        {roots.length > 0 && (
+          <input
+            className={`${INPUT} mt-3`}
+            value={resourceQuery}
+            placeholder="搜索资源名称"
+            onChange={(event) => setResourceQuery(event.target.value)}
+          />
+        )}
         <div className="mt-3 max-h-60 overflow-y-auto rounded-sm border border-border p-2 dark:border-white/10">
           {roots.length === 0 ? (
             <div className="px-2 py-6 text-center text-xs text-text-secondary">
@@ -748,23 +757,27 @@ function SourceForm({ types, editing, onCancel, onSaved, onNotice }: SourceFormP
             </div>
           ) : (
             <div className="flex flex-col gap-1">
-              {roots.map((node) => (
-                <TreeNode
-                  key={node.id}
-                  node={node}
-                  depth={0}
-                  selected={selected}
-                  expanded={expanded}
-                  childrenByParent={nodes}
-                  onToggle={toggleSelected}
-                  onExpand={toggleExpand}
-                />
-              ))}
+              {roots
+                .filter((node) => matchesNode(node, resourceQuery, nodes))
+                .map((node) => (
+                  <TreeNode
+                    key={node.id}
+                    node={node}
+                    depth={0}
+                    selected={selected}
+                    expanded={expanded}
+                    childrenByParent={nodes}
+                    forceOpen={Boolean(resourceQuery.trim())}
+                    onToggle={toggleSelected}
+                    onExpand={toggleExpand}
+                  />
+                ))}
             </div>
           )}
         </div>
         <p className="mt-2 text-xs text-text-muted">
           选择空间/知识库/页面/目录即可包含其后代；同步删除只对本轮完整列举且仍选中的范围生效。
+          不支持的平台类型（飞书表格/思维笔记/幻灯片/上传文件、Notion 数据库）会跳过并在日志计数。
         </p>
       </section>
 
@@ -803,19 +816,47 @@ function SourceForm({ types, editing, onCancel, onSaved, onNotice }: SourceFormP
   )
 }
 
+function matchesNode(
+  node: ResourceNode,
+  query: string,
+  childrenByParent: Record<string, ResourceNode[]>,
+): boolean {
+  const needle = query.trim().toLowerCase()
+  if (!needle) return true
+  if (
+    node.title.toLowerCase().includes(needle) ||
+    node.id.toLowerCase().includes(needle)
+  ) {
+    return true
+  }
+  return (childrenByParent[node.id] ?? []).some((child) =>
+    matchesNode(child, needle, childrenByParent),
+  )
+}
+
 interface TreeNodeProps {
   node: ResourceNode
   depth: number
   selected: string[]
   expanded: Record<string, boolean>
   childrenByParent: Record<string, ResourceNode[]>
+  forceOpen?: boolean
   onToggle: (id: string) => void
   onExpand: (node: ResourceNode) => void
 }
 
-function TreeNode({ node, depth, selected, expanded, childrenByParent, onToggle, onExpand }: TreeNodeProps) {
+function TreeNode({
+  node,
+  depth,
+  selected,
+  expanded,
+  childrenByParent,
+  forceOpen = false,
+  onToggle,
+  onExpand,
+}: TreeNodeProps) {
   const children = childrenByParent[node.id]
-  const isExpanded = Boolean(expanded[node.id])
+  const isExpanded = Boolean(expanded[node.id]) || forceOpen
   return (
     <div>
       <div
@@ -850,6 +891,7 @@ function TreeNode({ node, depth, selected, expanded, childrenByParent, onToggle,
               selected={selected}
               expanded={expanded}
               childrenByParent={childrenByParent}
+              forceOpen={forceOpen}
               onToggle={onToggle}
               onExpand={onExpand}
             />

@@ -367,6 +367,37 @@ class DatasourceStore:
 
     # ------------------------------------------------------------------ sync logs
 
+    def claim_sync(self, ds_id: str, trigger: str) -> str | None:
+        """Atomically move a datasource to running and create its log row.
+
+        Returns None when another run already owns the datasource. The status
+        update and log insert share one transaction so a crash cannot leave a
+        running log without the owning status bit (or vice versa).
+        """
+        log_id = uuid.uuid4().hex
+        now = now_iso()
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                cur = self._conn.execute(
+                    "UPDATE datasource SET sync_status = 'running', running_since = ? "
+                    "WHERE id = ? AND sync_status != 'running'",
+                    (now, ds_id),
+                )
+                if cur.rowcount == 0:
+                    self._conn.execute("ROLLBACK")
+                    return None
+                self._conn.execute(
+                    "INSERT INTO sync_log (id, datasource_id, trigger, status, started_at) "
+                    "VALUES (?, ?, ?, 'running', ?)",
+                    (log_id, ds_id, trigger, now),
+                )
+                self._conn.commit()
+            except sqlite3.Error:
+                self._conn.rollback()
+                raise
+        return log_id
+
     def start_sync_log(self, ds_id: str, trigger: str) -> str:
         log_id = uuid.uuid4().hex
         with self._lock:

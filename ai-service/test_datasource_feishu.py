@@ -186,6 +186,23 @@ def test_rate_limit_retry_after_and_reset_header():
     connector2.close()
 
 
+def test_transport_error_retries_and_succeeds():
+    sleeps: list[float] = []
+    state = {"calls": 0}
+
+    def handler(request):
+        if request.url.path == "/open-apis/wiki/v2/spaces":
+            state["calls"] += 1
+            if state["calls"] == 1:
+                raise httpx.ConnectError("boom", request=request)
+        return _base_handler()(request)
+
+    connector = _connector(handler, sleeps=sleeps)
+    assert connector.list_resources(None)[0].id == "s1"
+    assert any(abs(value - 2.0) < 0.01 for value in sleeps)
+    connector.close()
+
+
 def test_5xx_retries_once():
     sleeps: list[float] = []
     state = {"calls": 0}

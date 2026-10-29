@@ -168,7 +168,8 @@ def test_search_tree_and_enumerate():
     assert next(node for node in nodes if node.id == "db1").kind == "database"
     assert [node.id for node in connector.enumerate("p1").nodes] == ["p1", "p2"]
     assert [node.id for node in connector.enumerate("db1").nodes] == ["db1"]
-    assert connector.list_resources("p1") == []
+    assert [node.id for node in connector.list_resources("p1")] == ["p2"]
+    assert connector.list_resources("p2") == []
     connector.close()
 
 

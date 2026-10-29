@@ -87,7 +87,9 @@ def _handler(state):
                 return _json({"code": 500, "msg": "boom"}, status=500)
             return _json({"code": 0, "data": state["media"].get(media_id, {})})
         if path == "/openapi/note/v1/get_doc_content":
-            return _json({"code": 0, "data": {"content": "# Note\nhello"}})
+            return _json(
+                {"code": 0, "data": {"content": state.get("note_content", "# Note\nhello")}}
+            )
         if path.startswith("/files/"):
             name = path.rsplit("/", 1)[-1]
             if not name.endswith(".html") and request.headers.get("x-ima-sign") != SIGN:
@@ -259,6 +261,44 @@ def test_engine_media_id_churn_is_update(tmp_path: Path):
     assert second["updated"] == 1
     assert service.get_datasource(ds["id"])["doc_count"] == 1
     parent = ingestor.store.get_parent(f"ds:{ds['id']}:{logical_key('kb1', '', 'Doc')}")
+    assert parent is not None
+    service.close()
+
+
+def test_note_update_time_triggers_update(tmp_path: Path):
+    state = {
+        "kbs": [{"kb_id": "kb1", "kb_name": "KB"}],
+        "folders": {
+            "": [
+                {
+                    "media_id": "n1",
+                    "title": "Note",
+                    "media_type": 11,
+                    "update_time": "t1",
+                }
+            ]
+        },
+        "media": {
+            "n1": {
+                "media_type": 11,
+                "title": "Note",
+                "notebook_ext_info": {"notebook_id": "nb1"},
+            }
+        },
+        "note_content": "# Note\none",
+    }
+    service, ingestor, ds = _make_service(tmp_path, state)
+    first = service.get_sync_log(ds["id"], service.run_sync_now(ds["id"]))
+    assert first["created"] == 1
+
+    state["folders"][""][0]["update_time"] = "t2"
+    state["note_content"] = "# Note\ntwo"
+    second = service.get_sync_log(ds["id"], service.run_sync_now(ds["id"]))
+    assert second["updated"] == 1
+    assert service.get_datasource(ds["id"])["doc_count"] == 1
+    parent = ingestor.store.get_parent(
+        f"ds:{ds['id']}:{logical_key('kb1', '', 'Note')}"
+    )
     assert parent is not None
     service.close()
 

@@ -10,7 +10,7 @@ from typing import Any, Callable, Mapping, Sequence
 import httpx
 
 from datasource.registry import ConnectorRegistry
-from datasource.errors import AuthError, NotFoundError, RateLimited, VendorError
+from datasource.errors import AuthError, NetworkError, NotFoundError, RateLimited, VendorError
 from datasource.http import HttpClient, json_response
 from datasource.ingest import sanitize_file_name
 from datasource.ratelimit import TokenBucket
@@ -98,19 +98,29 @@ class FeishuClient:
         for attempt in range(attempts):
             token = self._token()
             self._limiter.acquire()
-            response = self._http.request(
-                method,
-                path,
-                params=params,
-                json=json,
-                headers={"Authorization": f"Bearer {token}"},
-            )
+            try:
+                response = self._http.request(
+                    method,
+                    path,
+                    params=params,
+                    json=json,
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            except NetworkError:
+                if attempt + 1 < attempts:
+                    self._sleep(float(2 ** (attempt + 1)))
+                    continue
+                raise
             if response.status_code == 401 and attempt + 1 < attempts:
                 self._tenant_token = ""
                 continue
             if response.status_code == 429:
                 if attempt + 1 < attempts:
-                    self._sleep(feishu_rate_limit_wait(response, self._wall_clock()))
+                    wait = max(
+                        feishu_rate_limit_wait(response, self._wall_clock()),
+                        float(2 ** (attempt + 1)),
+                    )
+                    self._sleep(wait)
                     continue
                 raise RateLimited("飞书限流")
             if response.status_code >= 500 and attempt + 1 < attempts:

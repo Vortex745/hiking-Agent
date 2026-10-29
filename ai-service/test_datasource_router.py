@@ -191,6 +191,32 @@ def test_saved_resources_and_validate(ctx):
     assert {node["id"] for node in ancestors} == {"doc-1", "root"}
 
 
+def test_edit_credentials_merge_and_saved_validation(ctx):
+    client, _, _, _ = ctx
+    created = _create(client)
+
+    blank = client.patch(
+        f"/api/v1/datasources/{created['id']}", json={"credentials": {"token": ""}}
+    )
+    assert blank.status_code == 200, blank.text
+    assert blank.json()["credentials_configured"] == {"token": True}
+    assert client.post(f"/api/v1/datasources/{created['id']}/validate").status_code == 200
+
+    bad = client.patch(
+        f"/api/v1/datasources/{created['id']}", json={"credentials": {"token": "bad"}}
+    )
+    assert bad.status_code == 200, bad.text
+    denied = client.post(f"/api/v1/datasources/{created['id']}/validate")
+    assert denied.status_code == 400
+    assert denied.json()["detail"]["code"] == "auth_failed"
+
+    restored = client.patch(
+        f"/api/v1/datasources/{created['id']}", json={"credentials": {"token": TOKEN}}
+    )
+    assert restored.status_code == 200
+    assert client.post(f"/api/v1/datasources/{created['id']}/validate").status_code == 200
+
+
 def test_concurrent_sync_returns_409(ctx):
     client, service, _, _ = ctx
     created = _create(client)

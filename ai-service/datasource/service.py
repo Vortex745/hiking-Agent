@@ -129,8 +129,17 @@ class DatasourceService:
                 raise ValidationError("知识源名称不能为空")
             fields["name"] = clean_name
         if credentials is not None:
+            try:
+                existing = self.secret_box.decrypt(ds["credentials_enc"])
+            except CredentialsUnreadable:
+                existing = {}
+            merged = dict(existing)
+            for key, value in credentials.items():
+                text = str(value or "").strip()
+                if text:
+                    merged[key] = text
             fields["credentials_enc"] = self.secret_box.encrypt(
-                _filter_credentials(metadata, credentials)
+                _filter_credentials(metadata, merged)
             )
         if settings is not None:
             fields["settings"] = _filter_settings(metadata, settings)
@@ -228,6 +237,14 @@ class DatasourceService:
         finally:
             connector.close()
 
+    def validate_saved(self, ds_id: str) -> None:
+        ds = self._require(ds_id)
+        connector = self._connector(ds)
+        try:
+            connector.validate()
+        finally:
+            connector.close()
+
     def list_resources(
         self,
         type: str,
@@ -280,10 +297,9 @@ class DatasourceService:
 
     def start_sync(self, ds_id: str, trigger: str = "manual") -> str:
         ds = self._require(ds_id)
-        if ds["sync_status"] == "running":
+        log_id = self.store.claim_sync(ds_id, trigger)
+        if log_id is None:
             raise ConflictError("该知识源正在同步，请等待本轮结束")
-        log_id = self.store.start_sync_log(ds_id, trigger)
-        self.store.set_sync_status(ds_id, "running", now_iso())
         if ds["schedule"]:
             self.store.set_next_run(ds_id, iso(next_run_at(ds["schedule"], now())))
         try:
@@ -305,10 +321,9 @@ class DatasourceService:
     def run_sync_now(self, ds_id: str, trigger: str = "manual") -> str:
         """Synchronous sync used by tests and explicit maintenance calls."""
         ds = self._require(ds_id)
-        if ds["sync_status"] == "running":
+        log_id = self.store.claim_sync(ds_id, trigger)
+        if log_id is None:
             raise ConflictError("该知识源正在同步，请等待本轮结束")
-        log_id = self.store.start_sync_log(ds_id, trigger)
-        self.store.set_sync_status(ds_id, "running", now_iso())
         if ds["schedule"]:
             self.store.set_next_run(ds_id, iso(next_run_at(ds["schedule"], now())))
         self._execute(ds_id, log_id, trigger)

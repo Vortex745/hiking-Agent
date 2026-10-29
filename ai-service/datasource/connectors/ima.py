@@ -184,13 +184,19 @@ class ImaConnector:
         for parent_folder_id, item in collected:
             title = _item_title(item)
             media_id = str(item.get("media_id") or "")
+            rev = str(
+                item.get("update_time")
+                or item.get("updated_at")
+                or item.get("modify_time")
+                or media_id
+            )
             external_id = logical_key(kb_id, parent_folder_id, title)
             by_key[external_id] = ResourceNode(
                 id=external_id,
                 title=title,
                 kind="item",
                 parent_id=root,
-                rev=media_id,
+                rev=rev,
                 meta={
                     "kb_id": kb_id,
                     "media_id": media_id,
@@ -231,7 +237,7 @@ class ImaConnector:
                     content=str(content or ""),
                     content_type="markdown",
                     file_name=sanitize_file_name(title, ".md"),
-                    rev=media_id,
+                    rev=node.rev or media_id,
                     metadata={"channel": "ima", "kind": "note"},
                 )
             )
@@ -256,7 +262,7 @@ class ImaConnector:
                     content_type="pdf",
                     data=body,
                     file_name=sanitize_file_name(title, ".pdf"),
-                    rev=media_id,
+                    rev=node.rev or media_id,
                     metadata={"channel": "ima"},
                 )
             )
@@ -270,7 +276,7 @@ class ImaConnector:
                     content=text,
                     content_type="markdown",
                     file_name=sanitize_file_name(title, ".md"),
-                    rev=media_id,
+                    rev=node.rev or media_id,
                     metadata={"channel": "ima"},
                 )
             )

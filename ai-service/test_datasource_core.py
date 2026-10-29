@@ -130,6 +130,26 @@ def test_store_due_running_and_recovery(tmp_path):
     store.close()
 
 
+def test_claim_sync_is_atomic(tmp_path):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    store = DatasourceStore(tmp_path / "datasource.sqlite")
+    ds = store.create_datasource(
+        type="fake", name="A", credentials_enc="enc", selected_resources=["root"]
+    )
+    barrier = threading.Barrier(2)
+
+    def claim():
+        barrier.wait(timeout=5)
+        return store.claim_sync(ds["id"], "manual")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: claim(), range(2)))
+    assert sum(1 for result in results if result) == 1
+    store.close()
+
+
 def test_deleting_datasource_cascades_rows(tmp_path):
     store = DatasourceStore(tmp_path / "datasource.sqlite")
     ds = store.create_datasource(
