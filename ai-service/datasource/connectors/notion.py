@@ -11,7 +11,7 @@ import httpx
 
 from datasource.registry import ConnectorRegistry
 from datasource.connectors.notion_markdown import render_blocks, render_rich_text
-from datasource.errors import NotFoundError
+from datasource.errors import AuthError, NotFoundError
 from datasource.http import HttpClient, json_response
 from datasource.ingest import sanitize_file_name
 from datasource.ratelimit import TokenBucket
@@ -135,7 +135,7 @@ class NotionConnector:
     ) -> None:
         token = str(credentials.get("token") or "")
         if not token:
-            raise ValueError("缺少 Notion Integration Token")
+            raise AuthError("缺少 Notion Integration Token")
         base_url = str(settings.get("base_url") or DEFAULT_BASE_URL)
         try:
             rate = int(str(settings.get("requests_per_minute") or "180"))

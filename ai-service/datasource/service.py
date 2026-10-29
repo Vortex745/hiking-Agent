@@ -68,6 +68,8 @@ class DatasourceService:
         self._owns_executor = executor is None
         self._scheduler_task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
+        self._state_lock = threading.Lock()
+        self._sync_running = False
         self.store.recover_interrupted()
 
     # ------------------------------------------------------------------ metadata / CRUD
@@ -313,48 +315,34 @@ class DatasourceService:
         return log_id
 
     def _execute(self, ds_id: str, log_id: str, trigger: str) -> None:
+        with self._state_lock:
+            self._sync_running = True
         try:
-            result = self._sync(ds_id, log_id, trigger)
-        except Exception as exc:
-            logger.warning("datasource sync failed ds=%s code=%s: %s", ds_id, _code(exc), _message(exc))
-            result = _SyncResult(
-                status="failed",
-                counts=SyncCounts(),
-                failures=[
-                    {
-                        "external_id": "",
-                        "title": "",
-                        "error_code": _code(exc),
-                        "message": _message(exc),
-                    }
-                ],
-                enumeration={},
-                error_code=_code(exc),
-                message=_message(exc),
-            )
-        self._finalize(ds_id, log_id, result)
-
-    def _execute_and_return(self, ds_id: str, log_id: str, trigger: str) -> _SyncResult:
-        try:
-            result = self._sync(ds_id, log_id, trigger)
-        except Exception as exc:
-            result = _SyncResult(
-                status="failed",
-                counts=SyncCounts(),
-                failures=[
-                    {
-                        "external_id": "",
-                        "title": "",
-                        "error_code": _code(exc),
-                        "message": _message(exc),
-                    }
-                ],
-                enumeration={},
-                error_code=_code(exc),
-                message=_message(exc),
-            )
-        self._finalize(ds_id, log_id, result)
-        return result
+            try:
+                result = self._sync(ds_id, log_id, trigger)
+            except Exception as exc:
+                logger.warning(
+                    "datasource sync failed ds=%s code=%s: %s", ds_id, _code(exc), _message(exc)
+                )
+                result = _SyncResult(
+                    status="failed",
+                    counts=SyncCounts(),
+                    failures=[
+                        {
+                            "external_id": "",
+                            "title": "",
+                            "error_code": _code(exc),
+                            "message": _message(exc),
+                        }
+                    ],
+                    enumeration={},
+                    error_code=_code(exc),
+                    message=_message(exc),
+                )
+            self._finalize(ds_id, log_id, result)
+        finally:
+            with self._state_lock:
+                self._sync_running = False
 
     def _sync(self, ds_id: str, log_id: str, trigger: str) -> _SyncResult:
         ds = self._require(ds_id)
@@ -648,6 +636,11 @@ class DatasourceService:
     def close(self) -> None:
         if self._owns_executor:
             self._executor.shutdown(wait=False, cancel_futures=True)
+        with self._state_lock:
+            running = self._sync_running
+        if running:
+            logger.warning("datasource service closed during a running sync; stores left to process exit")
+            return
         self.ingestor.close()
         self.store.close()
 

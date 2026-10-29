@@ -334,6 +334,7 @@ class FeishuConnector:
     def _spaces(self, limit: int = 0) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         page_token = ""
+        seen_tokens: set[str] = set()
         while True:
             params: dict[str, Any] = {"page_size": PAGE_SIZE}
             if page_token:
@@ -345,9 +346,11 @@ class FeishuConnector:
                 return items[:limit]
             if not data.get("has_more"):
                 return items
-            page_token = str(data.get("page_token") or "")
-            if not page_token:
+            next_token = str(data.get("page_token") or "")
+            if not next_token or next_token in seen_tokens:
                 return items
+            seen_tokens.add(next_token)
+            page_token = next_token
 
     def _nodes(
         self, space_id: str, parent_token: str
@@ -355,6 +358,7 @@ class FeishuConnector:
         items: list[dict[str, Any]] = []
         page_token = ""
         truncated = False
+        seen_tokens: set[str] = set()
         while True:
             params: dict[str, Any] = {"page_size": PAGE_SIZE}
             if parent_token:
@@ -371,9 +375,14 @@ class FeishuConnector:
                 break
             if not data.get("has_more"):
                 break
-            page_token = str(data.get("page_token") or "")
-            if not page_token:
+            next_token = str(data.get("page_token") or "")
+            if not next_token:
                 break
+            if next_token in seen_tokens:
+                truncated = True
+                break
+            seen_tokens.add(next_token)
+            page_token = next_token
         return items, not truncated, truncated
 
     def _get_node(self, node_token: str) -> dict[str, Any]:
