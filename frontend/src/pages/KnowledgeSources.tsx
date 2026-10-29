@@ -705,7 +705,12 @@ function SourceForm({ types, editing, onCancel, onSaved, onNotice }: SourceFormP
                   type={field.secret ? 'password' : 'text'}
                   autoComplete="off"
                   value={credentials[field.key] ?? ''}
-                  placeholder={field.placeholder || (field.secret ? '已配置，留空保持不变' : '')}
+                  placeholder={
+                    field.placeholder ||
+                    (field.secret && editing?.credentials_configured[field.key]
+                      ? '已配置，留空保持不变'
+                      : '')
+                  }
                   onChange={(event) =>
                     setCredentials((current) => ({ ...current, [field.key]: event.target.value }))
                   }
