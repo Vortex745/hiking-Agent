@@ -40,6 +40,8 @@ class Settings:
     redis_rest_token_source: str = ""
     rag_docs_api_url: str = ""
     rag_sqlite_db_path: str = "./data/rag.sqlite"  # SQLite 是唯一检索存储后端
+    datasource_db_path: str = ""
+    datasource_secret_key: str = ""
     feishu_app_id: str = ""
     feishu_app_secret: str = ""
     feishu_default_space_id: str = ""
@@ -163,6 +165,10 @@ class Settings:
         # 01 票据：graph runtime 开关
         # 04 票据：并行检索子问题上限
         self.rag_sqlite_db_path = os.getenv("RAG_SQLITE_DB_PATH", self._default_runtime_dir("data/rag.sqlite"))
+        self.datasource_db_path = os.getenv("DATASOURCE_DB_PATH", "") or str(
+            Path(self.rag_sqlite_db_path).with_name("datasource.sqlite")
+        )
+        self.datasource_secret_key = os.getenv("DATASOURCE_SECRET_KEY", "")
         self.feishu_app_id = os.getenv("FEISHU_APP_ID", "")
         self.feishu_app_secret = os.getenv("FEISHU_APP_SECRET", "")
         self.feishu_default_space_id = os.getenv("FEISHU_DEFAULT_SPACE_ID", "")

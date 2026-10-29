@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
 
@@ -62,7 +63,30 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("Chat v2 disabled — v1 已移除，chat 链路将不可用")
 
+    # 知识源：本地单进程调度。Vercel 没有可写持久化，管理面也会被本机守卫拒绝。
+    app.state.datasource_service = None
+    if not os.getenv("VERCEL"):
+        try:
+            from datasource.runtime import build_datasource_service
+
+            app.state.datasource_service = build_datasource_service(settings)
+            app.state.datasource_service.start_scheduler()
+            logger.info("✓ Datasource service assembled")
+        except Exception as exc:
+            logger.error(f"✗ Datasource service failed: {exc}", exc_info=True)
+
     yield
+
+    datasource_service = getattr(app.state, "datasource_service", None)
+    if datasource_service is not None:
+        try:
+            await datasource_service.stop_scheduler()
+        except Exception as exc:
+            logger.warning(f"datasource scheduler stop failed: {exc}")
+        try:
+            datasource_service.close()
+        except Exception as exc:
+            logger.warning(f"datasource service close failed: {exc}")
 
     # Ticket 06：释放 v2 runtime（SQLite stores + writer lock）
     from agent_v2.startup import release_v2_runtime
@@ -154,6 +178,14 @@ try:
     logger.info("✓ LLM config router loaded")
 except ImportError as e:
     logger.warning(f"✗ LLM config router unavailable: {e}")
+
+# 知识源管理路由：本机来源守卫；服务缺失时返回 503
+try:
+    from api.datasource_router import datasource_router
+    app.include_router(datasource_router, prefix="/api/v1")
+    logger.info("✓ Datasource router loaded")
+except ImportError as e:
+    logger.warning(f"✗ Datasource router unavailable: {e}")
 
 
 

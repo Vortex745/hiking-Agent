@@ -38,6 +38,7 @@ import {
 import { useExternalStoreRuntime, AssistantRuntimeProvider, type ExternalStoreAdapter, type ThreadMessage } from "@assistant-ui/react"
 import { GeminiThread } from '../components/assistant-ui/gemini/GeminiThread'
 import { GeminiSidebar } from '../components/assistant-ui/gemini/GeminiSidebar'
+import KnowledgeSourcesDialog from './KnowledgeSources'
 import X from 'reicon-react/icons/X'
 import Trash2 from 'reicon-react/icons/Trash2'
 import Clipboard from 'reicon-react/icons/Clipboard'
@@ -449,6 +450,7 @@ function SuperAgent() {
   const [memoryEnabled, setMemoryEnabled] = useState(false)
   const [memoryPending, setMemoryPending] = useState(false)
   const [memoryPanelOpen, setMemoryPanelOpen] = useState(false)
+  const [knowledgeSourcesOpen, setKnowledgeSourcesOpen] = useState(false)
   const [memoryItems, setMemoryItems] = useState<V2Memory[]>([])
   const [memoryTotal, setMemoryTotal] = useState(0)
   const [memoryOffset, setMemoryOffset] = useState(0)
@@ -1842,6 +1844,15 @@ function SuperAgent() {
               >
                 <Database className="h-4 w-4" />
               </button>
+              <button
+                type="button"
+                className="flex h-7 items-center gap-1 border-l border-white/15 pl-3 text-white/70 hover:text-white"
+                title="管理知识源"
+                onClick={() => setKnowledgeSourcesOpen(true)}
+              >
+                <Database className="h-4 w-4" />
+                知识源
+              </button>
             </div>
           {pendingMemoryConsent && (
             <div className="absolute left-4 right-4 top-16 z-50 ml-auto max-w-sm rounded-md border border-amber-400/30 bg-zinc-950 p-4 text-sm text-white shadow-xl">
@@ -1896,6 +1907,9 @@ function SuperAgent() {
             onRegenerate={handleRegenerate}
             realMessageCount={messages.length}
           />
+          {knowledgeSourcesOpen && (
+            <KnowledgeSourcesDialog onClose={() => setKnowledgeSourcesOpen(false)} />
+          )}
         </div>
       </div>
     </SessionRuntimeProvider>

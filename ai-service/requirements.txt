@@ -30,6 +30,8 @@ tavily-python>=0.7.0
 ormsgpack>=1.7.0
 pymupdf4llm>=0.0.17
 sqlite-vec>=0.1.6
+# Datasource credentials: AES-GCM at rest (ticket 01).
+cryptography>=42,<51
 # harness-p0-p1 Ticket 07: jieba is imported at module level by
 # rag/hybrid_retrieval.py, rag/sqlite_store.py and eval_fts5_chinese.py.
 # Declare it so a clean checkout can collect the backend regression.

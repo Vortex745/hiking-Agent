@@ -5,14 +5,13 @@
 """
 
 import logging
-import os
 import time
-from urllib.parse import urlsplit
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 import config
+from api.local_guard import require_local_request
 from api.models import (
     LlmConfigEmbeddingSectionResponse,
     LlmConfigResponse,
@@ -26,39 +25,6 @@ from config import settings
 from rag.sqlite_schema import read_vec0_dimensions
 
 logger = logging.getLogger("ai-service.llm_config")
-
-_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
-_ALLOWED_ORIGIN_SCHEMES = frozenset({"http", "https"})
-_CLIENT_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})
-
-
-def _is_allowed_origin(origin: str) -> bool:
-    """Origin 必须可解析为本机 http(s) 来源；端口不限（兼容任意 dev server 端口）。"""
-    try:
-        parsed = urlsplit(origin)
-        # 访问 port 会校验端口语法；非法端口同样视为畸形 Origin。
-        _ = parsed.port
-    except ValueError:
-        return False
-    return (
-        parsed.scheme in _ALLOWED_ORIGIN_SCHEMES
-        and parsed.hostname in _LOOPBACK_HOSTS
-    )
-
-
-def require_local_request(request: Request) -> None:
-    """拒绝非本机来源、非本机 Origin 与 Vercel 环境。"""
-    if os.getenv("VERCEL"):
-        raise HTTPException(status_code=403, detail="llm-config 在 Vercel 环境不可用")
-
-    client = request.client
-    if client is None or client.host not in _CLIENT_LOOPBACK_HOSTS:
-        raise HTTPException(status_code=403, detail="llm-config 仅允许本机访问")
-
-    origin = request.headers.get("origin")
-    if origin is not None and not _is_allowed_origin(origin):
-        raise HTTPException(status_code=403, detail="Origin 必须为本机 http(s) 来源")
-
 
 llm_config_router = APIRouter(
     prefix="/llm-config", dependencies=[Depends(require_local_request)]
