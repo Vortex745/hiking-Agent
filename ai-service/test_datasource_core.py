@@ -130,6 +130,27 @@ def test_store_due_running_and_recovery(tmp_path):
     store.close()
 
 
+def test_embedding_provider_is_bounded(monkeypatch):
+    import config
+    from datasource import ingest
+
+    captured: dict = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def embed_documents(self, texts):
+            return [[0.0, 0.1] for _ in texts]
+
+    monkeypatch.setattr("langchain_openai.OpenAIEmbeddings", FakeOpenAI)
+    monkeypatch.setattr(config.settings, "embedding_api_key", "test-key")
+    provider = ingest.build_embedding_provider_from_settings()
+    assert captured["timeout"] == 60.0
+    assert captured["max_retries"] == 2
+    assert provider.embed_texts(["a"]) == [[0.0, 0.1]]
+
+
 def test_claim_sync_is_atomic(tmp_path):
     import threading
     from concurrent.futures import ThreadPoolExecutor

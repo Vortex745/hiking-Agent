@@ -55,6 +55,8 @@ def build_embedding_provider_from_settings() -> EmbeddingProvider:
             api_key=settings.embedding_api_key,
             model=settings.embedding_model,
             check_embedding_ctx_length=False,
+            timeout=60.0,
+            max_retries=2,
         )
     )
 

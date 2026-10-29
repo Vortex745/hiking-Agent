@@ -163,8 +163,7 @@ def _connector(handler, *, sleeps=None):
 def test_search_tree_and_enumerate():
     connector = _connector(_handler())
     nodes = connector.list_resources(None)
-    assert [node.id for node in nodes] == ["p1", "p2", "db1"]
-    assert next(node for node in nodes if node.id == "p2").parent_id == "p1"
+    assert [node.id for node in nodes] == ["p1", "db1"]
     assert next(node for node in nodes if node.id == "db1").kind == "database"
     assert [node.id for node in connector.enumerate("p1").nodes] == ["p1", "p2"]
     assert [node.id for node in connector.enumerate("db1").nodes] == ["db1"]
@@ -175,7 +174,9 @@ def test_search_tree_and_enumerate():
 
 def test_fetch_page_and_database_skip():
     connector = _connector(_handler())
-    nodes = {node.id: node for node in connector.list_resources(None)}
+    roots = connector.list_resources(None)
+    nodes = {node.id: node for node in roots}
+    nodes.update({node.id: node for node in connector.list_resources("p1")})
     outcome = connector.fetch(nodes["p1"])
     assert outcome.item is not None
     assert "## 路线" in outcome.item.content

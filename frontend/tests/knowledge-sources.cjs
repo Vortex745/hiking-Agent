@@ -158,7 +158,7 @@ const json = (route, body, status = 200) =>
           },
         ])
       }
-      if (pathname.includes('/ancestors')) return json(route, [])
+      if (pathname.includes('/ancestors')) return json(route, [...roots, ...children])
       if (pathname.includes('/resources')) return json(route, roots)
       if (method === 'PATCH') {
         const body = request.postDataJSON()
@@ -195,6 +195,17 @@ const json = (route, body, status = 200) =>
     await page.getByText(/新增 1/).first().waitFor()
 
     await page.getByRole('button', { name: '返回列表' }).click()
+    await page.getByRole('button', { name: '编辑' }).click()
+    await page.getByText('编辑「测试语雀」').waitFor()
+    await page.getByText('路线文档', { exact: true }).waitFor()
+    const editScreenshotPath =
+      process.env.EDIT_SCREENSHOT_PATH ||
+      path.resolve(__dirname, '../../.screenshots/knowledge-sources-edit.png')
+    fs.mkdirSync(path.dirname(editScreenshotPath), { recursive: true })
+    await page.screenshot({ path: editScreenshotPath })
+    console.log(`EDIT_SCREENSHOT: ${editScreenshotPath}`)
+    await page.getByRole('button', { name: '取消' }).click()
+    await page.getByText('测试语雀', { exact: true }).waitFor()
     await page.getByRole('button', { name: '删除知识源 测试语雀' }).click()
     await page.getByText('删除「测试语雀」？').waitFor()
     await page.getByRole('button', { name: '取消' }).click()
@@ -205,7 +216,7 @@ const json = (route, body, status = 200) =>
     fs.mkdirSync(path.dirname(screenshotPath), { recursive: true })
     await page.screenshot({ path: screenshotPath })
     assert.deepEqual(errors, [], 'uncaught browser errors')
-    console.log('PASS: knowledge source create, credential test, tree pick, sync polling, logs and delete confirmation.')
+    console.log('PASS: knowledge source create, credential test, tree search, sync polling, logs, edit ancestor echo and delete confirmation.')
     console.log(`SCREENSHOT: ${screenshotPath}`)
   } finally {
     await browser.close()

@@ -162,8 +162,9 @@ class NotionConnector:
         ids = {node.id for node in nodes}
         if parent_id is None:
             return [
-                replace(node, parent_id=node.parent_id if node.parent_id in ids else None)
+                replace(node, parent_id=None)
                 for node in nodes
+                if not node.parent_id or node.parent_id not in ids
             ]
         return [
             replace(node, parent_id=parent_id)

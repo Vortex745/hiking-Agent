@@ -465,6 +465,23 @@ function SourceForm({ types, editing, onCancel, onSaved, onNotice }: SourceFormP
       .then((ancestors) => {
         if (cancelled) return
         setSelectedTitles(Object.fromEntries(ancestors.map((node) => [node.id, node.title])))
+        if (ancestors.length === 0) return
+        setNodes((current) => {
+          const next = { ...current }
+          for (const node of ancestors) {
+            const parentKey = node.parent_id ?? '__root__'
+            const siblings = next[parentKey] ?? []
+            if (!siblings.some((item) => item.id === node.id)) {
+              next[parentKey] = [...siblings, node]
+            }
+          }
+          return next
+        })
+        setExpanded((current) => {
+          const next = { ...current }
+          for (const node of ancestors) next[node.id] = true
+          return next
+        })
       })
       .catch(() => undefined)
     return () => {
