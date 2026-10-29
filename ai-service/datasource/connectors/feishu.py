@@ -206,6 +206,7 @@ class FeishuConnector:
             wall_clock_fn=wall_clock_fn,
             rate_per_minute=rate,
         )
+        self._space_titles: dict[str, str] = {}
 
     def validate(self) -> None:
         self._spaces(limit=1)
@@ -240,7 +241,13 @@ class FeishuConnector:
 
         for resource_id in ids:
             if ":" not in resource_id:
-                add(ResourceNode(id=resource_id, title=resource_id, kind="space"))
+                add(
+                    ResourceNode(
+                        id=resource_id,
+                        title=self._space_title(resource_id),
+                        kind="space",
+                    )
+                )
                 continue
             space_id, node_token = resource_id.split(":", 1)
             chain: list[ResourceNode] = []
@@ -254,10 +261,28 @@ class FeishuConnector:
                     current = str(node.get("parent_node_token") or "")
             except NotFoundError:
                 continue
-            add(ResourceNode(id=space_id, title=space_id, kind="space"))
+            add(
+                ResourceNode(
+                    id=space_id, title=self._space_title(space_id), kind="space"
+                )
+            )
             for node in reversed(chain):
                 add(node)
         return result
+
+    def _space_title(self, space_id: str) -> str:
+        if space_id in self._space_titles:
+            return self._space_titles[space_id]
+        title = space_id
+        try:
+            for space in self._spaces():
+                if str(space.get("space_id")) == space_id:
+                    title = str(space.get("name") or space_id)
+                    break
+        except Exception:
+            pass
+        self._space_titles[space_id] = title
+        return title
 
     def enumerate(self, root: str) -> EnumerationResult:
         nodes: list[ResourceNode] = []

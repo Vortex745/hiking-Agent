@@ -299,11 +299,12 @@ class DatasourceService:
 
     def start_sync(self, ds_id: str, trigger: str = "manual") -> str:
         ds = self._require(ds_id)
+        next_at = _next_run_for(ds)
         log_id = self.store.claim_sync(ds_id, trigger)
         if log_id is None:
             raise ConflictError("该知识源正在同步，请等待本轮结束")
-        if ds["schedule"]:
-            self.store.set_next_run(ds_id, iso(next_run_at(ds["schedule"], now())))
+        if next_at:
+            self.store.set_next_run(ds_id, next_at)
         try:
             self._executor.submit(self._execute, ds_id, log_id, trigger)
         except Exception:
@@ -323,11 +324,12 @@ class DatasourceService:
     def run_sync_now(self, ds_id: str, trigger: str = "manual") -> str:
         """Synchronous sync used by tests and explicit maintenance calls."""
         ds = self._require(ds_id)
+        next_at = _next_run_for(ds)
         log_id = self.store.claim_sync(ds_id, trigger)
         if log_id is None:
             raise ConflictError("该知识源正在同步，请等待本轮结束")
-        if ds["schedule"]:
-            self.store.set_next_run(ds_id, iso(next_run_at(ds["schedule"], now())))
+        if next_at:
+            self.store.set_next_run(ds_id, next_at)
         self._execute(ds_id, log_id, trigger)
         return log_id
 
@@ -700,6 +702,10 @@ def _next_at_or_raise(schedule: str) -> str | None:
         return iso(next_run_at(schedule, now()))
     except ValueError as exc:
         raise ValidationError(str(exc)) from exc
+
+
+def _next_run_for(ds: Mapping[str, Any]) -> str | None:
+    return _next_at_or_raise(str(ds.get("schedule") or ""))
 
 
 def _code(exc: BaseException) -> str:

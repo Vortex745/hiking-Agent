@@ -121,6 +121,15 @@ def test_ancestors_walk_parent_tokens():
     connector = _connector(_base_handler())
     ancestors = connector.resolve_ancestors(["s1:n2"])
     assert [node.id for node in ancestors] == ["s1", "s1:n1", "s1:n2"]
+    assert ancestors[0].title == "Space 1"
+    connector.close()
+
+
+def test_space_ancestor_uses_space_name():
+    connector = _connector(_base_handler())
+    ancestors = connector.resolve_ancestors(["s1"])
+    assert [node.id for node in ancestors] == ["s1"]
+    assert ancestors[0].title == "Space 1"
     connector.close()
 
 

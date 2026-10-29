@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from datasource.connectors.fake import FakeDoc, FakeState, register_fake
+from datasource.errors import ValidationError
 from datasource.ingest import RagIngestor
 from datasource.registry import ConnectorRegistry
 from datasource.secrets import SecretBox
@@ -249,6 +250,17 @@ def test_scheduler_loop_starts_due_source_and_stops(tmp_path):
     assert len(logs) == 1
     assert logs[0]["status"] == "success"
     assert logs[0]["created"] == 1
+    service.close()
+
+
+def test_corrupt_schedule_does_not_claim_sync(tmp_path):
+    service, store, _ = _build(tmp_path, _docs(("doc-1", "A", "a")))
+    ds = _create(service)
+    store.update_datasource(ds["id"], schedule="bad cron")
+    with pytest.raises(ValidationError):
+        service.start_sync(ds["id"], "manual")
+    assert store.get_datasource(ds["id"])["sync_status"] == "idle"
+    assert store.list_sync_logs(ds["id"]) == []
     service.close()
 
 
