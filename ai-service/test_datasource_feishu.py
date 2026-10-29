@@ -203,6 +203,42 @@ def test_transport_error_retries_and_succeeds():
     connector.close()
 
 
+def test_transport_retries_three_times_with_2_4_8():
+    sleeps: list[float] = []
+    state = {"spaces": 0}
+
+    def handler(request):
+        if request.url.path == "/open-apis/wiki/v2/spaces":
+            state["spaces"] += 1
+            if state["spaces"] <= 3:
+                raise httpx.ConnectError("boom", request=request)
+        return _base_handler()(request)
+
+    connector = _connector(handler, sleeps=sleeps)
+    assert connector.list_resources(None)[0].id == "s1"
+    for expected in (2.0, 4.0, 8.0):
+        assert any(abs(value - expected) < 0.01 for value in sleeps)
+    connector.close()
+
+
+def test_5xx_retries_only_once():
+    sleeps: list[float] = []
+    state = {"spaces": 0}
+
+    def handler(request):
+        if request.url.path == "/open-apis/wiki/v2/spaces":
+            state["spaces"] += 1
+            if state["spaces"] <= 2:
+                return _response({"code": 500}, 500)
+        return _base_handler()(request)
+
+    connector = _connector(handler, sleeps=sleeps)
+    with pytest.raises(VendorError):
+        connector.list_resources(None)
+    assert sum(1 for value in sleeps if abs(value - 2.0) < 0.01) == 1
+    connector.close()
+
+
 def test_5xx_retries_once():
     sleeps: list[float] = []
     state = {"calls": 0}

@@ -56,6 +56,7 @@ const roots = [
 ]
 const children = [
   { id: 'doc-1', title: '路线文档', kind: 'document', parent_id: 'root', has_children: false, rev: '1', url: '' },
+  { id: 'doc-2', title: '装备清单', kind: 'document', parent_id: 'root', has_children: false, rev: '1', url: '' },
 ]
 const baseSource = {
   id: 'ds-1',
@@ -158,8 +159,11 @@ const json = (route, body, status = 200) =>
           },
         ])
       }
-      if (pathname.includes('/ancestors')) return json(route, [...roots, ...children])
-      if (pathname.includes('/resources')) return json(route, roots)
+      if (pathname.includes('/ancestors')) return json(route, [...roots, children[0]])
+      if (pathname.includes('/resources')) {
+        const parent = url.searchParams.get('parent_id')
+        return json(route, parent ? children : roots)
+      }
       if (method === 'PATCH') {
         const body = request.postDataJSON()
         source = { ...source, ...body }
@@ -198,6 +202,9 @@ const json = (route, body, status = 200) =>
     await page.getByRole('button', { name: '编辑' }).click()
     await page.getByText('编辑「测试语雀」').waitFor()
     await page.getByText('路线文档', { exact: true }).waitFor()
+    await page.getByRole('button', { name: '收起 测试空间' }).click()
+    await page.getByRole('button', { name: '展开 测试空间' }).click()
+    await page.getByText('装备清单', { exact: true }).waitFor()
     const editScreenshotPath =
       process.env.EDIT_SCREENSHOT_PATH ||
       path.resolve(__dirname, '../../.screenshots/knowledge-sources-edit.png')
@@ -216,7 +223,7 @@ const json = (route, body, status = 200) =>
     fs.mkdirSync(path.dirname(screenshotPath), { recursive: true })
     await page.screenshot({ path: screenshotPath })
     assert.deepEqual(errors, [], 'uncaught browser errors')
-    console.log('PASS: knowledge source create, credential test, tree search, sync polling, logs, edit ancestor echo and delete confirmation.')
+    console.log('PASS: knowledge source create, credential test, tree search, sync polling, logs, edit ancestor echo + lazy sibling refetch and delete confirmation.')
     console.log(`SCREENSHOT: ${screenshotPath}`)
   } finally {
     await browser.close()

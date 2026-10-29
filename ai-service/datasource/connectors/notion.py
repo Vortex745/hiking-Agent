@@ -173,7 +173,26 @@ class NotionConnector:
         ]
 
     def resolve_ancestors(self, ids: Sequence[str]) -> list[ResourceNode]:
-        return []
+        if not ids:
+            return []
+        nodes = self._nodes()
+        by_id = {node.id: node for node in nodes}
+        result: list[ResourceNode] = []
+        seen: set[str] = set()
+        for object_id in ids:
+            chain: list[ResourceNode] = []
+            visited: set[str] = set()
+            current = by_id.get(object_id)
+            while current is not None and current.id not in visited and len(chain) < 50:
+                visited.add(current.id)
+                chain.append(current)
+                current = by_id.get(current.parent_id) if current.parent_id else None
+            for index, node in enumerate(reversed(chain)):
+                if node.id in seen:
+                    continue
+                seen.add(node.id)
+                result.append(replace(node, parent_id=None) if index == 0 else node)
+        return result
 
     def enumerate(self, root: str) -> EnumerationResult:
         nodes = self._nodes()

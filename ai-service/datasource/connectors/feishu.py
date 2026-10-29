@@ -94,9 +94,16 @@ class FeishuClient:
         params: dict[str, Any] | None = None,
         json: Any = None,
     ) -> dict[str, Any]:
-        attempts = 3
+        attempts = 4
+        server_retries = 0
         for attempt in range(attempts):
-            token = self._token()
+            try:
+                token = self._token()
+            except NetworkError:
+                if attempt + 1 < attempts:
+                    self._sleep(float(2 ** (attempt + 1)))
+                    continue
+                raise
             self._limiter.acquire()
             try:
                 response = self._http.request(
@@ -123,9 +130,11 @@ class FeishuClient:
                     self._sleep(wait)
                     continue
                 raise RateLimited("飞书限流")
-            if response.status_code >= 500 and attempt + 1 < attempts:
-                self._sleep(2.0)
-                continue
+            if response.status_code >= 500:
+                if server_retries < 1 and attempt + 1 < attempts:
+                    server_retries += 1
+                    self._sleep(2.0)
+                    continue
             payload = json_response(response)
             code = payload.get("code", 0) if isinstance(payload, dict) else 0
             if code == 99991400:

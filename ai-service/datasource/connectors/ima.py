@@ -184,12 +184,14 @@ class ImaConnector:
         for parent_folder_id, item in collected:
             title = _item_title(item)
             media_id = str(item.get("media_id") or "")
-            rev = str(
+            update_time = (
                 item.get("update_time")
                 or item.get("updated_at")
                 or item.get("modify_time")
-                or media_id
             )
+            rev = media_id
+            if str(item.get("media_type")) == str(NOTE_MEDIA_TYPE) and update_time:
+                rev = f"{media_id}:{update_time}"
             external_id = logical_key(kb_id, parent_folder_id, title)
             by_key[external_id] = ResourceNode(
                 id=external_id,

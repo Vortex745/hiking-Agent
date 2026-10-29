@@ -169,6 +169,10 @@ def test_search_tree_and_enumerate():
     assert [node.id for node in connector.enumerate("db1").nodes] == ["db1"]
     assert [node.id for node in connector.list_resources("p1")] == ["p2"]
     assert connector.list_resources("p2") == []
+    ancestors = connector.resolve_ancestors(["p2"])
+    assert [node.id for node in ancestors] == ["p1", "p2"]
+    assert ancestors[0].parent_id is None
+    assert ancestors[1].parent_id == "p1"
     connector.close()
 
 

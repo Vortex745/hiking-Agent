@@ -435,6 +435,7 @@ function SourceForm({ types, editing, onCancel, onSaved, onNotice }: SourceFormP
   const [schedule, setSchedule] = useState(editing?.schedule ?? '')
   const [syncDeletions, setSyncDeletions] = useState(editing?.sync_deletions ?? true)
   const [nodes, setNodes] = useState<Record<string, ResourceNode[]>>({})
+  const [fullyLoaded, setFullyLoaded] = useState<Record<string, boolean>>({})
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
   const [resourceQuery, setResourceQuery] = useState('')
   const [treeLoading, setTreeLoading] = useState(false)
@@ -445,6 +446,7 @@ function SourceForm({ types, editing, onCancel, onSaved, onNotice }: SourceFormP
   useEffect(() => {
     setCredentials({})
     setNodes({})
+    setFullyLoaded({})
     setExpanded({})
     setSelectedTitles({})
     if (!editing) setSelected([])
@@ -522,6 +524,7 @@ function SourceForm({ types, editing, onCancel, onSaved, onNotice }: SourceFormP
           ? await fetchSavedResources(editing.id, null)
           : await previewResources(type, credentialsForSubmit, settings, null)
       setNodes((current) => ({ ...current, __root__: roots }))
+      setFullyLoaded((current) => ({ ...current, __root__: true }))
       setSelectedTitles((current) => {
         const next = { ...current }
         for (const node of roots) next[node.id] = node.title
@@ -540,14 +543,22 @@ function SourceForm({ types, editing, onCancel, onSaved, onNotice }: SourceFormP
       return
     }
     setExpanded((current) => ({ ...current, [node.id]: true }))
-    if (nodes[node.id]) return
+    if (nodes[node.id] && fullyLoaded[node.id]) return
     setTreeLoading(true)
     try {
       const children =
         editing && !changeCredentials
           ? await fetchSavedResources(editing.id, node.id)
           : await previewResources(type, credentialsForSubmit, settings, node.id)
-      setNodes((current) => ({ ...current, [node.id]: children }))
+      setNodes((current) => {
+        const existing = current[node.id] ?? []
+        const ids = new Set(existing.map((item) => item.id))
+        return {
+          ...current,
+          [node.id]: [...existing, ...children.filter((item) => !ids.has(item.id))],
+        }
+      })
+      setFullyLoaded((current) => ({ ...current, [node.id]: true }))
       setSelectedTitles((current) => {
         const next = { ...current }
         for (const child of children) next[child.id] = child.title
