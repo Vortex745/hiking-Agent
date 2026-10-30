@@ -28,8 +28,12 @@ def build_datasource_service(settings) -> DatasourceService:
     def ingestor_factory(owner_id: str) -> RagIngestor:
         from auth.paths import user_rag_path
         from auth.user_config import effective_settings
+        from datasource.errors import IngestFailed
 
         effective = effective_settings(settings, owner_id)
+        if not str(getattr(effective, "embedding_api_key", "") or "").strip():
+            # 先报错再建库：否则会用默认维度创建 vec0，之后正确维度反而被 409 拦住。
+            raise IngestFailed("未配置 embedding 服务，请先在模型配置中填写 Embedding")
         db_path = user_rag_path(settings, owner_id)
         db_path.parent.mkdir(parents=True, exist_ok=True)
         return RagIngestor.from_settings(

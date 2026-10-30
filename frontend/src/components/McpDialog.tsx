@@ -6,7 +6,7 @@ import { Input } from './arc/input/input'
 import { RadioGroup } from './arc/radio-group/radio-group'
 import { Switch } from './arc/switch/switch'
 import { Textarea } from './arc/textarea/textarea'
-import { deleteMcpServer, getMcpOAuthStatus, listMcpServers, saveMcpServer, testMcpServer, type McpDraft, type McpServer } from '../api/mcp'
+import { clearBuiltinMcpCredentials, deleteMcpServer, getMcpOAuthStatus, listMcpServers, saveBuiltinMcpCredentials, saveMcpServer, testMcpServer, type McpDraft, type McpServer } from '../api/mcp'
 import { importMcpChoice, readMcpImport, type McpImportChoice } from './mcpImport'
 import './McpDialog.css'
 
@@ -22,8 +22,11 @@ type Form = {
 
 const emptyForm = (): Form => ({ name: '', transport: 'http', url: '', command: '', args: '[]', credentials: '', confirmed: false })
 const statusLabel: Record<McpServer['status'], string> = {
-  configured: '已配置', untested: '未测试', success: '测试成功', failed: '测试失败',
+  configured: '已配置', unconfigured: '未配置', untested: '未测试', success: '测试成功', failed: '测试失败',
 }
+
+const CREDENTIAL_LABELS: Record<string, string> = { AMAP_API_KEY: '高德 API Key' }
+const credentialLabel = (name: string) => CREDENTIAL_LABELS[name] ?? name
 
 function asDraft(form: Form, server: McpServer | null, testId?: string): McpDraft {
   const args: unknown = JSON.parse(form.args || '[]')
@@ -63,6 +66,8 @@ export function McpDialog({ onClose }: { onClose: () => void }) {
   const [testFailed, setTestFailed] = useState(false)
   const [authFlow, setAuthFlow] = useState<{ flow_id: string; auth_url: string } | null>(null)
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
+  const [builtinEditing, setBuiltinEditing] = useState<McpServer | null>(null)
+  const [builtinValues, setBuiltinValues] = useState<Record<string, string>>({})
 
   const refresh = useCallback(async () => {
     setLoading(true)
@@ -221,9 +226,89 @@ export function McpDialog({ onClose }: { onClose: () => void }) {
     finally { setBusy(false) }
   }
 
+  function openBuiltin(server: McpServer) {
+    setBuiltinEditing(server)
+    setBuiltinValues({})
+    setEditing(undefined)
+    setNotice('')
+    setError('')
+  }
+
+  async function saveBuiltin() {
+    if (!builtinEditing) return
+    const env: Record<string, string> = {}
+    for (const name of builtinEditing.env_names || []) {
+      env[name] = (builtinValues[name] || '').trim()
+    }
+    setBusy(true)
+    setError('')
+    setNotice('')
+    try {
+      const next = await saveBuiltinMcpCredentials(env)
+      setServers(next.servers)
+      setBuiltinEditing(null)
+      setNotice('已保存内置服务 Key。')
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '保存失败')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function clearBuiltin() {
+    if (!builtinEditing) return
+    setBusy(true)
+    setError('')
+    setNotice('')
+    try {
+      const next = await clearBuiltinMcpCredentials()
+      setServers(next.servers)
+      setBuiltinEditing(null)
+      setNotice('已清除内置服务 Key。')
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '清除失败')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const dialogTitle = builtinEditing
+    ? `配置 ${builtinEditing.name}`
+    : editing === undefined
+      ? 'MCP 接入'
+      : importing
+        ? '粘贴 MCP 配置'
+        : editing
+          ? '编辑 MCP 服务'
+          : '添加 MCP 服务'
+
   return (
-    <ArcDialog onClose={onClose} size="md" title={editing === undefined ? 'MCP 接入' : importing ? '粘贴 MCP 配置' : editing ? '编辑 MCP 服务' : '添加 MCP 服务'}>
-        {editing === undefined ? (
+    <ArcDialog onClose={onClose} size="md" title={dialogTitle}>
+        {builtinEditing ? (
+          <div className="mcp-panel">
+            <button className="mcp-back" onClick={() => { setBuiltinEditing(null); setError('') }}><ArrowLeft size={16} /> 返回服务列表</button>
+            {(builtinEditing.env_names || []).map(name => (
+              <Input key={name} label={credentialLabel(name)} type="password"
+                value={builtinValues[name] ?? ''}
+                onChange={event => setBuiltinValues(prev => ({ ...prev, [name]: event.target.value }))}
+                placeholder={builtinEditing.status === 'configured' ? '已设置，输入新值可替换' : '请填写服务 Key'}
+                autoComplete="off" />
+            ))}
+            <p className="mcp-note">
+              内置服务：{builtinEditing.transport.toUpperCase()} · {builtinEditing.command} {(builtinEditing.args || []).join(' ')}
+            </p>
+            <p className="mcp-note">工具：{builtinEditing.tools.join('、') || '—'}</p>
+            <p className="mcp-note">高德天气与高德地图共用同一个 Key；密钥只保存在当前账号的本机配置中。</p>
+            {error && <p role="alert" className="mcp-error">{error}</p>}
+            <div className="mcp-form-actions">
+              {builtinEditing.status === 'configured' && (
+                <Button variant="secondary" loading={busy} onClick={() => { void clearBuiltin() }}>清除 Key</Button>
+              )}
+              <Button loading={busy} disabled={busy || !(builtinEditing.env_names || []).every(name => (builtinValues[name] || '').trim())}
+                onClick={() => { void saveBuiltin() }}>保存</Button>
+            </div>
+          </div>
+        ) : editing === undefined ? (
           <div className="mcp-panel">
             <div className="mcp-toolbar">
               <span>{available ? `${servers.length} 个服务` : ''}</span>
@@ -241,7 +326,12 @@ export function McpDialog({ onClose }: { onClose: () => void }) {
                       <div className="mcp-row-name">{server.name}</div>
                       <div className="mcp-row-meta">{server.transport.toUpperCase()} · {statusLabel[server.status]} · {server.tools.length} 个工具</div>
                     </div>
-                    {server.builtin ? <span className="mcp-builtin">内置</span> : (
+                    {server.builtin ? (
+                      <div className="mcp-actions">
+                        <span className="mcp-builtin">内置</span>
+                        <button aria-label={`配置 ${server.name} 的 Key`} title="配置 Key" className="mcp-icon" onClick={() => openBuiltin(server)}><Pencil size={16} /></button>
+                      </div>
+                    ) : (
                       <div className="mcp-actions">
                         <Switch aria-label={`启用 ${server.name}`} checked={Boolean(server.enabled)} disabled={busy} onCheckedChange={value => { void toggle(server, value) }} />
                         <button aria-label={`编辑 ${server.name}`} title="编辑" className="mcp-icon" onClick={() => edit(server)}><Pencil size={16} /></button>

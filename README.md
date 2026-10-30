@@ -162,10 +162,10 @@ http://localhost:5173
 
 - 登录 ID 为 2–6 位字母、数字或下划线，区分大小写且唯一；密码 8–15 个字符。
 - JWT 保存在 HttpOnly Cookie 中（同时接受 `Authorization: Bearer`），`AUTH_JWT_SECRET` 未配置时自动生成 `data/auth.key`。
-- 会话记录、长期记忆、知识库、自定义 MCP 和模型配置都按登录账号隔离；高德天气/地图等内置 MCP 共享。
+- 会话记录、长期记忆、知识库、自定义 MCP 和模型配置都按登录账号隔离；高德天气/地图的内置定义共享，但 API Key 由各账号在 MCP 接入中自行填写（保存在 `agent_state/users/<user_id>/mcp_builtin.json`，接口只返回是否已配置）。
 - 规则前置：本机管理接口仍只接受本机来源，因此远程访问的账号只能聊天，不能管理知识源/MCP/模型。
 - 首个注册账号会认领旧版单用户数据：旧 `rag.sqlite` 与 `mcp_servers.json` 只复制到该账号目录，不移动原文件；`datasource` 行直接归属该账号（不复制行，旧代码回滚后仍可见）。
-- 模型配置的整体默认值仍在 `ai-service/.env`；账号只保存与系统默认不同的字段到 `data/users/<user_id>/llm_config.json`，API Key 加密落盘，可在配置页“恢复系统默认”。
+- 登录账号的模型配置完全自持：未配置即为空，不再继承 `ai-service/.env`；账号配置保存到 `data/users/<user_id>/llm_config.json`，API Key 加密落盘，接口只返回“已设置”而不回传任何密钥片段。`.env` 只服务无账号的旧单机模式与服务器自身配置。
 
 ### 常用健康检查
 

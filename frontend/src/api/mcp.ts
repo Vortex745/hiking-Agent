@@ -8,7 +8,7 @@ export interface McpServer {
   name: string
   builtin: boolean
   transport: 'http' | 'stdio'
-  status: 'configured' | 'untested' | 'success' | 'failed'
+  status: 'configured' | 'unconfigured' | 'untested' | 'success' | 'failed'
   tools: string[]
   url?: string
   command?: string
@@ -69,6 +69,10 @@ export interface McpOAuthStatus {
 export const listMcpServers = () => request<{ servers: McpServer[] }>(base)
 export const testMcpServer = (draft: McpDraft) =>
   request<McpTestResult>(`${base}/test`, 'POST', draft)
+export const saveBuiltinMcpCredentials = (env: Record<string, string>) =>
+  request<{ servers: McpServer[] }>(`${root}/builtin/credentials`, 'PUT', { env })
+export const clearBuiltinMcpCredentials = () =>
+  request<{ servers: McpServer[] }>(`${root}/builtin/credentials`, 'DELETE')
 export const getMcpOAuthStatus = (flowId: string) =>
   request<McpOAuthStatus>(`${root}/oauth/status/${encodeURIComponent(flowId)}`)
 export const saveMcpServer = (draft: McpDraft, id?: string) =>

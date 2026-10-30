@@ -87,9 +87,10 @@ def _get_retrieval_stack() -> tuple[VectorStoreRetriever, Any]:
 
     owner_id = current_owner_id.get()
     if owner_id:
-        return _get_owner_retrieval_stack(
-            owner_id, current_user_settings.get() or settings
-        )
+        effective = current_user_settings.get()
+        if effective is None:
+            raise RuntimeError("账号检索作用域缺少配置")
+        return _get_owner_retrieval_stack(owner_id, effective)
 
     global _retriever, _subgraph, _retrieval_stack_fingerprint
     with _retrieval_stack_lock:
@@ -201,14 +202,25 @@ async def hiking_knowledge_search(query: str, k: int = 4) -> dict[str, Any]:
             "message": "资料不足：检索问题为空。",
         }
 
-    from agent_v2.user_scope import current_owner_id
+    from agent_v2.user_scope import current_owner_id, current_user_settings
 
-    if current_owner_id.get() == "":
+    owner_id = current_owner_id.get()
+    if owner_id == "":
         return {
             "query": normalized_query,
             "chunks": [],
             "message": "资料不足：知识库未绑定当前登录账号。",
         }
+    if owner_id:
+        effective = current_user_settings.get()
+        if effective is None or not str(
+            getattr(effective, "embedding_api_key", "") or ""
+        ).strip():
+            return {
+                "query": normalized_query,
+                "chunks": [],
+                "message": "资料不足：本账号尚未配置 Embedding 模型，无法检索知识库。",
+            }
 
     try:
         retriever, subgraph = _get_retrieval_stack()

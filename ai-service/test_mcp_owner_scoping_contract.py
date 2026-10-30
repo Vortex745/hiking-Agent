@@ -155,6 +155,101 @@ def test_http_server_list_is_scoped_by_logged_in_account(tmp_path, monkeypatch) 
     assert {"高德天气", "高德地图"} <= names_b
 
 
+def test_builtin_credentials_are_account_scoped_and_never_echoed(
+    tmp_path, monkeypatch
+) -> None:
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from agent_v2.kernel_tools import build_profile_mcp_servers
+    from agent_v2.mcp_builtin_store import load_env
+    from api.mcp_router import mcp_router
+
+    monkeypatch.setattr(mcp_config_store.settings, "agent_v2_state_dir", str(tmp_path / "state"))
+    monkeypatch.setattr(mcp_config_store.settings, "agent_v2_sandbox_type", "local_native")
+    monkeypatch.delenv("AMAP_API_KEY", raising=False)
+    mcp_config_store.save_servers([_server("custom_a", "A 自定义")], OWNER_A)
+
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def inject_user(request, call_next):
+        request.state.user_id = request.headers.get("x-test-user", "")
+        return await call_next(request)
+
+    app.include_router(mcp_router, prefix="/api/v2")
+    client = TestClient(app, client=("127.0.0.1", 50000))
+
+    def builtins(owner: str) -> dict[str, dict]:
+        response = client.get("/api/v2/mcp/servers", headers={"x-test-user": owner})
+        assert response.status_code == 200, response.text
+        return {
+            server["id"]: server
+            for server in response.json()["servers"]
+            if server["builtin"]
+        }
+
+    before = builtins(OWNER_A)
+    assert set(before) == {"amap_weather", "amap_map"}
+    assert {server["status"] for server in before.values()} == {"unconfigured"}
+    assert before["amap_weather"]["command"] == "npx"
+    assert "@amap/amap-weather-mcp" in before["amap_weather"]["args"]
+    assert before["amap_weather"]["env_names"] == ["AMAP_API_KEY"]
+
+    saved = client.put(
+        "/api/v2/mcp/builtin/credentials",
+        json={"env": {"AMAP_API_KEY": "ak-account-a"}},
+        headers={"x-test-user": OWNER_A},
+    )
+    assert saved.status_code == 200, saved.text
+    assert "ak-account-a" not in saved.text
+    saved_servers = saved.json()["servers"]
+    assert {s["status"] for s in saved_servers if s["builtin"]} == {"configured"}
+    assert "custom_a" in {s["id"] for s in saved_servers}
+
+    assert {s["status"] for s in builtins(OWNER_B).values()} == {"unconfigured"}
+    assert load_env(OWNER_A) == {"AMAP_API_KEY": "ak-account-a"}
+
+    profile = SimpleNamespace(
+        profile_id="route_plan",
+        allowed_mcp_servers=("amap_weather", "amap_map"),
+    )
+    servers_a, audits_a = build_profile_mcp_servers(
+        profile, SimpleNamespace(), owner_id=OWNER_A
+    )
+    assert audits_a == []
+    assert servers_a["amap_map"]["env"] == {"AMAP_API_KEY": "ak-account-a"}
+
+    servers_b, audits_b = build_profile_mcp_servers(
+        profile, SimpleNamespace(), owner_id=OWNER_B
+    )
+    assert servers_b == {}
+    assert {audit["server_id"] for audit in audits_b} == {
+        "amap_weather",
+        "amap_map",
+    }
+
+    assert client.put(
+        "/api/v2/mcp/builtin/credentials",
+        json={"env": {"UNKNOWN_KEY": "x"}},
+        headers={"x-test-user": OWNER_A},
+    ).status_code == 400
+    assert client.put(
+        "/api/v2/mcp/builtin/credentials",
+        json={"env": {}},
+        headers={"x-test-user": OWNER_A},
+    ).status_code == 400
+
+    cleared = client.delete(
+        "/api/v2/mcp/builtin/credentials", headers={"x-test-user": OWNER_A}
+    )
+    assert cleared.status_code == 200, cleared.text
+    cleared_servers = cleared.json()["servers"]
+    assert {s["status"] for s in cleared_servers if s["builtin"]} == {"unconfigured"}
+    assert "custom_a" in {s["id"] for s in cleared_servers}
+    assert load_env(OWNER_A) == {}
+
+
 def test_oauth_status_cannot_be_polled_by_another_account(tmp_path, monkeypatch) -> None:
     from fastapi import FastAPI
     from fastapi.testclient import TestClient

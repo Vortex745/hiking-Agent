@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -17,6 +18,15 @@ from rag.sqlite_store import SQLiteStore
 
 OWNER_A = "a" * 32
 OWNER_B = "b" * 32
+
+
+def _fixture_effective() -> SimpleNamespace:
+    return SimpleNamespace(
+        embedding_base_url="http://127.0.0.1:1/v1",
+        embedding_api_key="fixture-key",
+        embedding_model="fixture-embedding",
+        embedding_dimensions=8,
+    )
 
 
 def _create_datasource(store: DatasourceStore, name: str, owner_id: str) -> dict:
@@ -94,9 +104,9 @@ def test_retrieval_never_crosses_account_indexes(tmp_path: Path, monkeypatch) ->
     _seed_user_index(settings, OWNER_A, "A-鳌太线.md", "# A 专属\n\nA 账号的营地水源资料：甲营地有季节性水源。")
     _seed_user_index(settings, OWNER_B, "B-雨崩.md", "# B 专属\n\nB 账号的雨崩路线资料：下雨崩有客栈补给。")
 
-    with owner_scope(OWNER_A):
+    with owner_scope(OWNER_A, _fixture_effective()):
         result_a = asyncio.run(hk.hiking_knowledge_search.ainvoke({"query": "营地水源补给"}))
-    with owner_scope(OWNER_B):
+    with owner_scope(OWNER_B, _fixture_effective()):
         result_b = asyncio.run(hk.hiking_knowledge_search.ainvoke({"query": "营地水源补给"}))
 
     sources_a = {chunk["source"] for chunk in result_a["chunks"]}
@@ -139,12 +149,38 @@ def test_new_account_without_directory_gets_empty_knowledge_not_a_crash(
     fresh_owner = "c" * 32
     assert not user_rag_path(settings, fresh_owner).parent.exists()
 
-    with owner_scope(fresh_owner):
+    with owner_scope(fresh_owner, _fixture_effective()):
         result = asyncio.run(hk.hiking_knowledge_search.ainvoke({"query": "鳌太线"}))
 
     assert result["chunks"] == []
     assert "资料不足" in result["message"]
     assert user_rag_path(settings, fresh_owner).parent.is_dir()
+
+
+def test_unconfigured_account_embedding_returns_empty_without_creating_index(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import tools.hiking_knowledge as hk
+
+    monkeypatch.setattr(settings, "rag_sqlite_db_path", str(tmp_path / "data" / "rag.sqlite"))
+    hk._owner_retrieval_stacks.clear()
+    fresh_owner = "d" * 32
+
+    with owner_scope(fresh_owner, _fixture_effective_unset()):
+        result = asyncio.run(hk.hiking_knowledge_search.ainvoke({"query": "鳌太线"}))
+
+    assert result["chunks"] == []
+    assert "尚未配置 Embedding" in result["message"]
+    assert not user_rag_path(settings, fresh_owner).parent.exists()
+
+
+def _fixture_effective_unset() -> SimpleNamespace:
+    return SimpleNamespace(
+        embedding_base_url="",
+        embedding_api_key="",
+        embedding_model="",
+        embedding_dimensions=1536,
+    )
 
 
 def test_explicit_empty_owner_fails_closed_instead_of_reading_legacy_index() -> None:

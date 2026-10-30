@@ -30,7 +30,10 @@ from agent_v2.mcp_oauth_flow import (
     resolve_oauth_callback,
     start_oauth_flow,
 )
-from agent_v2.mcp_registry import MCP_REGISTRY
+from agent_v2.mcp_builtin_store import clear_env as clear_builtin_env
+from agent_v2.mcp_builtin_store import load_env as load_builtin_env
+from agent_v2.mcp_builtin_store import save_env as save_builtin_env
+from agent_v2.mcp_registry import MCP_REGISTRY, check_mcp_available
 from agent_v2.mcp_oauth_store import prune_oauth_tokens
 from api.llm_config_router import require_local_request
 from auth.deps import current_user_id
@@ -112,24 +115,83 @@ def _test_key(owner_id: str, test_id: str) -> str:
     return f"{owner_id}:{test_id}"
 
 
-@mcp_router.get("/servers")
-async def list_mcp_servers(request: Request) -> dict:
-    owner_id = current_user_id(request)
-    builtins = [
+def _builtin_servers(owner_id: str) -> list[dict]:
+    env_source = load_builtin_env(owner_id) if owner_id else None
+    return [
         {
             "id": cfg.server_id,
             "name": cfg.description.split(" MCP", 1)[0],
             "builtin": True,
             "transport": cfg.transport,
-            "status": "configured",
+            "status": (
+                "configured"
+                if check_mcp_available(cfg, settings, env_source)
+                else "unconfigured"
+            ),
             "tools": list(cfg.tool_allowlist),
+            "command": cfg.command_or_url if cfg.transport == "stdio" else "",
+            "args": list(cfg.args) if cfg.transport == "stdio" else [],
+            "env_names": list(cfg.env_key_names),
         }
         for cfg in MCP_REGISTRY.values()
     ]
+
+
+def _all_servers(owner_id: str) -> list[dict]:
+    return _builtin_servers(owner_id) + [
+        public_server(server) for server in load_servers(owner_id or None)
+    ]
+
+
+@mcp_router.get("/servers")
+async def list_mcp_servers(request: Request) -> dict:
+    owner_id = current_user_id(request)
+    return {"servers": _all_servers(owner_id)}
+
+
+class BuiltinCredentialsInput(BaseModel):
+    env: dict[str, str] = Field(default_factory=dict)
+
+
+def _registry_env_names() -> set[str]:
     return {
-        "servers": builtins
-        + [public_server(server) for server in load_servers(owner_id or None)]
+        name for cfg in MCP_REGISTRY.values() for name in cfg.env_key_names
     }
+
+
+@mcp_router.put("/builtin/credentials")
+async def save_builtin_credentials(
+    body: BuiltinCredentialsInput, request: Request
+) -> dict:
+    owner_id = current_user_id(request)
+    if not owner_id:
+        raise HTTPException(status_code=400, detail="仅登录账号可配置内置 MCP 凭据")
+    unknown = sorted(set(body.env) - _registry_env_names())
+    if unknown:
+        raise HTTPException(
+            status_code=400, detail=f"不支持的 MCP 凭据：{', '.join(unknown)}"
+        )
+    if not body.env:
+        raise HTTPException(status_code=400, detail="请填写要保存的凭据")
+    try:
+        save_builtin_env(owner_id, body.env)
+    except OSError:
+        logger.exception("builtin mcp credentials write failed user=%s", owner_id)
+        raise HTTPException(status_code=500, detail="凭据写入失败，配置未保存")
+    return {"servers": _all_servers(owner_id)}
+
+
+@mcp_router.delete("/builtin/credentials")
+async def clear_builtin_credentials(request: Request) -> dict:
+    owner_id = current_user_id(request)
+    if not owner_id:
+        raise HTTPException(status_code=400, detail="仅登录账号可配置内置 MCP 凭据")
+    try:
+        clear_builtin_env(owner_id)
+    except OSError:
+        logger.exception("builtin mcp credentials clear failed user=%s", owner_id)
+        raise HTTPException(status_code=500, detail="凭据清除失败")
+    return {"servers": _all_servers(owner_id)}
 
 
 def _mark_failed(previous: dict | None, connection: dict, owner_id: str) -> None:

@@ -6,12 +6,10 @@ import { API, API_ORIGIN } from './config'
 const LLM_CONFIG_ENDPOINT = `${API_ORIGIN || '/api/v1'}/llm-config`
 const LLM_CONFIG_TEST_ENDPOINT = `${LLM_CONFIG_ENDPOINT}/test`
 
-const DEFAULT_EMBEDDING_DIMENSIONS = 1536
-
 export type ModelUsage = 'llm' | 'embedding' | 'rerank'
 export type ConfigSection = ModelUsage | 'decision'
 export type LlmSection = ModelUsage
-export type ConfigSource = 'system' | 'account'
+export type ConfigSource = 'account' | 'unset' | 'system'
 
 /** Server-side view of one section; keys are never returned in plain text. */
 export interface LlmConfigSection {
@@ -22,7 +20,7 @@ export interface LlmConfigSection {
 }
 
 export interface EmbeddingConfigSection extends LlmConfigSection {
-  dimensions: number
+  dimensions: number | null
 }
 
 export type DecisionMode = 'off' | 'shadow' | 'enforce'
@@ -123,14 +121,16 @@ function normalizeDecisionMode(value: unknown): DecisionMode {
 }
 
 function normalizeSource(value: unknown): ConfigSource {
-  return value === 'account' ? 'account' : 'system'
+  if (value === 'account') return 'account'
+  if (value === 'system') return 'system'
+  return 'unset'
 }
 
 function normalizeSnapshot(value: unknown): LlmConfigSnapshot {
   const root = isRecord(value) ? value : {}
   const embeddingRecord = isRecord(root.embedding) ? root.embedding : {}
   const embedding = readSection(embeddingRecord)
-  const dimensions = asFiniteNumber(embeddingRecord.dimensions) ?? DEFAULT_EMBEDDING_DIMENSIONS
+  const dimensions = asFiniteNumber(embeddingRecord.dimensions)
   const indexDimensions = asFiniteNumber(root.index_dimensions)
   const decisionRecord = isRecord(root.decision) ? root.decision : {}
   const decision = readSection(decisionRecord)
@@ -140,13 +140,11 @@ function normalizeSnapshot(value: unknown): LlmConfigSnapshot {
     llm: readSection(root.llm),
     embedding: {
       ...embedding,
-      dimensions: Math.round(dimensions),
+      dimensions: dimensions === null ? null : Math.round(dimensions),
     },
     rerank: readSection(root.rerank),
     decision: {
       ...decision,
-      baseUrl: decision.baseUrl || 'https://api.siliconflow.cn/v1',
-      model: decision.model || 'Kev-4b',
       mode: normalizeDecisionMode(decisionRecord.mode),
     },
     updatedAt: typeof root.updated_at === 'string' ? root.updated_at : null,
@@ -328,12 +326,6 @@ export async function testLlmConfig(
     modelCount: Math.round(modelCount),
     models,
   }
-}
-
-export function maskApiKey(value: string): string {
-  if (!value) return '未设置'
-  if (value.length < 10) return '已设置'
-  return `${value.slice(0, 4)}...${value.slice(-4)}`
 }
 
 export interface ModelInfo {

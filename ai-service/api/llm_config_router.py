@@ -36,12 +36,10 @@ llm_config_router = APIRouter(
 
 
 def _mask_api_key(value: str) -> tuple[str, bool]:
-    """返回 (打码值, 是否已设置)；永不返回明文。"""
+    """返回 (打码值, 是否已设置)；永不返回密钥的任何片段。"""
     if not value:
         return "", False
-    if len(value) < 10:
-        return "已设置", True
-    return f"{value[:4]}...{value[-4:]}", True
+    return "已设置", True
 
 
 def _index_path(owner_id: str) -> str:
@@ -53,14 +51,29 @@ def _index_path(owner_id: str) -> str:
 
 
 def _build_snapshot(owner_id: str = "") -> LlmConfigResponse:
-    from auth.user_config import effective_settings, section_sources
-
-    effective = effective_settings(settings, owner_id) if owner_id else settings
-    sources = (
-        section_sources(settings, owner_id)
-        if owner_id
-        else {section: "system" for section in ("llm", "embedding", "rerank", "decision")}
+    from auth.user_config import (
+        effective_settings,
+        section_sources,
+        user_config_updated_at,
     )
+
+    if owner_id:
+        effective = effective_settings(settings, owner_id)
+        sources = section_sources(settings, owner_id)
+        updated_at = user_config_updated_at(settings, owner_id)
+        embedding_dimensions = (
+            effective.embedding_dimensions
+            if sources.get("embedding") == "account"
+            else None
+        )
+    else:
+        effective = settings
+        sources = {
+            section: "system"
+            for section in ("llm", "embedding", "rerank", "decision")
+        }
+        updated_at = config.env_file_updated_at()
+        embedding_dimensions = effective.embedding_dimensions
     llm_masked, llm_set = _mask_api_key(effective.openai_api_key)
     embedding_masked, embedding_set = _mask_api_key(effective.embedding_api_key)
     rerank_masked, rerank_set = _mask_api_key(effective.rerank_api_key)
@@ -76,7 +89,7 @@ def _build_snapshot(owner_id: str = "") -> LlmConfigResponse:
         embedding=LlmConfigEmbeddingSectionResponse(
             base_url=effective.embedding_base_url,
             model=effective.embedding_model,
-            dimensions=effective.embedding_dimensions,
+            dimensions=embedding_dimensions,
             api_key_masked=embedding_masked,
             api_key_set=embedding_set,
         ),
@@ -93,7 +106,7 @@ def _build_snapshot(owner_id: str = "") -> LlmConfigResponse:
             api_key_set=decision_set,
             mode=effective.decision_model_mode,
         ),
-        updated_at=config.env_file_updated_at(),
+        updated_at=updated_at,
         index_dimensions=read_vec0_dimensions(_index_path(owner_id)),
         sources=sources,
     )
@@ -117,21 +130,48 @@ def _require_non_empty(section_name: str, field: str, value: str | None) -> str:
     return value.strip()
 
 
-def _validate_update(payload: LlmConfigUpdateRequest) -> dict[str, dict[str, object]]:
-    """把线上请求收敛成 config/user_config 接受的字段字典。"""
+def _validate_update(
+    payload: LlmConfigUpdateRequest, *, require_all: bool = False
+) -> dict[str, dict[str, object]]:
+    """把线上请求收敛成 config/user_config 接受的字段字典。
+
+    ``require_all`` 只用于无账号的旧单机模式；登录账号允许只提交需要的
+    分项，分项内 base_url 与 model 都为空表示清空该分项。
+    """
     sections: dict[str, dict[str, object]] = {}
-    for section_name in _REQUIRED_SECTIONS:
+    for section_name in ("llm", "embedding", "rerank", "decision"):
         section = getattr(payload, section_name)
         if section is None:
-            raise HTTPException(
-                status_code=400, detail=f"缺少 {section_name} 配置"
-            )
+            if require_all and section_name in _REQUIRED_SECTIONS:
+                raise HTTPException(
+                    status_code=400, detail=f"缺少 {section_name} 配置"
+                )
+            continue
+        base_url = (section.base_url or "").strip()
+        model = (section.model or "").strip()
+        if not base_url and not model:
+            if require_all:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{section_name}.base_url 和 {section_name}.model 不能为空",
+                )
+            sections[section_name] = {}
+            continue
+
         validated: dict[str, object] = {
             "base_url": _require_non_empty(section_name, "base_url", section.base_url),
             "model": _require_non_empty(section_name, "model", section.model),
             "api_key": section.api_key,
         }
-        if section_name == "embedding":
+        if section_name == "decision":
+            mode = section.mode or "off"
+            if mode not in {"off", "shadow", "enforce"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail="decision.mode 必须是 off/shadow/enforce",
+                )
+            validated["mode"] = mode
+        elif section_name == "embedding":
             dimensions = section.dimensions
             if dimensions is None:
                 raise HTTPException(
@@ -147,18 +187,6 @@ def _validate_update(payload: LlmConfigUpdateRequest) -> dict[str, dict[str, obj
                 )
             validated["dimensions"] = dimensions
         sections[section_name] = validated
-    if payload.decision is not None:
-        decision = payload.decision
-        validated = {
-            "base_url": _require_non_empty(
-                "decision", "base_url", decision.base_url
-            ),
-            "model": _require_non_empty("decision", "model", decision.model),
-            "api_key": decision.api_key,
-        }
-        if decision.mode is not None:
-            validated["mode"] = decision.mode
-        sections["decision"] = validated
     return sections
 
 
@@ -168,19 +196,20 @@ async def update_llm_config(
     request: Request,
 ) -> LlmConfigUpdateResponse:
     owner_id = current_user_id(request)
-    sections = _validate_update(payload)
-    requested_dimensions = sections["embedding"]["dimensions"]
+    sections = _validate_update(payload, require_all=not owner_id)
+    requested_dimensions = sections.get("embedding", {}).get("dimensions")
 
     # 维度冲突必须在任何写入之前拒绝，避免配置与索引永久不一致。
-    index_dimensions = read_vec0_dimensions(_index_path(owner_id))
-    if index_dimensions is not None and index_dimensions != requested_dimensions:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"embedding.dimensions={requested_dimensions} 与索引实际维度 "
-                f"{index_dimensions} 不一致，需重建索引"
-            ),
-        )
+    if requested_dimensions is not None:
+        index_dimensions = read_vec0_dimensions(_index_path(owner_id))
+        if index_dimensions is not None and index_dimensions != requested_dimensions:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"embedding.dimensions={requested_dimensions} 与索引实际维度 "
+                    f"{index_dimensions} 不一致，需重建索引"
+                ),
+            )
 
     if owner_id:
         from auth.user_config import effective_settings, save_overrides
@@ -236,21 +265,9 @@ async def update_llm_config(
 async def reset_llm_config(request: Request) -> LlmConfigUpdateResponse:
     owner_id = current_user_id(request)
     if not owner_id:
-        raise HTTPException(status_code=400, detail="仅登录账号支持恢复系统默认")
+        raise HTTPException(status_code=400, detail="仅登录账号支持清空账号配置")
     from auth.user_config import effective_settings, reset_overrides
 
-    index_dimensions = read_vec0_dimensions(_index_path(owner_id))
-    if (
-        index_dimensions is not None
-        and index_dimensions != settings.embedding_dimensions
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "恢复系统默认会使 embedding 维度与账号现有索引不一致，"
-                "请先重建索引"
-            ),
-        )
     before = effective_settings(settings, owner_id)
     reset_overrides(settings, owner_id)
     after = effective_settings(settings, owner_id)
@@ -290,7 +307,8 @@ async def test_llm_config(
 
     # 禁止把已存密钥转发到请求指定的新主机：base_url 变了就必须自带 key。
     if (
-        requested_base_url
+        stored_api_key
+        and requested_base_url
         and not requested_api_key
         and requested_base_url.rstrip("/") != stored_base_url.rstrip("/")
     ):

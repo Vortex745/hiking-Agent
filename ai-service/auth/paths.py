@@ -36,3 +36,7 @@ def user_config_path(settings, owner_id: str) -> Path:
 
 def user_mcp_path(settings, owner_id: str) -> Path:
     return user_state_dir(settings, owner_id) / "mcp_servers.json"
+
+
+def user_builtin_mcp_path(settings, owner_id: str) -> Path:
+    return user_state_dir(settings, owner_id) / "mcp_builtin.json"

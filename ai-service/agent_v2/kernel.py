@@ -314,7 +314,7 @@ def build_chat_model(settings: Any) -> Any:
     if not getattr(settings, "openai_api_key", ""):
         raise KernelModelFailure(
             "model_unavailable",
-            "主模型未配置 API Key (OPENAI_API_KEY 为空)。",
+            "本账号尚未配置主模型，请在设置 → 模型配置中填写 Base URL、模型与 API Key。",
         )
     try:
         from langchain_openai import ChatOpenAI

@@ -74,9 +74,13 @@ function formatTimestamp(value: string | null, fallback: string) {
 }
 
 function apiKeyPlaceholder(section: LlmConfigSection): string {
-  if (!section.apiKeySet) return '未设置'
-  if (!section.apiKeyMasked || section.apiKeyMasked === '已设置') return '已设置，留空保持不变'
-  return `已设置（${section.apiKeyMasked}），留空保持不变`
+  return section.apiKeySet ? '已设置，留空保持不变' : '未设置'
+}
+
+function sourceLabel(source: LlmConfigSnapshot['sources'][ConfigSection]): string {
+  if (source === 'account') return '账号'
+  if (source === 'system') return '系统'
+  return '未配置'
 }
 
 function createIdleSpeedState(): SpeedTestState {
@@ -707,21 +711,21 @@ function LlmConfigDialog({ onClose }: { onClose: () => void }) {
     setSaving(true)
     setSaveFeedback(null)
     setReindexWarning(false)
-    setNotice('正在恢复系统默认...')
+    setNotice('正在清空账号配置...')
     try {
       const next = await resetLlmConfig()
       setSnapshot(next)
       setDraft(draftFromSnapshot(next))
       setSpeedTests(createIdleSpeedTests())
-      setSaveFeedback({ tone: 'success', title: '已恢复系统默认' })
-      setNotice('已恢复系统默认')
+      setSaveFeedback({ tone: 'success', title: '已清空账号配置' })
+      setNotice('已清空账号配置')
     } catch (error) {
       setSaveFeedback({
         tone: 'error',
-        title: '恢复系统默认失败',
-        detail: error instanceof Error ? error.message : '恢复失败',
+        title: '清空账号配置失败',
+        detail: error instanceof Error ? error.message : '清空失败',
       })
-      setNotice('恢复失败')
+      setNotice('清空失败')
     } finally {
       setSaving(false)
     }
@@ -778,7 +782,7 @@ function LlmConfigDialog({ onClose }: { onClose: () => void }) {
             <span>
               当前账号 <b className="font-medium text-text-primary">{user?.login_id ?? ''}</b>
             </span>
-            <span className="text-text-muted">未修改的配置项继承系统默认</span>
+            <span className="text-text-muted">配置只保存在当前账号；未填写的分项保持为空</span>
             <span className="flex flex-wrap items-center gap-1.5">
               {(['llm', 'embedding', 'rerank', 'decision'] as ConfigSection[]).map((section) => (
                 <span
@@ -789,7 +793,7 @@ function LlmConfigDialog({ onClose }: { onClose: () => void }) {
                       : 'border-border bg-black/[0.02] text-text-muted dark:border-white/10 dark:bg-white/5'
                   }`}
                 >
-                  {sectionTitle[section]} · {snapshot.sources[section] === 'account' ? '账号' : '系统'}
+                  {sectionTitle[section]} · {sourceLabel(snapshot.sources[section])}
                 </span>
               ))}
             </span>
@@ -800,7 +804,7 @@ function LlmConfigDialog({ onClose }: { onClose: () => void }) {
               className="ml-auto inline-flex h-7 items-center gap-1.5 rounded-full border border-border bg-white px-3 text-[11px] text-text-secondary transition-colors hover:border-primary-light hover:text-primary-light disabled:cursor-not-allowed disabled:opacity-50 dark:border-white/10 dark:bg-white/5"
             >
               <Undo2 className="h-3.5 w-3.5" />
-              恢复系统默认
+              清空配置
             </button>
           </div>
         )}

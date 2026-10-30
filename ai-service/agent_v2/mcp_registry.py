@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 
 class UnknownMcpServerError(KeyError):
@@ -178,28 +178,32 @@ def list_profile_mcp_tools(
     return result
 
 
-def check_mcp_available(config: McpServerConfig, settings: Any) -> bool:
-    """True iff every required credential key is present in the environment.
+def check_mcp_available(
+    config: McpServerConfig,
+    settings: Any,
+    env_source: Mapping[str, str] | None = None,
+) -> bool:
+    """True iff every required credential key is present.
 
-    "Present" means the env var is set to a non-empty value. We do not
-    validate the credential itself — that is the server's job. The check
-    is cheap so the intake can call it to decide whether to mark a tool
-    unavailable without spawning the MCP subprocess.
-
-    Only ``env_key_names`` is checked here. HTTP header credentials are
-    expanded by the connector from ``settings``; their availability is
-    checked inside :func:`expand_credentials` because the values may
-    come from a secret manager rather than env vars.
+    ``env_source`` lets account-scoped callers supply the account's own
+    credentials; ``None`` keeps the legacy process-environment behavior.
+    "Present" means a non-empty value. The check does not validate the
+    credential itself — that is the server's job.
     """
     for key_name in config.env_key_names:
-        value = os.getenv(key_name, "").strip()
+        if env_source is not None:
+            value = str(env_source.get(key_name, "")).strip()
+        else:
+            value = os.getenv(key_name, "").strip()
         if not value:
             return False
     return True
 
 
 def expand_credentials(
-    config: McpServerConfig, settings: Any
+    config: McpServerConfig,
+    settings: Any,
+    env_source: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Return ``(env_dict, headers_dict)`` with actual secret values.
 
@@ -218,7 +222,10 @@ def expand_credentials(
     missing: list[str] = []
     env_dict: dict[str, str] = {}
     for key_name in config.env_key_names:
-        value = os.getenv(key_name, "").strip()
+        if env_source is not None:
+            value = str(env_source.get(key_name, "")).strip()
+        else:
+            value = os.getenv(key_name, "").strip()
         if not value:
             missing.append(key_name)
         else:

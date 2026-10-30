@@ -1,4 +1,4 @@
-"""账号级模型配置覆盖层：只存与系统默认不同的字段，API Key 加密落盘。"""
+"""账号级模型配置：账号自持（未配置即为空），API Key 加密落盘。"""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ _SECRET_BOXES: dict[str, SecretBox] = {}
 _VERSION = 1
 _SECTION_FIELDS = config.section_field_settings_attrs()
 _SECTIONS = tuple(_SECTION_FIELDS)
+_DEFAULT_EMBEDDING_DIMENSIONS = 1536
 
 
 def _secret_box(settings) -> SecretBox:
@@ -43,7 +44,7 @@ def _read(settings, owner_id: str) -> dict[str, dict[str, Any]]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        logger.warning("unreadable user config for %s; falling back to system defaults", owner_id)
+        logger.warning("unreadable user config for %s; treating sections as unconfigured", owner_id)
         return {}
     sections = data.get("sections") if isinstance(data, dict) else None
     if not isinstance(sections, dict):
@@ -82,54 +83,74 @@ def _write(settings, owner_id: str, sections: Mapping[str, Mapping[str, Any]]) -
 def section_sources(settings, owner_id: str) -> dict[str, str]:
     overrides = _read(settings, owner_id)
     return {
-        section: "account" if overrides.get(section) else "system"
+        section: "account" if overrides.get(section) else "unset"
         for section in _SECTIONS
     }
 
 
+def _section_defaults(settings) -> dict[str, Any]:
+    """非敏感默认值；账号未配置时模型/地址/密钥一律为空。
+
+    ``embedding_dimensions`` 取 Settings 类默认值而不是进程值：账号
+    不能从 .env 继承 ``EMBEDDING_DIMENSIONS``。
+    """
+    return {
+        "dimensions": getattr(
+            type(settings), "embedding_dimensions", _DEFAULT_EMBEDDING_DIMENSIONS
+        ),
+        "mode": "off",
+    }
+
+
 def effective_settings(settings, owner_id: str) -> Any:
-    """返回账号实际生效的 settings 副本；未覆盖字段继承系统默认。"""
+    """返回账号实际生效的 settings 副本。
+
+    登录账号完全自持：模型 / Embedding / Rerank / 决策四段只读账号
+    覆盖文件，未配置就是空，绝不回落到系统 .env。非模型字段（路径、
+    沙箱、开关等）仍从进程 settings 继承。
+    """
     effective = copy.copy(settings)
+    if not owner_id:
+        return effective
+
+    # 内置 MCP 凭据只从账号自己的 mcp_builtin.json 取；system 的
+    # AMAP_API_KEY 不进入账号作用域，避免日后被顺手读到。
+    if hasattr(effective, "amap_api_key"):
+        effective.amap_api_key = ""
+
     overrides = _read(settings, owner_id)
-    for section, fields in overrides.items():
-        attrs = _SECTION_FIELDS[section]
-        base_attr = attrs.get("base_url")
-        key_attr = attrs.get("api_key")
-        base_changed = bool(
-            base_attr
-            and "base_url" in fields
-            and fields["base_url"] != getattr(settings, base_attr, None)
-        )
-        account_key_applied = False
-        for field, value in fields.items():
-            attr = attrs.get(field)
-            if attr is None:
-                continue
+    defaults = _section_defaults(settings)
+    for section, attrs in _SECTION_FIELDS.items():
+        fields = overrides.get(section, {})
+        for field, attr in attrs.items():
             if field == "api_key":
-                try:
-                    decrypted = _secret_box(settings).decrypt(str(value))
-                except (CredentialsUnreadable, ValueError):
-                    logger.warning(
-                        "user api key unreadable section=%s user=%s",
-                        section,
-                        owner_id,
-                    )
-                    if base_changed and key_attr:
-                        setattr(effective, key_attr, "")
-                    continue
-                value = decrypted.get("api_key", "")
-                account_key_applied = True
-            setattr(effective, attr, value)
-        # 账号把 base_url 指向别的主机时，绝不能把系统密钥转发过去。
-        if base_changed and key_attr and not account_key_applied:
-            setattr(effective, key_attr, "")
+                continue
+            if field in defaults:
+                setattr(effective, attr, fields.get(field, defaults[field]))
+            else:
+                setattr(effective, attr, fields.get(field, ""))
+        key = ""
+        stored = fields.get("api_key")
+        if stored:
+            try:
+                key = _secret_box(settings).decrypt(str(stored)).get("api_key", "")
+            except (CredentialsUnreadable, ValueError):
+                logger.warning(
+                    "user api key unreadable section=%s user=%s",
+                    section,
+                    owner_id,
+                )
+        setattr(effective, attrs["api_key"], key)
     return effective
 
 
 def save_overrides(
     settings, owner_id: str, updates: Mapping[str, Mapping[str, Any]]
 ) -> list[str]:
-    """只写入与系统默认不同的字段；api_key 为空串表示保持账号已存值。"""
+    """写入账号自己的配置；base_url 与 model 都为空表示清空该段。
+
+    ``api_key`` 为空串表示保持账号已存值；清空分项会连同已存 key 一起删除。
+    """
     with _LOCK:
         overrides = _read(settings, owner_id)
         changed: list[str] = []
@@ -137,34 +158,52 @@ def save_overrides(
             attrs = _SECTION_FIELDS.get(section)
             if attrs is None:
                 continue
+            base_url = str(fields.get("base_url") or "").strip()
+            model = str(fields.get("model") or "").strip()
+            if not base_url and not model:
+                if overrides.pop(section, None) is not None:
+                    changed.append(f"{section}.cleared")
+                continue
+
             current = dict(overrides.get(section, {}))
-            for field, value in fields.items():
-                attr = attrs.get(field)
-                if attr is None:
-                    continue
-                if field == "api_key":
-                    if value is None:
-                        continue
-                    if isinstance(value, str) and not value.strip():
-                        always = current.get("api_key")
-                        if always:
-                            changed.append(f"{section}.api_key")
-                        continue
-                    current["api_key"] = _secret_box(settings).encrypt({"api_key": str(value)})
-                    changed.append(f"{section}.api_key")
-                    continue
-                default = getattr(settings, attr, None)
-                if value == default:
-                    current.pop(field, None)
+            current["base_url"] = base_url
+            current["model"] = model
+            changed.extend([f"{section}.base_url", f"{section}.model"])
+
+            if "dimensions" in fields and "dimensions" in attrs:
+                current["dimensions"] = int(fields["dimensions"])
+                changed.append(f"{section}.dimensions")
+            if "mode" in fields and "mode" in attrs:
+                mode = str(fields.get("mode") or "off")
+                if mode == "off":
+                    current.pop("mode", None)
                 else:
-                    current[field] = value
-                    changed.append(f"{section}.{field}")
-            if current:
-                overrides[section] = current
-            else:
-                overrides.pop(section, None)
+                    current["mode"] = mode
+                changed.append(f"{section}.mode")
+
+            api_key = fields.get("api_key")
+            if isinstance(api_key, str) and api_key.strip():
+                current["api_key"] = _secret_box(settings).encrypt(
+                    {"api_key": api_key}
+                )
+                changed.append(f"{section}.api_key")
+
+            overrides[section] = current
         _write(settings, owner_id, overrides)
         return changed
+
+
+def user_config_updated_at(settings, owner_id: str) -> str | None:
+    """账号配置文件最后修改时间（UTC ISO8601）；不存在为 None。"""
+    from datetime import datetime, timezone
+
+    try:
+        mtime = user_config_path(settings, owner_id).stat().st_mtime
+    except OSError:
+        return None
+    return datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat().replace(
+        "+00:00", "Z"
+    )
 
 
 def reset_overrides(settings, owner_id: str) -> None:

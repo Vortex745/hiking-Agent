@@ -2609,7 +2609,7 @@ class RunOrchestrator:
                     run_started_emitted = True
                 yield _emit("error", {
                     "code": "model_unavailable",
-                    "message": "主模型未配置 API Key (OPENAI_API_KEY 为空)。",
+                    "message": "本账号尚未配置主模型，请在设置 → 模型配置中填写 Base URL、模型与 API Key。",
                 })
                 mark_terminal_safe(runs_repo, run_id, "error")
                 return
@@ -5008,14 +5008,14 @@ class RunOrchestrator:
         mcp_required = getattr(profile, "allowed_mcp_servers", None)
         if mcp_required or projection.mcp_services:
             mcp_servers, mcp_audits = build_profile_mcp_servers(
-                profile, kernel_settings, projection=projection
+                profile, kernel_settings, projection=projection, owner_id=owner_id
             )
             if profile.profile_id == ProfileId.ROUTE_PLAN and not mcp_servers:
                 # Every allowlisted evidence source is unavailable → fail
                 # closed instead of fabricating a plan (Ticket 29 AC5).
                 yield emit("error", {
                     "code": "evidence_unavailable",
-                    "message": "关键证据源（地图/天气 MCP）不可用，无法提供可靠路线规划。",
+                    "message": "关键证据源（地图/天气 MCP）不可用：请先在设置 → MCP 接入中填写高德 API Key。无法提供可靠路线规划。",
                 })
                 mark_terminal_safe(self._runs_repo, run_id, "error")
                 return

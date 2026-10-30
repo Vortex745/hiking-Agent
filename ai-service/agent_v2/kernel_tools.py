@@ -920,7 +920,10 @@ _build_profile_mcp_unavailable_note = "MCP-server-unavailable"
 
 
 def build_profile_mcp_servers(
-    profile: Any, settings: Any, projection: Any | None = None
+    profile: Any,
+    settings: Any,
+    projection: Any | None = None,
+    owner_id: str = "",
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     """Materialize uni-kernel MCP configs for the profile's allowlist.
 
@@ -951,6 +954,15 @@ def build_profile_mcp_servers(
         allowed = getattr(profile, "allowed_mcp_servers", None)
     if not allowed:
         return {}, []
+
+    # 登录账号只用自己的内置 MCP 凭据；None 保留旧单机环境的进程 env。
+    if owner_id:
+        from agent_v2.mcp_builtin_store import load_env as load_builtin_env
+
+        env_source: dict[str, str] | None = load_builtin_env(owner_id)
+    else:
+        env_source = None
+
     servers: dict[str, dict[str, Any]] = {}
     audits: list[dict[str, Any]] = []
     for server_id in sorted(allowed):
@@ -969,10 +981,10 @@ def build_profile_mcp_servers(
             })
             continue
         try:
-            available = check_mcp_available(cfg, settings)
+            available = check_mcp_available(cfg, settings, env_source)
             if not available:
                 raise KernelAssemblyError(f"MCP server {server_id} 不可用")
-            env, headers = expand_credentials(cfg, settings)
+            env, headers = expand_credentials(cfg, settings, env_source)
             if missing := [k for k in cfg.env_key_names if not env.get(k)]:
                 raise KernelAssemblyError(f"MCP server {server_id} 缺少凭证: {missing}")
         except KernelAssemblyError as exc:

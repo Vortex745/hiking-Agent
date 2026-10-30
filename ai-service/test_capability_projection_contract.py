@@ -743,7 +743,7 @@ def test_mcp_discovery_events_are_replayable_and_policy_bound(
     """AC: MCP discovery evidence carries run_id + policy hash additively."""
     import agent_v2.kernel_tools as kt
 
-    def fake_build(profile, settings, projection=None):
+    def fake_build(profile, settings, projection=None, owner_id=""):
         assert projection is not None, "preflight must use the frozen projection"
         return (
             {

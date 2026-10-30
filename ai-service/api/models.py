@@ -21,7 +21,7 @@ class LlmConfigSectionResponse(BaseModel):
 
 
 class LlmConfigEmbeddingSectionResponse(LlmConfigSectionResponse):
-    dimensions: int
+    dimensions: int | None = None
 
 
 class LlmConfigDecisionSectionResponse(LlmConfigSectionResponse):

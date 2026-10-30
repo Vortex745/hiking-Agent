@@ -140,7 +140,7 @@ def test_get_masks_keys_and_reports_env_metadata(tmp_path, client, monkeypatch):
     assert body["llm"] == {
         "base_url": "https://llm.example/v1",
         "model": "llm-model",
-        "api_key_masked": "sk-l...7890",
+        "api_key_masked": "已设置",
         "api_key_set": True,
     }
     assert body["embedding"]["api_key_masked"] == "已设置"
@@ -151,7 +151,7 @@ def test_get_masks_keys_and_reports_env_metadata(tmp_path, client, monkeypatch):
     assert body["decision"] == {
         "base_url": "https://api.siliconflow.cn/v1",
         "model": "Kev-4b",
-        "api_key_masked": "sk-d...7890",
+        "api_key_masked": "已设置",
         "api_key_set": True,
         "mode": "shadow",
     }
@@ -311,7 +311,7 @@ def test_put_writes_env_preserves_comments_and_syncs_settings(
     body = response.json()
     assert body["llm"]["base_url"] == "https://llm.new/v1"
     assert body["llm"]["model"] == "llm-new"
-    assert body["llm"]["api_key_masked"] == "sk-l...7890"
+    assert body["llm"]["api_key_masked"] == "已设置"
     assert body["embedding"]["dimensions"] == 1024
     assert body["index_dimensions"] == 1024
     assert body["updated_at"] is not None
@@ -386,7 +386,7 @@ def test_put_with_empty_api_key_keeps_stored_key(tmp_path, client, monkeypatch):
     assert values["OPENAI_MODEL"] == "new-model"
     assert settings.openai_api_key == "sk-stored-llm-key"
     assert settings.embedding_api_key == "emb-stored-key"
-    assert response.json()["llm"]["api_key_masked"] == "sk-s...-key"
+    assert response.json()["llm"]["api_key_masked"] == "已设置"
 
 
 def test_put_rejects_dimension_mismatch_before_writing(tmp_path, client, monkeypatch):
@@ -595,6 +595,22 @@ def test_probe_omits_authorization_without_any_key(client, monkeypatch, fake_ups
     assert "Authorization" not in fake_upstream.last_request["headers"]
 
 
+def test_probe_allows_first_time_base_url_without_any_stored_key(
+    client, monkeypatch, fake_upstream
+):
+    monkeypatch.setattr(settings, "openai_base_url", "")
+    monkeypatch.setattr(settings, "openai_api_key", "")
+
+    response = client.post(
+        TEST_URL,
+        json={"section": "llm", "base_url": "https://first.example/v1"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert fake_upstream.last_request["url"] == "https://first.example/v1/models"
+    assert fake_upstream.last_request["headers"] == {}
+
+
 def test_probe_returns_model_ids_from_upstream_data(client, monkeypatch, fake_upstream):
     monkeypatch.setattr(settings, "openai_base_url", "https://llm.example/v1")
     monkeypatch.setattr(settings, "openai_api_key", "stored-key")
@@ -668,7 +684,7 @@ def test_put_decision_section_writes_env_and_snapshot(tmp_path, client, monkeypa
     assert body["decision"]["base_url"] == "https://api.siliconflow.cn/v1"
     assert body["decision"]["model"] == "Kev-4b"
     assert body["decision"]["mode"] == "shadow"
-    assert body["decision"]["api_key_masked"] == "sk-d...7890"
+    assert body["decision"]["api_key_masked"] == "已设置"
     assert "sk-decision-1234567890" not in response.text
     values = dotenv_values(env_path)
     assert values["DECISION_MODEL_BASE_URL"] == "https://api.siliconflow.cn/v1"
