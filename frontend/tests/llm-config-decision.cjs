@@ -54,6 +54,10 @@ function snapshot() {
       });
 
       await page.route('**/*', route => {
+
+        // JWT 鉴权门 fixture：浏览器测试默认已登录
+
+        if (new URL(route.request().url()).pathname === '/api/auth/me') return route.fulfill({ json: { user_id: 'test-user', login_id: 'tester', created_at: '2026-01-01T00:00:00Z' } });
         const request = route.request();
         const pathname = new URL(request.url()).pathname;
         if (pathname === '/api/v1/llm-config' && request.method() === 'GET') {

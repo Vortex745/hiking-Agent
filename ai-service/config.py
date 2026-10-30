@@ -49,6 +49,11 @@ class Settings:
     rag_sqlite_db_path: str = "./data/rag.sqlite"  # SQLite 是唯一检索存储后端
     datasource_db_path: str = ""
     datasource_secret_key: str = ""
+    # JWT 账号认证：secret 未配置时自动生成到 auth.key，重启保持登录态。
+    auth_db_path: str = ""
+    auth_secret_path: str = ""
+    auth_jwt_secret: str = ""
+    auth_token_ttl_seconds: int = 7 * 24 * 60 * 60
     feishu_app_id: str = ""
     feishu_app_secret: str = ""
     feishu_default_space_id: str = ""
@@ -193,6 +198,18 @@ class Settings:
             Path(self.rag_sqlite_db_path).with_name("datasource.sqlite")
         )
         self.datasource_secret_key = os.getenv("DATASOURCE_SECRET_KEY", "")
+        self.auth_db_path = os.getenv("AUTH_DB_PATH", "") or str(
+            Path(self.rag_sqlite_db_path).with_name("auth.sqlite")
+        )
+        self.auth_secret_path = os.getenv("AUTH_SECRET_PATH", "") or str(
+            Path(self.auth_db_path).with_name("auth.key")
+        )
+        self.auth_jwt_secret = os.getenv("AUTH_JWT_SECRET", "")
+        try:
+            ttl = int(os.getenv("AUTH_TOKEN_TTL_SECONDS", str(7 * 24 * 60 * 60)))
+        except ValueError:
+            ttl = 7 * 24 * 60 * 60
+        self.auth_token_ttl_seconds = ttl if ttl > 0 else 7 * 24 * 60 * 60
         self.feishu_app_id = os.getenv("FEISHU_APP_ID", "")
         self.feishu_app_secret = os.getenv("FEISHU_APP_SECRET", "")
         self.feishu_default_space_id = os.getenv("FEISHU_DEFAULT_SPACE_ID", "")

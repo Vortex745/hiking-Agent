@@ -100,6 +100,8 @@ from observability import tracing
 logger = logging.getLogger("ai-service.chat_v2")
 
 chat_v2_router = APIRouter(prefix="/chat")
+# 健康探针不要求登录，供 Gateway/监控 liveness 使用。
+chat_v2_public_router = APIRouter(prefix="/chat")
 # Ticket 10: artifact download endpoint lives under /api/v2/artifacts so
 # the URL is stable and decoupled from the chat run lifecycle. The chat
 # router owns the run stream; this router owns the published artifact.
@@ -827,7 +829,7 @@ async def chat_v2_events(
     }
 
 
-@chat_v2_router.get("/health")
+@chat_v2_public_router.get("/health")
 async def chat_v2_health():
     """Lightweight health probe for the v2 chat endpoint.
 

@@ -85,6 +85,8 @@ const snapshotBase = (over = {}) => ({
     const snapshotStatuses = [];
     page.on('pageerror', error => errors.push(error.stack || String(error)));
     await page.route('**/*', route => {
+      // JWT 鉴权门 fixture：浏览器测试默认已登录
+      if (new URL(route.request().url()).pathname === '/api/auth/me') return route.fulfill({ json: { user_id: 'test-user', login_id: 'tester', created_at: '2026-01-01T00:00:00Z' } });
       const url = new URL(route.request().url());
       const p = url.pathname;
       if (p === '/api/v2/chat/sse') {

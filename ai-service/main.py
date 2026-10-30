@@ -2,11 +2,18 @@ import logging
 import os
 import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from agent_v2.repositories.memory import MemoryStore
+from auth.deps import get_current_user
+from auth.router import auth_router
+from auth.security import load_or_create_secret
+from auth.service import AuthService
+from auth.store import AuthStore
 from config import settings
 from observability.logging_setup import RequestContextMiddleware, configure_logging
 
@@ -26,6 +33,18 @@ async def lifespan(app: FastAPI):
     from observability import tracing
 
     tracing.get_tracer()
+
+    # 账号认证：独立 SQLite 与 JWT secret；secret 默认自动生成并落盘。
+    auth_secret = settings.auth_jwt_secret or load_or_create_secret(
+        Path(settings.auth_secret_path)
+    )
+    app.state.auth_service = AuthService(
+        AuthStore(settings.auth_db_path),
+        MemoryStore(str(Path(settings.agent_v2_state_dir) / "agent_memory.sqlite")),
+        secret=auth_secret,
+        ttl_seconds=settings.auth_token_ttl_seconds,
+    )
+    logger.info("✓ Auth service assembled")
 
     # Ticket 03：Chat v2 启动守护 —— Vercel + v2 enabled 必须失败，不使用临时文件系统
     # 守护在所有其他装配之前执行，确保 v2 永远不会在不支持它的环境中启动
@@ -101,6 +120,13 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning(f"v2 runtime release failed: {exc}")
 
+    auth_service = getattr(app.state, "auth_service", None)
+    if auth_service is not None:
+        try:
+            auth_service.close()
+        except Exception as exc:
+            logger.warning(f"auth service close failed: {exc}")
+
     # 退出前刷新已产生的 span；重复调用安全，追踪关闭时为零操作。
     from observability import tracing
 
@@ -144,6 +170,10 @@ async def health():
 
 
 # 注册路由——按依赖可用性逐个加载
+# 除 /health、/api/v2/chat/health 与 /api/auth/* 外，所有数据面接口都要求登录。
+_AUTH = [Depends(get_current_user)]
+app.include_router(auth_router, prefix="/api")
+
 # Chat v2 路由（/api/v2/chat/sse）—— v1 chat 已移除，v2 是唯一 chat 链路
 # 路由始终注册；v2 关闭时端点返回 error terminal event（保持 SSE 契约统一）
 # Ticket 10: 同时注册 artifacts_v2_router，提供 /api/v2/artifacts/{artifact_id} 下载
@@ -152,15 +182,17 @@ try:
     from api.chat_v2 import (
         approvals_v2_router,
         artifacts_v2_router,
+        chat_v2_public_router,
         chat_v2_router,
     )
-    app.include_router(chat_v2_router, prefix="/api/v2")
-    app.include_router(artifacts_v2_router, prefix="/api/v2")
-    app.include_router(approvals_v2_router, prefix="/api/v2")
+    app.include_router(chat_v2_public_router, prefix="/api/v2")
+    app.include_router(chat_v2_router, prefix="/api/v2", dependencies=_AUTH)
+    app.include_router(artifacts_v2_router, prefix="/api/v2", dependencies=_AUTH)
+    app.include_router(approvals_v2_router, prefix="/api/v2", dependencies=_AUTH)
     from api.memory_v2 import memory_v2_router
-    app.include_router(memory_v2_router, prefix="/api/v2")
+    app.include_router(memory_v2_router, prefix="/api/v2", dependencies=_AUTH)
     from api.mcp_router import mcp_router
-    app.include_router(mcp_router, prefix="/api/v2")
+    app.include_router(mcp_router, prefix="/api/v2", dependencies=_AUTH)
     logger.info("✓ Chat v2 router loaded")
 except ImportError as e:
     logger.warning(f"✗ Chat v2 router unavailable: {e}")
@@ -168,15 +200,15 @@ except ImportError as e:
 # models 路由: 需要 openai, httpx
 try:
     from api.models_router import models_router
-    app.include_router(models_router, prefix="/api/v1")
+    app.include_router(models_router, prefix="/api/v1", dependencies=_AUTH)
     logger.info("✓ Models router loaded")
 except ImportError as e:
     logger.warning(f"✗ Models router unavailable: {e}")
 
-# LLM 配置路由: 仅本机可访问，读写 ai-service/.env
+# LLM 配置路由: 本机 + 登录账号
 try:
     from api.llm_config_router import llm_config_router
-    app.include_router(llm_config_router, prefix="/api/v1")
+    app.include_router(llm_config_router, prefix="/api/v1", dependencies=_AUTH)
     logger.info("✓ LLM config router loaded")
 except ImportError as e:
     logger.warning(f"✗ LLM config router unavailable: {e}")
@@ -184,7 +216,7 @@ except ImportError as e:
 # 知识源管理路由：本机来源守卫；服务缺失时返回 503
 try:
     from api.datasource_router import datasource_router
-    app.include_router(datasource_router, prefix="/api/v1")
+    app.include_router(datasource_router, prefix="/api/v1", dependencies=_AUTH)
     logger.info("✓ Datasource router loaded")
 except ImportError as e:
     logger.warning(f"✗ Datasource router unavailable: {e}")

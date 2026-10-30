@@ -19,6 +19,8 @@ const assert = require('node:assert/strict');
     let polls = 0;
     let savedDraft;
     await page.route('**/*', route => {
+      // JWT 鉴权门 fixture：浏览器测试默认已登录
+      if (new URL(route.request().url()).pathname === '/api/auth/me') return route.fulfill({ json: { user_id: 'test-user', login_id: 'tester', created_at: '2026-01-01T00:00:00Z' } });
       const pathname = new URL(route.request().url()).pathname;
       if (pathname === '/api/v2/mcp/servers') {
         if (route.request().method() === 'POST') {

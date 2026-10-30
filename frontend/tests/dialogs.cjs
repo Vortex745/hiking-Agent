@@ -23,6 +23,8 @@ const memories = Array.from({ length: 20 }, (_, index) => ({
         if (/DialogContent|DialogTitle|DialogDescription|Function components cannot be given refs/.test(message.text())) errors.push(message.text());
       });
       await page.route('**/*', route => {
+        // JWT 鉴权门 fixture：浏览器测试默认已登录
+        if (new URL(route.request().url()).pathname === '/api/auth/me') return route.fulfill({ json: { user_id: 'test-user', login_id: 'tester', created_at: '2026-01-01T00:00:00Z' } });
         const pathname = new URL(route.request().url()).pathname;
         if (pathname === '/api/v1/llm-config') return route.fulfill({ json: { llm: configSection, embedding: { ...configSection, dimensions: 1536 }, rerank: configSection, index_dimensions: 1536 } });
         if (pathname === '/api/v2/mcp/servers') return route.fulfill({ json: { servers } });

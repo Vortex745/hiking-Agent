@@ -44,6 +44,8 @@ const messages = [
       localStorage.removeItem('ai-hiking-agent-v2-active-run');
     }, { key: STORAGE_KEY, seed: messages });
     await page.route('**/*', (route) => {
+      // JWT 鉴权门 fixture：浏览器测试默认已登录
+      if (new URL(route.request().url()).pathname === '/api/auth/me') return route.fulfill({ json: { user_id: 'test-user', login_id: 'tester', created_at: '2026-01-01T00:00:00Z' } });
       const pathname = new URL(route.request().url()).pathname;
       return pathname.startsWith('/api/') ? route.fulfill({ json: { enabled: false } }) : route.continue();
     });

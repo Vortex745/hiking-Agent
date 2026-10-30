@@ -31,6 +31,8 @@ import {
 import { useExternalStoreRuntime, AssistantRuntimeProvider, type ExternalStoreAdapter, type ThreadMessage } from "@assistant-ui/react"
 import { GeminiThread } from '../components/assistant-ui/gemini/GeminiThread'
 import { GeminiSidebar } from '../components/assistant-ui/gemini/GeminiSidebar'
+import { useAuth } from '../auth/AuthContext'
+import { storageKey } from '../lib/userStorage'
 import { CircleCheck, Clipboard, Database, Map, Plug, Settings2, SlidersHorizontal, TriangleAlert } from 'lucide-react'
 import { DropdownMenu } from '../components/ui/dropdown-menu'
 import { MemoryDialog } from '../components/MemoryDialog'
@@ -212,7 +214,7 @@ interface V2PersistedRun {
 const V2_RUN_KEY = 'ai-hiking-agent-v2-active-run'
 function loadV2PersistedRun(): V2PersistedRun | null {
   try {
-    const raw = localStorage.getItem(V2_RUN_KEY)
+    const raw = localStorage.getItem(storageKey(V2_RUN_KEY))
     if (!raw) return null
     const parsed = JSON.parse(raw) as Partial<V2PersistedRun>
     if (
@@ -229,8 +231,8 @@ function loadV2PersistedRun(): V2PersistedRun | null {
 }
 function saveV2PersistedRun(run: V2PersistedRun | null): void {
   try {
-    if (run === null) localStorage.removeItem(V2_RUN_KEY)
-    else localStorage.setItem(V2_RUN_KEY, JSON.stringify(run))
+    if (run === null) localStorage.removeItem(storageKey(V2_RUN_KEY))
+    else localStorage.setItem(storageKey(V2_RUN_KEY), JSON.stringify(run))
   } catch { /* ignore */ }
 }
 
@@ -243,11 +245,11 @@ function createChatId() {
 
 function getOrCreateChatId() {
   try {
-    const saved = localStorage.getItem(CHAT_ID_KEY)
+    const saved = localStorage.getItem(storageKey(CHAT_ID_KEY))
     if (saved) return saved
 
     const next = createChatId()
-    localStorage.setItem(CHAT_ID_KEY, next)
+    localStorage.setItem(storageKey(CHAT_ID_KEY), next)
     return next
   } catch {
     return createChatId()
@@ -290,7 +292,7 @@ function getTodayDate() {
 
 function loadSessions(): ChatSession[] {
   try {
-    const saved = localStorage.getItem(SESSIONS_KEY)
+    const saved = localStorage.getItem(storageKey(SESSIONS_KEY))
     const parsed = saved ? JSON.parse(saved) : []
     if (!Array.isArray(parsed)) return []
     return parsed.map((session: Partial<ChatSession>) => ({
@@ -304,7 +306,7 @@ function loadSessions(): ChatSession[] {
 }
 
 function saveSessions(sessions: ChatSession[]) {
-  try { localStorage.setItem(SESSIONS_KEY, JSON.stringify(sessions.map(sanitizeSessionForStorage))) } catch { /* ignore */ }
+  try { localStorage.setItem(storageKey(SESSIONS_KEY), JSON.stringify(sessions.map(sanitizeSessionForStorage))) } catch { /* ignore */ }
 }
 
 function getBrowserLocation(timeout = 3000): Promise<BrowserLocation | null> {
@@ -419,9 +421,10 @@ function SessionRuntimeProvider({ adapter, children }: {
 }
 
 function SuperAgent() {
+  const { user, signOut } = useAuth()
   const [messages, setMessages] = useState<Message[]>(() => {
     try {
-      const saved = localStorage.getItem(STORAGE_KEY)
+      const saved = localStorage.getItem(storageKey(STORAGE_KEY))
       return saved ? JSON.parse(saved) : []
     } catch { return [] }
   })
@@ -429,9 +432,9 @@ function SuperAgent() {
   const [sessions, setSessions] = useState<ChatSession[]>(loadSessions)
   const [activeSessionId, setActiveSessionId] = useState<string | null>(() => {
     try {
-      const saved = localStorage.getItem(ACTIVE_SESSION_KEY)
+      const saved = localStorage.getItem(storageKey(ACTIVE_SESSION_KEY))
       if (saved) return saved
-      const savedMessages = localStorage.getItem(STORAGE_KEY)
+      const savedMessages = localStorage.getItem(storageKey(STORAGE_KEY))
       if (savedMessages) {
         const msgs = JSON.parse(savedMessages)
         if (msgs.length > 0) return generateId()
@@ -716,7 +719,7 @@ function SuperAgent() {
   // chatId from the session list.
   const rotateChatIdAfterForbidden = useCallback(() => {
     const next = createChatId()
-    localStorage.setItem(CHAT_ID_KEY, next)
+    localStorage.setItem(storageKey(CHAT_ID_KEY), next)
     chatIdRef.current = next
     if (activeSessionId) {
       setSessions(prev =>
@@ -1389,7 +1392,7 @@ function SuperAgent() {
 
   // Persist
   useEffect(() => {
-    try { localStorage.setItem(STORAGE_KEY, serializeMessages(messages)) } catch { /* ignore */ }
+    try { localStorage.setItem(storageKey(STORAGE_KEY), serializeMessages(messages)) } catch { /* ignore */ }
   }, [messages])
 
   // Persist sessions
@@ -1399,9 +1402,9 @@ function SuperAgent() {
 
   useEffect(() => {
     if (activeSessionId) {
-      try { localStorage.setItem(ACTIVE_SESSION_KEY, activeSessionId) } catch { /* ignore */ }
+      try { localStorage.setItem(storageKey(ACTIVE_SESSION_KEY), activeSessionId) } catch { /* ignore */ }
     } else {
-      try { localStorage.removeItem(ACTIVE_SESSION_KEY) } catch { /* ignore */ }
+      try { localStorage.removeItem(storageKey(ACTIVE_SESSION_KEY)) } catch { /* ignore */ }
     }
   }, [activeSessionId])
 
@@ -1492,9 +1495,9 @@ function SuperAgent() {
     const next = createChatId()
     setActiveSessionId(newId)
     setMessages([])
-    localStorage.setItem(CHAT_ID_KEY, next)
+    localStorage.setItem(storageKey(CHAT_ID_KEY), next)
     chatIdRef.current = next
-    try { localStorage.removeItem(STORAGE_KEY) } catch { /* ignore */ }
+    try { localStorage.removeItem(storageKey(STORAGE_KEY)) } catch { /* ignore */ }
   }, [messages, activeSessionId, teardownActiveStream])
 
   const loadSession = useCallback((session: ChatSession) => {
@@ -1513,9 +1516,9 @@ function SuperAgent() {
     }
     setActiveSessionId(target.id)
     chatIdRef.current = target.chatId
-    localStorage.setItem(CHAT_ID_KEY, target.chatId)
+    localStorage.setItem(storageKey(CHAT_ID_KEY), target.chatId)
     setMessages(target.messages)
-    try { localStorage.setItem(STORAGE_KEY, serializeMessages(target.messages)) } catch { /* ignore */ }
+    try { localStorage.setItem(storageKey(STORAGE_KEY), serializeMessages(target.messages)) } catch { /* ignore */ }
   }, [activeSessionId, messages, teardownActiveStream])
 
   const selectSession = useCallback((sessionId: string) => {
@@ -1531,9 +1534,9 @@ function SuperAgent() {
       setActiveSessionId(null)
       setMessages([])
       const next = createChatId()
-      localStorage.setItem(CHAT_ID_KEY, next)
+      localStorage.setItem(storageKey(CHAT_ID_KEY), next)
       chatIdRef.current = next
-      try { localStorage.removeItem(STORAGE_KEY) } catch { /* ignore */ }
+      try { localStorage.removeItem(storageKey(STORAGE_KEY)) } catch { /* ignore */ }
     }
   }, [activeSessionId, teardownActiveStream])
 
@@ -1675,9 +1678,9 @@ function SuperAgent() {
     teardownActiveStream()
     setMessages([])
     try {
-      localStorage.removeItem(STORAGE_KEY)
+      localStorage.removeItem(storageKey(STORAGE_KEY))
       const next = createChatId()
-      localStorage.setItem(CHAT_ID_KEY, next)
+      localStorage.setItem(storageKey(CHAT_ID_KEY), next)
       chatIdRef.current = next
     } catch { /* ignore */ }
   }
@@ -1760,6 +1763,8 @@ function SuperAgent() {
           onNewSession={createNewSession}
           onSelectSession={selectSession}
           onDeleteSession={deleteSession}
+          loginId={user?.login_id ?? ''}
+          onLogout={() => void signOut()}
         />
 
         {/* Main Gemini Thread Area */}

@@ -1,4 +1,5 @@
-import { Menu, MessageSquare, PanelLeft, Plus, Trash2, X } from 'lucide-react'
+import { ChevronUp, LogOut, Menu, MessageSquare, PanelLeft, Plus, Trash2, X } from 'lucide-react'
+import * as DropdownPrimitive from '@radix-ui/react-dropdown-menu'
 
 export interface ChatSessionMeta {
   id: string
@@ -18,10 +19,95 @@ interface GeminiSidebarProps {
   onNewSession: () => void
   onSelectSession: (sessionId: string) => void
   onDeleteSession: (sessionId: string) => void
+  /** 登录账号（登录 ID）与退出动作；账号信息固定展示在侧边栏底部。 */
+  loginId: string
+  onLogout: () => void
 }
 
 const ghostBtnClass =
   'flex size-8 shrink-0 items-center justify-center rounded-lg text-[#444746] transition-colors hover:bg-black/5 dark:text-[#c4c7c5] dark:hover:bg-white/10'
+
+function AccountMenu({
+  loginId,
+  collapsed,
+  onLogout,
+  onNavigate,
+}: {
+  loginId: string
+  collapsed: boolean
+  onLogout: () => void
+  onNavigate?: () => void
+}) {
+  const initial = (loginId || '?').slice(0, 1).toUpperCase()
+  const avatar = (
+    <span
+      aria-hidden="true"
+      className="flex size-7 shrink-0 items-center justify-center rounded-full bg-[#1a3c2a] text-[11px] font-semibold text-[#f0f4f9] dark:bg-[#c2e7ff] dark:text-[#001d35]"
+    >
+      {initial}
+    </span>
+  )
+
+  return (
+    <DropdownPrimitive.Root modal={false}>
+      <DropdownPrimitive.Trigger asChild>
+        <button
+          type="button"
+          aria-label={`账号 ${loginId}，打开账号菜单`}
+          title={collapsed ? loginId : undefined}
+          className={`flex w-full items-center gap-2.5 rounded-xl px-2 py-2 text-left transition-colors hover:bg-black/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1a3c2a]/30 dark:hover:bg-white/10 dark:focus-visible:ring-[#c2e7ff]/30 ${
+            collapsed ? 'justify-center' : ''
+          }`}
+        >
+          {avatar}
+          {!collapsed && (
+            <>
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-sm leading-5 text-[#1f1f1f] dark:text-[#e3e3e3]">
+                  {loginId}
+                </span>
+                <span className="block text-[11px] leading-4 text-[#5e6063] dark:text-[#9aa0a6]">
+                  本机账号
+                </span>
+              </span>
+              <ChevronUp className="size-3.5 shrink-0 text-[#5e6063] dark:text-[#9aa0a6]" aria-hidden="true" />
+            </>
+          )}
+        </button>
+      </DropdownPrimitive.Trigger>
+      <DropdownPrimitive.Portal>
+        <DropdownPrimitive.Content
+          side="top"
+          align="start"
+          sideOffset={8}
+          collisionPadding={12}
+          className="z-[120] w-[232px] rounded-2xl border border-black/5 bg-white p-1.5 shadow-xl dark:border-white/10 dark:bg-[#282a2c]"
+        >
+          <div className="px-2.5 py-2">
+            <div className="text-[11px] text-[#5e6063] dark:text-[#9aa0a6]">当前登录</div>
+            <div className="mt-0.5 truncate text-sm font-medium text-[#1f1f1f] dark:text-[#e3e3e3]">
+              {loginId}
+            </div>
+            <div className="mt-0.5 text-[11px] text-[#7b8087] dark:text-[#8e918f]">
+              知识库、MCP 与模型配置按账号隔离
+            </div>
+          </div>
+          <DropdownPrimitive.Separator className="my-1 h-px bg-black/5 dark:bg-white/10" />
+          <DropdownPrimitive.Item
+            onSelect={() => {
+              onNavigate?.()
+              onLogout()
+            }}
+            className="flex cursor-pointer items-center gap-2 rounded-lg px-2.5 py-2 text-sm text-[#b3261e] outline-none transition-colors data-[highlighted]:bg-[#fce8e6] dark:text-[#f2b8b5] dark:data-[highlighted]:bg-[#5c1d18]/60"
+          >
+            <LogOut className="size-4" aria-hidden="true" />
+            退出登录
+          </DropdownPrimitive.Item>
+        </DropdownPrimitive.Content>
+      </DropdownPrimitive.Portal>
+    </DropdownPrimitive.Root>
+  )
+}
 
 /**
  * Gemini-style docked session sidebar, mirroring assistant-ui's
@@ -40,6 +126,8 @@ export const GeminiSidebar = ({
   onNewSession,
   onSelectSession,
   onDeleteSession,
+  loginId,
+  onLogout,
 }: GeminiSidebarProps) => {
   const closeMobile = () => onMobileOpenChange(false)
 
@@ -150,6 +238,10 @@ export const GeminiSidebar = ({
             {sessionItems()}
           </div>
         </div>
+
+        <div className="shrink-0 border-t border-black/5 p-2 dark:border-white/10">
+          <AccountMenu loginId={loginId} collapsed={collapsed} onLogout={onLogout} />
+        </div>
       </aside>
 
       {/* Mobile trigger — top-left ghost button, like the example's SheetTrigger */}
@@ -192,6 +284,14 @@ export const GeminiSidebar = ({
         <div className="flex min-h-0 flex-1 flex-col px-2 pb-3 pt-1">
           {newThreadButton(false, closeMobile)}
           <div className="mt-1 flex min-h-0 flex-1 flex-col">{sessionItems(closeMobile)}</div>
+        </div>
+        <div className="shrink-0 border-t border-black/5 p-2 dark:border-white/10">
+          <AccountMenu
+            loginId={loginId}
+            collapsed={false}
+            onLogout={onLogout}
+            onNavigate={closeMobile}
+          />
         </div>
       </aside>
     </>

@@ -19,6 +19,8 @@ const servers = [
       page.setDefaultTimeout(10000);
       page.on('pageerror', error => errors.push(String(error)));
       await page.route('**/*', route => {
+        // JWT 鉴权门 fixture：浏览器测试默认已登录
+        if (new URL(route.request().url()).pathname === '/api/auth/me') return route.fulfill({ json: { user_id: 'test-user', login_id: 'tester', created_at: '2026-01-01T00:00:00Z' } });
         const pathname = new URL(route.request().url()).pathname;
         if (pathname === '/api/v2/mcp/servers') {
           return available ? route.fulfill({ json: { servers } }) : route.fulfill({ status: 403, json: { detail: 'MCP 管理仅在本机模式下可用' } });

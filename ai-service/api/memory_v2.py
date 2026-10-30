@@ -59,6 +59,10 @@ def resolve_request_subject(
     request: Request,
 ) -> tuple[MemoryService, SubjectResolution]:
     memory = get_memory_service(request)
+    auth_subject = getattr(request.state, "subject_id", None)
+    if auth_subject:
+        # 登录账号的 subject 在注册时固定；匿名 cookie 不再参与身份判定。
+        return memory, SubjectResolution(str(auth_subject), "", False)
     resolution = memory.resolve_subject(request.cookies.get(SUBJECT_COOKIE_NAME))
     request.state.subject_id = resolution.subject_id
     return memory, resolution
@@ -328,6 +332,14 @@ async def export_memories(request: Request):
 
 @memory_v2_router.post("/subject/rotate")
 async def rotate_subject(request: Request):
+    if getattr(request.state, "user_id", None):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "subject_managed_by_auth",
+                "message": "登录账号的身份由账号系统管理，不支持重置",
+            },
+        )
     memory, subject = resolve_request_subject(request)
     rotated = memory.rotate_subject(subject.subject_id)
     return subject_json(

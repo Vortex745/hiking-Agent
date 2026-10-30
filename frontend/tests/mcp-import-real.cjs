@@ -55,6 +55,8 @@ async function waitFor(url, process) {
     const page = await browser.newPage({ viewport: { width: 1280, height: 900 }, reducedMotion: 'reduce' });
     const mutations = [];
     await page.route('**/*', async route => {
+      // JWT 鉴权门 fixture：浏览器测试默认已登录
+      if (new URL(route.request().url()).pathname === '/api/auth/me') return route.fulfill({ json: { user_id: 'test-user', login_id: 'tester', created_at: '2026-01-01T00:00:00Z' } });
       const request = route.request();
       const pathname = new URL(request.url()).pathname;
       if (pathname.startsWith('/api/v2/mcp/servers')) {
