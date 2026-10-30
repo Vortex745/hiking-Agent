@@ -11,6 +11,7 @@ const DEFAULT_EMBEDDING_DIMENSIONS = 1536
 export type ModelUsage = 'llm' | 'embedding' | 'rerank'
 export type ConfigSection = ModelUsage | 'decision'
 export type LlmSection = ModelUsage
+export type ConfigSource = 'system' | 'account'
 
 /** Server-side view of one section; keys are never returned in plain text. */
 export interface LlmConfigSection {
@@ -37,6 +38,8 @@ export interface LlmConfigSnapshot {
   decision: LlmConfigDecisionSection
   updatedAt: string | null
   indexDimensions: number | null
+  /** 每段配置来自账号覆盖还是系统默认。 */
+  sources: Record<ConfigSection, ConfigSource>
 }
 
 export interface LlmConfigSaveResult extends LlmConfigSnapshot {
@@ -119,6 +122,10 @@ function normalizeDecisionMode(value: unknown): DecisionMode {
   return value === 'shadow' || value === 'enforce' ? value : 'off'
 }
 
+function normalizeSource(value: unknown): ConfigSource {
+  return value === 'account' ? 'account' : 'system'
+}
+
 function normalizeSnapshot(value: unknown): LlmConfigSnapshot {
   const root = isRecord(value) ? value : {}
   const embeddingRecord = isRecord(root.embedding) ? root.embedding : {}
@@ -127,6 +134,7 @@ function normalizeSnapshot(value: unknown): LlmConfigSnapshot {
   const indexDimensions = asFiniteNumber(root.index_dimensions)
   const decisionRecord = isRecord(root.decision) ? root.decision : {}
   const decision = readSection(decisionRecord)
+  const sourcesRecord = isRecord(root.sources) ? root.sources : {}
 
   return {
     llm: readSection(root.llm),
@@ -143,6 +151,12 @@ function normalizeSnapshot(value: unknown): LlmConfigSnapshot {
     },
     updatedAt: typeof root.updated_at === 'string' ? root.updated_at : null,
     indexDimensions: indexDimensions === null ? null : Math.round(indexDimensions),
+    sources: {
+      llm: normalizeSource(sourcesRecord.llm),
+      embedding: normalizeSource(sourcesRecord.embedding),
+      rerank: normalizeSource(sourcesRecord.rerank),
+      decision: normalizeSource(sourcesRecord.decision),
+    },
   }
 }
 
@@ -256,6 +270,21 @@ export async function saveLlmConfig(
     ...normalizeSnapshot(payload),
     reindexRecommended: isRecord(payload) && payload.reindex_recommended === true,
   }
+}
+
+/**
+ * Reset this account's overrides. The shared system defaults in `.env` are
+ * never touched, so another account cannot be affected by this call.
+ */
+export async function resetLlmConfig(
+  fetcher: FetchLike = defaultFetch(),
+): Promise<LlmConfigSnapshot> {
+  const response = await fetcher(LLM_CONFIG_ENDPOINT, {
+    method: 'DELETE',
+    headers: { Accept: 'application/json' },
+  })
+  if (!response.ok) throw await responseError(response)
+  return normalizeSnapshot(await response.json())
 }
 
 /**

@@ -19,7 +19,7 @@ from datasource.timeutil import now_iso, parse_iso
 
 logger = logging.getLogger("ai-service.datasource.store")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 
 CREATE TABLE IF NOT EXISTS datasource (
     id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL DEFAULT '',
     type TEXT NOT NULL,
     name TEXT NOT NULL,
     credentials_enc TEXT NOT NULL,
@@ -120,9 +121,22 @@ class DatasourceStore:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(_SCHEMA)
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(datasource)").fetchall()
+        }
+        if "owner_id" not in columns:
+            self._conn.execute(
+                "ALTER TABLE datasource ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''"
+            )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_datasource_owner ON datasource(owner_id)"
+        )
         row = self._conn.execute("SELECT version FROM schema_meta").fetchone()
         if row is None:
             self._conn.execute("INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,))
+        elif int(row["version"]) < SCHEMA_VERSION:
+            self._conn.execute("UPDATE schema_meta SET version = ?", (SCHEMA_VERSION,))
         self._conn.commit()
 
     @property
@@ -149,6 +163,7 @@ class DatasourceStore:
         schedule: str = "",
         sync_deletions: bool = True,
         next_run_at: str | None = None,
+        owner_id: str = "",
     ) -> dict[str, Any]:
         ds_id = uuid.uuid4().hex
         now = now_iso()
@@ -156,13 +171,14 @@ class DatasourceStore:
             self._conn.execute(
                 """
                 INSERT INTO datasource (
-                    id, type, name, credentials_enc, settings_json,
+                    id, owner_id, type, name, credentials_enc, settings_json,
                     selected_resources, schedule, sync_deletions, next_run_at,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     ds_id,
+                    owner_id,
                     type,
                     name,
                     credentials_enc,
@@ -180,21 +196,41 @@ class DatasourceStore:
         assert created is not None
         return created
 
-    def get_datasource(self, ds_id: str) -> dict[str, Any] | None:
+    def get_datasource(
+        self, ds_id: str, owner_id: str | None = None
+    ) -> dict[str, Any] | None:
+        sql = "SELECT * FROM datasource WHERE id = ?"
+        params: tuple[Any, ...] = (ds_id,)
+        if owner_id is not None:
+            sql += " AND owner_id = ?"
+            params = (ds_id, owner_id)
         with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM datasource WHERE id = ?", (ds_id,)
-            ).fetchone()
+            row = self._conn.execute(sql, params).fetchone()
         return _datasource_row(row) if row is not None else None
 
-    def list_datasources(self) -> list[dict[str, Any]]:
+    def list_datasources(self, owner_id: str | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM datasource"
+        params: tuple[Any, ...] = ()
+        if owner_id is not None:
+            sql += " WHERE owner_id = ?"
+            params = (owner_id,)
+        sql += " ORDER BY created_at ASC"
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM datasource ORDER BY created_at ASC"
-            ).fetchall()
+            rows = self._conn.execute(sql, params).fetchall()
         return [_datasource_row(row) for row in rows]
 
-    def update_datasource(self, ds_id: str, **fields: Any) -> dict[str, Any] | None:
+    def claim_legacy(self, owner_id: str) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE datasource SET owner_id = ? WHERE owner_id = ''",
+                (owner_id,),
+            )
+            self._conn.commit()
+        return cur.rowcount
+
+    def update_datasource(
+        self, ds_id: str, *, owner_id: str | None = None, **fields: Any
+    ) -> dict[str, Any] | None:
         updates: dict[str, Any] = {}
         for key, value in fields.items():
             if key not in _UPDATE_FIELDS:
@@ -209,19 +245,29 @@ class DatasourceStore:
             return self.get_datasource(ds_id)
         updates["updated_at"] = now_iso()
         assignments = ", ".join(f"{key} = ?" for key in updates)
+        where = "id = ?"
+        where_params: tuple[Any, ...] = (ds_id,)
+        if owner_id is not None:
+            where += " AND owner_id = ?"
+            where_params = (ds_id, owner_id)
         with self._lock:
             cur = self._conn.execute(
-                f"UPDATE datasource SET {assignments} WHERE id = ?",
-                (*updates.values(), ds_id),
+                f"UPDATE datasource SET {assignments} WHERE {where}",
+                (*updates.values(), *where_params),
             )
             self._conn.commit()
         if cur.rowcount == 0:
             return None
         return self.get_datasource(ds_id)
 
-    def delete_datasource(self, ds_id: str) -> bool:
+    def delete_datasource(self, ds_id: str, owner_id: str | None = None) -> bool:
+        sql = "DELETE FROM datasource WHERE id = ?"
+        params: tuple[Any, ...] = (ds_id,)
+        if owner_id is not None:
+            sql += " AND owner_id = ?"
+            params = (ds_id, owner_id)
         with self._lock:
-            cur = self._conn.execute("DELETE FROM datasource WHERE id = ?", (ds_id,))
+            cur = self._conn.execute(sql, params)
             self._conn.commit()
         return cur.rowcount > 0
 

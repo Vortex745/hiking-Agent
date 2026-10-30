@@ -289,11 +289,13 @@ class VectorStoreRetriever:
         api_key: str | None = None,
         model: str | None = None,
         dimensions: int | None = None,
+        db_path: str | None = None,
     ):
         self.embedding_base_url = base_url if base_url is not None else settings.embedding_base_url
         self.embedding_api_key = api_key if api_key is not None else settings.embedding_api_key
         self.embedding_model = model if model is not None else settings.embedding_model
         self.embedding_dimensions = dimensions if dimensions is not None else settings.embedding_dimensions
+        self.db_path = db_path if db_path is not None else settings.rag_sqlite_db_path
 
         self.embeddings: OpenAIEmbeddings | None = None
         self._sqlite_client: _SQLiteStoreClient | None = None
@@ -308,7 +310,7 @@ class VectorStoreRetriever:
             )
 
         self._sqlite_client = _SQLiteStoreClient(
-            settings.rag_sqlite_db_path,
+            self.db_path,
             embedding_dimensions=self.embedding_dimensions,
         )
         count = self._sqlite_client.document_count()

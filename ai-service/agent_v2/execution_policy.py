@@ -42,6 +42,7 @@ POLICY_KIND = "execution"
 def build_execution_policy(
     profile: CapabilityProfile,
     settings: Any,
+    owner_id: str = "",
 ) -> dict[str, Any]:
     """Freeze the complete execution policy for one admission.
 
@@ -61,7 +62,7 @@ def build_execution_policy(
     if profile.profile_id in (ProfileId.CHAT, ProfileId.ROUTE_PLAN):
         from agent_v2.mcp_config_store import enabled_servers
 
-        for server in enabled_servers(settings):
+        for server in enabled_servers(settings, owner_id or None):
             allowed_mcp_servers.append(server["id"])
             mcp_summary[server["id"]] = {
                 "transport": server["transport"],

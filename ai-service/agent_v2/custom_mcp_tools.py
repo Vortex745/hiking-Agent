@@ -61,7 +61,8 @@ def _is_oauth_error(exc: BaseException) -> bool:
 
 class CustomMcpTool(BaseAgentTool[Any]):
     def __init__(self, *, server: dict, descriptor: dict, revision: str,
-                 run_id: str, runs_repo: Any, audit_sink: Callable) -> None:
+                 run_id: str, runs_repo: Any, audit_sink: Callable,
+                 owner_id: str = "") -> None:
         self.name = f"mcp__{server['id']}__{descriptor['name']}"
         self.description = descriptor["description"]
         self.args_schema = json_schema_to_model(self.name, descriptor["schema"])
@@ -71,12 +72,16 @@ class CustomMcpTool(BaseAgentTool[Any]):
         self._run_id = run_id
         self._runs_repo = runs_repo
         self._audit_sink = audit_sink
+        self._owner_id = owner_id
 
     async def execute(self, params: BaseModel) -> ToolResult:
         args = params.model_dump(exclude_unset=True)
         call_args = {"call_id": current_mcp_call_id(), "arguments": args}
         run_record = self._runs_repo.get_run(self._run_id)
-        server = next((item for item in load_servers() if item["id"] == self._server_id), None)
+        server = next(
+            (item for item in load_servers(self._owner_id or None) if item["id"] == self._server_id),
+            None,
+        )
         if server is None or not server["enabled"] or server["revision"] != self._revision:
             return ToolResult(error="MCP 配置已改变，请重新发起请求。")
 
@@ -104,7 +109,7 @@ class CustomMcpTool(BaseAgentTool[Any]):
         if not won:
             return ToolResult(error="MCP 调用无法取得执行权，未执行。")
         try:
-            auth = await oauth_auth(server)
+            auth = await oauth_auth(server, self._owner_id or None)
             async with asyncio.timeout(15):
                 async with LocalMcpClient(self._server_id, client_config(server), auth=auth) as client:
                     tool = next(item for item in client.tools if item.name == self.name)
@@ -206,8 +211,12 @@ class CustomMcpTool(BaseAgentTool[Any]):
         return ToolResult(output=output or None, error=error or None)
 
 
-def build_custom_mcp_tools(projection: Any, runs_repo: Any, audit_sink: Callable) -> list[CustomMcpTool]:
-    servers = {server["id"]: server for server in load_servers()}
+def build_custom_mcp_tools(
+    projection: Any, runs_repo: Any, audit_sink: Callable, owner_id: str = ""
+) -> list[CustomMcpTool]:
+    servers = {
+        server["id"]: server for server in load_servers(owner_id or None)
+    }
     tools: list[CustomMcpTool] = []
     for service in projection.mcp_services:
         if not service.revision:
@@ -217,6 +226,9 @@ def build_custom_mcp_tools(projection: Any, runs_repo: Any, audit_sink: Callable
             raise ValueError("MCP 配置已改变，请重新发起请求。")
         for descriptor in server["tool_descriptors"]:
             if descriptor["name"] in service.tools:
-                tools.append(CustomMcpTool(server=server, descriptor=descriptor, revision=service.revision,
-                                           run_id=projection.run_id, runs_repo=runs_repo, audit_sink=audit_sink))
+                tools.append(CustomMcpTool(
+                    server=server, descriptor=descriptor, revision=service.revision,
+                    run_id=projection.run_id, runs_repo=runs_repo, audit_sink=audit_sink,
+                    owner_id=owner_id,
+                ))
     return tools

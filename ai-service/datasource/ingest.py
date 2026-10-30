@@ -42,18 +42,19 @@ def sanitize_file_name(title: str, extension: str) -> str:
     return name
 
 
-def build_embedding_provider_from_settings() -> EmbeddingProvider:
+def build_embedding_provider_from_settings(runtime_settings=None) -> EmbeddingProvider:
     from langchain_openai import OpenAIEmbeddings
 
     from config import settings
 
-    if not settings.embedding_api_key:
+    effective = runtime_settings or settings
+    if not effective.embedding_api_key:
         raise IngestFailed("未配置 embedding 服务，无法同步文档")
     return OpenAIEmbeddingAdapter(
         OpenAIEmbeddings(
-            base_url=settings.embedding_base_url,
-            api_key=settings.embedding_api_key,
-            model=settings.embedding_model,
+            base_url=effective.embedding_base_url,
+            api_key=effective.embedding_api_key,
+            model=effective.embedding_model,
             check_embedding_ctx_length=False,
             timeout=60.0,
             max_retries=2,
@@ -79,11 +80,18 @@ class RagIngestor:
         return self._store
 
     @classmethod
-    def from_settings(cls, db_path: Path | str, dimensions: int) -> "RagIngestor":
+    def from_settings(
+        cls,
+        db_path: Path | str,
+        dimensions: int,
+        runtime_settings=None,
+    ) -> "RagIngestor":
         return cls(
             db_path,
             dimensions,
-            provider_factory=build_embedding_provider_from_settings,
+            provider_factory=lambda: build_embedding_provider_from_settings(
+                runtime_settings
+            ),
         )
 
     def _pipeline_obj(self) -> IngestionPipeline:

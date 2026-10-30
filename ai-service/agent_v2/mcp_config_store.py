@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -47,20 +48,31 @@ class LocalMcpClient(McpClient):
         )
 
 
-def _path() -> Path:
+_OWNER_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _owner_dir(owner_id: str) -> Path:
+    if not _OWNER_ID_RE.fullmatch(owner_id):
+        raise ValueError("invalid owner id")
+    return Path(settings.agent_v2_state_dir) / "users" / owner_id
+
+
+def _path(owner_id: str | None = None) -> Path:
+    if owner_id:
+        return _owner_dir(owner_id) / "mcp_servers.json"
     return Path(settings.agent_v2_state_dir) / "mcp_servers.json"
 
 
-def load_servers() -> list[dict[str, Any]]:
-    path = _path()
+def load_servers(owner_id: str | None = None) -> list[dict[str, Any]]:
+    path = _path(owner_id)
     if not path.exists():
         return []
     data = json.loads(path.read_text(encoding="utf-8"))
     return data["servers"]
 
 
-def save_servers(servers: list[dict[str, Any]]) -> None:
-    path = _path()
+def save_servers(servers: list[dict[str, Any]], owner_id: str | None = None) -> None:
+    path = _path(owner_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
@@ -81,6 +93,13 @@ def connection_fingerprint(server: dict[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(connection, sort_keys=True, ensure_ascii=False).encode("utf-8")
     ).hexdigest()
+
+
+def scoped_fingerprint(server: dict[str, Any], owner_id: str | None = None) -> str:
+    base = connection_fingerprint(server)
+    if not owner_id:
+        return base
+    return hashlib.sha256(f"{owner_id}\0{base}".encode("utf-8")).hexdigest()
 
 
 def client_config(server: dict[str, Any]) -> dict[str, Any]:
@@ -111,7 +130,29 @@ def public_server(server: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def enabled_servers(runtime_settings: Any = settings) -> list[dict[str, Any]]:
+def all_scoped_fingerprints() -> set[str]:
+    """所有账号 + 旧版配置的 OAuth 指纹，用于安全地清理已删除的服务。"""
+    fingerprints = {
+        scoped_fingerprint(server, None) for server in load_servers()
+    }
+    users_root = Path(settings.agent_v2_state_dir) / "users"
+    if users_root.is_dir():
+        for child in users_root.iterdir():
+            if not child.is_dir() or not _OWNER_ID_RE.fullmatch(child.name):
+                continue
+            try:
+                servers = load_servers(child.name)
+            except (OSError, ValueError, KeyError, json.JSONDecodeError):
+                continue
+            fingerprints.update(
+                scoped_fingerprint(server, child.name) for server in servers
+            )
+    return fingerprints
+
+
+def enabled_servers(
+    runtime_settings: Any = settings, owner_id: str | None = None
+) -> list[dict[str, Any]]:
     if getattr(runtime_settings, "agent_v2_sandbox_type", "") != "local_native":
         return []
-    return [server for server in load_servers() if server["enabled"]]
+    return [server for server in load_servers(owner_id) if server["enabled"]]

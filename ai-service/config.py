@@ -373,6 +373,14 @@ def section_settings_attrs() -> dict[str, tuple[str, str]]:
     }
 
 
+def section_field_settings_attrs() -> dict[str, dict[str, str]]:
+    """Return a copy of section -> field -> Settings attribute mapping."""
+    return {
+        section: dict(fields)
+        for section, fields in _SECTION_FIELD_SETTINGS_ATTRS.items()
+    }
+
+
 def _parse_runtime_dimensions(value: Any) -> int:
     """把 dimensions 解析为正整数；布尔/小数/非数字/非正数一律拒绝。"""
     if isinstance(value, bool):

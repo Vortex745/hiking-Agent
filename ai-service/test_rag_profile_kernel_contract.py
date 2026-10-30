@@ -205,9 +205,10 @@ def _seeded_knowledge_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     db_path = tmp_path / "rag.sqlite"
     monkeypatch.setattr(settings, "rag_sqlite_db_path", str(db_path))
+    dimensions = settings.embedding_dimensions
 
-    store = SQLiteStore(str(db_path), embedding_dimensions=1536)
-    pipeline = IngestionPipeline(store=store, embedding_provider=FakeEmbedding(dimensions=1536))
+    store = SQLiteStore(str(db_path), embedding_dimensions=dimensions)
+    pipeline = IngestionPipeline(store=store, embedding_provider=FakeEmbedding(dimensions=dimensions))
     report = pipeline.ingest_content(
         markdown="# 鳌太线装备\n\n鳌太线穿越需要帐篷、睡袋和防风外套，夏季仍需保暖。",
         source="鳌太线攻略.md",

@@ -23,6 +23,8 @@ from api.models import (
     LlmConfigUpdateRequest,
     LlmConfigUpdateResponse,
 )
+from auth.deps import current_user_id
+from auth.paths import user_rag_path
 from config import settings
 from rag.sqlite_schema import read_vec0_dimensions
 
@@ -42,47 +44,64 @@ def _mask_api_key(value: str) -> tuple[str, bool]:
     return f"{value[:4]}...{value[-4:]}", True
 
 
-def _build_snapshot() -> LlmConfigResponse:
-    llm_masked, llm_set = _mask_api_key(settings.openai_api_key)
-    embedding_masked, embedding_set = _mask_api_key(settings.embedding_api_key)
-    rerank_masked, rerank_set = _mask_api_key(settings.rerank_api_key)
-    decision_masked, decision_set = _mask_api_key(settings.decision_model_api_key)
+def _index_path(owner_id: str) -> str:
+    return (
+        str(user_rag_path(settings, owner_id))
+        if owner_id
+        else settings.rag_sqlite_db_path
+    )
+
+
+def _build_snapshot(owner_id: str = "") -> LlmConfigResponse:
+    from auth.user_config import effective_settings, section_sources
+
+    effective = effective_settings(settings, owner_id) if owner_id else settings
+    sources = (
+        section_sources(settings, owner_id)
+        if owner_id
+        else {section: "system" for section in ("llm", "embedding", "rerank", "decision")}
+    )
+    llm_masked, llm_set = _mask_api_key(effective.openai_api_key)
+    embedding_masked, embedding_set = _mask_api_key(effective.embedding_api_key)
+    rerank_masked, rerank_set = _mask_api_key(effective.rerank_api_key)
+    decision_masked, decision_set = _mask_api_key(effective.decision_model_api_key)
 
     return LlmConfigResponse(
         llm=LlmConfigSectionResponse(
-            base_url=settings.openai_base_url,
-            model=settings.openai_model,
+            base_url=effective.openai_base_url,
+            model=effective.openai_model,
             api_key_masked=llm_masked,
             api_key_set=llm_set,
         ),
         embedding=LlmConfigEmbeddingSectionResponse(
-            base_url=settings.embedding_base_url,
-            model=settings.embedding_model,
-            dimensions=settings.embedding_dimensions,
+            base_url=effective.embedding_base_url,
+            model=effective.embedding_model,
+            dimensions=effective.embedding_dimensions,
             api_key_masked=embedding_masked,
             api_key_set=embedding_set,
         ),
         rerank=LlmConfigSectionResponse(
-            base_url=settings.rerank_base_url,
-            model=settings.rerank_model,
+            base_url=effective.rerank_base_url,
+            model=effective.rerank_model,
             api_key_masked=rerank_masked,
             api_key_set=rerank_set,
         ),
         decision=LlmConfigDecisionSectionResponse(
-            base_url=settings.decision_model_base_url,
-            model=settings.decision_model_name,
+            base_url=effective.decision_model_base_url,
+            model=effective.decision_model_name,
             api_key_masked=decision_masked,
             api_key_set=decision_set,
-            mode=settings.decision_model_mode,
+            mode=effective.decision_model_mode,
         ),
         updated_at=config.env_file_updated_at(),
-        index_dimensions=read_vec0_dimensions(settings.rag_sqlite_db_path),
+        index_dimensions=read_vec0_dimensions(_index_path(owner_id)),
+        sources=sources,
     )
 
 
 @llm_config_router.get("", response_model=LlmConfigResponse)
-async def get_llm_config() -> LlmConfigResponse:
-    return _build_snapshot()
+async def get_llm_config(request: Request) -> LlmConfigResponse:
+    return _build_snapshot(current_user_id(request))
 
 
 _REQUIRED_SECTIONS = ("llm", "embedding", "rerank")
@@ -99,7 +118,7 @@ def _require_non_empty(section_name: str, field: str, value: str | None) -> str:
 
 
 def _validate_update(payload: LlmConfigUpdateRequest) -> dict[str, dict[str, object]]:
-    """把线上请求收敛成 config.update_runtime_config 接受的字段字典。"""
+    """把线上请求收敛成 config/user_config 接受的字段字典。"""
     sections: dict[str, dict[str, object]] = {}
     for section_name in _REQUIRED_SECTIONS:
         section = getattr(payload, section_name)
@@ -146,18 +165,45 @@ def _validate_update(payload: LlmConfigUpdateRequest) -> dict[str, dict[str, obj
 @llm_config_router.put("", response_model=LlmConfigUpdateResponse)
 async def update_llm_config(
     payload: LlmConfigUpdateRequest,
+    request: Request,
 ) -> LlmConfigUpdateResponse:
+    owner_id = current_user_id(request)
     sections = _validate_update(payload)
     requested_dimensions = sections["embedding"]["dimensions"]
 
     # 维度冲突必须在任何写入之前拒绝，避免配置与索引永久不一致。
-    index_dimensions = read_vec0_dimensions(settings.rag_sqlite_db_path)
+    index_dimensions = read_vec0_dimensions(_index_path(owner_id))
     if index_dimensions is not None and index_dimensions != requested_dimensions:
         raise HTTPException(
             status_code=409,
             detail=(
                 f"embedding.dimensions={requested_dimensions} 与索引实际维度 "
                 f"{index_dimensions} 不一致，需重建索引"
+            ),
+        )
+
+    if owner_id:
+        from auth.user_config import effective_settings, save_overrides
+
+        before = effective_settings(settings, owner_id)
+        try:
+            changed = save_overrides(settings, owner_id, sections)
+        except OSError:
+            logger.exception("user llm-config write failed user=%s", owner_id)
+            raise HTTPException(status_code=500, detail="账号配置写入失败，配置未保存")
+        after = effective_settings(settings, owner_id)
+        logger.info(
+            "user llm-config updated fields=%s user=%s",
+            ", ".join(changed) or "(none)",
+            owner_id,
+        )
+        snapshot = _build_snapshot(owner_id)
+        return LlmConfigUpdateResponse(
+            **snapshot.model_dump(),
+            reindex_recommended=(
+                after.embedding_base_url != before.embedding_base_url
+                or after.embedding_model != before.embedding_model
+                or after.embedding_dimensions != before.embedding_dimensions
             ),
         )
 
@@ -186,6 +232,20 @@ async def update_llm_config(
     )
 
 
+@llm_config_router.delete("", response_model=LlmConfigUpdateResponse)
+async def reset_llm_config(request: Request) -> LlmConfigUpdateResponse:
+    owner_id = current_user_id(request)
+    if not owner_id:
+        raise HTTPException(status_code=400, detail="仅登录账号支持恢复系统默认")
+    from auth.user_config import reset_overrides
+
+    reset_overrides(settings, owner_id)
+    snapshot = _build_snapshot(owner_id)
+    return LlmConfigUpdateResponse(
+        **snapshot.model_dump(), reindex_recommended=False
+    )
+
+
 _SECTION_SETTINGS_ATTRS = config.section_settings_attrs()
 _PROBE_TIMEOUT_SECONDS = 15.0
 
@@ -193,13 +253,21 @@ _PROBE_TIMEOUT_SECONDS = 15.0
 @llm_config_router.post("/test", response_model=LlmConfigTestResponse)
 async def test_llm_config(
     payload: LlmConfigTestRequest,
+    request: Request,
 ) -> LlmConfigTestResponse:
-    """探测上游 /models；空 base_url/api_key 回退已存配置，不落盘。"""
+    """探测上游 /models；空 base_url/api_key 回退账号/系统已存配置，不落盘。"""
+    owner_id = current_user_id(request)
+    if owner_id:
+        from auth.user_config import effective_settings
+
+        effective = effective_settings(settings, owner_id)
+    else:
+        effective = settings
     base_url_attr, api_key_attr = _SECTION_SETTINGS_ATTRS[payload.section]
     requested_base_url = (payload.base_url or "").strip()
     requested_api_key = (payload.api_key or "").strip()
-    stored_base_url = (getattr(settings, base_url_attr) or "").strip()
-    stored_api_key = (getattr(settings, api_key_attr) or "").strip()
+    stored_base_url = (getattr(effective, base_url_attr) or "").strip()
+    stored_api_key = (getattr(effective, api_key_attr) or "").strip()
 
     # 禁止把已存密钥转发到请求指定的新主机：base_url 变了就必须自带 key。
     if (
@@ -225,7 +293,7 @@ async def test_llm_config(
         if not api_key:
             raise HTTPException(status_code=400, detail="decision.api_key 未配置")
         model = (payload.model or "").strip() or (
-            getattr(settings, "decision_model_name", "") or "Kev-4b"
+            getattr(effective, "decision_model_name", "") or "Kev-4b"
         )
         try:
             latency_ms, choice = await probe_systemone(

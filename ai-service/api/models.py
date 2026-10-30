@@ -35,6 +35,7 @@ class LlmConfigResponse(BaseModel):
     decision: LlmConfigDecisionSectionResponse
     updated_at: str | None
     index_dimensions: int | None
+    sources: dict[str, str] | None = None
 
 
 class LlmConfigSectionUpdate(BaseModel):

@@ -2252,6 +2252,8 @@ class RunOrchestrator:
         req: ChatFlowRequest,
         *,
         subject_id: str | None = None,
+        owner_id: str = "",
+        settings: Any | None = None,
     ) -> AsyncGenerator[EventEnvelope | str, None]:
         """Drive one run and yield its events.
 
@@ -2263,6 +2265,7 @@ class RunOrchestrator:
             request_id=req.request_id,
             conversation_id=req.conversation_id or "",
         )
+        run_settings = settings if settings is not None else self._settings
 
         # When v2 is disabled or the runtime is the Ticket 03 placeholder
         # (no ``runs`` attribute), ``runs_repo`` is None and persistence
@@ -2353,7 +2356,7 @@ class RunOrchestrator:
             # here when v2 is off, but the endpoint defends in depth. No
             # admission happens: a request that can never execute must
             # not leave a durable run behind.
-            if not self._settings.agent_v2_enabled:
+            if not run_settings.agent_v2_enabled:
                 yield _emit("error", {
                     "code": "v2_disabled",
                     "message": "Chat v2 is disabled (AGENT_V2_ENABLED=false).",
@@ -2376,7 +2379,7 @@ class RunOrchestrator:
             # server policy, not the client, authorizes cowork. Runs
             # before admission so an unauthorized request creates no run.
             if profile.profile_id == ProfileId.COWORK and not is_cowork_authorized(
-                self._settings
+                run_settings
             ):
                 yield _emit("error", {
                     "code": "cowork_unauthorized",
@@ -2392,7 +2395,9 @@ class RunOrchestrator:
             # with the run and every later execution step reads the frozen
             # snapshot, never the live config.
             try:
-                execution_policy = build_execution_policy(profile, self._settings)
+                execution_policy = build_execution_policy(
+                    profile, run_settings, owner_id=owner_id
+                )
             except Exception:
                 logger.exception(
                     "chat_v2: execution policy build failed for request_id=%s",
@@ -2409,7 +2414,7 @@ class RunOrchestrator:
             # call or sandbox creation. A failure here is terminal and
             # never reaches execution; the same request_id retry repairs
             # only the missing durable records.
-            policy_settings: Any = self._settings
+            policy_settings: Any = run_settings
             if runs_repo is not None:
                 try:
                     admission = runs_repo.admit(
@@ -2472,7 +2477,7 @@ class RunOrchestrator:
                         run_id,
                         profile_name=req.profile_id,
                         status="running",
-                        model_name=getattr(self._settings, "openai_model", ""),
+                        model_name=getattr(run_settings, "openai_model", ""),
                     )
 
                 if conversation_forbidden:
@@ -2529,7 +2534,7 @@ class RunOrchestrator:
                     resolved_policy = runs_repo.resolve_policy_snapshot(run_id)
                     profile = resolved_policy.profile()
                     policy_settings = freeze_settings(
-                        self._settings, resolved_policy.policy
+                        run_settings, resolved_policy.policy
                     )
                     # BCDEF ticket 10: project the capability/risk/effect
                     # surface from the SAME frozen snapshot. Failure here
@@ -2593,7 +2598,7 @@ class RunOrchestrator:
             # requires this to be a terminal ``error`` event, not an HTTP
             # 500. The admission ``run_started`` frame (if persistence is
             # on) already told the client the run began.
-            if not self._settings.openai_api_key:
+            if not run_settings.openai_api_key:
                 if not run_started_emitted:
                     yield _emit("run_started", {})
                     run_started_emitted = True
@@ -2653,6 +2658,7 @@ class RunOrchestrator:
                     req, profile, run_id=run_id, emit=_emit,
                     settings=policy_settings,
                     projection=capability_projection,
+                    owner_id=owner_id,
                 )
                 try:
                     async for envelope in route_flow:
@@ -2679,6 +2685,7 @@ class RunOrchestrator:
                     req, profile, run_id=run_id, emit=_emit,
                     settings=policy_settings,
                     projection=capability_projection,
+                    owner_id=owner_id,
                 )
                 try:
                     async for envelope in rag_flow:
@@ -2764,6 +2771,7 @@ class RunOrchestrator:
                     memory=memory, subject_id=subject_id,
                     settings=policy_settings,
                     projection=capability_projection,
+                    owner_id=owner_id,
                 )
                 try:
                     async for envelope in chat_flow:
@@ -3609,6 +3617,8 @@ class RunOrchestrator:
         run_id: str,
         from_seq: int = 0,
         subject_id: str | None = None,
+        owner_id: str = "",
+        settings: Any | None = None,
     ) -> AsyncGenerator[EventEnvelope, None]:
         """Resume stream wrapper: closes silently on a failed finalize fence.
 
@@ -3616,7 +3626,13 @@ class RunOrchestrator:
         the assistant + terminal durability fence. When that fence fails
         the stream closes without a terminal; snapshot/replay explain it.
         """
-        impl = self._stream_resume_impl(run_id=run_id, from_seq=from_seq, subject_id=subject_id)
+        impl = self._stream_resume_impl(
+            run_id=run_id,
+            from_seq=from_seq,
+            subject_id=subject_id,
+            owner_id=owner_id,
+            settings=settings,
+        )
         try:
             async for envelope in impl:
                 yield envelope
@@ -3640,6 +3656,8 @@ class RunOrchestrator:
         run_id: str,
         from_seq: int = 0,
         subject_id: str | None = None,
+        owner_id: str = "",
+        settings: Any | None = None,
     ) -> AsyncGenerator[EventEnvelope, None]:
         """Produce the resume event stream — spec AC4, AC5, AC7.
 
@@ -3661,6 +3679,7 @@ class RunOrchestrator:
         """
         runs_repo = self._runs_repo
         telemetry = self._telemetry
+        run_settings = settings if settings is not None else self._settings
         if runs_repo is None:
             yield EventEnvelope(
                 version="2", sequence=1, type="error",
@@ -3803,7 +3822,7 @@ class RunOrchestrator:
                 # adapted settings are re-derived here only as a fail-closed
                 # REVALIDATION of policy identity — never to re-resolve the
                 # current default profile, model or capability.
-                assert_policy_frozen(self._settings, resolved_policy.policy)
+                assert_policy_frozen(run_settings, resolved_policy.policy)
             except BoundaryError as exc:
                 logger.error(
                     "run_orchestration: policy snapshot unusable during resume "
@@ -3956,8 +3975,9 @@ class RunOrchestrator:
                 continuation = self._stream_kernel_turn(
                     req, resolved_policy.profile(), run_id=run_id, emit=emit,
                     memory=self._memory, subject_id=subject_id,
-                    settings=freeze_settings(self._settings, resolved_policy.policy),
+                    settings=freeze_settings(run_settings, resolved_policy.policy),
                     projection=resume_projection, resume=True,
+                    owner_id=owner_id,
                     resume_interrupt_id=json.loads(resolved.args_canonical)["interrupt_id"],
                 )
                 try:
@@ -4897,6 +4917,7 @@ class RunOrchestrator:
         subject_id: str | None = None,
         settings: Any | None = None,
         projection: CapabilityProjection | None = None,
+        owner_id: str = "",
         resume: bool = False,
         resume_interrupt_id: str | None = None,
     ) -> AsyncGenerator[EventEnvelope, None]:
@@ -5048,7 +5069,10 @@ class RunOrchestrator:
                     return
                 from agent_v2.custom_mcp_tools import build_custom_mcp_tools
                 try:
-                    extra_tools.extend(build_custom_mcp_tools(projection, self._runs_repo, audit_entries.append))
+                    extra_tools.extend(build_custom_mcp_tools(
+                        projection, self._runs_repo, audit_entries.append,
+                        owner_id=owner_id,
+                    ))
                 except ValueError:
                     yield emit("error", {"code": "mcp_config_changed", "message": "MCP 配置已改变，请重新发起请求。"})
                     mark_terminal_safe(self._runs_repo, run_id, "error")

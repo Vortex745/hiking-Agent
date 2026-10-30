@@ -10,7 +10,9 @@
     "test:browser": "node tests/session-switch-white-screen.cjs",
     "test:browser:activity": "node tests/agent-activity-trace.cjs",
     "test:browser:knowledge": "node tests/knowledge-sources.cjs",
-    "test:browser:llm-config": "node tests/llm-config-decision.cjs"
+    "test:browser:llm-config": "node tests/llm-config-decision.cjs",
+    "test:browser:auth": "node tests/auth.cjs",
+    "test:browser:llm-config-account": "node tests/llm-config-account.cjs"
   },
   "dependencies": {
     "@amap/amap-jsapi-loader": "^1.0.1",

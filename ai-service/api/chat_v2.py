@@ -86,6 +86,8 @@ from agent_v2.sandbox_lifecycle import (
     SandboxCleanupResult,
     run_sandbox_cleanup,
 )
+from agent_v2.user_scope import current_owner_id, current_user_settings
+from auth.user_config import effective_settings as load_user_settings
 from agent_v2.run_orchestration import (
     ChatFlowRequest,
     RunOrchestrator,
@@ -441,10 +443,18 @@ async def chat_v2_sse(req: ChatV2Request, request: Request):
         # every exit — normal terminal close, immediate close, cancel and
         # client disconnect — so the orchestrator's ownership token is
         # released and its cleanup finallys run instead of leaking to GC.
+        owner_id = str(getattr(request.state, "user_id", "") or "")
+        effective_settings = (
+            load_user_settings(settings, owner_id) if owner_id else settings
+        )
         stream = orchestrator.stream_chat(
             flow_req,
             subject_id=getattr(request.state, "subject_id", None),
+            owner_id=owner_id,
+            settings=effective_settings,
         )
+        owner_token = current_owner_id.set(owner_id)
+        settings_token = current_user_settings.set(effective_settings)
         try:
             with tracing.start_span(
                 "chat.request",
@@ -478,6 +488,8 @@ async def chat_v2_sse(req: ChatV2Request, request: Request):
                     raise
         finally:
             await _aclose_stream_generator(stream)
+            current_user_settings.reset(settings_token)
+            current_owner_id.reset(owner_token)
             tracing.reset_session(session_token)
             leases.release()
 
@@ -1226,10 +1238,18 @@ async def chat_v2_resume(
         # agent-lifecycle-repair ticket 02: the connection owns the resume
         # generator; close it deterministically on every exit so the
         # execution token is released and cleanup finallys run.
+        owner_id = str(getattr(request.state, "user_id", "") or "")
+        effective_settings = (
+            load_user_settings(settings, owner_id) if owner_id else settings
+        )
         stream = orchestrator.stream_resume(
             run_id=run_id, from_seq=from_seq,
             subject_id=getattr(request.state, "subject_id", None),
+            owner_id=owner_id,
+            settings=effective_settings,
         )
+        owner_token = current_owner_id.set(owner_id)
+        settings_token = current_user_settings.set(effective_settings)
         try:
             with tracing.start_span(
                 "chat.resume",
@@ -1255,6 +1275,8 @@ async def chat_v2_resume(
                     raise
         finally:
             await _aclose_stream_generator(stream)
+            current_user_settings.reset(settings_token)
+            current_owner_id.reset(owner_token)
             tracing.reset_session(session_token)
             leases.release()
 

@@ -8,7 +8,7 @@ import math
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from datasource.connector import Connector
 from datasource.errors import (
@@ -58,11 +58,15 @@ class DatasourceService:
         *,
         executor: ThreadPoolExecutor | None = None,
         scheduler_interval_seconds: float = 30.0,
+        ingestor_factory: Callable[[str], RagIngestor] | None = None,
     ) -> None:
         self.store = store
         self.registry = registry
         self.ingestor = ingestor
         self.secret_box = secret_box
+        self._ingestor_factory = ingestor_factory
+        self._ingestors: dict[str, RagIngestor] = {}
+        self._ingestor_lock = threading.Lock()
         self._executor = executor or ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="datasource-sync"
         )
@@ -89,6 +93,7 @@ class DatasourceService:
         selected_resources: Sequence[str],
         schedule: str = "",
         sync_deletions: bool = True,
+        owner_id: str = "",
     ) -> dict[str, Any]:
         metadata = self.registry.metadata(type)
         clean_name = (name or "").strip()
@@ -108,6 +113,7 @@ class DatasourceService:
             schedule=schedule,
             sync_deletions=sync_deletions,
             next_run_at=next_at,
+            owner_id=owner_id,
         )
         return self.response(ds)
 
@@ -115,6 +121,7 @@ class DatasourceService:
         self,
         ds_id: str,
         *,
+        owner_id: str | None = None,
         name: str | None = None,
         credentials: Mapping[str, str] | None = None,
         settings: Mapping[str, Any] | None = None,
@@ -122,7 +129,7 @@ class DatasourceService:
         schedule: str | None = None,
         sync_deletions: bool | None = None,
     ) -> dict[str, Any]:
-        ds = self._require(ds_id)
+        ds = self._require(ds_id, owner_id)
         metadata = self.registry.metadata(ds["type"])
         fields: dict[str, Any] = {}
         if name is not None:
@@ -155,26 +162,29 @@ class DatasourceService:
             schedule = schedule.strip()
             next_at = _next_at_or_raise(schedule)
             fields["schedule"] = schedule
-        updated = self.store.update_datasource(ds_id, **fields)
+        updated = self.store.update_datasource(ds_id, owner_id=owner_id, **fields)
         assert updated is not None
         if schedule_changed:
             self.store.set_next_run(ds_id, next_at)
-            updated = self._require(ds_id)
+            updated = self._require(ds_id, owner_id)
         return self.response(updated)
 
-    def delete_datasource(self, ds_id: str, *, purge_docs: bool = False) -> bool:
-        self._require(ds_id)
+    def delete_datasource(
+        self, ds_id: str, *, purge_docs: bool = False, owner_id: str | None = None
+    ) -> bool:
+        self._require(ds_id, owner_id)
         if purge_docs:
-            self.purge_docs(ds_id)
-        return self.store.delete_datasource(ds_id)
+            self.purge_docs(ds_id, owner_id=owner_id)
+        return self.store.delete_datasource(ds_id, owner_id)
 
-    def purge_docs(self, ds_id: str) -> int:
-        self._require(ds_id)
+    def purge_docs(self, ds_id: str, owner_id: str | None = None) -> int:
+        ds = self._require(ds_id, owner_id)
+        ingestor = self._ingestor_for(ds.get("owner_id") or "")
         deleted = 0
         for row in self.store.list_synced_docs(ds_id):
             if row["rag_source"]:
                 try:
-                    self.ingestor.delete(row["rag_source"])
+                    ingestor.delete(row["rag_source"])
                 except Exception as exc:
                     logger.warning("purge rag doc failed ds=%s external_id=%s: %s", ds_id, row["external_id"], exc)
                     continue
@@ -182,11 +192,13 @@ class DatasourceService:
             deleted += 1
         return deleted
 
-    def list_datasources(self) -> list[dict[str, Any]]:
-        return [self.response(ds) for ds in self.store.list_datasources()]
+    def list_datasources(self, owner_id: str | None = None) -> list[dict[str, Any]]:
+        return [
+            self.response(ds) for ds in self.store.list_datasources(owner_id)
+        ]
 
-    def get_datasource(self, ds_id: str) -> dict[str, Any]:
-        return self.response(self._require(ds_id))
+    def get_datasource(self, ds_id: str, owner_id: str | None = None) -> dict[str, Any]:
+        return self.response(self._require(ds_id, owner_id))
 
     def response(self, ds: Mapping[str, Any]) -> dict[str, Any]:
         configured: dict[str, bool] = {}
@@ -239,8 +251,8 @@ class DatasourceService:
         finally:
             connector.close()
 
-    def validate_saved(self, ds_id: str) -> None:
-        ds = self._require(ds_id)
+    def validate_saved(self, ds_id: str, owner_id: str | None = None) -> None:
+        ds = self._require(ds_id, owner_id)
         connector = self._connector(ds)
         try:
             connector.validate()
@@ -279,16 +291,20 @@ class DatasourceService:
         finally:
             connector.close()
 
-    def list_resources_for(self, ds_id: str, parent_id: str | None) -> list[ResourceNode]:
-        ds = self._require(ds_id)
+    def list_resources_for(
+        self, ds_id: str, parent_id: str | None, owner_id: str | None = None
+    ) -> list[ResourceNode]:
+        ds = self._require(ds_id, owner_id)
         connector = self._connector(ds)
         try:
             return connector.list_resources(parent_id)
         finally:
             connector.close()
 
-    def resolve_ancestors_for(self, ds_id: str, ids: Sequence[str]) -> list[ResourceNode]:
-        ds = self._require(ds_id)
+    def resolve_ancestors_for(
+        self, ds_id: str, ids: Sequence[str], owner_id: str | None = None
+    ) -> list[ResourceNode]:
+        ds = self._require(ds_id, owner_id)
         connector = self._connector(ds)
         try:
             return connector.resolve_ancestors(ids)
@@ -297,8 +313,10 @@ class DatasourceService:
 
     # ------------------------------------------------------------------ sync
 
-    def start_sync(self, ds_id: str, trigger: str = "manual") -> str:
-        ds = self._require(ds_id)
+    def start_sync(
+        self, ds_id: str, trigger: str = "manual", owner_id: str | None = None
+    ) -> str:
+        ds = self._require(ds_id, owner_id)
         next_at = _next_run_for(ds)
         log_id = self.store.claim_sync(ds_id, trigger)
         if log_id is None:
@@ -321,9 +339,11 @@ class DatasourceService:
             raise
         return log_id
 
-    def run_sync_now(self, ds_id: str, trigger: str = "manual") -> str:
+    def run_sync_now(
+        self, ds_id: str, trigger: str = "manual", owner_id: str | None = None
+    ) -> str:
         """Synchronous sync used by tests and explicit maintenance calls."""
-        ds = self._require(ds_id)
+        ds = self._require(ds_id, owner_id)
         next_at = _next_run_for(ds)
         log_id = self.store.claim_sync(ds_id, trigger)
         if log_id is None:
@@ -365,6 +385,7 @@ class DatasourceService:
 
     def _sync(self, ds_id: str, log_id: str, trigger: str) -> _SyncResult:
         ds = self._require(ds_id)
+        ingestor = self._ingestor_for(ds.get("owner_id") or "")
         selected = list(ds["selected_resources"])
         if not selected:
             raise ValidationError("未选择任何资源")
@@ -409,12 +430,13 @@ class DatasourceService:
                         seen,
                         counts,
                         failures,
+                        ingestor,
                     )
             guard_tripped = False
             guard_message = ""
             if ds["sync_deletions"]:
                 guard_tripped, guard_message = self._reconcile_deletions(
-                    ds_id, selected, seen, known, enumeration, counts, failures
+                    ds_id, selected, seen, known, enumeration, counts, failures, ingestor
                 )
 
             status = "success"
@@ -456,6 +478,7 @@ class DatasourceService:
         seen: dict[str, set[str]],
         counts: SyncCounts,
         failures: list[dict[str, Any]],
+        ingestor: RagIngestor,
     ) -> None:
         counts.discovered += 1
         seen[root].add(node.id)
@@ -478,7 +501,7 @@ class DatasourceService:
                 raise VendorError("连接器返回空结果")
             counts.fetched += 1
             source = f"ds:{ds_id}:{node.id}"
-            action = self.ingestor.upsert(item, source)
+            action = ingestor.upsert(item, source)
             if action == "created":
                 counts.created += 1
             elif action == "updated":
@@ -530,6 +553,7 @@ class DatasourceService:
         enumeration: Mapping[str, Any],
         counts: SyncCounts,
         failures: list[dict[str, Any]],
+        ingestor: RagIngestor,
     ) -> tuple[bool, str]:
         candidates: list[dict[str, Any]] = []
         known_total = 0
@@ -551,7 +575,7 @@ class DatasourceService:
             return True, f"待删除 {len(candidates)} 篇超过警戒值 {guard}，本轮不删除"
         for row in candidates:
             try:
-                self.ingestor.delete(row["rag_source"])
+                ingestor.delete(row["rag_source"])
             except Exception as exc:
                 failures.append(_failure(row["external_id"], row["file_name"], exc))
                 counts.failed += 1
@@ -581,19 +605,25 @@ class DatasourceService:
 
     # ------------------------------------------------------------------ logs / documents
 
-    def list_sync_logs(self, ds_id: str, limit: int = 20) -> list[dict[str, Any]]:
-        self._require(ds_id)
+    def list_sync_logs(
+        self, ds_id: str, limit: int = 20, owner_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        self._require(ds_id, owner_id)
         return self.store.list_sync_logs(ds_id, limit)
 
-    def get_sync_log(self, ds_id: str, log_id: str) -> dict[str, Any]:
-        self._require(ds_id)
+    def get_sync_log(
+        self, ds_id: str, log_id: str, owner_id: str | None = None
+    ) -> dict[str, Any]:
+        self._require(ds_id, owner_id)
         log = self.store.get_sync_log(log_id)
         if log is None or log["datasource_id"] != ds_id:
             raise NotFoundError("同步记录不存在")
         return log
 
-    def list_documents(self, ds_id: str) -> list[dict[str, Any]]:
-        self._require(ds_id)
+    def list_documents(
+        self, ds_id: str, owner_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        self._require(ds_id, owner_id)
         return self.store.list_synced_docs(ds_id)
 
     # ------------------------------------------------------------------ scheduler
@@ -621,7 +651,11 @@ class DatasourceService:
         started: list[str] = []
         for ds in self.store.list_due(moment_iso):
             try:
-                started.append(self.start_sync(ds["id"], "schedule"))
+                started.append(
+                    self.start_sync(
+                        ds["id"], "schedule", owner_id=ds.get("owner_id") or ""
+                    )
+                )
             except ConflictError:
                 continue
             except Exception:
@@ -644,11 +678,21 @@ class DatasourceService:
 
     # ------------------------------------------------------------------ helpers
 
-    def _require(self, ds_id: str) -> dict[str, Any]:
-        ds = self.store.get_datasource(ds_id)
+    def _require(self, ds_id: str, owner_id: str | None = None) -> dict[str, Any]:
+        ds = self.store.get_datasource(ds_id, owner_id)
         if ds is None:
             raise NotFoundError("知识源不存在")
         return ds
+
+    def _ingestor_for(self, owner_id: str) -> RagIngestor:
+        if not owner_id or self._ingestor_factory is None:
+            return self.ingestor
+        with self._ingestor_lock:
+            ingestor = self._ingestors.get(owner_id)
+            if ingestor is None:
+                ingestor = self._ingestor_factory(owner_id)
+                self._ingestors[owner_id] = ingestor
+            return ingestor
 
     def _connector(self, ds: Mapping[str, Any]) -> Connector:
         credentials = self.secret_box.decrypt(ds["credentials_enc"])
@@ -662,6 +706,14 @@ class DatasourceService:
         if running:
             logger.warning("datasource service closed during a running sync; stores left to process exit")
             return
+        with self._ingestor_lock:
+            owner_ingestors = list(self._ingestors.values())
+            self._ingestors.clear()
+        for ingestor in owner_ingestors:
+            try:
+                ingestor.close()
+            except Exception as exc:
+                logger.warning("owner ingestor close failed: %s", exc)
         self.ingestor.close()
         self.store.close()
 

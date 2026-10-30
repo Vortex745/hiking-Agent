@@ -5,6 +5,8 @@ from fastapi import APIRouter, HTTPException, Request
 
 import config
 from api.models import ModelsFetchRequest, ModelsFetchResponse
+from auth.deps import current_user_id
+from auth.user_config import effective_settings
 from config import settings
 
 logger = logging.getLogger("ai-service.models")
@@ -30,8 +32,10 @@ async def models_fetch(req: ModelsFetchRequest, request: Request):
         attrs = config.section_settings_attrs().get(req.section)
         if attrs is None:
             raise HTTPException(status_code=400, detail=f"unknown section: {req.section}")
-        stored_base_url = str(getattr(settings, attrs[0], "") or "").rstrip("/")
-        stored_api_key = str(getattr(settings, attrs[1], "") or "")
+        owner_id = current_user_id(request)
+        effective = effective_settings(settings, owner_id) if owner_id else settings
+        stored_base_url = str(getattr(effective, attrs[0], "") or "").rstrip("/")
+        stored_api_key = str(getattr(effective, attrs[1], "") or "")
         if not stored_api_key:
             raise HTTPException(
                 status_code=400, detail=f"{req.section}.api_key 未配置"

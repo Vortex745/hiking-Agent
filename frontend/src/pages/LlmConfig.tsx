@@ -16,9 +16,11 @@ import {
   Save,
   Server,
   TriangleAlert,
+  Undo2,
 } from 'lucide-react'
 import ArcCard from '../components/ui/card'
 import ArcDialog from '../components/ui/dialog'
+import { useAuth } from '../auth/AuthContext'
 import {
   ConfigSection,
   DecisionConfigDraft,
@@ -37,6 +39,7 @@ import {
   ModelInfo,
   ModelUsage,
   repairModelSelection,
+  resetLlmConfig,
   saveLlmConfig,
   testLlmConfig,
 } from '../api/llmConfig'
@@ -510,6 +513,7 @@ function DecisionSectionEditor({
 }
 
 function LlmConfigDialog({ onClose }: { onClose: () => void }) {
+  const { user } = useAuth()
   const [loadState, setLoadState] = useState<LoadState>('loading')
   const [loadError, setLoadError] = useState('')
   const [snapshot, setSnapshot] = useState<LlmConfigSnapshot | null>(null)
@@ -698,6 +702,31 @@ function LlmConfigDialog({ onClose }: { onClose: () => void }) {
 
   const actionsDisabled = loadState !== 'ready' || saving || testing
 
+  const handleRestoreDefaults = async () => {
+    if (actionsDisabled) return
+    setSaving(true)
+    setSaveFeedback(null)
+    setReindexWarning(false)
+    setNotice('正在恢复系统默认...')
+    try {
+      const next = await resetLlmConfig()
+      setSnapshot(next)
+      setDraft(draftFromSnapshot(next))
+      setSpeedTests(createIdleSpeedTests())
+      setSaveFeedback({ tone: 'success', title: '已恢复系统默认' })
+      setNotice('已恢复系统默认')
+    } catch (error) {
+      setSaveFeedback({
+        tone: 'error',
+        title: '恢复系统默认失败',
+        detail: error instanceof Error ? error.message : '恢复失败',
+      })
+      setNotice('恢复失败')
+    } finally {
+      setSaving(false)
+    }
+  }
+
   return (
     <>
       <ArcDialog
@@ -743,6 +772,38 @@ function LlmConfigDialog({ onClose }: { onClose: () => void }) {
         title="模型配置"
       >
         <div className="flex flex-col gap-5">
+
+        {snapshot && (
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-md border border-border bg-white px-3 py-2 text-xs text-text-secondary shadow-sm dark:border-white/10 dark:bg-[#1e1f20]">
+            <span>
+              当前账号 <b className="font-medium text-text-primary">{user?.login_id ?? ''}</b>
+            </span>
+            <span className="text-text-muted">未修改的配置项继承系统默认</span>
+            <span className="flex flex-wrap items-center gap-1.5">
+              {(['llm', 'embedding', 'rerank', 'decision'] as ConfigSection[]).map((section) => (
+                <span
+                  key={section}
+                  className={`rounded-full border px-2 py-0.5 ${
+                    snapshot.sources[section] === 'account'
+                      ? 'border-[#1a3c2a]/20 bg-[#1a3c2a]/10 text-[#1a3c2a] dark:border-[#c2e7ff]/30 dark:bg-[#c2e7ff]/10 dark:text-[#c2e7ff]'
+                      : 'border-border bg-black/[0.02] text-text-muted dark:border-white/10 dark:bg-white/5'
+                  }`}
+                >
+                  {sectionTitle[section]} · {snapshot.sources[section] === 'account' ? '账号' : '系统'}
+                </span>
+              ))}
+            </span>
+            <button
+              type="button"
+              onClick={() => void handleRestoreDefaults()}
+              disabled={actionsDisabled}
+              className="ml-auto inline-flex h-7 items-center gap-1.5 rounded-full border border-border bg-white px-3 text-[11px] text-text-secondary transition-colors hover:border-primary-light hover:text-primary-light disabled:cursor-not-allowed disabled:opacity-50 dark:border-white/10 dark:bg-white/5"
+            >
+              <Undo2 className="h-3.5 w-3.5" />
+              恢复系统默认
+            </button>
+          </div>
+        )}
 
         {loadState === 'loading' && (
           <section className="flex items-center justify-center gap-3 rounded-md border border-border bg-white px-6 py-16 shadow-sm dark:border-white/10 dark:bg-[#1e1f20]">

@@ -24,9 +24,22 @@ def build_datasource_service(settings) -> DatasourceService:
         settings.rag_sqlite_db_path,
         settings.embedding_dimensions,
     )
+
+    def ingestor_factory(owner_id: str) -> RagIngestor:
+        from auth.paths import user_rag_path
+        from auth.user_config import effective_settings
+
+        effective = effective_settings(settings, owner_id)
+        return RagIngestor.from_settings(
+            str(user_rag_path(settings, owner_id)),
+            effective.embedding_dimensions,
+            runtime_settings=effective,
+        )
+
     return DatasourceService(
         store,
         build_default_registry(),
         ingestor,
         secret_box,
+        ingestor_factory=ingestor_factory,
     )

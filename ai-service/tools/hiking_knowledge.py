@@ -41,6 +41,8 @@ _retrieval_stack_lock = threading.Lock()
 _retriever: VectorStoreRetriever | None = None
 _subgraph: Any = None
 _retrieval_stack_fingerprint: tuple[Any, ...] | None = None
+# 账号级检索栈：key=owner_id，value=(retriever, subgraph, fingerprint)。
+_owner_retrieval_stacks: dict[str, tuple[VectorStoreRetriever, Any, tuple[Any, ...]]] = {}
 
 
 def _make_parent_retriever_fn(retriever: VectorStoreRetriever):
@@ -80,6 +82,14 @@ def _get_retrieval_stack() -> tuple[VectorStoreRetriever, Any]:
     此时关闭它会抽走其 SQLite 连接。引用归零后由 GC 关闭，天然等待在飞
     请求释放旧栈。
     """
+    from agent_v2.user_scope import current_owner_id, current_user_settings
+
+    owner_id = current_owner_id.get()
+    if owner_id:
+        return _get_owner_retrieval_stack(
+            owner_id, current_user_settings.get() or settings
+        )
+
     global _retriever, _subgraph, _retrieval_stack_fingerprint
     with _retrieval_stack_lock:
         fingerprint = _embedding_fingerprint()
@@ -88,17 +98,60 @@ def _get_retrieval_stack() -> tuple[VectorStoreRetriever, Any]:
             or _subgraph is None
             or _retrieval_stack_fingerprint != fingerprint
         ):
-            from rag.retrieve_subgraph import build_retrieve_subgraph
-
-            retriever = VectorStoreRetriever()
-            subgraph = build_retrieve_subgraph(
-                retriever=retriever,
-                parent_retriever_fn=_make_parent_retriever_fn(retriever),
-            )
+            retriever, subgraph = _build_retrieval_stack(settings.rag_sqlite_db_path)
             _retriever = retriever
             _subgraph = subgraph
             _retrieval_stack_fingerprint = fingerprint
     return _retriever, _subgraph
+
+
+def _build_retrieval_stack(
+    db_path: str, effective_settings: Any | None = None
+) -> tuple[VectorStoreRetriever, Any]:
+    from rag.retrieve_subgraph import build_retrieve_subgraph
+
+    effective = effective_settings or settings
+    if effective_settings is None:
+        # 旧全局作用域：保持无参构造，测试与脚本可替换 VectorStoreRetriever。
+        retriever = VectorStoreRetriever()
+    else:
+        retriever = VectorStoreRetriever(
+            base_url=effective.embedding_base_url,
+            api_key=effective.embedding_api_key,
+            model=effective.embedding_model,
+            dimensions=effective.embedding_dimensions,
+            db_path=db_path,
+        )
+    subgraph = build_retrieve_subgraph(
+        retriever=retriever,
+        parent_retriever_fn=_make_parent_retriever_fn(retriever),
+    )
+    return retriever, subgraph
+
+
+def _get_owner_retrieval_stack(
+    owner_id: str, effective_settings: Any
+) -> tuple[VectorStoreRetriever, Any]:
+    from auth.paths import user_rag_path
+
+    db_path = str(user_rag_path(settings, owner_id))
+    fingerprint = (
+        owner_id,
+        effective_settings.embedding_base_url,
+        effective_settings.embedding_api_key,
+        effective_settings.embedding_model,
+        effective_settings.embedding_dimensions,
+        db_path,
+    )
+    with _retrieval_stack_lock:
+        entry = _owner_retrieval_stacks.get(owner_id)
+        if entry is None or entry[2] != fingerprint:
+            retriever, subgraph = _build_retrieval_stack(
+                db_path, effective_settings
+            )
+            _owner_retrieval_stacks[owner_id] = (retriever, subgraph, fingerprint)
+        retriever, subgraph, _ = _owner_retrieval_stacks[owner_id]
+    return retriever, subgraph
 
 
 def _docs_from_page_documents(page_docs: list) -> list[dict[str, Any]]:

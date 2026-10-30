@@ -25,9 +25,10 @@
 const { chromium } = require('playwright');
 const assert = require('node:assert/strict');
 
-const RUN_KEY = 'ai-hiking-agent-v2-active-run';
-const CHAT_KEY = 'ai-hiking-agent-chat';
-const CHAT_ID_KEY = 'ai-hiking-agent-chat-id';
+// 与 /api/auth/me fixture 的 test-user 保持一致：会话存储按账号命名空间隔离。
+const RUN_KEY = 'u:test-user:ai-hiking-agent-v2-active-run';
+const CHAT_KEY = 'u:test-user:ai-hiking-agent-chat';
+const CHAT_ID_KEY = 'u:test-user:ai-hiking-agent-chat-id';
 
 const env = (runId, seq, type, payload = {}) => ({
   version: '2',

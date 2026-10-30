@@ -22,7 +22,7 @@ from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAu
 from pydantic import AnyUrl
 import httpx
 
-from agent_v2.mcp_config_store import connection_fingerprint
+from agent_v2.mcp_config_store import scoped_fingerprint
 from config import settings
 
 _LOCK = threading.Lock()
@@ -232,6 +232,7 @@ async def _refresh_expired_token(fingerprint: str) -> None:
 async def build_oauth_provider(
     server: dict[str, Any],
     *,
+    owner_id: str | None = None,
     redirect_handler: Callable[[str], Awaitable[None]] | None = None,
     callback_handler: Callable[[], Awaitable[tuple[str, str | None]]] | None = None,
 ) -> OAuthClientProvider:
@@ -243,7 +244,7 @@ async def build_oauth_provider(
     Cache the AS metadata from a prior authorization (or fetch it from the
     recorded issuer) so an expired access token refreshes correctly.
     """
-    fingerprint = connection_fingerprint(server)
+    fingerprint = scoped_fingerprint(server, owner_id)
     await _refresh_expired_token(fingerprint)
     provider = OAuthClientProvider(
         server_url=server["url"],
@@ -271,7 +272,9 @@ async def build_oauth_provider(
     return provider
 
 
-async def oauth_auth(server: dict[str, Any]) -> OAuthClientProvider | None:
+async def oauth_auth(
+    server: dict[str, Any], owner_id: str | None = None
+) -> OAuthClientProvider | None:
     """Runtime auth for HTTP servers: reuse stored tokens, refresh when expired.
 
     Without stored tokens the provider stays passive for servers that do not
@@ -281,7 +284,7 @@ async def oauth_auth(server: dict[str, Any]) -> OAuthClientProvider | None:
     """
     if server.get("transport") != "http" or not server.get("url"):
         return None
-    return await build_oauth_provider(server)
+    return await build_oauth_provider(server, owner_id=owner_id)
 
 
 def prune_oauth_tokens(keep_fingerprints: set[str]) -> None:

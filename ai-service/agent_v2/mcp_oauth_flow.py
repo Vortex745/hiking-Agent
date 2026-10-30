@@ -16,7 +16,11 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 from urllib.parse import parse_qs, urlsplit
 
-from agent_v2.mcp_config_store import LocalMcpClient, client_config, connection_fingerprint
+from agent_v2.mcp_config_store import (
+    LocalMcpClient,
+    client_config,
+    scoped_fingerprint,
+)
 from agent_v2.mcp_oauth_store import build_oauth_provider, save_authorization_server
 
 logger = logging.getLogger(__name__)
@@ -35,6 +39,7 @@ class OAuthFlow:
     id: str
     fingerprint: str
     server_id: str | None
+    owner_id: str = ""
     status: Literal["starting", "auth_required", "success", "error"] = "starting"
     auth_url: str | None = None
     expected_state: str | None = None
@@ -58,15 +63,22 @@ _by_state: dict[str, str] = {}
 _consumed_states: dict[str, str] = {}
 
 
-def start_oauth_flow(connection: dict[str, Any], server_id: str | None) -> OAuthFlow:
+def start_oauth_flow(
+    connection: dict[str, Any], server_id: str | None, owner_id: str = ""
+) -> OAuthFlow:
     _expire()
-    fingerprint = connection_fingerprint(connection)
+    fingerprint = scoped_fingerprint(connection, owner_id or None)
     existing_id = _by_fingerprint.get(fingerprint)
     if existing_id:
         existing = _flows.get(existing_id)
         if existing is not None and existing.status in {"starting", "auth_required"}:
             return existing
-    flow = OAuthFlow(id=uuid.uuid4().hex, fingerprint=fingerprint, server_id=server_id)
+    flow = OAuthFlow(
+        id=uuid.uuid4().hex,
+        fingerprint=fingerprint,
+        server_id=server_id,
+        owner_id=owner_id,
+    )
     _flows[flow.id] = flow
     _by_fingerprint[fingerprint] = flow.id
     flow.task = asyncio.create_task(_run_flow(flow, connection))
@@ -151,6 +163,7 @@ async def _run_flow(flow: OAuthFlow, connection: dict[str, Any]) -> None:
         async with asyncio.timeout(_MAX_OAUTH_SECONDS):
             provider = await build_oauth_provider(
                 connection,
+                owner_id=flow.owner_id or None,
                 redirect_handler=lambda url: _capture_auth_url(flow, url),
                 callback_handler=lambda: _await_callback(flow),
             )

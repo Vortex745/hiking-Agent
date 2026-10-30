@@ -83,13 +83,13 @@ class AuthService:
         *,
         secret: str,
         ttl_seconds: int,
-        on_first_user: Callable[[str], None] | None = None,
+        on_register: Callable[[str], None] | None = None,
     ) -> None:
         self.store = store
         self.memory_store = memory_store
         self.secret = secret
         self.ttl_seconds = int(ttl_seconds)
-        self._on_first_user = on_first_user
+        self._on_register = on_register
         self._register_lock = threading.Lock()
 
     def close(self) -> None:
@@ -102,7 +102,6 @@ class AuthService:
         with self._register_lock:
             if self.store.get_by_login_id(login_id) is not None:
                 raise DuplicateLoginId("该登录 ID 已被使用（区分大小写）")
-            first_user = self.store.count_users() == 0
             user_id = uuid.uuid4().hex
             subject_id = self.memory_store.get_or_create_subject(
                 _subject_token_hash(user_id)
@@ -116,11 +115,11 @@ class AuthService:
                 )
             except DuplicateLoginIdError as exc:
                 raise DuplicateLoginId("该登录 ID 已被使用（区分大小写）") from exc
-            if first_user and self._on_first_user is not None:
+            if self._on_register is not None:
                 try:
-                    self._on_first_user(user_id)
+                    self._on_register(user_id)
                 except Exception:
-                    logger.exception("first-user legacy claim failed user=%s", user_id)
+                    logger.exception("legacy data claim failed user=%s", user_id)
             self.store.touch_login(user_id)
         return self._session(_user_from_row(row))
 

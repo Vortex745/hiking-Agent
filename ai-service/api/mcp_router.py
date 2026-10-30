@@ -13,12 +13,14 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, model_validator
 
 from agent_v2.mcp_config_store import (
+    all_scoped_fingerprints,
     client_config,
     connection_fingerprint,
     load_servers,
     LocalMcpClient,
     public_server,
     save_servers,
+    scoped_fingerprint,
 )
 from agent_v2.mcp_oauth_flow import (
     abort_oauth_flow,
@@ -28,9 +30,10 @@ from agent_v2.mcp_oauth_flow import (
     resolve_oauth_callback,
     start_oauth_flow,
 )
-from agent_v2.mcp_oauth_store import prune_oauth_tokens
 from agent_v2.mcp_registry import MCP_REGISTRY
+from agent_v2.mcp_oauth_store import prune_oauth_tokens
 from api.llm_config_router import require_local_request
+from auth.deps import current_user_id
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -105,8 +108,13 @@ def _connection(body: ServerInput, previous: dict | None) -> dict:
     return connection
 
 
+def _test_key(owner_id: str, test_id: str) -> str:
+    return f"{owner_id}:{test_id}"
+
+
 @mcp_router.get("/servers")
-async def list_mcp_servers() -> dict:
+async def list_mcp_servers(request: Request) -> dict:
+    owner_id = current_user_id(request)
     builtins = [
         {
             "id": cfg.server_id,
@@ -118,35 +126,43 @@ async def list_mcp_servers() -> dict:
         }
         for cfg in MCP_REGISTRY.values()
     ]
-    return {"servers": builtins + [public_server(server) for server in load_servers()]}
+    return {
+        "servers": builtins
+        + [public_server(server) for server in load_servers(owner_id or None)]
+    }
 
 
-def _mark_failed(previous: dict | None, connection: dict) -> None:
+def _mark_failed(previous: dict | None, connection: dict, owner_id: str) -> None:
     if previous and connection_fingerprint(previous) == connection_fingerprint(connection):
         previous["status"] = "failed"
-        save_servers([previous if item["id"] == previous["id"] else item for item in load_servers()])
+        save_servers(
+            [
+                previous if item["id"] == previous["id"] else item
+                for item in load_servers(owner_id or None)
+            ],
+            owner_id or None,
+        )
 
 
-@mcp_router.post("/servers/test")
-async def test_mcp_server(body: ServerInput) -> dict:
-    previous = _existing(load_servers(), body.server_id)
+async def test_mcp_server(body: ServerInput, owner_id: str = "") -> dict:
+    previous = _existing(load_servers(owner_id or None), body.server_id)
     if body.server_id and previous is None:
         raise HTTPException(status_code=404, detail="MCP 服务不存在")
     connection = _connection(body, previous)
     if connection["transport"] == "stdio" and not body.stdio_confirmed:
         raise HTTPException(status_code=400, detail="请确认在本机启动该命令")
     if connection["transport"] == "http":
-        flow = start_oauth_flow(connection, body.server_id)
+        flow = start_oauth_flow(connection, body.server_id, owner_id=owner_id)
         try:
             await asyncio.wait_for(asyncio.shield(flow.ready), timeout=15)
         except asyncio.TimeoutError:
             abort_oauth_flow(flow, "连接超时")
-            _mark_failed(previous, connection)
+            _mark_failed(previous, connection, owner_id)
             raise HTTPException(status_code=502, detail="连接失败，请检查配置和服务状态") from None
         if flow.status == "auth_required":
             return {"status": "auth_required", "auth_url": flow.auth_url, "flow_id": flow.id}
         if flow.status != "success":
-            _mark_failed(previous, connection)
+            _mark_failed(previous, connection, owner_id)
             raise HTTPException(status_code=502, detail="连接失败，请检查配置和服务状态")
         tools = flow.tools
     else:
@@ -155,11 +171,19 @@ async def test_mcp_server(body: ServerInput) -> dict:
                 async with LocalMcpClient("test", client_config(connection)) as client:
                     tools = describe_tools(client)
         except Exception:
-            _mark_failed(previous, connection)
+            _mark_failed(previous, connection, owner_id)
             raise HTTPException(status_code=502, detail="连接失败，请检查配置和服务状态") from None
     test_id = uuid.uuid4().hex
-    _tests[test_id] = (connection_fingerprint(connection), tools)
+    _tests[_test_key(owner_id, test_id)] = (
+        scoped_fingerprint(connection, owner_id or None),
+        tools,
+    )
     return {"test_id": test_id, "tools": [tool["name"] for tool in tools], "status": "success"}
+
+
+@mcp_router.post("/servers/test")
+async def test_mcp_server_endpoint(body: ServerInput, request: Request) -> dict:
+    return await test_mcp_server(body, current_user_id(request))
 
 
 _OAUTH_CALLBACK_OK = """<!doctype html><html lang="zh-CN"><meta charset="utf-8">
@@ -206,15 +230,16 @@ async def oauth_callback(
 
 
 @mcp_router.get("/oauth/status/{flow_id}")
-async def oauth_status(flow_id: str) -> dict:
+async def oauth_status(flow_id: str, request: Request) -> dict:
     flow = get_oauth_flow(flow_id)
     if flow is None:
         raise HTTPException(status_code=404, detail="授权流程不存在或已过期")
+    owner_id = current_user_id(request) or flow.owner_id
     payload: dict = {"status": flow.status}
     if flow.status == "success":
         if flow.test_id is None:
             flow.test_id = uuid.uuid4().hex
-            _tests[flow.test_id] = (flow.fingerprint, flow.tools)
+            _tests[_test_key(owner_id, flow.test_id)] = (flow.fingerprint, flow.tools)
         payload["test_id"] = flow.test_id
         payload["tools"] = [tool["name"] for tool in flow.tools]
     elif flow.status == "error":
@@ -222,16 +247,16 @@ async def oauth_status(flow_id: str) -> dict:
     return payload
 
 
-def _save(body: ServerInput, server_id: str | None) -> dict:
-    servers = load_servers()
+def _save(body: ServerInput, server_id: str | None, owner_id: str = "") -> dict:
+    servers = load_servers(owner_id or None)
     previous = _existing(servers, server_id)
     if server_id and previous is None:
         raise HTTPException(status_code=404, detail="MCP 服务不存在")
     connection = _connection(body, previous)
-    fingerprint = connection_fingerprint(connection)
-    test = _tests.get(body.test_id or "")
+    fingerprint = scoped_fingerprint(connection, owner_id or None)
+    test = _tests.get(_test_key(owner_id, body.test_id or ""))
     tested = bool(test and test[0] == fingerprint)
-    unchanged = bool(previous and connection_fingerprint(previous) == fingerprint)
+    unchanged = bool(previous and connection_fingerprint(previous) == connection_fingerprint(connection))
     if body.enabled and not tested and not (unchanged and previous["status"] == "success"):
         raise HTTPException(status_code=400, detail="启用前请先成功测试当前配置")
     server = {
@@ -247,30 +272,31 @@ def _save(body: ServerInput, server_id: str | None) -> dict:
         servers[servers.index(previous)] = server
     else:
         servers.append(server)
-    save_servers(servers)
-    prune_oauth_tokens({connection_fingerprint(item) for item in servers})
+    save_servers(servers, owner_id or None)
+    prune_oauth_tokens(all_scoped_fingerprints())
     if tested:
-        _tests.pop(body.test_id, None)
+        _tests.pop(_test_key(owner_id, body.test_id or ""), None)
     return public_server(server)
 
 
 @mcp_router.post("/servers")
-async def create_mcp_server(body: ServerInput) -> dict:
-    return _save(body, None)
+async def create_mcp_server(body: ServerInput, request: Request) -> dict:
+    return _save(body, None, current_user_id(request))
 
 
 @mcp_router.put("/servers/{server_id}")
-async def update_mcp_server(server_id: str, body: ServerInput) -> dict:
-    return _save(body, server_id)
+async def update_mcp_server(server_id: str, body: ServerInput, request: Request) -> dict:
+    return _save(body, server_id, current_user_id(request))
 
 
 @mcp_router.delete("/servers/{server_id}")
-async def delete_mcp_server(server_id: str) -> dict:
-    servers = load_servers()
+async def delete_mcp_server(server_id: str, request: Request) -> dict:
+    owner_id = current_user_id(request)
+    servers = load_servers(owner_id or None)
     server = _existing(servers, server_id)
     if server is None:
         raise HTTPException(status_code=404, detail="MCP 服务不存在")
     servers.remove(server)
-    save_servers(servers)
-    prune_oauth_tokens({connection_fingerprint(item) for item in servers})
+    save_servers(servers, owner_id or None)
+    prune_oauth_tokens(all_scoped_fingerprints())
     return {"deleted": True}
