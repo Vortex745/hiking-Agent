@@ -92,13 +92,24 @@ def decode_token(token: str, secret: str) -> dict:
 
 
 def load_or_create_secret(path: Path) -> str:
-    if path.is_file():
+    try:
         value = path.read_text(encoding="utf-8").strip()
         if value:
             return value
+    except OSError:
+        pass
     path.parent.mkdir(parents=True, exist_ok=True)
     value = secrets.token_urlsafe(48)
-    path.write_text(value, encoding="utf-8")
+    try:
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        # 另一个进程先创建了密钥：读取它，避免两套 JWT 密钥并存。
+        existing = path.read_text(encoding="utf-8").strip()
+        if existing:
+            return existing
+        fd = os.open(str(path), os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(value)
     try:
         os.chmod(path, 0o600)
     except OSError:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -111,6 +112,7 @@ def test_legacy_mcp_is_claimed_only_once(tmp_path) -> None:
     try:
         claim_legacy_data(settings, store, OWNER_A)
         claim_legacy_data(settings, store, OWNER_B)
+        assert store.get_meta("legacy_owner_id") == OWNER_A
     finally:
         store.close()
 
@@ -151,3 +153,47 @@ def test_http_server_list_is_scoped_by_logged_in_account(tmp_path, monkeypatch) 
     # 高德内置服务两边共享
     assert {"高德天气", "高德地图"} <= names_a
     assert {"高德天气", "高德地图"} <= names_b
+
+
+def test_oauth_status_cannot_be_polled_by_another_account(tmp_path, monkeypatch) -> None:
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from agent_v2 import mcp_oauth_flow
+    from api.mcp_router import mcp_router
+
+    monkeypatch.setattr(mcp_config_store.settings, "agent_v2_state_dir", str(tmp_path / "state"))
+    monkeypatch.setattr(mcp_config_store.settings, "agent_v2_sandbox_type", "local_native")
+    flow = SimpleNamespace(
+        id="flow-a",
+        owner_id=OWNER_A,
+        status="success",
+        test_id="test-a",
+        fingerprint="fp-a",
+        tools=[{"name": "ping"}],
+        created_at=time.monotonic(),
+        expected_state=None,
+        callback=None,
+        task=None,
+    )
+    mcp_oauth_flow._flows[flow.id] = flow
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def inject_user(request, call_next):
+        request.state.user_id = request.headers.get("x-test-user", "")
+        return await call_next(request)
+
+    app.include_router(mcp_router, prefix="/api/v2")
+    client = TestClient(app, client=("127.0.0.1", 50000))
+    try:
+        assert client.get(
+            "/api/v2/mcp/oauth/status/flow-a", headers={"x-test-user": OWNER_B}
+        ).status_code == 404
+        response = client.get(
+            "/api/v2/mcp/oauth/status/flow-a", headers={"x-test-user": OWNER_A}
+        )
+        assert response.status_code == 200
+        assert response.json()["tools"] == ["ping"]
+    finally:
+        mcp_oauth_flow._flows.pop(flow.id, None)

@@ -5,12 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import uuid
 from pathlib import Path
 from typing import Any
 
 import httpx
+from auth.paths import is_owner_id, user_state_dir
 from config import settings
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamable_http_client
@@ -48,13 +48,8 @@ class LocalMcpClient(McpClient):
         )
 
 
-_OWNER_ID_RE = re.compile(r"^[0-9a-f]{32}$")
-
-
 def _owner_dir(owner_id: str) -> Path:
-    if not _OWNER_ID_RE.fullmatch(owner_id):
-        raise ValueError("invalid owner id")
-    return Path(settings.agent_v2_state_dir) / "users" / owner_id
+    return user_state_dir(settings, owner_id)
 
 
 def _path(owner_id: str | None = None) -> Path:
@@ -138,7 +133,7 @@ def all_scoped_fingerprints() -> set[str]:
     users_root = Path(settings.agent_v2_state_dir) / "users"
     if users_root.is_dir():
         for child in users_root.iterdir():
-            if not child.is_dir() or not _OWNER_ID_RE.fullmatch(child.name):
+            if not child.is_dir() or not is_owner_id(child.name):
                 continue
             try:
                 servers = load_servers(child.name)

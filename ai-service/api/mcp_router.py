@@ -234,7 +234,10 @@ async def oauth_status(flow_id: str, request: Request) -> dict:
     flow = get_oauth_flow(flow_id)
     if flow is None:
         raise HTTPException(status_code=404, detail="授权流程不存在或已过期")
-    owner_id = current_user_id(request) or flow.owner_id
+    owner_id = current_user_id(request)
+    if flow.owner_id and owner_id and flow.owner_id != owner_id:
+        raise HTTPException(status_code=404, detail="授权流程不存在或已过期")
+    owner_id = flow.owner_id or owner_id
     payload: dict = {"status": flow.status}
     if flow.status == "success":
         if flow.test_id is None:

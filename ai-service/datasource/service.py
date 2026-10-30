@@ -65,8 +65,6 @@ class DatasourceService:
         self.ingestor = ingestor
         self.secret_box = secret_box
         self._ingestor_factory = ingestor_factory
-        self._ingestors: dict[str, RagIngestor] = {}
-        self._ingestor_lock = threading.Lock()
         self._executor = executor or ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="datasource-sync"
         )
@@ -179,17 +177,21 @@ class DatasourceService:
 
     def purge_docs(self, ds_id: str, owner_id: str | None = None) -> int:
         ds = self._require(ds_id, owner_id)
-        ingestor = self._ingestor_for(ds.get("owner_id") or "")
+        ingestor, owned = self._open_ingestor(ds.get("owner_id") or "")
         deleted = 0
-        for row in self.store.list_synced_docs(ds_id):
-            if row["rag_source"]:
-                try:
-                    ingestor.delete(row["rag_source"])
-                except Exception as exc:
-                    logger.warning("purge rag doc failed ds=%s external_id=%s: %s", ds_id, row["external_id"], exc)
-                    continue
-            self.store.delete_synced_doc(ds_id, row["external_id"])
-            deleted += 1
+        try:
+            for row in self.store.list_synced_docs(ds_id):
+                if row["rag_source"]:
+                    try:
+                        ingestor.delete(row["rag_source"])
+                    except Exception as exc:
+                        logger.warning("purge rag doc failed ds=%s external_id=%s: %s", ds_id, row["external_id"], exc)
+                        continue
+                self.store.delete_synced_doc(ds_id, row["external_id"])
+                deleted += 1
+        finally:
+            if owned:
+                ingestor.close()
         return deleted
 
     def list_datasources(self, owner_id: str | None = None) -> list[dict[str, Any]]:
@@ -385,12 +387,17 @@ class DatasourceService:
 
     def _sync(self, ds_id: str, log_id: str, trigger: str) -> _SyncResult:
         ds = self._require(ds_id)
-        ingestor = self._ingestor_for(ds.get("owner_id") or "")
         selected = list(ds["selected_resources"])
         if not selected:
             raise ValidationError("未选择任何资源")
         credentials = self.secret_box.decrypt(ds["credentials_enc"])
-        connector = self.registry.create(ds["type"], credentials, ds["settings"])
+        ingestor, owned = self._open_ingestor(ds.get("owner_id") or "")
+        try:
+            connector = self.registry.create(ds["type"], credentials, ds["settings"])
+        except Exception:
+            if owned:
+                ingestor.close()
+            raise
         counts = SyncCounts()
         failures: list[dict[str, Any]] = []
         enumeration: dict[str, Any] = {}
@@ -466,6 +473,8 @@ class DatasourceService:
             )
         finally:
             connector.close()
+            if owned:
+                ingestor.close()
 
     def _ingest_node(
         self,
@@ -684,15 +693,10 @@ class DatasourceService:
             raise NotFoundError("知识源不存在")
         return ds
 
-    def _ingestor_for(self, owner_id: str) -> RagIngestor:
+    def _open_ingestor(self, owner_id: str) -> tuple[RagIngestor, bool]:
         if not owner_id or self._ingestor_factory is None:
-            return self.ingestor
-        with self._ingestor_lock:
-            ingestor = self._ingestors.get(owner_id)
-            if ingestor is None:
-                ingestor = self._ingestor_factory(owner_id)
-                self._ingestors[owner_id] = ingestor
-            return ingestor
+            return self.ingestor, False
+        return self._ingestor_factory(owner_id), True
 
     def _connector(self, ds: Mapping[str, Any]) -> Connector:
         credentials = self.secret_box.decrypt(ds["credentials_enc"])
@@ -706,14 +710,6 @@ class DatasourceService:
         if running:
             logger.warning("datasource service closed during a running sync; stores left to process exit")
             return
-        with self._ingestor_lock:
-            owner_ingestors = list(self._ingestors.values())
-            self._ingestors.clear()
-        for ingestor in owner_ingestors:
-            try:
-                ingestor.close()
-            except Exception as exc:
-                logger.warning("owner ingestor close failed: %s", exc)
         self.ingestor.close()
         self.store.close()
 

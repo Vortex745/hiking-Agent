@@ -93,6 +93,14 @@ def effective_settings(settings, owner_id: str) -> Any:
     overrides = _read(settings, owner_id)
     for section, fields in overrides.items():
         attrs = _SECTION_FIELDS[section]
+        base_attr = attrs.get("base_url")
+        key_attr = attrs.get("api_key")
+        base_changed = bool(
+            base_attr
+            and "base_url" in fields
+            and fields["base_url"] != getattr(settings, base_attr, None)
+        )
+        account_key_applied = False
         for field, value in fields.items():
             attr = attrs.get(field)
             if attr is None:
@@ -102,13 +110,19 @@ def effective_settings(settings, owner_id: str) -> Any:
                     decrypted = _secret_box(settings).decrypt(str(value))
                 except (CredentialsUnreadable, ValueError):
                     logger.warning(
-                        "user api key unreadable section=%s user=%s; using system default",
+                        "user api key unreadable section=%s user=%s",
                         section,
                         owner_id,
                     )
+                    if base_changed and key_attr:
+                        setattr(effective, key_attr, "")
                     continue
                 value = decrypted.get("api_key", "")
+                account_key_applied = True
             setattr(effective, attr, value)
+        # 账号把 base_url 指向别的主机时，绝不能把系统密钥转发过去。
+        if base_changed and key_attr and not account_key_applied:
+            setattr(effective, key_attr, "")
     return effective
 
 

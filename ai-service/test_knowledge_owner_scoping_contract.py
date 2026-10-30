@@ -117,3 +117,40 @@ def _fake_retriever_init(original):
         self.embeddings = FakeEmbedding(dimensions=8)
 
     return init
+
+
+def test_new_account_without_directory_gets_empty_knowledge_not_a_crash(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from rag.retriever import VectorStoreRetriever
+    import tools.hiking_knowledge as hk
+
+    monkeypatch.setattr(settings, "rag_sqlite_db_path", str(tmp_path / "data" / "rag.sqlite"))
+    monkeypatch.setattr(settings, "embedding_api_key", "fixture-key")
+    monkeypatch.setattr(settings, "embedding_base_url", "http://127.0.0.1:1/v1")
+    monkeypatch.setattr(settings, "embedding_model", "fixture-embedding")
+    monkeypatch.setattr(settings, "embedding_dimensions", 8)
+    monkeypatch.setattr(
+        VectorStoreRetriever,
+        "__init__",
+        _fake_retriever_init(VectorStoreRetriever.__init__),
+    )
+    hk._owner_retrieval_stacks.clear()
+    fresh_owner = "c" * 32
+    assert not user_rag_path(settings, fresh_owner).parent.exists()
+
+    with owner_scope(fresh_owner):
+        result = asyncio.run(hk.hiking_knowledge_search.ainvoke({"query": "鳌太线"}))
+
+    assert result["chunks"] == []
+    assert "资料不足" in result["message"]
+    assert user_rag_path(settings, fresh_owner).parent.is_dir()
+
+
+def test_explicit_empty_owner_fails_closed_instead_of_reading_legacy_index() -> None:
+    import tools.hiking_knowledge as hk
+
+    with owner_scope(""):
+        result = asyncio.run(hk.hiking_knowledge_search.ainvoke({"query": "鳌太线"}))
+    assert result["chunks"] == []
+    assert "未绑定" in result["message"]

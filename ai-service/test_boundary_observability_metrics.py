@@ -502,7 +502,7 @@ def _get(app: FastAPI, path: str) -> Any:
 
 def test_chat_v2_health_exposes_the_seven_counters_additively():
     app = FastAPI()
-    app.include_router(chat_v2_module.chat_v2_router, prefix="/api/v2")
+    app.include_router(chat_v2_module.chat_v2_public_router, prefix="/api/v2")
 
     get_boundary_metrics().observe("replay_gap")
     payload = _get(app, "/api/v2/chat/health").json()

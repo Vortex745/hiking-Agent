@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from pathlib import Path
 from typing import Any
 
 from langchain_core.tools import tool
@@ -135,6 +136,7 @@ def _get_owner_retrieval_stack(
     from auth.paths import user_rag_path
 
     db_path = str(user_rag_path(settings, owner_id))
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     fingerprint = (
         owner_id,
         effective_settings.embedding_base_url,
@@ -197,6 +199,15 @@ async def hiking_knowledge_search(query: str, k: int = 4) -> dict[str, Any]:
             "query": normalized_query,
             "chunks": [],
             "message": "资料不足：检索问题为空。",
+        }
+
+    from agent_v2.user_scope import current_owner_id
+
+    if current_owner_id.get() == "":
+        return {
+            "query": normalized_query,
+            "chunks": [],
+            "message": "资料不足：知识库未绑定当前登录账号。",
         }
 
     try:

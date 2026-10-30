@@ -445,7 +445,7 @@ async def chat_v2_sse(req: ChatV2Request, request: Request):
         # released and its cleanup finallys run instead of leaking to GC.
         owner_id = str(getattr(request.state, "user_id", "") or "")
         effective_settings = (
-            load_user_settings(settings, owner_id) if owner_id else settings
+            load_user_settings(settings, owner_id) if owner_id else None
         )
         stream = orchestrator.stream_chat(
             flow_req,
@@ -1240,7 +1240,7 @@ async def chat_v2_resume(
         # execution token is released and cleanup finallys run.
         owner_id = str(getattr(request.state, "user_id", "") or "")
         effective_settings = (
-            load_user_settings(settings, owner_id) if owner_id else settings
+            load_user_settings(settings, owner_id) if owner_id else None
         )
         stream = orchestrator.stream_resume(
             run_id=run_id, from_seq=from_seq,

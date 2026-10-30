@@ -22,6 +22,9 @@ from auth.store import AuthStore, DuplicateLoginIdError
 
 logger = logging.getLogger("ai-service.auth")
 
+# 未知 ID 也执行一次同成本校验，避免用响应时间枚举账号。
+_DUMMY_PASSWORD_HASH = hash_password("not-a-real-account-password")
+
 
 @dataclass(frozen=True, slots=True)
 class AuthUser:
@@ -125,7 +128,9 @@ class AuthService:
 
     def login(self, login_id: str, password: str) -> AuthSession:
         row = self.store.get_by_login_id(login_id)
-        if row is None or not verify_password(password, row["password_hash"]):
+        encoded = row["password_hash"] if row is not None else _DUMMY_PASSWORD_HASH
+        valid = verify_password(password, encoded)
+        if row is None or not valid:
             raise InvalidCredentials("登录 ID 或密码错误")
         self.store.touch_login(row["user_id"])
         return self._session(_user_from_row(row))

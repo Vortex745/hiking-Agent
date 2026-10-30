@@ -19,9 +19,16 @@ logger = logging.getLogger("ai-service.auth.legacy")
 _MCP_META_KEY = "legacy_mcp_claimed_by"
 _DATASOURCE_META_KEY = "legacy_datasource_claimed_by"
 _RAG_META_KEY = "legacy_rag_claimed_by"
+_OWNER_META_KEY = "legacy_owner_id"
 
 
 def claim_legacy_data(settings, auth_store: AuthStore, owner_id: str) -> None:
+    # 旧单用户数据只能归第一个注册账号；即使某类复制失败，也不能让后注册账号接手。
+    claimed_by = auth_store.get_meta(_OWNER_META_KEY)
+    if not claimed_by:
+        auth_store.set_meta(_OWNER_META_KEY, owner_id)
+    elif claimed_by != owner_id:
+        return
     _claim_mcp(settings, auth_store, owner_id)
     _claim_datasources(settings, auth_store, owner_id)
     _claim_rag(settings, auth_store, owner_id)

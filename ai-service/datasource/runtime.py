@@ -30,8 +30,10 @@ def build_datasource_service(settings) -> DatasourceService:
         from auth.user_config import effective_settings
 
         effective = effective_settings(settings, owner_id)
+        db_path = user_rag_path(settings, owner_id)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
         return RagIngestor.from_settings(
-            str(user_rag_path(settings, owner_id)),
+            str(db_path),
             effective.embedding_dimensions,
             runtime_settings=effective,
         )

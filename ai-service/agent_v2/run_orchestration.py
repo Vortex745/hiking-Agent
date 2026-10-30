@@ -2395,9 +2395,14 @@ class RunOrchestrator:
             # with the run and every later execution step reads the frozen
             # snapshot, never the live config.
             try:
-                execution_policy = build_execution_policy(
-                    profile, run_settings, owner_id=owner_id
-                )
+                if owner_id:
+                    execution_policy = build_execution_policy(
+                        profile, run_settings, owner_id=owner_id
+                    )
+                else:
+                    execution_policy = build_execution_policy(
+                        profile, run_settings
+                    )
             except Exception:
                 logger.exception(
                     "chat_v2: execution policy build failed for request_id=%s",

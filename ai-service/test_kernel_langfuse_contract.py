@@ -8,9 +8,17 @@ the tool-span handler from ticket 04.
 
 from types import SimpleNamespace
 
+import pytest
+
 import agent_v2.kernel as kernel_mod
 from agent_v2.kernel import run_chat_turn
 from langchain_core.messages import AIMessage
+
+
+@pytest.fixture(autouse=True)
+def _no_llm_log(monkeypatch):
+    """LLM_LOG 是独立通道：本文件只测 tracing，避免前序测试的全局开关污染。"""
+    monkeypatch.setattr(kernel_mod.llm_log, "enabled", lambda: False)
 
 
 class _FakeAgent:

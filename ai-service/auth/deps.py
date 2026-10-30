@@ -58,5 +58,10 @@ def get_optional_user(request: Request) -> AuthUser | None:
 
 
 def current_user_id(request: Request) -> str:
-    """端点内读取账号标识；鉴权由路由级依赖保证，缺失时返回空串供裸挂载测试使用。"""
-    return str(getattr(request.state, "user_id", "") or "")
+    """端点内读取账号标识；主应用未通过鉴权时拒绝，裸挂载测试退化为空 owner。"""
+    user_id = str(getattr(request.state, "user_id", "") or "")
+    if user_id:
+        return user_id
+    if getattr(request.app.state, "auth_service", None) is not None:
+        raise _unauthorized("请先登录")
+    return ""

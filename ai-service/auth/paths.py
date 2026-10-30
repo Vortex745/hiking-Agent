@@ -8,6 +8,10 @@ from pathlib import Path
 _OWNER_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
+def is_owner_id(value: str) -> bool:
+    return bool(_OWNER_ID_RE.fullmatch(value or ""))
+
+
 def _owner(owner_id: str) -> str:
     if not _OWNER_ID_RE.fullmatch(owner_id or ""):
         raise ValueError("invalid owner id")

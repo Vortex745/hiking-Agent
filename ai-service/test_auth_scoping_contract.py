@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+from fastapi import Request
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 from agent_v2.memory_service import MemoryService
@@ -57,3 +59,27 @@ def test_logged_in_subject_wins_over_anonymous_cookie(tmp_path: Path) -> None:
     assert resolved_memory is memory
     assert resolution.subject_id == user.subject_id
     assert resolution.issued is False
+
+
+def test_missing_user_is_rejected_once_auth_is_assembled() -> None:
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from auth.deps import current_user_id
+
+    guarded = FastAPI()
+    guarded.state.auth_service = object()
+
+    @guarded.get("/probe")
+    def probe(request: Request):
+        return {"owner": current_user_id(request)}
+
+    assert TestClient(guarded).get("/probe").status_code == 401
+
+    bare = FastAPI()
+
+    @bare.get("/probe")
+    def bare_probe(request: Request):
+        return {"owner": current_user_id(request)}
+
+    assert TestClient(bare).get("/probe").json() == {"owner": ""}

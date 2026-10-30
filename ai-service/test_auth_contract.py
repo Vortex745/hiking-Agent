@@ -153,3 +153,40 @@ def test_invalid_credentials_error_is_stable(tmp_path: Path) -> None:
     _register(client)
     with pytest.raises(InvalidCredentials):
         service.login("Abc1", "wrongpass1")
+
+
+def test_secret_file_is_created_once_and_reused(tmp_path: Path) -> None:
+    from auth.security import load_or_create_secret
+
+    path = tmp_path / "auth.key"
+    first = load_or_create_secret(path)
+    second = load_or_create_secret(path)
+    assert first == second
+    assert path.read_text(encoding="utf-8").strip() == first
+
+
+def test_main_app_data_routes_require_login(tmp_path: Path) -> None:
+    import main
+
+    service = AuthService(
+        AuthStore(str(tmp_path / "auth.sqlite")),
+        MemoryStore(str(tmp_path / "agent_memory.sqlite")),
+        secret="test-secret",
+        ttl_seconds=3600,
+    )
+    previous = getattr(main.app.state, "auth_service", None)
+    main.app.state.auth_service = service
+    try:
+        client = TestClient(main.app, client=("127.0.0.1", 50000))
+        for path in (
+            "/api/v1/llm-config",
+            "/api/v1/datasources",
+            "/api/v2/mcp/servers",
+            "/api/v2/chat/snapshot/run-test",
+            "/api/v2/memory/settings",
+        ):
+            response = client.get(path)
+            assert response.status_code == 401, (path, response.status_code, response.text)
+    finally:
+        main.app.state.auth_service = previous
+        service.close()

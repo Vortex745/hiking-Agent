@@ -237,12 +237,31 @@ async def reset_llm_config(request: Request) -> LlmConfigUpdateResponse:
     owner_id = current_user_id(request)
     if not owner_id:
         raise HTTPException(status_code=400, detail="仅登录账号支持恢复系统默认")
-    from auth.user_config import reset_overrides
+    from auth.user_config import effective_settings, reset_overrides
 
+    index_dimensions = read_vec0_dimensions(_index_path(owner_id))
+    if (
+        index_dimensions is not None
+        and index_dimensions != settings.embedding_dimensions
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "恢复系统默认会使 embedding 维度与账号现有索引不一致，"
+                "请先重建索引"
+            ),
+        )
+    before = effective_settings(settings, owner_id)
     reset_overrides(settings, owner_id)
+    after = effective_settings(settings, owner_id)
     snapshot = _build_snapshot(owner_id)
     return LlmConfigUpdateResponse(
-        **snapshot.model_dump(), reindex_recommended=False
+        **snapshot.model_dump(),
+        reindex_recommended=(
+            after.embedding_base_url != before.embedding_base_url
+            or after.embedding_model != before.embedding_model
+            or after.embedding_dimensions != before.embedding_dimensions
+        ),
     )
 
 

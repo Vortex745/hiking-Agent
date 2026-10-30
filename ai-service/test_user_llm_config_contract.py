@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).parent))
 
 from auth import user_config
-from auth.paths import user_config_path
+from auth.paths import user_config_path, user_rag_path
 from config import settings
 
 OWNER_A = "a" * 32
@@ -84,6 +84,36 @@ def test_values_equal_to_system_default_are_not_stored(temp_rag_path) -> None:
     assert not user_config_path(settings, OWNER_A).exists()
 
 
+def test_account_base_url_change_never_inherits_the_system_key(
+    temp_rag_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "openai_base_url", "https://system.example/v1")
+    monkeypatch.setattr(settings, "openai_api_key", "sk-system-secret")
+    monkeypatch.setattr(settings, "openai_model", "system-model")
+
+    # 只改 model：base 未变，可以继续用系统 key
+    user_config.save_overrides(settings, OWNER_A, {"llm": {"model": "a-model"}})
+    assert user_config.effective_settings(settings, OWNER_A).openai_api_key == "sk-system-secret"
+
+    # 改 base 但不给账号自己的 key：不能把系统 key 发到账号指定的主机
+    user_config.save_overrides(
+        settings,
+        OWNER_A,
+        {"llm": {"base_url": "https://account.example/v1", "api_key": ""}},
+    )
+    effective = user_config.effective_settings(settings, OWNER_A)
+    assert effective.openai_base_url == "https://account.example/v1"
+    assert effective.openai_api_key == ""
+
+    # 账号自己提供 key 后才生效
+    user_config.save_overrides(
+        settings,
+        OWNER_A,
+        {"llm": {"api_key": "sk-account-key"}},
+    )
+    assert user_config.effective_settings(settings, OWNER_A).openai_api_key == "sk-account-key"
+
+
 def _client() -> TestClient:
     from api.llm_config_router import llm_config_router
 
@@ -148,3 +178,17 @@ def test_http_config_is_scoped_to_the_logged_in_account(temp_rag_path) -> None:
     assert reset.status_code == 200
     assert reset.json()["llm"]["model"] == system_model
     assert reset.json()["sources"]["llm"] == "system"
+
+
+def test_reset_refuses_to_break_an_existing_account_index(temp_rag_path) -> None:
+    from rag import sqlite_schema
+
+    dimensions = 512 if settings.embedding_dimensions != 512 else 768
+    path = user_rag_path(settings, OWNER_A)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sqlite_schema.connect(path, embedding_dimensions=dimensions).close()
+
+    client = _client()
+    response = client.delete("/api/v1/llm-config", headers={"x-test-user": OWNER_A})
+    assert response.status_code == 409, response.text
+    assert "维度" in response.text
