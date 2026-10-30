@@ -6,10 +6,11 @@
  * data that the presenter renders.
  */
 
-export type ActivityStatus = 'running' | 'done' | 'error' | 'pending';
+export type ActivityStatus = 'running' | 'done' | 'error' | 'pending' | 'unknown';
 
 export type ActivityKind =
   | 'thought'
+  | 'model'
   | 'tool'
   | 'artifact'
   | 'approval'
@@ -60,6 +61,7 @@ const TOOL_LABELS: Record<string, string> = {
   sandbox_write: '写入工作区文件',
   web_search: '搜索网页',
   web_scraping: '抓取网页内容',
+  focus_map: '地图定位',
 };
 
 const RESOLVED_APPROVAL_STATUSES = new Set([
@@ -133,6 +135,11 @@ export function readActivityEvents(
 
 function toolAction(tool: string): string {
   return TOOL_LABELS[tool] ?? `执行 ${tool}`;
+}
+
+/** Discovery/describe rows are capabilities, not execution steps. */
+function isDiscoveryEvent(tool: string): boolean {
+  return tool.endsWith('__discovery');
 }
 
 function formatDuration(value: unknown): string | undefined {
@@ -352,6 +359,7 @@ export function buildAgentActivity(input: {
   let lastApprovalUnresolved = false;
   let hasRejectedApproval = false;
   let hasExpiredApproval = false;
+  let hasUnknownResult = false;
 
   events.forEach((event, index) => {
     const metadata = event.metadata;
@@ -378,9 +386,44 @@ export function buildAgentActivity(input: {
         return;
       }
 
+      case 'model_round': {
+        // Agent process tracking ticket 03: one main-model round. The start
+        // event opens the line; the finish event settles it with its
+        // duration. ``step`` identifies the round so parallel or repeated
+        // rounds cannot settle someone else's line.
+        lastApprovalUnresolved = false;
+        const state = readMetadataText(metadata, 'state');
+        if (state === 'finished') {
+          const runningIndex = findLineIndex(
+            lines,
+            line => line.kind === 'model' && line.status === 'running',
+            'backward',
+          );
+          if (runningIndex < 0) return;
+          const running = lines[runningIndex];
+          if (!running) return;
+          const settled: ActivityLine = { ...running, status: 'done' };
+          const duration = formatDuration(metadata?.duration_ms);
+          if (duration) settled.description = duration;
+          lines[runningIndex] = settled;
+          return;
+        }
+        const label =
+          readText(event.content) ??
+          readMetadataText(metadata, 'message') ??
+          '模型处理中';
+        lines.push({
+          id: `event-${index}`,
+          kind: 'model',
+          status: 'running',
+          title: label,
+        });
+        return;
+      }
+
       case 'tool_call': {
         const tool = readMetadataText(metadata, 'tool');
-        if (!tool) return;
+        if (!tool || isDiscoveryEvent(tool)) return;
         lastApprovalUnresolved = false;
 
         // Every call creates a line, including parallel calls to the same
@@ -402,17 +445,28 @@ export function buildAgentActivity(input: {
         const tool = readMetadataText(metadata, 'tool');
         const status = readMetadataText(metadata, 'status');
         if (!tool || !status) return;
+        // Discovery describes capabilities; ``authorized`` records a
+        // permission decision. Neither is an execution result or a failure.
+        if (isDiscoveryEvent(tool) || status === 'authorized') return;
         lastApprovalUnresolved = false;
 
+        const unknown = status === 'outcome_unknown';
         const succeeded = status === 'ok' || status === 'recovered';
         const denied = status === 'denied';
         const action = toolAction(tool);
-        const title = succeeded
-          ? `已${action}`
-          : denied
-            ? `${action}被拒绝`
-            : `${action}失败`;
-        const lineStatus: ActivityStatus = succeeded ? 'done' : 'error';
+        const title = unknown
+          ? '本次调用结果未确认'
+          : succeeded
+            ? `已${action}`
+            : denied
+              ? `${action}被拒绝`
+              : `${action}失败`;
+        const lineStatus: ActivityStatus = unknown
+          ? 'unknown'
+          : succeeded
+            ? 'done'
+            : 'error';
+        if (unknown) hasUnknownResult = true;
         const description = describeToolResult(metadata);
 
         const runningIndex = findRunningToolLine(lines, tool);
@@ -596,17 +650,21 @@ export function buildAgentActivity(input: {
   }
 
   const hasError = lines.some(line => line.status === 'error');
+  const hasUnknown = hasUnknownResult || lines.some(line => line.status === 'unknown');
+  // A model round is a step too: the count answers "how much actually ran".
   const stepCount = lines.filter(
-    line => line.kind === 'tool' || line.kind === 'artifact',
+    line => line.kind === 'tool' || line.kind === 'artifact' || line.kind === 'model',
   ).length;
 
   const status: ActivityStatus = approvalWait
     ? 'pending'
     : hasRejectedApproval || hasExpiredApproval || hasError
       ? 'error'
-      : isRunning
-        ? 'running'
-        : 'done';
+      : !isRunning && hasUnknown
+        ? 'unknown'
+        : isRunning
+          ? 'running'
+          : 'done';
 
   let summary: string;
   if (approvalWait) {
@@ -616,14 +674,25 @@ export function buildAgentActivity(input: {
   } else if (hasExpiredApproval) {
     summary = '确认已过期';
   } else if (hasError) {
-    summary = '有步骤执行失败';
+    summary = hasUnknown ? '有调用失败或未确认' : '有步骤执行失败';
+  } else if (hasUnknown) {
+    summary = '有调用结果未确认';
   } else if (isRunning) {
-    if (hasText) {
-      summary = '正在生成回答';
+    // The collapsed summary IS the current step: whatever real line is
+    // executing right now (a tool, a model round) names itself, so the
+    // reader never sees a generic "正在处理". Synthetic placeholder lines
+    // carry no step information and are skipped.
+    const runningLine = lines.find(
+      line => line.status === 'running' && !line.id.startsWith('state-'),
+    )
+    if (runningLine) {
+      summary = runningLine.title
+    } else if (hasText) {
+      summary = '正在生成回答'
     } else if (!hadEventLines) {
-      summary = '正在思考';
+      summary = '正在思考'
     } else {
-      summary = '正在处理';
+      summary = '正在处理'
     }
   } else {
     summary = stepCount > 0 ? `已完成 ${stepCount} 个步骤` : '思考过程';
@@ -634,7 +703,7 @@ export function buildAgentActivity(input: {
     status,
     summary,
     defaultExpanded:
-      isRunning || approvalWait || hasRejectedApproval || hasExpiredApproval || hasError,
+      isRunning || approvalWait || hasRejectedApproval || hasExpiredApproval || hasError || hasUnknown,
     lines,
   };
 }

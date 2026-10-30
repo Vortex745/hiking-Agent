@@ -7,13 +7,7 @@
  * existing page-level approval toast.
  */
 import { useEffect, useRef, useState } from 'react'
-import AlertTriangle from 'reicon-react/icons/AlertTriangle'
-import ChatLine from 'reicon-react/icons/ChatLine'
-import Check from 'reicon-react/icons/Check'
-import Clock from 'reicon-react/icons/Clock'
-import Document from 'reicon-react/icons/Document'
-import Lightbulb from 'reicon-react/icons/Lightbulb'
-import Loader from 'reicon-react/icons/Loader'
+import { Check, CircleHelp, Clock, FileText, Lightbulb, LoaderCircle, MessageSquareText, TriangleAlert } from 'lucide-react'
 import {
   Trace,
   TraceCollapsible,
@@ -37,29 +31,31 @@ const SUMMARY_ICONS = {
   // the rotating indicator, so two spinners cannot compete in one trace.
   running: Lightbulb,
   done: Check,
-  error: AlertTriangle,
+  error: TriangleAlert,
   pending: Clock,
+  unknown: CircleHelp,
 }
 
 const ICON_CLASS = 'h-3.5 w-3.5'
 
 function lineIcon(line: ActivityLine) {
-  if (line.status === 'error') return AlertTriangle
+  if (line.status === 'error') return TriangleAlert
+  if (line.status === 'unknown') return CircleHelp
   if (line.status === 'pending') return Clock
-  if (line.status === 'running') return Loader
+  if (line.status === 'running') return LoaderCircle
 
   switch (line.kind) {
     case 'tool':
     case 'approval':
       return Check
     case 'artifact':
-      return Document
+      return FileText
     case 'review':
-      return AlertTriangle
+      return TriangleAlert
     case 'thought':
       return Lightbulb
     case 'answer':
-      return ChatLine
+      return MessageSquareText
     default:
       return Check
   }
@@ -93,7 +89,7 @@ export function AgentActivityTrace({
 
   const status = model.status
   const SummaryIcon = SUMMARY_ICONS[status]
-  const summaryLineStatus = status === 'done' ? undefined : status
+  const summaryLineStatus = status === 'done' || status === 'unknown' ? undefined : status
 
   return (
     <div
@@ -118,9 +114,13 @@ export function AgentActivityTrace({
             <Trace className="mt-1.5 ml-[7px] min-w-0 border-l border-border/70 pl-3">
               {model.lines.map(line => {
                 const Icon = lineIcon(line)
+                const lineStatus =
+                  line.status === 'done' || line.status === 'unknown'
+                    ? undefined
+                    : line.status
                 return (
                   <div key={line.id} className="flex flex-col gap-1 py-0.5">
-                    <TraceLine status={line.status === 'done' ? undefined : line.status}>
+                    <TraceLine status={lineStatus}>
                       <TraceIcon>
                         <Icon className={iconClassName(line.status)} />
                       </TraceIcon>

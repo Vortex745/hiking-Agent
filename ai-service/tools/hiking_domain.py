@@ -170,6 +170,15 @@ async def gear_checklist(
 
 
 @tool
+async def focus_map(name: str) -> dict[str, Any]:
+    """Record the single scenic spot that the current turn focuses on."""
+    cleaned = (name or "").strip()
+    if not cleaned:
+        return {"ok": False, "message": "景点名为空，无法定位。"}
+    return {"ok": True, "name": cleaned[:80]}
+
+
+@tool
 async def risk_assessment(
     destination: str | None = None,
     weather: str | None = None,

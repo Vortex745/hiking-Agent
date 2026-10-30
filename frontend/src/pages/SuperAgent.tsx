@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback, type Dispatch, type ReactNode, type SetStateAction } from 'react'
+import { useState, useRef, useEffect, useCallback, useMemo, type Dispatch, type ReactNode, type SetStateAction } from 'react'
 import { API } from '../api/config'
 import {
   createV2StreamConnection,
@@ -7,21 +7,13 @@ import {
   fetchV2Events,
   submitV2Approval,
   buildV2ResumeUrlFromDecision,
-  fetchV2MemorySettings,
-  updateV2MemorySettings,
   submitV2MemoryDecision,
-  fetchV2Memories,
-  updateV2Memory,
-  deleteV2Memory,
-  clearV2Memories,
-  exportV2Memories,
   planV2Recovery,
   V2_TERMINAL_RUN_STATUSES,
   type V2EventEnvelope,
   type V2RunSnapshot,
   type V2ApprovalRequest,
   type V2ApprovalDecisionResponse,
-  type V2Memory,
   type V2MemoryCandidate,
 } from '../api/chatV2'
 import {
@@ -32,22 +24,19 @@ import {
   isV2Paused,
   reconcileV2Snapshot,
   assistantTextFromSnapshot,
+  buildRecoveredTrace,
   readArtifact as readArtifactFromPayload,
   type V2ConversationState,
 } from '../api/v2Reducer'
 import { useExternalStoreRuntime, AssistantRuntimeProvider, type ExternalStoreAdapter, type ThreadMessage } from "@assistant-ui/react"
 import { GeminiThread } from '../components/assistant-ui/gemini/GeminiThread'
 import { GeminiSidebar } from '../components/assistant-ui/gemini/GeminiSidebar'
+import { CircleCheck, Clipboard, Database, Map, Plug, Settings2, SlidersHorizontal, TriangleAlert } from 'lucide-react'
+import { DropdownMenu } from '../components/ui/dropdown-menu'
+import { MemoryDialog } from '../components/MemoryDialog'
+import { McpDialog } from '../components/McpDialog'
 import KnowledgeSourcesDialog from './KnowledgeSources'
-import X from 'reicon-react/icons/X'
-import Trash2 from 'reicon-react/icons/Trash2'
-import Clipboard from 'reicon-react/icons/Clipboard'
-import CheckCircle from 'reicon-react/icons/CheckCircle'
-import AlertTriangle from 'reicon-react/icons/AlertTriangle'
-import Map from 'reicon-react/icons/Map'
-import Database from 'reicon-react/icons/Database'
-import Download from 'reicon-react/icons/Download'
-import Pen from 'reicon-react/icons/Pen'
+import LlmConfigDialog from './LlmConfig'
 
 interface Message {
   role: 'user' | 'assistant'
@@ -72,6 +61,34 @@ type AgentTraceEvent = {
   content: string
   metadata?: Record<string, unknown>
 }
+/** 从当前会话最近的 focus_map 工具调用中取唯一景点；没有则返回 null。 */
+function extractMapFocus(messages: Message[]): { name: string } | null {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const events = messages[i].traceEvents
+    if (!events?.length) continue
+    for (let j = events.length - 1; j >= 0; j -= 1) {
+      const event = events[j]
+      const metadata = event.metadata
+      if (!metadata || metadata.tool !== 'focus_map') continue
+      if (event.type === 'tool_result') {
+        const prefix = '地图定位：'
+        const content = event.content.trim()
+        if (content.startsWith(prefix)) {
+          const name = content.slice(prefix.length).trim()
+          if (name) return { name }
+        }
+        continue
+      }
+      if (event.type !== 'tool_call') continue
+      const args = metadata.args
+      if (!args || typeof args !== 'object') continue
+      const name = (args as Record<string, unknown>).name
+      if (typeof name === 'string' && name.trim()) return { name: name.trim() }
+    }
+  }
+  return null
+}
+
 type TraceAppendOptions = {
   /** Replacement content; a function receives the current last message. */
   content?: string | ((last: Message) => string)
@@ -139,8 +156,8 @@ function shouldRequestRouteFollowupLocation(text: string, messages: Message[]) {
 
 const quickTags = [
   { icon: Clipboard, text: '生成行程', scenario: 'route_plan' as AgentScenario },
-  { icon: CheckCircle, text: '检查装备', scenario: 'gear_check' as AgentScenario },
-  { icon: AlertTriangle, text: '风险提醒', scenario: 'risk_assessment' as AgentScenario },
+  { icon: CircleCheck, text: '检查装备', scenario: 'gear_check' as AgentScenario },
+  { icon: TriangleAlert, text: '风险提醒', scenario: 'risk_assessment' as AgentScenario },
   { icon: Map, text: '推荐路线', scenario: 'route_plan' as AgentScenario },
 ]
 
@@ -408,6 +425,7 @@ function SuperAgent() {
       return saved ? JSON.parse(saved) : []
     } catch { return [] }
   })
+  const mapFocus = useMemo(() => extractMapFocus(messages), [messages])
   const [sessions, setSessions] = useState<ChatSession[]>(loadSessions)
   const [activeSessionId, setActiveSessionId] = useState<string | null>(() => {
     try {
@@ -447,17 +465,16 @@ function SuperAgent() {
   // ``approval.required`` event. ``pendingApproval`` mirrors the
   // reducer's ``pendingApproval`` as React state so the approve/reject
   // prompt re-renders when a run pauses.
-  const [memoryEnabled, setMemoryEnabled] = useState(false)
-  const [memoryPending, setMemoryPending] = useState(false)
-  const [memoryPanelOpen, setMemoryPanelOpen] = useState(false)
+  const [configOpen, setConfigOpen] = useState(false)
+  const [memoryDialogOpen, setMemoryDialogOpen] = useState(false)
+  const [mcpDialogOpen, setMcpDialogOpen] = useState(false)
   const [knowledgeSourcesOpen, setKnowledgeSourcesOpen] = useState(false)
-  const [memoryItems, setMemoryItems] = useState<V2Memory[]>([])
-  const [memoryTotal, setMemoryTotal] = useState(0)
-  const [memoryOffset, setMemoryOffset] = useState(0)
-  const [memoryListPending, setMemoryListPending] = useState(false)
-  const [memoryError, setMemoryError] = useState('')
+  const [memoryRefreshKey, setMemoryRefreshKey] = useState(0)
+  const suppressMenuRefocus = useRef(false)
+  const settingsTriggerRef = useRef<HTMLButtonElement>(null)
   const [pendingMemoryConsent, setPendingMemoryConsent] = useState<V2MemoryCandidate | null>(null)
   const [memoryDecisionPending, setMemoryDecisionPending] = useState(false)
+  const [memoryDecisionError, setMemoryDecisionError] = useState('')
   const [pendingApproval, setPendingApproval] = useState<V2ApprovalRequest | null>(null)
   const v2RunRef = useRef<V2PersistedRun | null>(loadV2PersistedRun())
   const v2StateRef = useRef<V2ConversationState>(initialV2State)
@@ -465,53 +482,25 @@ function SuperAgent() {
     'idle' | 'submitting' | 'resuming' | 'resolved' | 'error'
   >('idle')
 
-  useEffect(() => {
-    let cancelled = false
-    void fetchV2MemorySettings()
-      .then(settings => { if (!cancelled) setMemoryEnabled(settings.enabled) })
-      .catch(() => { if (!cancelled) setMemoryEnabled(false) })
-    return () => { cancelled = true }
+  const closeLlmConfig = useCallback(() => {
+    setConfigOpen(false)
+    window.requestAnimationFrame(() => settingsTriggerRef.current?.focus())
   }, [])
 
-  const handleMemoryToggle = useCallback(async () => {
-    if (memoryPending) return
-    setMemoryPending(true)
-    try {
-      const settings = await updateV2MemorySettings(!memoryEnabled)
-      setMemoryEnabled(settings.enabled)
-    } finally {
-      setMemoryPending(false)
-    }
-  }, [memoryEnabled, memoryPending])
+  const closeMemoryDialog = useCallback(() => {
+    setMemoryDialogOpen(false)
+    window.requestAnimationFrame(() => settingsTriggerRef.current?.focus())
+  }, [])
 
-  useEffect(() => {
-    if (!memoryPanelOpen) return
-    let cancelled = false
-    setMemoryListPending(true)
-    setMemoryError('')
-    void fetchV2Memories(20, memoryOffset)
-      .then(page => {
-        if (cancelled) return
-        setMemoryItems(page.items)
-        setMemoryTotal(page.total)
-      })
-      .catch(error => {
-        if (!cancelled) setMemoryError(error instanceof Error ? error.message : '记忆加载失败')
-      })
-      .finally(() => { if (!cancelled) setMemoryListPending(false) })
-    return () => { cancelled = true }
-  }, [memoryPanelOpen, memoryOffset])
-
-  const reloadMemories = useCallback(async () => {
-    const page = await fetchV2Memories(20, memoryOffset)
-    setMemoryItems(page.items)
-    setMemoryTotal(page.total)
-  }, [memoryOffset])
+  const closeMcpDialog = useCallback(() => {
+    setMcpDialogOpen(false)
+    window.requestAnimationFrame(() => settingsTriggerRef.current?.focus())
+  }, [])
 
   const handleMemoryDecision = useCallback(async (decision: 'approve' | 'reject') => {
     if (!pendingMemoryConsent || memoryDecisionPending) return
     setMemoryDecisionPending(true)
-    setMemoryError('')
+    setMemoryDecisionError('')
     try {
       await submitV2MemoryDecision(
         pendingMemoryConsent.candidate_id,
@@ -520,66 +509,14 @@ function SuperAgent() {
       )
       setPendingMemoryConsent(null)
       v2StateRef.current = { ...v2StateRef.current, pendingMemoryConsent: null }
-      if (memoryPanelOpen) await reloadMemories()
+      setMemoryRefreshKey(key => key + 1)
     } catch (error) {
-      setMemoryError(error instanceof Error ? error.message : '记忆决策失败')
+      setMemoryDecisionError(error instanceof Error ? error.message : '记忆决策失败')
     } finally {
       setMemoryDecisionPending(false)
     }
-  }, [memoryDecisionPending, memoryPanelOpen, pendingMemoryConsent, reloadMemories])
+  }, [memoryDecisionPending, pendingMemoryConsent])
 
-  const handleMemoryEdit = useCallback(async (item: V2Memory) => {
-    const content = window.prompt('记忆内容', item.content)
-    if (content === null || !content.trim()) return
-    const category = window.prompt('类别', item.category)
-    if (category === null || !category.trim()) return
-    const ttlInput = window.prompt('有效期天数（留空表示永久）', '')
-    if (ttlInput === null) return
-    const ttlDays = ttlInput.trim() ? Number(ttlInput) : null
-    if (ttlDays !== null && (!Number.isInteger(ttlDays) || ttlDays < 1 || ttlDays > 3650)) {
-      setMemoryError('有效期必须是 1 到 3650 天的整数')
-      return
-    }
-    try {
-      await updateV2Memory(item.memory_id, {
-        content: content.trim(),
-        category: category.trim(),
-        ttl_days: ttlDays,
-      })
-      await reloadMemories()
-    } catch (error) {
-      setMemoryError(error instanceof Error ? error.message : '记忆更新失败')
-    }
-  }, [reloadMemories])
-
-  const handleMemoryDelete = useCallback(async (memoryId: string) => {
-    try {
-      await deleteV2Memory(memoryId)
-      await reloadMemories()
-    } catch (error) {
-      setMemoryError(error instanceof Error ? error.message : '记忆删除失败')
-    }
-  }, [reloadMemories])
-
-  const handleMemoryClear = useCallback(async () => {
-    if (!window.confirm('确认清除全部长期记忆？此操作无法撤销。')) return
-    try {
-      await clearV2Memories()
-      setMemoryOffset(0)
-      await reloadMemories()
-    } catch (error) {
-      setMemoryError(error instanceof Error ? error.message : '记忆清除失败')
-    }
-  }, [reloadMemories])
-
-  const handleMemoryExport = useCallback(async () => {
-    try {
-      const exported = await exportV2Memories()
-      window.open(API.chatV2Artifact(exported.artifact_id), '_blank', 'noopener,noreferrer')
-    } catch (error) {
-      setMemoryError(error instanceof Error ? error.message : '记忆导出失败')
-    }
-  }, [])
 
   // Ticket 08: v2 event handlers (spec AC2). Map v2 wire events to stable
   // UI state. These are defined as useCallbacks before the recovery effect
@@ -651,6 +588,18 @@ function SuperAgent() {
       setPendingMemoryConsent(next.pendingMemoryConsent)
     }
 
+    if (event.type === 'progress' && event.payload.stage === 'model') {
+      // Agent process tracking ticket 03: a model round boundary rides the
+      // existing ``progress`` type. It becomes its own timeline line; the
+      // start carries the round label, the finish carries the duration.
+      const traceEvent: AgentTraceEvent = {
+        type: 'model_round',
+        content:
+          typeof event.payload.message === 'string' ? event.payload.message : '',
+        metadata: event.payload as Record<string, unknown>,
+      }
+      appendTraceEvent(setMessages, traceEvent, { isStreaming: true })
+    }
     if (event.type === 'text') {
       const delta = typeof event.payload.content === 'string' ? event.payload.content : ''
       if (!delta) return
@@ -1144,9 +1093,20 @@ function SuperAgent() {
     // A10: the decision response carries the canonical resume URL — the
     // backend owns the gateway path. Fall back to the documented path
     // when the field is absent.
+    //
+    // AC6 stores ``sequence_cursor`` one frame back at ``run.paused`` so a
+    // refresh can replay the pause prompt. Resuming must NOT reuse that
+    // held-back cursor: the replay would re-deliver the already-consumed
+    // ``run.paused`` and the stream client would treat it as terminal and
+    // abort the resume before the continuation (the reducer cursor has
+    // already advanced past the pause).
+    const resumeFrom = Math.max(
+      persisted.sequence_cursor,
+      v2StateRef.current.sequenceCursor,
+    )
     const resumeUrl = buildV2ResumeUrlFromDecision(
       decisionResponse ?? { resume_url: '', run_id: persisted.run_id },
-      persisted.sequence_cursor,
+      resumeFrom,
     )
     attachV2Stream(resumeUrl, '', {
       onOpen: () => setConnectionStatus('connected'),
@@ -1237,6 +1197,12 @@ function SuperAgent() {
       }
       v2StateRef.current = next
 
+      // Tickets 05/06: rebuild the timeline from reducer state. A replay
+      // that carries no trace-worthy events (legacy run, or a run whose
+      // progress-class events were dropped) leaves whatever the stored
+      // message already shows instead of wiping the user's history.
+      const replayedTraceEvents = buildRecoveredTrace(next)
+
       setMessages(prev => {
         if (prev.length === 0) {
           // Fresh page load: restore the user message + assistant turn.
@@ -1261,6 +1227,10 @@ function SuperAgent() {
               // A02: artifacts delivered before the refresh are part of
               // the replay state — reattach so download cards survive.
               artifacts: next.artifacts.length > 0 ? next.artifacts : undefined,
+              // Tickets 05/06: the inline timeline is rebuilt from the
+              // reducer's ordered trace entries, so a refresh keeps the
+              // tool calls, model rounds and reasoning already seen.
+              traceEvents: replayedTraceEvents.length > 0 ? replayedTraceEvents : undefined,
             })
           }
           return restored
@@ -1278,6 +1248,8 @@ function SuperAgent() {
             content: recoveredAssistantContent(next),
             isStreaming: !isV2Terminal(next) && !isV2Paused(next),
             artifacts: next.artifacts.length > 0 ? next.artifacts : undefined,
+            traceEvents:
+              replayedTraceEvents.length > 0 ? replayedTraceEvents : last.traceEvents,
           }
         }
         return updated
@@ -1824,92 +1796,77 @@ function SuperAgent() {
               </div>
             </div>
           )}
-          <div className="absolute top-4 right-4 z-40 flex h-9 items-center gap-3 rounded-md border border-white/10 bg-black/50 px-3 text-xs text-white/80 backdrop-blur-md">
-              <label className="flex cursor-pointer items-center gap-2">
-                <span>长期记忆</span>
-                <input
-                  type="checkbox"
-                  className="h-4 w-4 accent-emerald-500"
-                  checked={memoryEnabled}
-                  disabled={memoryPending}
-                  onChange={() => { void handleMemoryToggle() }}
-                />
-              </label>
-              <button
-                type="button"
-                className="flex h-7 w-7 items-center justify-center text-white/70 hover:text-white disabled:opacity-50"
-                title="管理长期记忆"
-                disabled={!memoryEnabled}
-                onClick={() => setMemoryPanelOpen(open => !open)}
-              >
-                <Database className="h-4 w-4" />
-              </button>
-              <button
-                type="button"
-                className="flex h-7 items-center gap-1 border-l border-white/15 pl-3 text-white/70 hover:text-white"
-                title="管理知识源"
-                onClick={() => setKnowledgeSourcesOpen(true)}
-              >
-                <Database className="h-4 w-4" />
-                知识源
-              </button>
-            </div>
+          <div className="absolute top-4 right-4 z-40">
+            <DropdownMenu
+              icon={<Settings2 className="h-4 w-4" />}
+              items={[
+                {
+                  label: '模型配置',
+                  icon: <SlidersHorizontal className="h-4 w-4" />,
+                  onSelect: () => {
+                    suppressMenuRefocus.current = true
+                    setConfigOpen(true)
+                  },
+                },
+                {
+                  label: '长期记忆',
+                  icon: <Database className="h-4 w-4" />,
+                  separatorBefore: true,
+                  onSelect: () => {
+                    suppressMenuRefocus.current = true
+                    setMemoryDialogOpen(true)
+                  },
+                },
+                {
+                  label: '知识源',
+                  icon: <Database className="h-4 w-4" />,
+                  separatorBefore: true,
+                  onSelect: () => {
+                    suppressMenuRefocus.current = true
+                    setKnowledgeSourcesOpen(true)
+                  },
+                },
+                {
+                  label: 'MCP 接入',
+                  icon: <Plug className="h-4 w-4" />,
+                  separatorBefore: true,
+                  onSelect: () => {
+                    suppressMenuRefocus.current = true
+                    setMcpDialogOpen(true)
+                  },
+                },
+              ]}
+              label="设置"
+              triggerRef={settingsTriggerRef}
+              onCloseAutoFocus={(event) => {
+                if (!suppressMenuRefocus.current) return
+                suppressMenuRefocus.current = false
+                event.preventDefault()
+              }}
+            />
+          </div>
+          {configOpen && <LlmConfigDialog onClose={closeLlmConfig} />}
+          {memoryDialogOpen && <MemoryDialog onClose={closeMemoryDialog} refreshKey={memoryRefreshKey} />}
+          {mcpDialogOpen && <McpDialog onClose={closeMcpDialog} />}
+          {knowledgeSourcesOpen && <KnowledgeSourcesDialog onClose={() => setKnowledgeSourcesOpen(false)} />}
           {pendingMemoryConsent && (
             <div className="absolute left-4 right-4 top-16 z-50 ml-auto max-w-sm rounded-md border border-amber-400/30 bg-zinc-950 p-4 text-sm text-white shadow-xl">
               <div className="font-medium">确认保存 {pendingMemoryConsent.category}</div>
               <div className="mt-2 break-words text-white/75">{pendingMemoryConsent.preview}</div>
+              {memoryDecisionError && <div className="mt-2 text-xs text-red-300">{memoryDecisionError}</div>}
               <div className="mt-3 flex justify-end gap-2">
                 <button className="px-3 py-1.5 text-white/70 hover:text-white" disabled={memoryDecisionPending} onClick={() => { void handleMemoryDecision('reject') }}>拒绝</button>
                 <button className="rounded-md bg-emerald-600 px-3 py-1.5 text-white hover:bg-emerald-500 disabled:opacity-50" disabled={memoryDecisionPending} onClick={() => { void handleMemoryDecision('approve') }}>保存</button>
               </div>
             </div>
           )}
-          {memoryPanelOpen && (
-            <div className="absolute right-4 top-16 z-50 w-[calc(100%-2rem)] max-w-sm rounded-md border border-white/10 bg-zinc-950 p-4 text-sm text-white shadow-xl">
-              <div className="flex items-center justify-between">
-                <h2 className="font-medium">长期记忆</h2>
-                <div className="flex items-center gap-1">
-                  <button className="flex h-8 w-8 items-center justify-center text-white/70 hover:text-white" title="导出 JSON" onClick={() => { void handleMemoryExport() }}><Download className="h-4 w-4" /></button>
-                  <button className="flex h-8 w-8 items-center justify-center text-red-300 hover:text-red-200" title="清除全部" onClick={() => { void handleMemoryClear() }}><Trash2 className="h-4 w-4" /></button>
-                  <button className="flex h-8 w-8 items-center justify-center text-white/70 hover:text-white" title="关闭" onClick={() => setMemoryPanelOpen(false)}><X className="h-4 w-4" /></button>
-                </div>
-              </div>
-              {memoryError && <div className="mt-2 text-xs text-red-300">{memoryError}</div>}
-              <div className="mt-3 max-h-72 overflow-y-auto">
-                {memoryListPending && <div className="py-6 text-center text-white/50">加载中...</div>}
-                {!memoryListPending && memoryItems.length === 0 && <div className="py-6 text-center text-white/50">暂无长期记忆</div>}
-                {memoryItems.map(item => (
-                  <div key={item.memory_id} className="border-t border-white/10 py-3 first:border-t-0">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <div className="text-xs text-emerald-300">{item.category}</div>
-                        <div className="mt-1 break-words text-white/85">{item.content}</div>
-                      </div>
-                      <div className="flex shrink-0 gap-1">
-                        <button className="flex h-7 w-7 items-center justify-center text-white/60 hover:text-white" title="编辑" onClick={() => { void handleMemoryEdit(item) }}><Pen className="h-3.5 w-3.5" /></button>
-                        <button className="flex h-7 w-7 items-center justify-center text-red-300 hover:text-red-200" title="删除" onClick={() => { void handleMemoryDelete(item.memory_id) }}><Trash2 className="h-3.5 w-3.5" /></button>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-              {memoryTotal > 20 && (
-                <div className="mt-3 flex items-center justify-between border-t border-white/10 pt-3 text-xs text-white/60">
-                  <button disabled={memoryOffset === 0} onClick={() => setMemoryOffset(Math.max(0, memoryOffset - 20))}>上一页</button>
-                  <span>{memoryOffset + 1}-{Math.min(memoryOffset + 20, memoryTotal)} / {memoryTotal}</span>
-                  <button disabled={memoryOffset + 20 >= memoryTotal} onClick={() => setMemoryOffset(memoryOffset + 20)}>下一页</button>
-                </div>
-              )}
-            </div>
-          )}
           <GeminiThread
             emptyTitle="告诉我你的徒步计划，我将为你规划路线、安排任务，并提供安全建议。"
+            mapFocus={mapFocus}
+            mapSessionKey={activeSessionId ?? 'new'}
             onRegenerate={handleRegenerate}
             realMessageCount={messages.length}
           />
-          {knowledgeSourcesOpen && (
-            <KnowledgeSourcesDialog onClose={() => setKnowledgeSourcesOpen(false)} />
-          )}
         </div>
       </div>
     </SessionRuntimeProvider>

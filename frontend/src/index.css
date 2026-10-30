@@ -323,6 +323,279 @@
   transform: scale(var(--icon-swap-start-scale));
 }
 
+/* uiarc-style dropdown menu: Radix 菜单 + 跟随指针滑动的高亮块。 */
+.arc-menu {
+  position: relative;
+  z-index: 90;
+  min-width: 12rem;
+  max-width: var(--radix-dropdown-menu-content-available-width);
+  padding: 5px;
+  border: 1px solid rgb(255 255 255 / 0.1);
+  border-radius: 10px;
+  background: rgb(17 18 19 / 0.96);
+  box-shadow: 0 18px 48px rgb(0 0 0 / 0.45);
+  backdrop-filter: blur(18px);
+  transform-origin: var(--radix-dropdown-menu-content-transform-origin);
+}
+.arc-menu[data-state="open"] {
+  animation: arc-menu-in var(--dropdown-open-dur) var(--dropdown-ease) both;
+}
+.arc-menu[data-state="closed"] {
+  opacity: 0;
+}
+.arc-menu-highlight {
+  position: absolute;
+  top: 0;
+  right: 5px;
+  left: 5px;
+  border-radius: 7px;
+  background: rgb(255 255 255 / 0.08);
+  pointer-events: none;
+  transition:
+    transform 260ms var(--ease-spring),
+    height    260ms var(--ease-spring),
+    opacity    80ms linear;
+}
+.arc-menu-highlight[data-tone="danger"] {
+  background: rgb(248 113 113 / 0.14);
+}
+.arc-menu-highlight[data-glide="false"] {
+  transition: opacity 80ms linear;
+}
+.arc-menu-item {
+  position: relative;
+  display: flex;
+  min-height: 36px;
+  align-items: center;
+  gap: 10px;
+  padding: 0 11px;
+  border-radius: 7px;
+  color: rgb(255 255 255 / 0.86);
+  font-size: 12px;
+  cursor: pointer;
+  outline: none;
+  animation: arc-menu-item-in 180ms var(--ease-out) both;
+  animation-delay: calc(min(var(--i, 0), 4) * 28ms);
+}
+.arc-menu-icon {
+  display: inline-flex;
+  width: 17px;
+  flex: none;
+  color: rgb(255 255 255 / 0.55);
+}
+.arc-menu-item[data-disabled] {
+  opacity: 0.45;
+  cursor: default;
+}
+.arc-menu-item-danger,
+.arc-menu-item-danger .arc-menu-icon {
+  color: #fca5a5;
+}
+.arc-menu-separator {
+  height: 1px;
+  margin: 4px -1px;
+  background: rgb(255 255 255 / 0.12);
+}
+
+@keyframes arc-menu-in {
+  from { opacity: 0; transform: translateY(-5px) scale(0.97); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes arc-menu-item-in {
+  from { opacity: 0; transform: translateY(-3px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .arc-menu[data-state="open"],
+  .arc-menu-item {
+    animation: none;
+  }
+  .arc-menu-highlight {
+    transition: none;
+  }
+}
+
+/* Arc 风格卡片：标题按钮铺满整卡，action 仅作视觉提示。 */
+.arc-card {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  overflow: hidden;
+  isolation: isolate;
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  background: var(--bg-card);
+  color: var(--text-primary);
+  transition:
+    transform 180ms var(--ease-out),
+    border-color 180ms var(--ease-out),
+    box-shadow 180ms var(--ease-out);
+}
+@media (hover: hover) and (pointer: fine) {
+  .arc-card:hover {
+    transform: translateY(-2px);
+    border-color: color-mix(in srgb, var(--primary-light) 38%, var(--border-color));
+    box-shadow: 0 10px 30px rgb(0 0 0 / 0.1);
+  }
+}
+.arc-card:has(.arc-card-trigger:focus-visible) {
+  outline: 2px solid var(--primary-light);
+  outline-offset: 2px;
+}
+.arc-card-media {
+  display: flex;
+  min-height: 78px;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 18px;
+  border-bottom: 1px solid color-mix(in srgb, var(--primary-light) 16%, var(--border-color));
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--primary-light) 12%, var(--bg-card)),
+    var(--bg-card)
+  );
+}
+.arc-card-icon {
+  display: grid;
+  width: 40px;
+  height: 40px;
+  flex: none;
+  place-items: center;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--primary-light) 14%, transparent);
+  color: var(--primary-light);
+}
+.arc-card-content {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 6px;
+  padding: 16px 18px 18px;
+}
+.arc-card-title {
+  width: fit-content;
+  max-width: 100%;
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+.arc-card-trigger {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-align: left;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.arc-card-trigger::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+}
+.arc-card-trigger:focus-visible { outline: none; }
+.arc-card-description {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.arc-card-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: auto;
+  padding-top: 14px;
+}
+.arc-card-byline {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.arc-card-meta {
+  overflow: hidden;
+  color: var(--text-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.arc-card-status {
+  color: var(--text-muted);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.arc-card-action {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 2px;
+  color: var(--primary-light);
+  font-size: 12px;
+  font-weight: 500;
+  pointer-events: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .arc-card { transition: none; }
+  .arc-card:hover { transform: none; }
+}
+
+/* Arc 文字显现：每个片段从自身裁切框中升起，并从柔和模糊中收紧。 */
+.arc-reveal { text-wrap: balance; }
+.arc-reveal-line { display: block; }
+/* 羽化的下边缘让模糊的字从下方浮出而不是被硬线切断；负外边距抵消内边距，不改变排版。 */
+.arc-reveal-clip {
+  display: inline-block;
+  vertical-align: top;
+  padding: 0.1em 0.16em 0.24em;
+  margin: -0.1em -0.16em -0.24em;
+  mask-image: linear-gradient(#000 calc(100% - 0.18em), transparent);
+}
+/* 三条轨道：升起最长，淡入最先结束，去模糊落在两者之间。
+   backwards 填充让片段在延迟期间保持隐藏，结束后不留 transform / filter。 */
+.arc-reveal-word {
+  display: inline-block;
+  animation:
+    arc-reveal-rise 0.76s cubic-bezier(0.16, 1, 0.3, 1) var(--reveal-delay, 0s) backwards,
+    arc-reveal-fade 0.44s cubic-bezier(0.22, 1, 0.36, 1) var(--reveal-delay, 0s) backwards,
+    arc-reveal-focus 0.58s cubic-bezier(0.16, 1, 0.3, 1) var(--reveal-delay, 0s) backwards;
+}
+.arc-reveal-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+  user-select: none;
+}
+@keyframes arc-reveal-rise {
+  from { transform: translateY(0.62em); }
+}
+@keyframes arc-reveal-fade {
+  from { opacity: 0; }
+}
+@keyframes arc-reveal-focus {
+  from { filter: blur(var(--reveal-blur, 4px)); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .arc-reveal-clip { mask-image: none; }
+  .arc-reveal-word { animation: none; }
+}
+
 .chat-sidebar {
   transition:
     width var(--panel-close-dur) var(--panel-ease),
@@ -374,71 +647,6 @@
     .press-scale:active {
       transform: scale(0.97);
     }
-  }
-}
-
-/* Lifecycle event slider */
-.lifecycle-slider {
-  -webkit-appearance: none;
-  appearance: none;
-  height: 3px;
-  border-radius: 2px;
-  background: rgba(0, 0, 0, 0.1);
-  outline: none;
-  cursor: pointer;
-}
-
-.lifecycle-slider::-webkit-slider-thumb {
-  -webkit-appearance: none;
-  appearance: none;
-  width: 12px;
-  height: 12px;
-  border-radius: 50%;
-  background: #0b57d0;
-  border: 2px solid #fff;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
-  cursor: grab;
-  transition: transform 120ms var(--ease-out), box-shadow 120ms var(--ease-out);
-}
-
-.lifecycle-slider::-webkit-slider-thumb:hover {
-  transform: scale(1.2);
-  box-shadow: 0 2px 8px rgba(11, 87, 208, 0.3);
-}
-
-.lifecycle-slider::-webkit-slider-thumb:active {
-  cursor: grabbing;
-  transform: scale(1.1);
-}
-
-.lifecycle-slider::-moz-range-thumb {
-  width: 12px;
-  height: 12px;
-  border-radius: 50%;
-  background: #0b57d0;
-  border: 2px solid #fff;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
-  cursor: grab;
-}
-
-.lifecycle-slider::-moz-range-track {
-  height: 3px;
-  border-radius: 2px;
-  background: rgba(0, 0, 0, 0.1);
-}
-
-@media (prefers-color-scheme: dark) {
-  .lifecycle-slider {
-    background: rgba(255, 255, 255, 0.12);
-  }
-  .lifecycle-slider::-webkit-slider-thumb {
-    border-color: #1e1f20;
-  }
-  .lifecycle-slider::-moz-range-thumb {
-    border-color: #1e1f20;
-  }
-  .lifecycle-slider::-moz-range-track {
-    background: rgba(255, 255, 255, 0.12);
   }
 }
 

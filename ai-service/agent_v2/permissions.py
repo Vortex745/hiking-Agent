@@ -81,6 +81,7 @@ _TOOL_RISK: dict[str, RiskLevel] = {
     "risk_assessment": RiskLevel.LOW,
     "memory_save": RiskLevel.LOW,
     "memory_search": RiskLevel.LOW,
+    "focus_map": RiskLevel.LOW,
     # ---- route_plan profile ----
     "route_research": RiskLevel.MEDIUM,
     "web_search": RiskLevel.MEDIUM,

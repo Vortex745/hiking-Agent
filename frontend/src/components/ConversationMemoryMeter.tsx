@@ -1,4 +1,4 @@
-import Database from 'reicon-react/icons/Database'
+import { Database } from 'lucide-react'
 import { getConversationMemoryProgress } from '../api/conversationMemory'
 
 interface ConversationMemoryMeterProps {

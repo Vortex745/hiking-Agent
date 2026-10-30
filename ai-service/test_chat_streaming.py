@@ -137,6 +137,45 @@ def test_partial_stream_has_one_terminal_and_no_late_text(tmp_path, outcome):
     asyncio.run(scenario())
 
 
+def test_invalid_tool_arguments_after_preamble_is_one_error_terminal(tmp_path):
+    """A streamed preamble must not survive as a successful assistant answer."""
+    from agent_v2.kernel import KernelModelFailure
+
+    async def scenario():
+        async def kernel(**kwargs):
+            await kwargs["on_text"]("参数已确认，开始生成图片。", EVIDENCE)
+            raise KernelModelFailure(
+                "invalid_tool_arguments",
+                "工具参数格式错误，本次请求未完成。",
+            )
+
+        repo = _repo(tmp_path)
+        orch = RunOrchestrator(settings=_settings(), runs_repo=repo,
+                               memory=_FakeMemory(), kernel_turn=kernel)
+        request = ChatFlowRequest(
+            message="生成图片",
+            request_id="invalid-args-stream",
+            conversation_id="conv-invalid-args",
+        )
+        events = [event async for event in orch.stream_chat(request, subject_id=SUBJECT_ID)]
+
+        assert [e.type for e in events if e.type in {"done", "error", "cancelled"}] == ["error"]
+        assert events[-1].payload["code"] == "invalid_tool_arguments"
+        assert "".join(
+            event.payload["content"] for event in events if event.type == "text"
+        ) == "参数已确认，开始生成图片。"
+        # The partial preamble may remain in the transcript, but the run and
+        # its terminal are error — never a successful assistant completion.
+        run = repo.control.get_run_by_request("invalid-args-stream")
+        assert run.status == "error"
+        stored = repo.checkpoints.get_messages(conversation_id="conv-invalid-args")
+        assert [row.content for row in stored if row.role == "assistant"] == [
+            "参数已确认，开始生成图片。"
+        ]
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("content", ["<mm:think>private</mm:think>安全", "<think>private", "<reasoning>private</reasoning>安全"])
 def test_reasoning_filter_matches_final_projection_at_every_split(content):
     from agent_v2.kernel import _StreamingPublicText, extract_final_text

@@ -29,6 +29,13 @@ class Settings:
     rerank_top_k: int = 4
     rerank_timeout_seconds: float = 15.0
     rerank_enabled: bool = True
+    # 决策模型（SiliconFlow System One / TypeSafe 契约）。
+    # off=不调用；shadow=只记录；enforce=参与证据门禁。
+    decision_model_base_url: str = "https://api.siliconflow.cn/v1"
+    decision_model_api_key: str = ""
+    decision_model_name: str = "Kev-4b"
+    decision_model_mode: str = "off"
+    decision_model_timeout_seconds: float = 5.0
     database_url: str = "postgresql://ai_hiking:ai_hiking@localhost:5432/ai_hiking"
     database_url_source: str = ""
     database_connect_timeout_seconds: int = 2
@@ -56,7 +63,7 @@ class Settings:
     # UniHarness 不可变 commit pin（Ticket 25：vendored 真实 fork 基线，
     # provenance 见 third_party/uniharness-provenance.md；值为含项目 delta
     # 的 fork HEAD，upstream 基点 757bf3d… 必须是其祖先）
-    agent_v2_uniharness_pin: str = "b026a26250487678aedc2beef0d0b6ae802de5c4"
+    agent_v2_uniharness_pin: str = "aeceee7ea5bdb8c4dcaa7d1c54400afacabe5556"
     # v2 持久化目录（chat_checkpoints/agent_control/agent_memory 三个 SQLite 的父目录）
     agent_v2_state_dir: str = "./agent_state"
     # Ticket 09: artifact profile 使用的沙箱类型。
@@ -140,6 +147,23 @@ class Settings:
         self.rerank_top_k = int(os.getenv("RERANK_TOP_K", "4"))
         self.rerank_timeout_seconds = float(os.getenv("RERANK_TIMEOUT_SECONDS", "15"))
         self.rerank_enabled = os.getenv("RERANK_ENABLED", "true").lower() == "true"
+        self.decision_model_base_url = os.getenv(
+            "DECISION_MODEL_BASE_URL", "https://api.siliconflow.cn/v1"
+        )
+        self.decision_model_api_key = os.getenv("DECISION_MODEL_API_KEY", "")
+        self.decision_model_name = os.getenv("DECISION_MODEL_NAME", "Kev-4b")
+        _decision_mode = os.getenv("DECISION_MODEL_MODE", "off").lower()
+        self.decision_model_mode = (
+            _decision_mode
+            if _decision_mode in {"off", "shadow", "enforce"}
+            else "off"
+        )
+        try:
+            self.decision_model_timeout_seconds = float(
+                os.getenv("DECISION_MODEL_TIMEOUT_SECONDS", "5")
+            )
+        except ValueError:
+            self.decision_model_timeout_seconds = 5.0
         database_url, database_url_source = self._first_env("DATABASE_URL")
         self.database_url = database_url or "postgresql://ai_hiking:ai_hiking@localhost:5432/ai_hiking"
         self.database_url_source = database_url_source if database_url else "local_default"
@@ -180,7 +204,7 @@ class Settings:
         # Ticket 03：Chat v2 配置加载
         self.agent_v2_enabled = os.getenv("AGENT_V2_ENABLED", "false").lower() == "true"
         self.agent_v2_uniharness_pin = os.getenv(
-            "AGENT_V2_UNIHARNESS_PIN", "b026a26250487678aedc2beef0d0b6ae802de5c4"
+            "AGENT_V2_UNIHARNESS_PIN", "aeceee7ea5bdb8c4dcaa7d1c54400afacabe5556"
         )
         self.agent_v2_state_dir = os.getenv(
             "AGENT_V2_STATE_DIR", self._default_runtime_dir("agent_state")
@@ -290,6 +314,12 @@ _SECTION_FIELD_ENV_KEYS: dict[str, dict[str, str]] = {
         "api_key": "RERANK_API_KEY",
         "model": "RERANK_MODEL",
     },
+    "decision": {
+        "base_url": "DECISION_MODEL_BASE_URL",
+        "api_key": "DECISION_MODEL_API_KEY",
+        "model": "DECISION_MODEL_NAME",
+        "mode": "DECISION_MODEL_MODE",
+    },
 }
 
 _SECTION_FIELD_SETTINGS_ATTRS: dict[str, dict[str, str]] = {
@@ -309,7 +339,21 @@ _SECTION_FIELD_SETTINGS_ATTRS: dict[str, dict[str, str]] = {
         "api_key": "rerank_api_key",
         "model": "rerank_model",
     },
+    "decision": {
+        "base_url": "decision_model_base_url",
+        "api_key": "decision_model_api_key",
+        "model": "decision_model_name",
+        "mode": "decision_model_mode",
+    },
 }
+
+
+def section_settings_attrs() -> dict[str, tuple[str, str]]:
+    """Return section -> (base_url settings attr, api_key settings attr)."""
+    return {
+        section: (fields["base_url"], fields["api_key"])
+        for section, fields in _SECTION_FIELD_SETTINGS_ATTRS.items()
+    }
 
 
 def _parse_runtime_dimensions(value: Any) -> int:
@@ -444,6 +488,12 @@ def update_runtime_config(
                     continue
             elif field == "dimensions":
                 value = _parse_runtime_dimensions(raw_value)
+            elif field == "mode":
+                value = _parse_runtime_text(section_name, field, raw_value).lower()
+                if value not in {"off", "shadow", "enforce"}:
+                    raise ValueError(
+                        f"{section_name}.mode must be one of off/shadow/enforce"
+                    )
             else:
                 value = _parse_runtime_text(section_name, field, raw_value)
             env_updates[env_key] = str(value)

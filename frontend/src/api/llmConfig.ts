@@ -9,6 +9,7 @@ const LLM_CONFIG_TEST_ENDPOINT = `${LLM_CONFIG_ENDPOINT}/test`
 const DEFAULT_EMBEDDING_DIMENSIONS = 1536
 
 export type ModelUsage = 'llm' | 'embedding' | 'rerank'
+export type ConfigSection = ModelUsage | 'decision'
 export type LlmSection = ModelUsage
 
 /** Server-side view of one section; keys are never returned in plain text. */
@@ -23,10 +24,17 @@ export interface EmbeddingConfigSection extends LlmConfigSection {
   dimensions: number
 }
 
+export type DecisionMode = 'off' | 'shadow' | 'enforce'
+
+export interface LlmConfigDecisionSection extends LlmConfigSection {
+  mode: DecisionMode
+}
+
 export interface LlmConfigSnapshot {
   llm: LlmConfigSection
   embedding: EmbeddingConfigSection
   rerank: LlmConfigSection
+  decision: LlmConfigDecisionSection
   updatedAt: string | null
   indexDimensions: number | null
 }
@@ -46,10 +54,15 @@ export interface EmbeddingConfigDraft extends LlmConfigDraftSection {
   dimensions: number | null
 }
 
+export interface DecisionConfigDraft extends LlmConfigDraftSection {
+  mode: DecisionMode
+}
+
 export interface LlmConfigDraft {
   llm: LlmConfigDraftSection
   embedding: EmbeddingConfigDraft
   rerank: LlmConfigDraftSection
+  decision: DecisionConfigDraft
 }
 
 export interface LlmConfigTestResult {
@@ -102,12 +115,18 @@ function readSection(value: unknown): LlmConfigSection {
   }
 }
 
+function normalizeDecisionMode(value: unknown): DecisionMode {
+  return value === 'shadow' || value === 'enforce' ? value : 'off'
+}
+
 function normalizeSnapshot(value: unknown): LlmConfigSnapshot {
   const root = isRecord(value) ? value : {}
   const embeddingRecord = isRecord(root.embedding) ? root.embedding : {}
   const embedding = readSection(embeddingRecord)
   const dimensions = asFiniteNumber(embeddingRecord.dimensions) ?? DEFAULT_EMBEDDING_DIMENSIONS
   const indexDimensions = asFiniteNumber(root.index_dimensions)
+  const decisionRecord = isRecord(root.decision) ? root.decision : {}
+  const decision = readSection(decisionRecord)
 
   return {
     llm: readSection(root.llm),
@@ -116,6 +135,12 @@ function normalizeSnapshot(value: unknown): LlmConfigSnapshot {
       dimensions: Math.round(dimensions),
     },
     rerank: readSection(root.rerank),
+    decision: {
+      ...decision,
+      baseUrl: decision.baseUrl || 'https://api.siliconflow.cn/v1',
+      model: decision.model || 'Kev-4b',
+      mode: normalizeDecisionMode(decisionRecord.mode),
+    },
     updatedAt: typeof root.updated_at === 'string' ? root.updated_at : null,
     indexDimensions: indexDimensions === null ? null : Math.round(indexDimensions),
   }
@@ -138,6 +163,12 @@ export function draftFromSnapshot(snapshot: LlmConfigSnapshot): LlmConfigDraft {
     rerank: {
       baseUrl: snapshot.rerank.baseUrl,
       model: snapshot.rerank.model,
+      apiKey: '',
+    },
+    decision: {
+      baseUrl: snapshot.decision.baseUrl,
+      model: snapshot.decision.model,
+      mode: snapshot.decision.mode,
       apiKey: '',
     },
   }
@@ -200,6 +231,10 @@ export async function saveLlmConfig(
   if (draft.embedding.dimensions !== null && Number.isFinite(draft.embedding.dimensions)) {
     embedding.dimensions = Math.round(draft.embedding.dimensions)
   }
+  const decision = {
+    ...toWireSection(draft.decision),
+    mode: draft.decision.mode,
+  }
 
   const response = await fetcher(LLM_CONFIG_ENDPOINT, {
     method: 'PUT',
@@ -211,6 +246,7 @@ export async function saveLlmConfig(
       llm: toWireSection(draft.llm),
       embedding,
       rerank: toWireSection(draft.rerank),
+      decision,
     }),
   })
   if (!response.ok) throw await responseError(response)
@@ -227,14 +263,16 @@ export async function saveLlmConfig(
  * the stored server values, so a masked key can still be tested.
  */
 export async function testLlmConfig(
-  section: LlmSection,
+  section: ConfigSection,
   baseUrl?: string,
   apiKey?: string,
+  model?: string,
   fetcher: FetchLike = defaultFetch(),
 ): Promise<LlmConfigTestResult> {
   const body: Record<string, unknown> = { section }
   if (baseUrl?.trim()) body.base_url = baseUrl.trim()
   if (apiKey?.trim()) body.api_key = apiKey.trim()
+  if (model?.trim()) body.model = model.trim()
 
   const response = await fetcher(LLM_CONFIG_TEST_ENDPOINT, {
     method: 'POST',
@@ -393,23 +431,40 @@ function inferModelUsage(model: ModelInfo): ModelUsage | 'other' {
   return inferred === 'unknown' ? 'llm' : inferred
 }
 
-export function filterModelsByUsage(models: ModelInfo[], usage: ModelUsage): ModelInfo[] {
-  return models.filter(model => inferModelUsage(model) === usage)
+export function filterModelsByUsage(
+  models: ModelInfo[],
+  section: ConfigSection,
+): ModelInfo[] {
+  if (section === 'decision') {
+    const hints = ['jev', 'kev', 'semif', 'noul', 'systemone', 'system-one', 'decision']
+    const matched = models.filter(model => {
+      const id = model.id.toLowerCase()
+      return hints.some(hint => id.includes(hint))
+    })
+    // A provider may use arbitrary decision-model names; never hide its list.
+    return matched.length > 0 ? matched : models
+  }
+  return models.filter(model => inferModelUsage(model) === section)
 }
 
 export function repairModelSelection(
   currentModel: string,
-  usage: ModelUsage,
+  section: ConfigSection,
   candidates: ModelInfo[],
 ): string {
   const trimmed = currentModel.trim()
+  if (section === 'decision') {
+    // Decision aliases are provider-specific; keep a manually entered name.
+    if (!candidates.length) return trimmed
+    return trimmed || candidates[0].id
+  }
   if (!candidates.length) return trimmed
   if (candidates.some(model => model.id === trimmed)) return trimmed
 
   const inferred = inferModelUsageFromHints(trimmed.toLowerCase(), 'unknown')
   if (!trimmed) return candidates[0].id
 
-  if (inferred !== 'unknown' && inferred !== usage) {
+  if (inferred !== 'unknown' && inferred !== section) {
     return candidates[0].id
   }
 
@@ -419,12 +474,15 @@ export function repairModelSelection(
 export async function fetchModels(
   baseUrl: string,
   apiKey: string,
+  section?: ConfigSection,
   fetcher: FetchLike = defaultFetch(),
 ): Promise<ModelInfo[]> {
+  const body: Record<string, unknown> = { base_url: baseUrl, api_key: apiKey }
+  if (section) body.section = section
   const resp = await fetcher(API.modelsFetch, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ base_url: baseUrl, api_key: apiKey }),
+    body: JSON.stringify(body),
   })
 
   if (!resp.ok) {

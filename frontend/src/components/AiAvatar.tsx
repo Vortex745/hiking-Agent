@@ -1,5 +1,4 @@
-import Heart from 'reicon-react/icons/Heart'
-import Sparkles from 'reicon-react/icons/Sparkles'
+import { Heart, Sparkles } from 'lucide-react'
 
 interface AiAvatarProps {
   type: 'love' | 'agent'

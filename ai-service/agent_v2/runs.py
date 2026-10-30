@@ -2260,6 +2260,8 @@ def _approval_snapshot_payload(approval: ApprovalRecord) -> dict[str, Any]:
         args = json.loads(approval.args_canonical) if approval.args_canonical else {}
     except (TypeError, ValueError):
         args = {}
+    if approval.tool_name.startswith("mcp__") and "call_id" in args and "arguments" in args:
+        args = args["arguments"]
     return {
         "approval_id": approval.approval_id,
         "run_id": approval.run_id,

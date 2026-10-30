@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 
 import api.llm_config_router as llm_config_router
 import config
+from agent_v2.decisions import DecisionCallError
 from config import settings
 from rag import sqlite_schema
 
@@ -34,6 +35,10 @@ SETTINGS_ATTRS = (
     "rerank_base_url",
     "rerank_api_key",
     "rerank_model",
+    "decision_model_base_url",
+    "decision_model_api_key",
+    "decision_model_name",
+    "decision_model_mode",
     "rag_sqlite_db_path",
 )
 
@@ -48,6 +53,10 @@ ENV_KEYS = (
     "RERANK_BASE_URL",
     "RERANK_API_KEY",
     "RERANK_MODEL",
+    "DECISION_MODEL_BASE_URL",
+    "DECISION_MODEL_API_KEY",
+    "DECISION_MODEL_NAME",
+    "DECISION_MODEL_MODE",
 )
 
 
@@ -119,6 +128,10 @@ def test_get_masks_keys_and_reports_env_metadata(tmp_path, client, monkeypatch):
     monkeypatch.setattr(settings, "rerank_base_url", "https://rerank.example/v1")
     monkeypatch.setattr(settings, "rerank_model", "rerank-model")
     monkeypatch.setattr(settings, "rerank_api_key", "")
+    monkeypatch.setattr(settings, "decision_model_base_url", "https://api.siliconflow.cn/v1")
+    monkeypatch.setattr(settings, "decision_model_name", "Kev-4b")
+    monkeypatch.setattr(settings, "decision_model_api_key", "sk-decision-1234567890")
+    monkeypatch.setattr(settings, "decision_model_mode", "shadow")
 
     response = client.get(BASE_URL)
 
@@ -135,6 +148,13 @@ def test_get_masks_keys_and_reports_env_metadata(tmp_path, client, monkeypatch):
     assert body["embedding"]["dimensions"] == 1024
     assert body["rerank"]["api_key_masked"] == ""
     assert body["rerank"]["api_key_set"] is False
+    assert body["decision"] == {
+        "base_url": "https://api.siliconflow.cn/v1",
+        "model": "Kev-4b",
+        "api_key_masked": "sk-d...7890",
+        "api_key_set": True,
+        "mode": "shadow",
+    }
     assert body["index_dimensions"] == 1024
     assert body["updated_at"] == config.env_file_updated_at()
     assert body["updated_at"].endswith("Z")
@@ -624,3 +644,113 @@ def test_probe_maps_connection_errors_to_502(client, monkeypatch, fake_upstream)
 
     assert response.status_code == 502
     assert "stored-key" not in response.text
+
+
+def test_put_decision_section_writes_env_and_snapshot(tmp_path, client, monkeypatch):
+    env_path = _write_env(
+        tmp_path / ".env",
+        "OPENAI_MODEL=old-model\nEMBEDDING_DIMENSIONS=1024\n",
+    )
+    monkeypatch.setattr(config, "ENV_PATH", env_path)
+    monkeypatch.setattr(settings, "rag_sqlite_db_path", str(_make_index_db(tmp_path, 1024)))
+    payload = _valid_put_payload()
+    payload["decision"] = {
+        "base_url": "https://api.siliconflow.cn/v1",
+        "model": "Kev-4b",
+        "api_key": "sk-decision-1234567890",
+        "mode": "shadow",
+    }
+
+    response = client.put(BASE_URL, json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["decision"]["base_url"] == "https://api.siliconflow.cn/v1"
+    assert body["decision"]["model"] == "Kev-4b"
+    assert body["decision"]["mode"] == "shadow"
+    assert body["decision"]["api_key_masked"] == "sk-d...7890"
+    assert "sk-decision-1234567890" not in response.text
+    values = dotenv_values(env_path)
+    assert values["DECISION_MODEL_BASE_URL"] == "https://api.siliconflow.cn/v1"
+    assert values["DECISION_MODEL_API_KEY"] == "sk-decision-1234567890"
+    assert values["DECISION_MODEL_NAME"] == "Kev-4b"
+    assert values["DECISION_MODEL_MODE"] == "shadow"
+    assert settings.decision_model_mode == "shadow"
+    assert settings.decision_model_api_key == "sk-decision-1234567890"
+
+
+def test_put_decision_rejects_invalid_mode_without_writing(
+    tmp_path, client, monkeypatch
+):
+    env_path = _write_env(tmp_path / ".env", "EMBEDDING_DIMENSIONS=1024\n")
+    before = env_path.read_text(encoding="utf-8")
+    monkeypatch.setattr(config, "ENV_PATH", env_path)
+    monkeypatch.setattr(settings, "rag_sqlite_db_path", str(_make_index_db(tmp_path, 1024)))
+    monkeypatch.setattr(settings, "decision_model_mode", "off")
+    payload = _valid_put_payload()
+    payload["decision"] = {
+        "base_url": "https://api.siliconflow.cn/v1",
+        "model": "Kev-4b",
+        "mode": "sometimes",
+    }
+
+    response = client.put(BASE_URL, json=payload)
+
+    assert response.status_code == 400
+    assert env_path.read_text(encoding="utf-8") == before
+    assert settings.decision_model_mode == "off"
+
+
+def test_probe_decision_uses_systemone_contract(client, monkeypatch):
+    calls: dict = {}
+
+    async def fake_probe(**kwargs):
+        calls.update(kwargs)
+        return 123, "ok"
+
+    monkeypatch.setattr(llm_config_router, "probe_systemone", fake_probe)
+    monkeypatch.setattr(
+        settings, "decision_model_base_url", "https://api.siliconflow.cn/v1"
+    )
+    monkeypatch.setattr(settings, "decision_model_api_key", "stored-decision-key")
+    monkeypatch.setattr(settings, "decision_model_name", "Kev-4b")
+
+    response = client.post(TEST_URL, json={"section": "decision"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {"latency_ms": 123, "model_count": 1, "models": ["ok"]}
+    assert calls == {
+        "base_url": "https://api.siliconflow.cn/v1",
+        "api_key": "stored-decision-key",
+        "model": "Kev-4b",
+        "timeout_seconds": 15.0,
+    }
+
+
+def test_probe_decision_requires_api_key(client, monkeypatch):
+    monkeypatch.setattr(
+        settings, "decision_model_base_url", "https://api.siliconflow.cn/v1"
+    )
+    monkeypatch.setattr(settings, "decision_model_api_key", "")
+
+    response = client.post(TEST_URL, json={"section": "decision"})
+
+    assert response.status_code == 400
+    assert "api_key" in response.json()["detail"]
+
+
+def test_probe_decision_maps_upstream_auth_to_401(client, monkeypatch):
+    async def fake_probe(**kwargs):
+        raise DecisionCallError("upstream_auth", 401)
+
+    monkeypatch.setattr(llm_config_router, "probe_systemone", fake_probe)
+    monkeypatch.setattr(
+        settings, "decision_model_base_url", "https://api.siliconflow.cn/v1"
+    )
+    monkeypatch.setattr(settings, "decision_model_api_key", "stored-decision-key")
+
+    response = client.post(TEST_URL, json={"section": "decision"})
+
+    assert response.status_code == 401
+    assert "stored-decision-key" not in response.text

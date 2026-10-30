@@ -1,9 +1,4 @@
-import Menu from 'reicon-react/icons/Menu'
-import MessageSquare from 'reicon-react/icons/MessageSquare'
-import Plus from 'reicon-react/icons/Plus'
-import Sidebar from 'reicon-react/icons/Sidebar'
-import Trash2 from 'reicon-react/icons/Trash2'
-import X from 'reicon-react/icons/X'
+import { Menu, MessageSquare, PanelLeft, Plus, Trash2, X } from 'lucide-react'
 
 export interface ChatSessionMeta {
   id: string
@@ -135,7 +130,7 @@ export const GeminiSidebar = ({
             title={collapsed ? '展开侧边栏' : '收起侧边栏'}
             className={ghostBtnClass}
           >
-            <Sidebar className="size-4" />
+            <PanelLeft className="size-4" />
           </button>
           {!collapsed && (
             <span className="ml-2 truncate text-sm font-medium text-[#1f1f1f] dark:text-[#e3e3e3]">对话历史</span>

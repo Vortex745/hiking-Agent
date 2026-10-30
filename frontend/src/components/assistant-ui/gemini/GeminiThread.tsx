@@ -5,25 +5,20 @@ import {
   MessagePrimitive,
   useMessage,
 } from "@assistant-ui/react";
-import ArrowUp from 'reicon-react/icons/ArrowUp';
-import RotateRight from 'reicon-react/icons/RotateRight';
-import Copy from 'reicon-react/icons/Copy';
-import Check from 'reicon-react/icons/Check';
-import X from 'reicon-react/icons/X';
-import More from 'reicon-react/icons/More';
-import Thumbtack from 'reicon-react/icons/Thumbtack';
-import Grid from 'reicon-react/icons/Grid';
-import Paperclip from 'reicon-react/icons/Paperclip';
-import Download from 'reicon-react/icons/Download';
+import { ArrowUp, Check, Copy, Download, Paperclip, RotateCw } from 'lucide-react';
 import { getConversationMemoryProgress } from '../../../api/conversationMemory';
 import { API } from '../../../api/config';
+import { splitLegacyMcpOutput } from '../../../lib/chatOutput';
 import { StreamingText, useStreamingText } from '../../StreamingText';
 import { AgentActivityTrace } from '../../agent-activity/AgentActivityTrace';
+import { TextReveal } from '../../ui/text-reveal';
+import { ViewOnMap } from '../../ui/view-on-map';
+import { ChatImages, type ChatImage } from '../../ui/chat-images';
 import {
   buildAgentActivity,
   readActivityEvents,
 } from '../../agent-activity/agentActivityModel';
-import { useRef, useState, createContext, useContext, useCallback, useEffect, useLayoutEffect, type RefObject, type PointerEvent as ReactPointerEvent } from 'react';
+import { useRef, useState, createContext, useContext, useCallback, type RefObject } from 'react';
 import gsap from 'gsap';
 import { useGSAP } from '@gsap/react';
 
@@ -36,6 +31,10 @@ interface GeminiThreadProps {
   onUploadClick?: () => void;
   /** Real message count from the parent page's state (for accurate memory meter) */
   realMessageCount?: number;
+  /** 当前会话最近一次由 AI 聚焦的唯一景点 */
+  mapFocus?: { name: string } | null;
+  /** 会话标识，切换后地图重新解析目标 */
+  mapSessionKey?: string;
 }
 
 /** Context to pass callbacks down to ChatMessage without prop drilling */
@@ -44,7 +43,7 @@ const ThreadActionsContext = createContext<{
   realMessageCount: number;
 }>({ realMessageCount: 0 });
 
-export const GeminiThread = ({ emptyTitle, onRegenerate, onUploadClick, realMessageCount = 0 }: GeminiThreadProps) => (
+export const GeminiThread = ({ emptyTitle, onRegenerate, onUploadClick, realMessageCount = 0, mapFocus, mapSessionKey }: GeminiThreadProps) => (
   <ThreadActionsContext.Provider value={{ onRegenerate, realMessageCount }}>
     <ThreadPrimitive.Root className="h-full bg-[#fdfcfc] dark:bg-[#131314] flex flex-col overflow-hidden w-full relative">
       <AuiIf condition={(s) => s.thread.isEmpty}>
@@ -62,6 +61,7 @@ export const GeminiThread = ({ emptyTitle, onRegenerate, onUploadClick, realMess
           </div>
         </div>
       </AuiIf>
+      <ViewOnMap focus={mapFocus} sessionKey={mapSessionKey} />
     </ThreadPrimitive.Root>
   </ThreadActionsContext.Provider>
 );
@@ -73,7 +73,11 @@ const EmptyState = ({ emptyTitle, onUploadClick }: { emptyTitle: string; onUploa
       className="pointer-events-none absolute top-1/2 left-1/2 h-[330px] w-[720px] -translate-x-1/2 -translate-y-1/2 bg-[radial-gradient(closest-side,#a9d1fb,transparent)] opacity-70 blur-[55px] dark:bg-[radial-gradient(closest-side,#1d4068,transparent)] dark:opacity-65"
     />
     <div className="relative z-10 w-full max-w-[800px] px-6 flex flex-col items-center">
-      <h1 className="text-center text-3xl font-medium mb-12 text-[#1f1f1f] dark:text-[#e3e3e3]">{emptyTitle}</h1>
+      <TextReveal
+        as="h1"
+        className="text-center text-3xl font-medium mb-12 text-[#1f1f1f] dark:text-[#e3e3e3]"
+        text={emptyTitle}
+      />
       <Composer onUploadClick={onUploadClick} />
     </div>
   </div>
@@ -140,81 +144,56 @@ const formatArtifactSize = (value: unknown) => {
 }
 
 const MARKDOWN_PATTERN = /(!\[[^\]]*\]\([^)]+\)|\[[^\]]*\]\([^)]+\)|\*\*(?=\S)[\s\S]*?\S\*\*)/g;
-const IMAGE_URL_PATTERN = /\.(jpg|jpeg|png|gif|webp|avif|bmp)(\?.*)?$/i;
-type PreviewImage = { src: string; alt: string };
+// Only image syntax becomes a ChatImages preview. A normal link to an image
+// URL is still a link; it opens in a new tab and never fetches a protected
+// original just because its path ends in .jpg.
+const imageFromMarkdown = (segment: string): ChatImage | null => {
+  const imageMatch = segment.match(/^!\[([^\]]*)\]\(([^)]+)\)$/);
+  if (imageMatch) return { alt: imageMatch[1] || '图片', src: imageMatch[2] };
+  return null;
+};
 
 const MarkdownText = (part: any) => {
-  const [previewImage, setPreviewImage] = useState<PreviewImage | null>(null);
   const raw = part.text || part.part?.text || '';
+  // Older messages persisted raw MCP JSON after this marker. Strip it at
+  // display time (and surface any image URLs) without rewriting history.
+  const displayText = splitLegacyMcpOutput(raw);
   const role = useMessage((state) => state.role);
   const status = useMessage((state) => state.status?.type);
-  const reveal = useStreamingText(raw, role === 'assistant' && status === 'running');
+  const reveal = useStreamingText(displayText, role === 'assistant' && status === 'running');
   // Split on bold, images, and links patterns
   const segments = reveal.text.split(MARKDOWN_PATTERN);
-
-  useEffect(() => {
-    if (!previewImage) return;
-
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setPreviewImage(null);
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [previewImage]);
+  const imageRuns: { start: number; end: number; images: ChatImage[] }[] = [];
+  let imageRun: (typeof imageRuns)[number] | null = null;
+  segments.forEach((seg: string, i: number) => {
+    const image = imageFromMarkdown(seg);
+    if (image) {
+      if (!imageRun) {
+        imageRun = { start: i, end: i, images: [] };
+        imageRuns.push(imageRun);
+      }
+      imageRun.end = i;
+      imageRun.images.push(image);
+      return;
+    }
+    if (imageRun && !seg.trim()) { imageRun.end = i; return; }
+    imageRun = null;
+  });
 
   return (
-    <div className="whitespace-pre-wrap leading-relaxed relative streaming-text" data-full-text={raw}>
+    <div className="whitespace-pre-wrap leading-relaxed relative streaming-text" data-full-text={displayText}>
       {segments.map((seg: string, i: number) => {
         if (!seg) return null;
-        
-        const imgMatch = seg.match(/^!\[([^\]]*)\]\(([^)]+)\)$/);
-        if (imgMatch) {
-          const alt = imgMatch[1] || '图片';
-          const src = imgMatch[2];
-          return (
-            <button
-              key={i}
-              type="button"
-              onClick={() => setPreviewImage({ src, alt })}
-              className="my-2 block max-w-full cursor-zoom-in overflow-hidden rounded-xl border border-black/5 shadow-sm transition-opacity hover:opacity-95 focus:outline-none focus:ring-2 focus:ring-[#0b57d0]/60 dark:border-white/5"
-              aria-label={`放大图片：${alt}`}
-              title="放大图片"
-            >
-              <img 
-                src={src} 
-                alt={alt} 
-                className="block max-w-full max-h-[350px] object-cover" 
-                loading="lazy"
-              />
-            </button>
-          );
+        if (imageFromMarkdown(seg)) {
+          const run = imageRuns.find((entry) => entry.start === i);
+          return run ? <ChatImages key={`images-${i}`} images={run.images} /> : null;
         }
-        
+        if (!seg.trim() && imageRuns.some((entry) => i > entry.start && i <= entry.end)) return null;
+
         const linkMatch = seg.match(/^\[([^\]]*)\]\(([^)]+)\)$/);
         if (linkMatch) {
           const linkText = linkMatch[1];
           const linkUrl = linkMatch[2];
-          // Auto-detect image URLs and render as thumbnails
-          if (IMAGE_URL_PATTERN.test(linkUrl)) {
-            return (
-              <button
-                key={i}
-                type="button"
-                onClick={() => setPreviewImage({ src: linkUrl, alt: linkText || '图片' })}
-                className="my-2 block max-w-full cursor-zoom-in overflow-hidden rounded-xl border border-black/5 shadow-sm transition-opacity hover:opacity-95 focus:outline-none focus:ring-2 focus:ring-[#0b57d0]/60 dark:border-white/5"
-                aria-label={`放大图片：${linkText || '图片'}`}
-                title="放大图片"
-              >
-                <img
-                  src={linkUrl}
-                  alt={linkText || '图片'}
-                  className="block max-w-full max-h-[350px] object-cover"
-                  loading="lazy"
-                />
-              </button>
-            );
-          }
           return (
             <a
               key={i}
@@ -234,34 +213,6 @@ const MarkdownText = (part: any) => {
         
         return <span key={i}><StreamingText text={seg} animate={reveal.animate} /></span>;
       })}
-      {previewImage && (
-        <div
-          className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm"
-          role="dialog"
-          aria-modal="true"
-          aria-label={`图片预览：${previewImage.alt}`}
-          onClick={() => setPreviewImage(null)}
-        >
-          <button
-            type="button"
-            className="absolute right-4 top-4 flex h-10 w-10 items-center justify-center rounded-full bg-black/60 text-white transition-colors hover:bg-black/80 focus:outline-none focus:ring-2 focus:ring-white"
-            onClick={(event) => {
-              event.stopPropagation();
-              setPreviewImage(null);
-            }}
-            aria-label="关闭图片预览"
-            title="关闭图片预览"
-          >
-            <X className="size-5" aria-hidden="true" />
-          </button>
-          <img
-            src={previewImage.src}
-            alt={previewImage.alt}
-            className="max-h-[90vh] max-w-[92vw] rounded-xl object-contain shadow-2xl"
-            onClick={(event) => event.stopPropagation()}
-          />
-        </div>
-      )}
     </div>
   );
 };
@@ -375,33 +326,10 @@ const CustomToolCall = (part: any) => {
   return null;
 };
 
-type LifecycleStep = {
-  title: string;
-  detail: string;
-  state: 'complete' | 'active' | 'pending';
-};
-
-type LifecyclePosition = {
-  x: number;
-  y: number;
-};
-
-const LIFECYCLE_PANEL_WIDTH = 330;
-const LIFECYCLE_PANEL_HEIGHT = 420;
-const LIFECYCLE_PANEL_MARGIN = 12;
-
 function prefersReducedMotion() {
   return typeof window !== 'undefined'
     && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 }
-
-const traceLabels: Record<string, string> = {
-  tool_call: '工具调用',
-  tool_result: '工具结果',
-  artifact_progress: '产物生成',
-  review_notice: '需人工核查',
-  approval_required: '需要确认',
-};
 
 function getPartToolName(part: any) {
   return part?.toolName || part?.part?.toolName || part?.tool_name || '';
@@ -423,282 +351,10 @@ function getMessageText(content: readonly any[]) {
     .join('');
 }
 
-function stepState(done: boolean, active: boolean): LifecycleStep['state'] {
-  if (done) return 'complete';
-  if (active) return 'active';
-  return 'pending';
-}
-
-function getAgentLifecycle(events: any[], isRunning: boolean, hasText: boolean): LifecycleStep[] {
-  const hasToolEvent = events.some(event => ['tool_call', 'tool_result', 'approval_required'].includes(event?.type));
-
-  // 仅保留可由后端 trace 事件推导的阶段：记忆读取/查询改写在后端无对应
-  // phase 发射源（rewriter 已随 RAG 模块合并删除），重新引入前需先补后端。
-  return [
-    {
-      title: '请求理解',
-      detail: '识别徒步意图、场景和缺失信息',
-      state: stepState(events.length > 0, isRunning && events.length === 0),
-    },
-    {
-      title: '工具编排',
-      detail: '按风险等级选择并执行徒步工具',
-      state: stepState(hasToolEvent, isRunning && !hasToolEvent && !hasText),
-    },
-    {
-      title: '回答生成',
-      detail: '整合工具结果并流式生成回复',
-      state: stepState(hasText, isRunning && !hasText),
-    },
-    {
-      title: '完成收尾',
-      detail: '结束 SSE、提交可沉淀的会话记忆',
-      state: stepState(!isRunning && hasText, false),
-    },
-  ];
-}
-
-function getGenericLifecycle(isRunning: boolean, hasText: boolean): LifecycleStep[] {
-  return [
-    {
-      title: '建立连接',
-      detail: '向后端发送请求并等待首个 SSE 事件',
-      state: stepState(hasText, isRunning && !hasText),
-    },
-    {
-      title: '回答生成',
-      detail: '接收 text 事件并增量更新消息',
-      state: stepState(hasText, isRunning && !hasText),
-    },
-    {
-      title: '完成收尾',
-      detail: '接收 done 事件后解除运行状态',
-      state: stepState(!isRunning && hasText, false),
-    },
-  ];
-}
-
-function buildLifecycle(content: readonly any[], isRunning: boolean) {
-  const text = getMessageText(content).trim();
-  const hasText = text.length > 0;
-  const traceEvents = (getToolArgs(content, 'traceEvents') || []) as any[];
-
-  if (traceEvents.length > 0) {
-    return {
-      title: 'Agent 技术生命周期',
-      steps: getAgentLifecycle(traceEvents, isRunning, hasText),
-      recentEvents: traceEvents.map(event => ({
-        label: traceLabels[event?.type] || event?.type || '事件',
-        content: String(event?.content || '').trim(),
-      })).filter(event => event.content),
-    };
-  }
-
-  return {
-    title: '流式回复生命周期',
-    steps: getGenericLifecycle(isRunning, hasText),
-    recentEvents: [],
-  };
-}
-
-function clampLifecyclePosition(position: LifecyclePosition): LifecyclePosition {
-  if (typeof window === 'undefined') return position;
-
-  const maxX = Math.max(
-    LIFECYCLE_PANEL_MARGIN,
-    window.innerWidth - LIFECYCLE_PANEL_WIDTH - LIFECYCLE_PANEL_MARGIN,
-  );
-  const maxY = Math.max(
-    LIFECYCLE_PANEL_MARGIN,
-    window.innerHeight - LIFECYCLE_PANEL_HEIGHT - LIFECYCLE_PANEL_MARGIN,
-  );
-
-  return {
-    x: Math.min(Math.max(position.x, LIFECYCLE_PANEL_MARGIN), maxX),
-    y: Math.min(Math.max(position.y, LIFECYCLE_PANEL_MARGIN), maxY),
-  };
-}
-
-const LifecycleHoverPanel = ({
-  content,
-  isRunning,
-  pinned,
-  position,
-  flipBelow,
-  panelRef,
-  onPinToggle,
-  onDragStart,
-}: {
-  content: readonly any[];
-  isRunning: boolean;
-  pinned: boolean;
-  position: LifecyclePosition;
-  flipBelow: boolean;
-  panelRef: RefObject<HTMLDivElement>;
-  onPinToggle: () => void;
-  onDragStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
-}) => {
-  const lifecycle = buildLifecycle(content, isRunning);
-  const [activeItem, setActiveItem] = useState<{type: 'step' | 'event', index: number} | null>(null);
-  const [sliderIndex, setSliderIndex] = useState(lifecycle.recentEvents.length - 1);
-  const [userDragging, setUserDragging] = useState(false);
-  const prevEventCountRef = useRef(lifecycle.recentEvents.length);
-
-  // Auto-advance slider to latest event when new events arrive (unless user is dragging)
-  useEffect(() => {
-    const count = lifecycle.recentEvents.length;
-    if (count > prevEventCountRef.current && !userDragging) {
-      setSliderIndex(count - 1);
-    }
-    prevEventCountRef.current = count;
-  }, [lifecycle.recentEvents.length, userDragging]);
-
-  return (
-    <div
-      ref={panelRef}
-      className={`z-50 flex w-[240px] flex-col overflow-visible rounded-2xl border border-black/10 bg-white/95 p-4 text-left shadow-[0_16px_50px_rgba(0,0,0,0.18)] backdrop-blur-xl dark:border-white/10 dark:bg-[#1e1f20]/95 ${
-        pinned
-          ? 'fixed left-0 top-0 max-h-[72vh] will-change-transform'
-          : `absolute left-1/2 -translate-x-1/2 ${
-              flipBelow ? 'top-full mt-2' : 'bottom-full mb-2'
-            } max-h-[min(420px,80vh)]`
-      }`}
-      style={pinned ? { transform: `translate3d(${position.x}px, ${position.y}px, 0)` } : undefined}
-      data-lifecycle-panel={pinned ? 'pinned' : 'hover'}
-    >
-      <div
-        className={`mb-3 flex shrink-0 items-center justify-between gap-3 ${pinned ? 'cursor-grab active:cursor-grabbing' : ''}`}
-        onPointerDown={onDragStart}
-      >
-        <div className="min-w-0 text-[13px] font-medium text-[#1f1f1f] dark:text-[#e3e3e3]">
-          {lifecycle.title}
-        </div>
-        <div className="flex shrink-0 items-center gap-1">
-          {pinned && <Grid className="h-3.5 w-3.5 text-[#5f6368] dark:text-[#bdc1c6]" />}
-          <button
-            type="button"
-            className="rounded-full p-1 text-[#5f6368] transition-colors hover:bg-black/5 hover:text-[#1f1f1f] dark:text-[#bdc1c6] dark:hover:bg-white/10 dark:hover:text-[#e3e3e3]"
-            aria-pressed={pinned}
-            aria-label={pinned ? '取消钉住流程' : '钉住流程'}
-            title={pinned ? '取消钉住' : '钉住流程'}
-            onPointerDown={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-            }}
-            onClick={onPinToggle}
-          >
-            {pinned
-              ? <Thumbtack className="h-3.5 w-3.5" weight="Filled" />
-              : <Thumbtack className="h-3.5 w-3.5" />
-            }
-          </button>
-        </div>
-      </div>
-      <div className="shrink-0 space-y-1" onMouseLeave={() => setActiveItem(null)}>
-        {lifecycle.steps.map((step, index) => (
-          <div
-            key={`${step.title}-${index}`}
-            className="flex items-center gap-2 p-1.5 hover:bg-black/5 dark:hover:bg-white/10 rounded cursor-pointer transition-colors"
-            onMouseEnter={() => setActiveItem({type: 'step', index})}
-          >
-            <span
-              className={`h-2.5 w-2.5 rounded-full shrink-0 ${
-                step.state === 'complete'
-                  ? 'bg-[#0b57d0]'
-                  : step.state === 'active'
-                    ? 'bg-[#0b57d0] shadow-[0_0_0_5px_rgba(11,87,208,0.12)] animate-pulse'
-                    : 'bg-black/15 dark:bg-white/20'
-              }`}
-            />
-            <span className="text-[12px] font-medium text-[#1f1f1f] dark:text-[#e3e3e3]">
-              {step.title}
-            </span>
-          </div>
-        ))}
-      </div>
-      {lifecycle.recentEvents.length > 0 && (() => {
-        const maxIdx = lifecycle.recentEvents.length - 1;
-        const safeIdx = Math.min(Math.max(sliderIndex, 0), maxIdx);
-        const currentEvent = lifecycle.recentEvents[safeIdx];
-        return (
-          <div className="mt-2 flex min-h-0 flex-1 flex-col overflow-y-auto border-t border-black/10 pt-2 dark:border-white/10">
-            <div className="mb-1.5 shrink-0 flex items-center justify-between px-1.5">
-              <span className="text-[11px] font-medium text-[#5f6368] dark:text-[#bdc1c6]">事件流程</span>
-              <span className="text-[10px] tabular-nums text-[#5f6368] dark:text-[#bdc1c6] opacity-70">{safeIdx + 1} / {lifecycle.recentEvents.length}</span>
-            </div>
-            {/* Slider */}
-            <div className="px-1.5 mb-2">
-              <input
-                type="range"
-                min={0}
-                max={maxIdx}
-                value={safeIdx}
-                onChange={(e) => { setSliderIndex(Number(e.target.value)); setUserDragging(true); }}
-                onMouseUp={() => setUserDragging(false)}
-                onTouchEnd={() => setUserDragging(false)}
-                className="lifecycle-slider w-full"
-                aria-label="浏览事件"
-              />
-            </div>
-            {/* Current event card */}
-            {currentEvent && (
-              <div
-                className="mx-1.5 rounded-lg bg-black/[0.03] dark:bg-white/[0.05] p-2.5 transition-all duration-150"
-                onMouseEnter={() => setActiveItem({type: 'event', index: safeIdx})}
-                onMouseLeave={() => setActiveItem(null)}
-              >
-                <div className="flex items-center gap-1.5 mb-1">
-                  <span className={`h-1.5 w-1.5 rounded-full shrink-0 ${
-                    safeIdx === maxIdx ? 'bg-[#0b57d0] animate-pulse' : 'bg-[#0b57d0]/60'
-                  }`} />
-                  <span className="text-[12px] font-medium text-[#1f1f1f] dark:text-[#e3e3e3]">{currentEvent.label}</span>
-                </div>
-                <div className="text-[11px] leading-relaxed text-[#444746] dark:text-[#c4c7c5] whitespace-pre-wrap break-all line-clamp-4">
-                  {currentEvent.content}
-                </div>
-              </div>
-            )}
-          </div>
-        );
-      })()}
-
-      {/* Right Side Detail Panel */}
-      {activeItem && (
-        <div
-          className="absolute left-full top-1/2 -translate-y-1/2 ml-2 w-[260px] z-50 flex flex-col rounded-xl border border-black/10 bg-white/95 p-4 text-left shadow-[0_8px_30px_rgba(0,0,0,0.12)] backdrop-blur-xl dark:border-white/10 dark:bg-[#1e1f20]/95 pointer-events-none"
-        >
-          {activeItem.type === 'step' && (
-            <>
-               <div className="font-medium text-[13px] text-[#1f1f1f] dark:text-[#e3e3e3] mb-1.5">{lifecycle.steps[activeItem.index].title}</div>
-               <div className="text-[12px] leading-snug text-[#5f6368] dark:text-[#bdc1c6]">{lifecycle.steps[activeItem.index].detail}</div>
-            </>
-          )}
-          {activeItem.type === 'event' && (
-             <>
-               <div className="font-medium text-[13px] text-[#1f1f1f] dark:text-[#e3e3e3] mb-1.5">{lifecycle.recentEvents[activeItem.index].label}</div>
-               <div className="text-[12px] leading-snug text-[#444746] dark:text-[#c4c7c5] whitespace-pre-wrap break-all">{lifecycle.recentEvents[activeItem.index].content}</div>
-             </>
-          )}
-        </div>
-      )}
-    </div>
-  );
-};
-
 const ChatMessage = () => {
   const msgRef = useRef<HTMLDivElement>(null);
-  const lifecycleAnchorRef = useRef<HTMLDivElement>(null);
   const { onRegenerate, realMessageCount } = useContext(ThreadActionsContext);
   const [copied, setCopied] = useState(false);
-  const [showLifecycle, setShowLifecycle] = useState(false);
-  const [lifecyclePinned, setLifecyclePinned] = useState(false);
-  const [lifecyclePosition, setLifecyclePosition] = useState<LifecyclePosition>(() => ({
-    x: LIFECYCLE_PANEL_MARGIN,
-    y: 96,
-  }));
-  const lifecyclePanelRef = useRef<HTMLDivElement>(null);
-  const lifecyclePositionRef = useRef(lifecyclePosition);
-  const [lifecycleFlipBelow, setLifecycleFlipBelow] = useState(false);
   const messageContent = useMessage((state) => state.content) as any[] || [];
   const messageStatusType = useMessage((state) => state.status?.type);
   const artifactArgs = getToolArgs(messageContent, "artifacts");
@@ -710,24 +366,6 @@ const ChatMessage = () => {
     hasText: getMessageText(messageContent).trim().length > 0,
   });
 
-  useEffect(() => {
-    lifecyclePositionRef.current = lifecyclePosition;
-  }, [lifecyclePosition]);
-
-  // Hover 面板用 CSS bottom-full 锚在触发按钮上方，短回答时按钮贴近视口顶，
-  // 面板会整体溢出屏幕外；打开时量一次 anchor 上下空间决定是否翻转到下方。
-  useLayoutEffect(() => {
-    if (!showLifecycle || lifecyclePinned) return;
-    const rect = lifecycleAnchorRef.current?.getBoundingClientRect();
-    if (!rect || typeof window === 'undefined') return;
-    const spaceAbove = rect.top;
-    const spaceBelow = window.innerHeight - rect.bottom;
-    setLifecycleFlipBelow(
-      spaceAbove < LIFECYCLE_PANEL_HEIGHT + LIFECYCLE_PANEL_MARGIN
-        && spaceBelow > spaceAbove,
-    );
-  }, [showLifecycle, lifecyclePinned]);
-  
   useGSAP(() => {
     const message = msgRef.current;
     if (!message || prefersReducedMotion()) return;
@@ -764,87 +402,6 @@ const ChatMessage = () => {
     onRegenerate?.();
   }, [onRegenerate]);
 
-  const placePinnedLifecycle = useCallback(() => {
-    const rect = lifecycleAnchorRef.current?.getBoundingClientRect();
-    const fallback = {
-      x: typeof window === 'undefined'
-        ? LIFECYCLE_PANEL_MARGIN
-        : window.innerWidth - LIFECYCLE_PANEL_WIDTH - 24,
-      y: 96,
-    };
-    if (!rect) {
-      setLifecyclePosition(clampLifecyclePosition(fallback));
-      return;
-    }
-
-    setLifecyclePosition(clampLifecyclePosition({
-      x: rect.left + rect.width / 2 - LIFECYCLE_PANEL_WIDTH / 2,
-      y: rect.top - LIFECYCLE_PANEL_HEIGHT - 10,
-    }));
-  }, []);
-
-  const handleLifecyclePinToggle = useCallback(() => {
-    if (lifecyclePinned) {
-      setLifecyclePinned(false);
-      setShowLifecycle(false);
-      return;
-    }
-
-    placePinnedLifecycle();
-    setLifecyclePinned(true);
-    setShowLifecycle(true);
-  }, [lifecyclePinned, placePinnedLifecycle]);
-
-  const handleLifecycleDragStart = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    if (!lifecyclePinned || event.button !== 0) return;
-
-    event.preventDefault();
-    try {
-      event.currentTarget.setPointerCapture(event.pointerId);
-    } catch {
-      // Some synthetic/browser combinations do not allow capture here.
-    }
-    const startX = event.clientX;
-    const startY = event.clientY;
-    const startPosition = lifecyclePositionRef.current;
-    let nextPosition = startPosition;
-    let frame = 0;
-
-    const applyDragPosition = () => {
-      frame = 0;
-      const panel = lifecyclePanelRef.current;
-      if (panel) {
-        gsap.set(panel, {
-          x: nextPosition.x,
-          y: nextPosition.y,
-          force3D: true,
-        });
-      }
-    };
-
-    const handlePointerMove = (moveEvent: PointerEvent) => {
-      const dx = moveEvent.clientX - startX;
-      const dy = moveEvent.clientY - startY;
-      nextPosition = clampLifecyclePosition({
-        x: startPosition.x + dx,
-        y: startPosition.y + dy,
-      });
-      lifecyclePositionRef.current = nextPosition;
-      if (!frame) frame = window.requestAnimationFrame(applyDragPosition);
-    };
-
-    const handlePointerUp = () => {
-      if (frame) window.cancelAnimationFrame(frame);
-      window.removeEventListener('pointermove', handlePointerMove);
-      window.removeEventListener('pointercancel', handlePointerUp);
-      setLifecyclePosition(lifecyclePositionRef.current);
-    };
-
-    window.addEventListener('pointermove', handlePointerMove);
-    window.addEventListener('pointerup', handlePointerUp, { once: true });
-    window.addEventListener('pointercancel', handlePointerUp, { once: true });
-  }, [lifecyclePinned]);
-
   return (
     <MessagePrimitive.Root className="w-full flex flex-col mb-8 max-w-[800px] mx-auto px-4">
       <div ref={msgRef} className="w-full flex flex-col">
@@ -874,7 +431,7 @@ const ChatMessage = () => {
                   onClick={handleRegenerate}
                   title="重新生成"
                 >
-                  <RotateRight className="w-[15px] h-[15px]" />
+                  <RotateCw className="w-[15px] h-[15px]" />
                 </button>
                 <button
                   className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-full transition-colors press-scale"
@@ -886,35 +443,6 @@ const ChatMessage = () => {
                     : <Copy className="w-[15px] h-[15px]" />
                   }
                 </button>
-                <div
-                  ref={lifecycleAnchorRef}
-                  className="relative"
-                  onMouseEnter={() => setShowLifecycle(true)}
-                  onMouseLeave={() => { if (!lifecyclePinned) setShowLifecycle(false); }}
-                  onFocus={() => setShowLifecycle(true)}
-                  onBlur={() => { if (!lifecyclePinned) setShowLifecycle(false); }}
-                >
-                  <button
-                    className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-full transition-colors press-scale"
-                    title="思考流程"
-                    aria-label="查看思考流程"
-                    onClick={() => setShowLifecycle(true)}
-                  >
-                    <More className="w-[15px] h-[15px]" />
-                  </button>
-                  {(showLifecycle || lifecyclePinned) && (
-                    <LifecycleHoverPanel
-                      content={messageContent}
-                      isRunning={isMessageRunning}
-                      pinned={lifecyclePinned}
-                      position={lifecyclePosition}
-                      flipBelow={lifecycleFlipBelow}
-                      panelRef={lifecyclePanelRef}
-                      onPinToggle={handleLifecyclePinToggle}
-                      onDragStart={handleLifecycleDragStart}
-                    />
-                  )}
-                </div>
                 
                 {/* Only show memory meter on the last message */}
                 <AuiIf condition={(s) => s.message.isLast}>

@@ -19,6 +19,9 @@
 //     losing/duplicate connection is read-only) → snapshot stays
 //     RUNNING first, then converges to done — no fabricated recovery
 //     failure, exactly ONE /chat/sse POST (no duplicate model submit).
+//  8. approval decision → resume starts at the pause sequence (not the
+//     held-back AC6 cursor), so a replayed run.paused never aborts the
+//     continuation.
 const { chromium } = require('playwright');
 const assert = require('node:assert/strict');
 
@@ -72,12 +75,13 @@ const snapshotBase = (over = {}) => ({
   const base = process.env.BASE_URL || 'http://localhost:5173';
   const results = [];
 
-  const openPage = async ({ run, snapshot, snapshotFor, eventsFor, sse, extraRoutes = {} }) => {
-    const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+  const openPage = async ({ run, snapshot, snapshotFor, eventsFor, resumeEventsFor, sse, extraRoutes = {}, viewport }) => {
+    const page = await browser.newPage({ viewport: viewport || { width: 1280, height: 900 } });
     page.setDefaultTimeout(8000);
     const errors = [];
     const calls = { sse: 0, snapshot: 0, events: 0, cancel: 0 };
     const eventsQueries = [];
+    const resumeQueries = [];
     const snapshotStatuses = [];
     page.on('pageerror', error => errors.push(error.stack || String(error)));
     await page.route('**/*', route => {
@@ -86,6 +90,14 @@ const snapshotBase = (over = {}) => ({
       if (p === '/api/v2/chat/sse') {
         calls.sse += 1;
         return route.fulfill({ contentType: 'text/event-stream', body: sseBody(sse || []) });
+      }
+      if (p.startsWith('/api/v2/chat/resume/')) {
+        const fromSeq = Number(url.searchParams.get('from_seq') || '0');
+        resumeQueries.push(fromSeq);
+        return route.fulfill({
+          contentType: 'text/event-stream',
+          body: sseBody(resumeEventsFor ? resumeEventsFor(fromSeq) : []),
+        });
       }
       if (p.startsWith('/api/v2/chat/snapshot/')) {
         calls.snapshot += 1;
@@ -120,7 +132,7 @@ const snapshotBase = (over = {}) => ({
       { runKey: RUN_KEY, chatKey: CHAT_KEY, chatIdKey: CHAT_ID_KEY, runSeed: run || null },
     );
     await page.goto(base);
-    return { page, errors, calls, eventsQueries, snapshotStatuses };
+    return { page, errors, calls, eventsQueries, resumeQueries, snapshotStatuses };
   };
 
   const contentTexts = async page =>
@@ -410,6 +422,295 @@ const snapshotBase = (over = {}) => ({
     assert.deepEqual(errors, [], 'scenario 7: uncaught browser errors');
     await page.close();
     results.push('7 observation-stream close → running snapshot polled to done; single model submit, no fake failure');
+  }
+
+  // ---- 8. approval resume starts at the pause sequence -----------------------
+  {
+    const approval = {
+      approval_id: 'apr-8', run_id: 'run-fix', tool: 'mcp__custom__get_credits',
+      args: {}, risk_level: 'high',
+      impact: '执行 MCP 工具 mcp__custom__get_credits',
+      expires_at: '2027-01-01T00:00:00+00:00',
+      message: '需要批准后才能执行 MCP 工具。',
+    };
+    const { page, errors, resumeQueries } = await openPage({
+      run: null,
+      sse: [
+        env('run-fix', 1, 'run_started'),
+        env('run-fix', 2, 'approval.required', approval),
+        env('run-fix', 3, 'run.paused', { approval_id: 'apr-8' }),
+      ],
+      extraRoutes: {
+        '/api/v2/approvals/apr-8/decision': {
+          json: {
+            approval_id: 'apr-8', run_id: 'run-fix', tool: approval.tool,
+            decision: 'approve', status: 'approved', idempotent: false,
+            resume_url: '/api/v2/chat/resume/run-fix',
+          },
+        },
+      },
+      // Real server replay semantics: a resume from the held-back cursor
+      // re-delivers run.paused and would abort the continuation.
+      resumeEventsFor: fromSeq =>
+        [
+          ...(fromSeq < 3 ? [env('run-fix', 3, 'run.paused', { approval_id: 'apr-8' })] : []),
+          env('run-fix', 4, 'approval.resolved', {
+            approval_id: 'apr-8', decision: 'approve', status: 'approved',
+          }),
+          env('run-fix', 5, 'text', { content: '审批后继续的回答' }),
+          env('run-fix', 6, 'done'),
+        ],
+    });
+    await page.getByRole('textbox', { name: '输入徒步问题' }).fill('要审批的图片请求');
+    await page.getByRole('button', { name: '发送消息' }).click();
+    await page.getByRole('button', { name: '批准' }).waitFor();
+    const held = JSON.parse(await readRun(page));
+    assert.equal(held.sequence_cursor, 2, 'scenario 8: the paused run keeps the held-back cursor');
+    await page.getByRole('button', { name: '批准' }).click();
+    await page.locator('[data-full-text]').filter({ hasText: '审批后继续的回答' }).waitFor();
+    assert.deepEqual(resumeQueries, [3], `scenario 8: resume must start at the pause sequence 3, got ${JSON.stringify(resumeQueries)}`);
+    assert.deepEqual(errors, [], 'scenario 8: uncaught browser errors');
+    await page.close();
+    results.push('8 approval resume starts at the pause sequence (stale run.paused replay cannot abort it)');
+  }
+
+  // Expand a collapsed activity trace so its lines can be asserted.
+  const openTrace = async page => {
+    const trace = page.locator('[data-slot="agent-activity"]').first();
+    await trace.waitFor();
+    const trigger = trace.locator('[data-slot="trace-collapsible-trigger"]').first();
+    if ((await trigger.getAttribute('aria-expanded')) === 'false') {
+      await trigger.click();
+    }
+    return trace;
+  };
+
+  // ---- 9. mid-run refresh rebuilds the tool lines (ticket 05) ----------------
+  {
+    const runningSnapshot = snapshotBase({
+      status: 'running',
+      sequence_cursor: 3,
+      messages: [
+        { role: 'user', content: '恢复测试问题', sequence: 0, run_id: 'run-fix' },
+      ],
+    });
+    const doneSnapshot = snapshotBase({
+      status: 'done',
+      terminal_type: 'done',
+      terminal_persisted: true,
+      terminal_event_type: 'done',
+      sequence_cursor: 5,
+      messages: [
+        { role: 'user', content: '恢复测试问题', sequence: 0, run_id: 'run-fix' },
+        { role: 'assistant', content: '恢复后的完整回答', sequence: 4, run_id: 'run-fix' },
+      ],
+    });
+    const { page, errors, calls } = await openPage({
+      run: {
+        run_id: 'run-fix', request_id: 'req-fix', conversation_id: 'chat-fix',
+        sequence_cursor: 1, user_message: '恢复测试问题', v2_status: 'running',
+      },
+      sse: [],
+      snapshotFor: call => (call === 1 ? runningSnapshot : doneSnapshot),
+      // The server replay is complete and ordered; the cursor decides where
+      // it starts. The snapshot only decides the run's control status.
+      eventsFor: fromSeq => [
+        ['tool_call', { tool: 'hiking_knowledge_search', args: { query: '雪线' }, step: 0 }],
+        ['tool_result', {
+          tool: 'hiking_knowledge_search', status: 'ok', duration_ms: 1200,
+          evidence: { has_chunks: true, chunks: [{}, {}] },
+        }],
+        ['text', { content: '恢复后的完整回答' }],
+        ['done', {}],
+      ]
+        .map(([type, payload], index) => env('run-fix', index + 2, type, payload))
+        .filter(event => event.sequence > fromSeq),
+    });
+    await page.locator('[data-full-text]').filter({ hasText: '恢复后的完整回答' }).waitFor();
+    const trace = await openTrace(page);
+    const lines = trace.locator('[data-slot="trace-collapsible-content"] [data-slot="trace-line"]');
+    assert.equal(await lines.count(), 1, 'scenario 9: exactly one rebuilt tool line');
+    assert.equal(
+      await trace.getByText('已检索徒步知识库', { exact: true }).count(),
+      1,
+      'scenario 9: the finished call line survived the refresh',
+    );
+    assert.equal(
+      await trace.getByText('查询「雪线」 · 1.2s · 2 条', { exact: true }).count(),
+      1,
+      'scenario 9: arguments and result detail were rebuilt together',
+    );
+    assert.equal(calls.sse, 0, 'scenario 9: recovery made no model call');
+    await page.waitForFunction(key => localStorage.getItem(key) === null, RUN_KEY);
+    assert.deepEqual(errors, [], 'scenario 9: uncaught browser errors');
+    await page.close();
+    results.push('9 mid-run refresh rebuilds the tool call + result line exactly once');
+  }
+
+  // ---- 10. model rounds, reasoning and the wait line survive refresh --------
+  {
+    const approval = {
+      approval_id: 'apr-10', run_id: 'run-fix', tool: 'sandbox_bash',
+      args: { command: 'ls' }, risk_level: 'high',
+      impact: '在沙箱内执行 Bash 命令：ls',
+      expires_at: '2027-01-01T00:00:00+00:00',
+      message: '需要您的批准才能在沙箱内执行 Bash 命令。',
+    };
+    const { page, errors } = await openPage({
+      run: {
+        run_id: 'run-fix', request_id: 'req-fix', conversation_id: 'chat-fix',
+        sequence_cursor: 1, user_message: '要审批的问题', v2_status: 'paused',
+      },
+      sse: [],
+      snapshot: snapshotBase({ status: 'paused', sequence_cursor: 7, pending_approvals: [approval] }),
+      eventsFor: fromSeq => (fromSeq < 7 ? [
+        env('run-fix', 2, 'progress', {
+          stage: 'model', step: 0, state: 'started', message: '模型第 1 轮',
+        }),
+        env('run-fix', 3, 'thought', { content: '先确认用户要执行什么命令。' }),
+        env('run-fix', 4, 'progress', { stage: 'model', step: 0, state: 'finished', duration_ms: 800 }),
+        env('run-fix', 5, 'tool_call', {
+          tool: 'hiking_knowledge_search', args: { query: '雪线' }, step: 0,
+        }),
+        env('run-fix', 6, 'tool_result', {
+          tool: 'hiking_knowledge_search', status: 'ok', duration_ms: 600,
+          evidence: { has_chunks: true, chunks: [{}] },
+        }),
+        env('run-fix', 7, 'approval.required', approval),
+      ] : []),
+    });
+    await page.getByRole('button', { name: '批准' }).waitFor();
+    const trace = await openTrace(page);
+    assert.equal(
+      await trace.getByText('等待你的确认', { exact: true }).count(),
+      1,
+      'scenario 10: the approval wait summary is back',
+    );
+    assert.equal(await trace.getByText('模型第 1 轮', { exact: true }).count(), 1);
+    assert.equal(
+      await trace.getByText('800ms', { exact: true }).count(),
+      1,
+      'scenario 10: the model round kept its duration',
+    );
+    assert.equal(await trace.getByText('已检索徒步知识库', { exact: true }).count(), 1);
+    assert.equal(await trace.getByText('思考', { exact: true }).count(), 1);
+    assert.equal(
+      await trace.getByText('等待确认：执行沙箱命令', { exact: true }).count(),
+      1,
+      'scenario 10: the pending wait line is preserved',
+    );
+    assert.equal(
+      await trace.locator('[data-slot="trace-collapsible-content"] [data-slot="trace-line"]').count(),
+      4,
+      'scenario 10: model round + tool + thought + wait, no duplicate rows',
+    );
+    assert.deepEqual(errors, [], 'scenario 10: uncaught browser errors');
+    await page.close();
+    results.push('10 paused refresh restores model round, tool, reasoning and wait lines without duplicates');
+  }
+
+  // ---- 11. legacy run (results only) degrades without inventing rows --------
+  {
+    const { page, errors } = await openPage({
+      run: {
+        run_id: 'run-fix', request_id: 'req-fix', conversation_id: 'chat-fix',
+        sequence_cursor: 0, user_message: '旧会话问题', v2_status: 'running',
+      },
+      sse: [],
+      snapshot: snapshotBase({
+        status: 'done',
+        terminal_type: 'done',
+        terminal_persisted: true,
+        sequence_cursor: 3,
+        messages: [
+          { role: 'user', content: '旧会话问题', sequence: 0, run_id: 'run-fix' },
+          { role: 'assistant', content: '旧会话回答', sequence: 2, run_id: 'run-fix' },
+        ],
+      }),
+      // Legacy replay: a result row only — no tool_call, no rounds, no thoughts.
+      eventsFor: fromSeq => (fromSeq < 3 ? [
+        env('run-fix', 1, 'tool_result', {
+          tool: 'hiking_knowledge_search', status: 'ok', duration_ms: 900,
+          evidence: { has_chunks: true, chunks: [{}] },
+        }),
+        env('run-fix', 3, 'done'),
+      ] : []),
+    });
+    await page.locator('[data-full-text]').filter({ hasText: '旧会话回答' }).waitFor();
+    const trace = await openTrace(page);
+    assert.equal(
+      await trace.getByText('已检索徒步知识库', { exact: true }).count(),
+      1,
+      'scenario 11: the legacy result row still renders',
+    );
+    assert.equal(
+      await trace.getByText('900ms · 1 条', { exact: true }).count(),
+      1,
+      'scenario 11: the legacy row keeps its duration and evidence count',
+    );
+    assert.equal(
+      await trace.getByText('模型第 1 轮', { exact: false }).count(),
+      0,
+      'scenario 11: no model round is invented for a legacy run',
+    );
+    assert.equal(
+      await trace.locator('[data-slot="trace-collapsible-content"] [data-slot="trace-line"]').count(),
+      1,
+      'scenario 11: exactly the existing subset',
+    );
+    assert.deepEqual(errors, [], 'scenario 11: uncaught browser errors');
+    await page.close();
+    results.push('11 legacy results-only replay degrades to that subset without invented rows');
+  }
+
+  // ---- 12. 390px: the rebuilt timeline does not overflow the page ----------
+  {
+    const approval = {
+      approval_id: 'apr-12', run_id: 'run-fix', tool: 'sandbox_bash',
+      args: { command: 'ls -la /tmp' }, risk_level: 'high',
+      impact: '在沙箱内执行 Bash 命令：ls -la /tmp',
+      expires_at: '2027-01-01T00:00:00+00:00',
+      message: '需要您的批准才能在沙箱内执行 Bash 命令。',
+    };
+    const { page, errors } = await openPage({
+      viewport: { width: 390, height: 844 },
+      run: {
+        run_id: 'run-fix', request_id: 'req-fix', conversation_id: 'chat-fix',
+        sequence_cursor: 1, user_message: '要审批的问题', v2_status: 'paused',
+      },
+      sse: [],
+      snapshot: snapshotBase({ status: 'paused', sequence_cursor: 7, pending_approvals: [approval] }),
+      eventsFor: fromSeq => (fromSeq < 7 ? [
+        env('run-fix', 2, 'progress', {
+          stage: 'model', step: 0, state: 'started', message: '模型第 1 轮',
+        }),
+        env('run-fix', 3, 'progress', { stage: 'model', step: 0, state: 'finished', duration_ms: 700 }),
+        env('run-fix', 5, 'tool_call', {
+          tool: 'hiking_knowledge_search',
+          args: { query: '雪线冬季露营装备清单与注意事项' },
+          step: 0,
+        }),
+        env('run-fix', 6, 'tool_result', {
+          tool: 'hiking_knowledge_search', status: 'ok', duration_ms: 600,
+          evidence: { has_chunks: true, chunks: [{}] },
+        }),
+        env('run-fix', 7, 'approval.required', approval),
+      ] : []),
+    });
+    await page.getByRole('button', { name: '批准' }).waitFor();
+    const trace = await openTrace(page);
+    assert.equal(
+      await trace.getByText('模型第 1 轮', { exact: true }).count(),
+      1,
+      'scenario 12: the rebuilt model row is visible at 390px',
+    );
+    const overflow = await page.evaluate(
+      () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    );
+    assert.ok(overflow <= 0, `scenario 12: no horizontal overflow at 390px, got ${overflow}px`);
+    assert.deepEqual(errors, [], 'scenario 12: uncaught browser errors');
+    await page.close();
+    results.push('12 390px recovery renders the rebuilt timeline without horizontal overflow');
   }
 
   await browser.close();

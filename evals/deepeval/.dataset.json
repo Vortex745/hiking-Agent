@@ -34,5 +34,293 @@
       "source": "promptfoo",
       "description": "Missing trip context triggers clarification before a definitive plan"
     }
+  },
+  {
+    "name": "gen-en-01",
+    "input": "Imagine complete novices attempting Siguniang Dafeng 3D2N during volatile autumn conditions. What could go wrong?",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "en"
+    }
+  },
+  {
+    "name": "gen-en-02",
+    "input": "Considering Wugong Mt's altitude, May weather & 2-day partner camping, what layered gear is essential?",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "en"
+    }
+  },
+  {
+    "name": "gen-zh-01",
+    "input": "贡嘎雪山环线7天夏季徒步，突发雷暴山洪频发，如何制定暴雨防范预案？",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "zh"
+    }
+  },
+  {
+    "name": "gen-zh-02",
+    "input": "首登4000+m稻城亚丁，如何预防AMS、高反并制定适应策略？",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "zh"
+    }
+  },
+  {
+    "name": "gen-zh-03",
+    "input": "冬日黄山一日徒步穿什么鞋兼顾防滑保暖轻便且适冰岩陡坡？",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "zh"
+    }
+  },
+  {
+    "name": "gen-en-03",
+    "input": "Compare rainy vs dry hiking conditions at Tiger Leaping Gorge: risks, safety & scenery.",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "en"
+    }
+  },
+  {
+    "name": "gen-en-04",
+    "input": "Compare hike durations from Baoguosi vs Wannian Temple to Emei Shan's Golden Summit (avg stamina).",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "en"
+    }
+  },
+  {
+    "name": "gen-zh-04",
+    "input": "清明假期南太行山脉3天经典穿越徒步（如郭亮村-王莽岭-挂壁公路线路），求推荐含难度分级、补给及露营方案的详细攻略？",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "zh"
+    }
+  },
+  {
+    "name": "gen-zh-05",
+    "input": "去哈巴雪山前，仅跑步不足，如何制定含高海拔适应、核心力量、负重训练的体能计划？",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "zh"
+    }
+  },
+  {
+    "name": "gen-zh-06",
+    "input": "秋季5天川西小环线徒步，帐篷睡袋等保暖装备必须吗？如何轻量化？",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "zh"
+    }
+  },
+  {
+    "name": "gen-zh-07",
+    "input": "假设独自徒步灵山中途迷路、天气骤变，一天往返是否足够？",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "zh"
+    }
+  },
+  {
+    "name": "gen-zh-08",
+    "input": "夏季雨崩村4天高原徒步，亚热带季风气候蚂蟥活动密度、叮咬风险及物理化学综合防治方案？",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "zh"
+    }
+  },
+  {
+    "name": "gen-en-05",
+    "input": "Compare Zhangjiajie's Golden Whip Stream vs. Ten-Mile Gallery for 8-yr-old kid's day hike.",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "en"
+    }
+  },
+  {
+    "name": "gen-zh-09",
+    "input": "秋季5天鳌太穿越：新手能走吗？需评估天气、装备、海拔、应急风险。",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "zh"
+    }
+  },
+  {
+    "name": "gen-en-06",
+    "input": "Compare Meili Snow Mt vs Kailash Mt kora: duration & altitude sickness risk.",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "en"
+    }
+  },
+  {
+    "name": "gen-zh-10",
+    "input": "夏季徒步川藏线高海拔路段紫外线强，不同肤质需准备哪些高效防晒措施及装备？",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "zh"
+    }
+  },
+  {
+    "name": "gen-zh-11",
+    "input": "贡嘎西坡国庆高海拔微气候对多日徒步安全有何影响？",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "zh"
+    }
+  },
+  {
+    "name": "gen-zh-12",
+    "input": "户外新手冬太白山2天徒步难度？含装备清单、路线规划、天气应急及安全预案？",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "zh"
+    }
+  },
+  {
+    "name": "gen-zh-13",
+    "input": "莫干山一日徒步：如何结合老人耐力、地形坡度、补给点与景观配置最优路线？",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "zh"
+    }
+  },
+  {
+    "name": "gen-zh-14",
+    "input": "五月徒步玉龙雪山4506m冰川公园等高海拔路线，预防急性高原反应（AMS），是否需提前备便携式O₂瓶？",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "zh"
+    }
+  },
+  {
+    "name": "gen-en-07",
+    "input": "Given Kanas' UV/temp/wetland conditions, how to integrate heatstroke & insect-prevention strategies for student treks?",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "en"
+    }
+  },
+  {
+    "name": "gen-en-08",
+    "input": "Compare Gongga Grand Loop vs Everest Base Camp treks: duration, difficulty, and supply point availability.",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "en"
+    }
+  },
+  {
+    "name": "gen-zh-15",
+    "input": "Considering spring mud & water, evaluate 1-day trail feasibility & trekking pole necessity at 九溪十八涧.",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "zh"
+    }
+  },
+  {
+    "name": "gen-zh-16",
+    "input": "假设广东突遇极端天气，中级者如何规划2天1夜徒步路线避险？",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "zh"
+    }
+  },
+  {
+    "name": "gen-en-09",
+    "input": "Optimize crampon geometry & boot stiffness for Mt. Emei's alpine ice traverses.",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "en"
+    }
+  },
+  {
+    "name": "gen-zh-17",
+    "input": "结合洛堆峰雪线高差与秋季气候，推导徒步装备的多维决策逻辑。",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "zh"
+    }
+  },
+  {
+    "name": "gen-zh-18",
+    "input": "汛期6d徒步横断山脉（贡嘎环线等）突遇泥石流，如何预判地声/地面震颤等前兆，科学逃生、团队自救并获救？",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "zh"
+    }
+  },
+  {
+    "name": "gen-zh-19",
+    "input": "膝盖不适，求嵩山少室山坡度平缓、非石阶、落差<300m的轻松徒步路线推荐？",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "zh"
+    }
+  },
+  {
+    "name": "gen-zh-20",
+    "input": "秋季徒步怒江大峡谷无人区，沿线补给点及应急撤退路线如何规划？",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "zh"
+    }
+  },
+  {
+    "name": "gen-zh-21",
+    "input": "清明天气多变、单人体能瓶颈与朝台全程里程，5天能否胜任五台山徒步？",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "zh"
+    }
+  },
+  {
+    "name": "gen-zh-22",
+    "input": "夏季徒步滇藏线（如米拉山口5013m）突发AMS，如何科学预防与急救处置？",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "zh"
+    }
+  },
+  {
+    "name": "gen-zh-23",
+    "input": "两年冰川经验，冬季单人徒步昆布冰瀑路线需注意哪些安全问题？",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "zh"
+    }
+  },
+  {
+    "name": "gen-en-10",
+    "input": "Connect spring warming at Wuyishan to snake emergence, assess trek risk, derive bite prevention strategies.",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "en"
+    }
+  },
+  {
+    "name": "gen-zh-24",
+    "input": "神农架原始森林4天徒步，地形遮蔽、设备选型与应急预案如何协同保障通讯？",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "zh"
+    }
+  },
+  {
+    "name": "gen-en-11",
+    "input": "Explore ultralight layering & acclimatization strategies for solo off-season treks in Zhagana's high-altitude alpine terrain.",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "en"
+    }
+  },
+  {
+    "name": "gen-en-12",
+    "input": "Assess physical readiness for winter solo trekking Bhutan's Lunana Trail at 5500m+ elevation.",
+    "additional_metadata": {
+      "source": "deepeval-generate-goldens",
+      "language": "en"
+    }
   }
 ]

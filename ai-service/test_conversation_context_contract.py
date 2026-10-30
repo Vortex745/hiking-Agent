@@ -819,8 +819,7 @@ def test_controlled_double_behavior_changes_with_history(tmp_path: Path):
         _req("改成下周", "req-d3", conversation_id="conv-fresh"),
     )
     assert fresh_calls[0]["history"] == []
-    assert "沿用" not in _text_of(fresh)
-    assert "资料不足" in _text_of(fresh)
+    assert _text_of(fresh) == "缺少出发日期，无法沿用任何约束。"
 
 
 def test_old_ungrounded_assistant_fact_in_history_cannot_bypass_evidence_gate(
@@ -1068,6 +1067,9 @@ def test_two_turn_http_sse_followup_receives_server_side_history(
     monkeypatch.setattr(chat_v2_module.settings, "openai_api_key", "sk-fake")
     monkeypatch.setattr(chat_v2_module.settings, "openai_model", "fake-model")
     monkeypatch.setattr(chat_v2_module.settings, "agent_v2_cowork_policy", "disabled")
+    # Keep the live custom MCP state out of the HTTP fixture: an enabled
+    # user server would enter the frozen policy and require checkpoints.
+    monkeypatch.setattr(chat_v2_module.settings, "agent_v2_state_dir", str(tmp_path))
 
     def _fake_subject(request: Any) -> Any:
         request.state.subject_id = "sub-ctx"
@@ -1112,7 +1114,7 @@ def test_two_turn_http_sse_followup_receives_server_side_history(
             "conversation_id": CONVERSATION,
         })
     )
-    assert first[-1]["type"] == "done"
+    assert first[-1]["type"] == "done", first[-1]
     assert seen[0]["history"] == []  # fresh conversation on turn 1
 
     second = asyncio.run(

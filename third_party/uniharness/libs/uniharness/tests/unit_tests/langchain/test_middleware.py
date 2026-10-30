@@ -26,6 +26,7 @@ from uniharness.harness.reminders import Reminder
 from uniharness.langchain.middleware import (
     _IMAGE_EXTRACTED,
     AgentMiddleware,
+    InvalidToolArgumentsError,
     UniHarnessState,
     _create_denied_response,
     _detect_skill_call,
@@ -692,3 +693,160 @@ class TestImageExtractionPipeline:
         )
         result = await mw.abefore_model(state)
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# aafter_model — invalid tool arguments
+# ---------------------------------------------------------------------------
+
+
+def _invalid(name: str = "generate_image", call_id: str | None = "call-1") -> dict[str, Any]:
+    return {
+        "name": name,
+        "args": '{"aspect":16:9,"prompt":清晨高山徒步}',
+        "id": call_id,
+        "error": "Failed to parse JSON: Expecting property name",
+    }
+
+
+def _ai_with_calls(
+    *,
+    invalid: list[dict[str, Any]] | None = None,
+    valid: list[dict[str, Any]] | None = None,
+    content: str = "参数已确认，开始生成图片。",
+) -> AIMessage:
+    return AIMessage(
+        content=content,
+        tool_calls=list(valid or []),
+        invalid_tool_calls=list(invalid or []),
+    )
+
+
+class TestInvalidToolCallRepair:
+    """The one-repair boundary for model tool calls with malformed arguments."""
+
+    async def test_first_invalid_reply_pairs_one_error_message_per_call(self) -> None:
+        mw = _make_middleware()
+        state = _state(
+            [
+                SystemMessage(content=SYSTEM_PROMPT),
+                HumanMessage(content="生成图片"),
+                _ai_with_calls(invalid=[_invalid("generate_image", "call-1"), _invalid("get_credits", "call-2")]),
+            ]
+        )
+        result = await mw.aafter_model(state)
+
+        assert result is not None
+        assert result["jump_to"] == "model"
+        assert result["invalid_tool_call_repair_count"] == 1
+        assert result["awaiting_tool_call_repair"] is True
+        feedback = result["messages"]
+        assert [msg.tool_call_id for msg in feedback] == ["call-1", "call-2"]
+        assert all(isinstance(msg, ToolMessage) for msg in feedback)
+        assert all(msg.status == "error" for msg in feedback)
+        # The feedback must not echo malformed raw arguments or prompt text.
+        assert all("aspect" not in msg.content and "清晨" not in msg.content for msg in feedback)
+        assert all("valid JSON" in msg.content for msg in feedback)
+
+    async def test_mixed_valid_and_invalid_calls_fail_before_execution(self) -> None:
+        mw = _make_middleware()
+        state = _state(
+            [
+                SystemMessage(content=SYSTEM_PROMPT),
+                HumanMessage(content="生成图片"),
+                _ai_with_calls(
+                    invalid=[_invalid()],
+                    valid=[{"name": "get_credits", "args": {}, "id": "call-2", "type": "tool_call"}],
+                ),
+            ]
+        )
+        with pytest.raises(InvalidToolArgumentsError) as excinfo:
+            await mw.aafter_model(state)
+        assert excinfo.value.code == "mixed_tool_call_arguments"
+        assert excinfo.value.call_ids == ("call-1",)
+
+    async def test_second_invalid_reply_is_not_repaired_again(self) -> None:
+        mw = _make_middleware()
+        state = _state(
+            [
+                SystemMessage(content=SYSTEM_PROMPT),
+                HumanMessage(content="生成图片"),
+                _ai_with_calls(invalid=[_invalid()]),
+            ]
+        )
+        state["awaiting_tool_call_repair"] = True  # type: ignore[typeddict-item]
+        with pytest.raises(InvalidToolArgumentsError) as excinfo:
+            await mw.aafter_model(state)
+        assert excinfo.value.code == "tool_call_arguments_repair_exhausted"
+
+    async def test_repair_budget_is_consumed_for_the_run(self) -> None:
+        mw = _make_middleware()
+        state = _state(
+            [
+                SystemMessage(content=SYSTEM_PROMPT),
+                HumanMessage(content="生成图片"),
+                _ai_with_calls(invalid=[_invalid()]),
+            ]
+        )
+        state["invalid_tool_call_repair_count"] = 1  # type: ignore[typeddict-item]
+        with pytest.raises(InvalidToolArgumentsError) as excinfo:
+            await mw.aafter_model(state)
+        assert excinfo.value.code == "tool_call_arguments_repair_exhausted"
+
+    async def test_missing_call_id_fails_instead_of_guessing(self) -> None:
+        mw = _make_middleware()
+        state = _state(
+            [
+                SystemMessage(content=SYSTEM_PROMPT),
+                HumanMessage(content="生成图片"),
+                _ai_with_calls(invalid=[_invalid(call_id=None)]),
+            ]
+        )
+        with pytest.raises(InvalidToolArgumentsError) as excinfo:
+            await mw.aafter_model(state)
+        assert excinfo.value.code == "tool_call_arguments_missing_id"
+
+    async def test_repaired_valid_call_clears_awaiting_state(self) -> None:
+        mw = _make_middleware()
+        state = _state(
+            [
+                SystemMessage(content=SYSTEM_PROMPT),
+                HumanMessage(content="生成图片"),
+                ToolMessage(content="rejected", tool_call_id="call-1"),
+                _ai_with_calls(valid=[{"name": "generate_image", "args": {"aspect": "16:9"}, "id": "call-1", "type": "tool_call"}]),
+            ]
+        )
+        state["awaiting_tool_call_repair"] = True  # type: ignore[typeddict-item]
+        state["invalid_tool_call_repair_count"] = 1  # type: ignore[typeddict-item]
+        result = await mw.aafter_model(state)
+        assert result == {"awaiting_tool_call_repair": False}
+
+    async def test_text_only_reply_while_awaiting_repair_fails(self) -> None:
+        mw = _make_middleware()
+        state = _state(
+            [
+                SystemMessage(content=SYSTEM_PROMPT),
+                HumanMessage(content="生成图片"),
+                ToolMessage(content="rejected", tool_call_id="call-1"),
+                AIMessage(content="抱歉，我无法生成图片。"),
+            ]
+        )
+        state["awaiting_tool_call_repair"] = True  # type: ignore[typeddict-item]
+        with pytest.raises(InvalidToolArgumentsError) as excinfo:
+            await mw.aafter_model(state)
+        assert excinfo.value.code == "tool_call_arguments_repair_failed"
+
+    async def test_compaction_turns_skip_the_repair_check(self) -> None:
+        mw = _make_middleware()
+        state = _state(
+            [
+                SystemMessage(content=SYSTEM_PROMPT),
+                HumanMessage(content="q"),
+                _ai_with_calls(invalid=[_invalid()]),
+            ],
+            phase=CompactionPhase.REQUESTING,
+        )
+        result = await mw.aafter_model(state)
+        assert result is not None
+        assert result["compaction_phase"] == CompactionPhase.APPLYING
+        assert "invalid_tool_call_repair_count" not in result

@@ -5,7 +5,7 @@ import {
   CollapsibleTrigger,
 } from "@radix-ui/react-collapsible"
 import { clsx, type ClassValue } from "clsx"
-import ChevronRight from "reicon-react/icons/ChevronRight"
+import { ChevronRight } from "lucide-react"
 import { twMerge } from "tailwind-merge"
 
 function cn(...inputs: ClassValue[]) {

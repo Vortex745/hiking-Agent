@@ -11,8 +11,10 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 import config
+from agent_v2.decisions import DecisionCallError, probe_systemone
 from api.local_guard import require_local_request
 from api.models import (
+    LlmConfigDecisionSectionResponse,
     LlmConfigEmbeddingSectionResponse,
     LlmConfigResponse,
     LlmConfigSectionResponse,
@@ -44,6 +46,7 @@ def _build_snapshot() -> LlmConfigResponse:
     llm_masked, llm_set = _mask_api_key(settings.openai_api_key)
     embedding_masked, embedding_set = _mask_api_key(settings.embedding_api_key)
     rerank_masked, rerank_set = _mask_api_key(settings.rerank_api_key)
+    decision_masked, decision_set = _mask_api_key(settings.decision_model_api_key)
 
     return LlmConfigResponse(
         llm=LlmConfigSectionResponse(
@@ -64,6 +67,13 @@ def _build_snapshot() -> LlmConfigResponse:
             model=settings.rerank_model,
             api_key_masked=rerank_masked,
             api_key_set=rerank_set,
+        ),
+        decision=LlmConfigDecisionSectionResponse(
+            base_url=settings.decision_model_base_url,
+            model=settings.decision_model_name,
+            api_key_masked=decision_masked,
+            api_key_set=decision_set,
+            mode=settings.decision_model_mode,
         ),
         updated_at=config.env_file_updated_at(),
         index_dimensions=read_vec0_dimensions(settings.rag_sqlite_db_path),
@@ -118,6 +128,18 @@ def _validate_update(payload: LlmConfigUpdateRequest) -> dict[str, dict[str, obj
                 )
             validated["dimensions"] = dimensions
         sections[section_name] = validated
+    if payload.decision is not None:
+        decision = payload.decision
+        validated = {
+            "base_url": _require_non_empty(
+                "decision", "base_url", decision.base_url
+            ),
+            "model": _require_non_empty("decision", "model", decision.model),
+            "api_key": decision.api_key,
+        }
+        if decision.mode is not None:
+            validated["mode"] = decision.mode
+        sections["decision"] = validated
     return sections
 
 
@@ -164,11 +186,7 @@ async def update_llm_config(
     )
 
 
-_SECTION_SETTINGS_ATTRS = {
-    "llm": ("openai_base_url", "openai_api_key"),
-    "embedding": ("embedding_base_url", "embedding_api_key"),
-    "rerank": ("rerank_base_url", "rerank_api_key"),
-}
+_SECTION_SETTINGS_ATTRS = config.section_settings_attrs()
 _PROBE_TIMEOUT_SECONDS = 15.0
 
 
@@ -203,6 +221,30 @@ async def test_llm_config(
             status_code=400, detail=f"{payload.section}.base_url 未配置"
         )
     api_key = requested_api_key or stored_api_key
+    if payload.section == "decision":
+        if not api_key:
+            raise HTTPException(status_code=400, detail="decision.api_key 未配置")
+        model = (payload.model or "").strip() or (
+            getattr(settings, "decision_model_name", "") or "Kev-4b"
+        )
+        try:
+            latency_ms, choice = await probe_systemone(
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                timeout_seconds=_PROBE_TIMEOUT_SECONDS,
+            )
+        except DecisionCallError as exc:
+            if exc.code == "upstream_auth":
+                raise HTTPException(status_code=401, detail="上游拒绝访问") from exc
+            logger.warning(
+                "llm-config decision probe failed code=%s", exc.code
+            )
+            raise HTTPException(status_code=502, detail="决策模型探测失败") from exc
+        return LlmConfigTestResponse(
+            latency_ms=latency_ms, model_count=1, models=[choice]
+        )
+
     url = f"{base_url.rstrip('/')}/models"
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 

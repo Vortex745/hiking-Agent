@@ -19,11 +19,16 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from observability import llm_log, tracing
-from observability.callbacks import ToolLogCallbackHandler, ToolSpanCallbackHandler
+from observability.callbacks import (
+    ToolActivityCallbackHandler,
+    ToolLogCallbackHandler,
+    ToolSpanCallbackHandler,
+)
 
 logger = logging.getLogger("ai-service.agent_v2.kernel")
 
@@ -143,12 +148,72 @@ class _ThoughtBuffer:
         self._emitted += len(chunk)
         await self._on_thought(chunk)
 
+
+class _ModelRounds:
+    """Track MAIN-model rounds and report each started/finished pair.
+
+    Agent process tracking ticket 03: a "round" is one main-model step of
+    the graph. Subagents, compaction and tool models never reach this
+    tracker because the caller filters them out first. Exactly one
+    ``started`` and one ``finished`` event leave per round, including the
+    failure paths (the caller closes in a ``finally``).
+    """
+
+    def __init__(self, on_activity: Callable[[str, dict[str, Any]], None] | None) -> None:
+        self._on_activity = on_activity
+        self._step: Any = _ROUND_STEP_UNSET
+        self._active = False
+        self._started_at = 0.0
+        self._index = 0
+
+    def _push(self, payload: dict[str, Any]) -> None:
+        if self._on_activity is None:
+            return
+        try:
+            self._on_activity("model_round", payload)
+        except Exception:  # pragma: no cover - reporting must never break a turn
+            logger.exception("model round sink failure (non-fatal)")
+
+    def observe(self, step: Any) -> None:
+        """Open a round on a new main-model step; close the previous one."""
+        if step == self._step:
+            # Same step: never reopen after the round was closed by its own
+            # tool decision.
+            return
+        self.close()
+        self._step = step
+        self._active = True
+        self._index += 1
+        self._started_at = time.perf_counter()
+        self._push({"index": self._index, "step": step, "state": "started"})
+
+    def close(self, state: str = "finished") -> None:
+        if not self._active:
+            return
+        self._active = False
+        self._push({
+            "index": self._index,
+            "step": self._step,
+            "state": state,
+            "duration_ms": round((time.perf_counter() - self._started_at) * 1000, 1),
+        })
+
 # Built-in tool groups exposed by the vendored fork's create_agent.
 BUILTIN_TOOL_GROUPS: frozenset[str] = frozenset({"cli", "web", "todo", "task", "skills"})
+
+_ROUND_STEP_UNSET = object()
 
 
 class KernelAssemblyError(RuntimeError):
     """Kernel could not be assembled from the provided configuration."""
+
+
+class KernelApprovalPending(RuntimeError):
+    """The checkpointed graph stopped before an approval-gated tool call."""
+
+    def __init__(self, details: dict[str, Any]) -> None:
+        super().__init__("approval pending")
+        self.details = details
 
 
 class KernelModelFailure(RuntimeError):
@@ -163,6 +228,29 @@ class KernelModelFailure(RuntimeError):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+def _map_invalid_tool_arguments(exc: BaseException) -> KernelModelFailure | None:
+    """Translate the kernel's typed argument error into the public failure.
+
+    The middleware owns detection and the one repair attempt; the kernel
+    only maps the type. Codes, counts, and call ids are logged — never raw
+    arguments, prompts, tool payloads, or the original exception text.
+    """
+    from uniharness.langchain.middleware import InvalidToolArgumentsError
+
+    if not isinstance(exc, InvalidToolArgumentsError):
+        return None
+    logger.warning(
+        "chat kernel invalid tool arguments: code=%s calls=%d ids=%s",
+        exc.code,
+        exc.call_count,
+        ",".join(exc.call_ids) or "-",
+    )
+    return KernelModelFailure(
+        "invalid_tool_arguments",
+        "工具参数格式错误，本次请求未完成。",
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -419,13 +507,17 @@ def build_kernel_messages(
     return messages
 
 
-def _callbacks_for_turn(turn_span: Any) -> list[Any]:
+def _callbacks_for_turn(turn_span: Any, on_activity: Any = None) -> list[Any]:
     """Tool callbacks for this turn: spans and/or the local execution log.
 
     The log handler is independent of tracing so enabling LLM_LOG never
     requires Langfuse, and enabling tracing never duplicates log records.
+    ``on_activity`` (agent process tracking ticket 02) adds the live
+    activity channel; it is opt-in so no other kernel consumer pays for it.
     """
     handlers: list[Any] = []
+    if on_activity is not None:
+        handlers.append(ToolActivityCallbackHandler(on_activity))
     if tracing.tracing_enabled():
         handlers.append(ToolSpanCallbackHandler(parent_span=turn_span))
     if llm_log.enabled():
@@ -448,8 +540,11 @@ async def run_chat_turn(
     subagent_definitions: dict[str, Any] | None = None,
     on_text: Callable[[str, list[dict[str, Any]]], Awaitable[None]] | None = None,
     on_thought: Callable[[str], Awaitable[None]] | None = None,
+    on_activity: Callable[[str, dict[str, Any]], None] | None = None,
     history: list[dict[str, str]] | None = None,
     compaction_threshold: int | None = None,
+    resume: bool = False,
+    resume_interrupt_id: str | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Run ONE chat turn through the real UniHarness model loop (T28 entry).
 
@@ -541,81 +636,111 @@ async def run_chat_turn(
             # Ticket 04: only tool spans ride on callbacks. Generations are
             # traced by the model decorator (ticket 03), avoiding duplicate
             # generation nodes. LLM_LOG rides the same seam without spans.
-            callbacks = _callbacks_for_turn(turn_span)
+            callbacks = _callbacks_for_turn(turn_span, on_activity)
             if callbacks:
                 invoke_config = dict(invoke_config or {})
                 invoke_config["callbacks"] = callbacks
             # Ticket 05 (T08): ONE input construction for every kernel invocation —
             # bounded history first, the current user message appended exactly once.
             input_messages = build_kernel_messages(message=message, history=history)
+            if resume:
+                from langgraph.types import Command
+                graph_input = Command(resume={resume_interrupt_id: True} if resume_interrupt_id else True)
+            else:
+                graph_input = {"messages": input_messages}
             try:
                 try:
                     if on_text is None:
                         result = await asyncio.wait_for(
-                            agent.ainvoke({"messages": input_messages}, config=invoke_config),
+                            agent.ainvoke(graph_input, config=invoke_config),
                             timeout=240,
                         )
+                        interrupts = result.get("__interrupt__", ())
                     else:
                         result = {}
+                        interrupts = ()
                         public_text = _StreamingPublicText()
                         thoughts = _ThoughtBuffer(on_thought)
                         step = None
-                        async with asyncio.timeout(240):
-                            async for mode, data in agent.astream(
-                                {"messages": input_messages}, config=invoke_config,
-                                stream_mode=["messages", "values"],
-                            ):
-                                if mode == "values":
-                                    result = data
-                                    continue
-                                chunk, metadata = data
-                                # Compaction, tool models, and subagents are not the reply.
-                                namespace = metadata.get("langgraph_checkpoint_ns", "")
-                                if (metadata.get("langgraph_node") != "model"
-                                    or "|" in namespace
-                                    or (namespace and not namespace.startswith("model:"))):
-                                    continue
-                                if getattr(chunk, "tool_call_chunks", None) or getattr(chunk, "tool_calls", None):
-                                    continue
-                                if metadata.get("langgraph_step") != step:
-                                    # A new model step opens a new reasoning segment.
-                                    await thoughts.flush()
-                                    public_text = _StreamingPublicText()
-                                    step = metadata.get("langgraph_step")
-                                content = getattr(chunk, "content", "")
-                                if isinstance(content, list):
-                                    content = "".join(
-                                        block if isinstance(block, str) else block.get("text", "")
-                                        for block in content
-                                        if isinstance(block, str) or (isinstance(block, dict) and block.get("type") == "text")
-                                    )
-                                # Some OpenAI-compatible providers return reasoning
-                                # out-of-band instead of inside <think> tags.
-                                extra = getattr(chunk, "additional_kwargs", None)
-                                if isinstance(extra, dict):
-                                    for key in ("reasoning_content", "reasoning"):
-                                        hidden = extra.get(key)
-                                        if isinstance(hidden, str):
-                                            await thoughts.add(hidden)
-                                delta = public_text.feed(content if isinstance(content, str) else "")
+                        rounds = _ModelRounds(on_activity)
+                        try:
+                            async with asyncio.timeout(240):
+                                async for mode, data in agent.astream(
+                                    graph_input, config=invoke_config,
+                                    stream_mode=["messages", "values", "updates"],
+                                ):
+                                    if mode == "values":
+                                        result = data
+                                        continue
+                                    if mode == "updates":
+                                        if "__interrupt__" in data:
+                                            interrupts = data["__interrupt__"]
+                                        continue
+                                    chunk, metadata = data
+                                    # Compaction, tool models, and subagents are not the reply.
+                                    namespace = metadata.get("langgraph_checkpoint_ns", "")
+                                    if (metadata.get("langgraph_node") != "model"
+                                        or "|" in namespace
+                                        or (namespace and not namespace.startswith("model:"))):
+                                        continue
+                                    # Agent process tracking ticket 03: a main-model
+                                    # step boundary opens a new round; the previous
+                                    # round is closed by the same edge.
+                                    rounds.observe(metadata.get("langgraph_step"))
+                                    if getattr(chunk, "tool_call_chunks", None) or getattr(chunk, "tool_calls", None):
+                                        # A tool decision ends the round that made it.
+                                        rounds.close()
+                                        continue
+                                    if metadata.get("langgraph_step") != step:
+                                        # A new model step opens a new reasoning segment.
+                                        await thoughts.flush()
+                                        public_text = _StreamingPublicText()
+                                        step = metadata.get("langgraph_step")
+                                    content = getattr(chunk, "content", "")
+                                    if isinstance(content, list):
+                                        content = "".join(
+                                            block if isinstance(block, str) else block.get("text", "")
+                                            for block in content
+                                            if isinstance(block, str) or (isinstance(block, dict) and block.get("type") == "text")
+                                        )
+                                    # Some OpenAI-compatible providers return reasoning
+                                    # out-of-band instead of inside <think> tags.
+                                    extra = getattr(chunk, "additional_kwargs", None)
+                                    if isinstance(extra, dict):
+                                        for key in ("reasoning_content", "reasoning"):
+                                            hidden = extra.get(key)
+                                            if isinstance(hidden, str):
+                                                await thoughts.add(hidden)
+                                    delta = public_text.feed(content if isinstance(content, str) else "")
+                                    hidden_delta = public_text.take_reasoning()
+                                    if hidden_delta:
+                                        await thoughts.add(hidden_delta)
+                                    if delta:
+                                        await on_text(delta, audit_entries)
+                                delta = public_text.feed("", final=True)
                                 hidden_delta = public_text.take_reasoning()
                                 if hidden_delta:
                                     await thoughts.add(hidden_delta)
                                 if delta:
                                     await on_text(delta, audit_entries)
-                            delta = public_text.feed("", final=True)
-                            hidden_delta = public_text.take_reasoning()
-                            if hidden_delta:
-                                await thoughts.add(hidden_delta)
-                            if delta:
-                                await on_text(delta, audit_entries)
-                            await thoughts.flush()
+                                await thoughts.flush()
+                        finally:
+                            # Timeout, model error, interrupt and normal
+                            # exhaustion all close the live round exactly once.
+                            rounds.close()
                 except TimeoutError as exc:
                     raise KernelModelFailure("model_timeout", "模型响应超时，请稍后重试。") from exc
+                if interrupts:
+                    raise KernelApprovalPending({**interrupts[0].value, "interrupt_id": interrupts[0].id})
                 text = extract_final_text(result)
+            except KernelApprovalPending:
+                raise
             except KernelModelFailure:
                 raise
             except Exception as exc:
+                mapped = _map_invalid_tool_arguments(exc)
+                if mapped is not None:
+                    raise mapped from exc
                 logger.exception("chat kernel run failed")
                 raise KernelModelFailure(
                     "kernel_run_failed",
@@ -630,6 +755,11 @@ async def run_chat_turn(
             llm_log.end_turn(turn_token, status="ok", final_text=text)
             return text, audit_entries
         except BaseException as exc:
+            # Pause/failure exits still own the audits of completed calls.
+            # The orchestrator publishes them before it emits the terminal;
+            # without this they die with the local list.
+            if isinstance(exc, (KernelApprovalPending, KernelModelFailure)):
+                exc.audit_entries = list(audit_entries)
             tracing.record_exception(turn_span, exc)
             llm_log.end_turn(turn_token, status="error", error=exc)
             raise

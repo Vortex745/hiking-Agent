@@ -57,11 +57,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, AsyncGenerator, Callable
+from typing import Any, AsyncGenerator, Callable, Iterator
 
 from agent_v2.approvals import (
     canonical_args,
@@ -104,6 +106,13 @@ from agent_v2.events import (
     EventStream,
     TerminalEventAlreadyEmitted,
 )
+from agent_v2.decisions import (
+    RetrievalDecision,
+    await_decision,
+    decision_mode,
+    decision_overrides_keywords,
+    run_retrieval_decision,
+)
 from agent_v2.execution_contract import BoundaryError, ExecutionErrorCode
 from agent_v2.execution_policy import build_execution_policy, freeze_settings
 from agent_v2.sandbox_lifecycle import (
@@ -118,6 +127,7 @@ from agent_v2.leases import (
 )
 from agent_v2.policy_adapters import policy_error_payload
 from agent_v2.memory_tools import extract_sensitive_memory
+from agent_v2.mcp_output_render import compose_mcp_reply
 from agent_v2.observability import CapacityExceeded
 from agent_v2.permissions import PermissionDecision
 from agent_v2.profiles import (
@@ -135,6 +145,7 @@ from agent_v2.runs import (
     TerminalPersistFailure,
 )
 from agent_v2.startup import is_cowork_authorized
+from observability.redaction import is_denied_key, sanitize_mapping, scrub_text
 
 logger = logging.getLogger("ai-service.run_orchestration")
 
@@ -158,6 +169,10 @@ class ChatFlowRequest:
     profile_id: str = "chat"
     conversation_id: str | None = None
     current_location: Any | None = None
+    # Optional per-turn decision result. It rides on the request (instead of a
+    # new gate parameter) so the regression-injection harness can keep
+    # monkeypatching the historical gate signature.
+    retrieval_decision: RetrievalDecision | None = None
 
 
 # Kernel entry: ``agent_v2.kernel.run_chat_turn`` and test fakes with the
@@ -892,19 +907,147 @@ async def _kernel_plan_turn(
     return plan_text, [*audits, *sandbox_audits]
 
 
+_MCP_UNCONFIRMED_REPLY = "本次调用结果未确认，未自动重试。"
+_MCP_UNCONFIRMED_RESULT = "本次调用结果未确认"
+
+# Agent process tracking ticket 02: the public ``tool_call`` summary stays a
+# summary — bounded key count and value length, redacted through the ONE
+# existing redaction entry point.
+_MAX_TOOL_ARG_KEYS = 8
+_MAX_TOOL_ARG_TEXT = 240
+
+
+def _public_tool_args(args: Any) -> dict[str, Any]:
+    """Redacted, bounded arguments for the public ``tool_call`` event."""
+    if isinstance(args, str):
+        text = scrub_text(args, _MAX_TOOL_ARG_TEXT).strip()
+        return {"input": text} if text else {}
+    if not isinstance(args, dict):
+        return {}
+
+    public: dict[str, Any] = {}
+    for key, value in args.items():
+        if len(public) >= _MAX_TOOL_ARG_KEYS:
+            break
+        name = str(key)
+        if is_denied_key(name):
+            # Coordinates, credentials, addresses and memory bodies never
+            # belong on the wire, not even as a redaction marker.
+            continue
+        if isinstance(value, str):
+            public[name] = scrub_text(value, _MAX_TOOL_ARG_TEXT)
+        elif isinstance(value, (int, float, bool)) or value is None:
+            public[name] = value
+        elif isinstance(value, dict):
+            public[name] = sanitize_mapping(value)
+        else:
+            public[name] = scrub_text(str(value), _MAX_TOOL_ARG_TEXT)
+    return public
+
+
+class _ActivityChannel:
+    """Thread-safe queue of live activity facts for one kernel turn.
+
+    Agent process tracking ticket 02/03: tool callbacks (which may run on an
+    executor thread) push here; the orchestrator's polling loop drains and
+    publishes. A plain deque + lock keeps producers free of event-loop
+    affinity, and a failing push can never reach the tool.
+    """
+
+    def __init__(self) -> None:
+        self._items: deque[tuple[str, dict[str, Any]]] = deque()
+        self._lock = threading.Lock()
+
+    def push(self, kind: str, payload: dict[str, Any]) -> None:
+        with self._lock:
+            self._items.append((kind, payload))
+
+    def drain(self) -> list[tuple[str, dict[str, Any]]]:
+        with self._lock:
+            items = list(self._items)
+            self._items.clear()
+        return items
+
+
 def _tool_result_payloads(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Public ``tool_result`` payloads for kernel audit entries."""
     payloads: list[dict[str, Any]] = []
     for entry in entries:
-        payload: dict[str, Any] = {"tool": entry.get("tool") or entry.get("server_id")}
-        if entry.get("phase") == "denied":
-            payload["status"] = "denied"
-            payload["reason"] = entry.get("code")
-        else:
-            payload["status"] = "ok" if entry.get("ok") else str(entry.get("code") or "error")
-            payload["duration_ms"] = entry.get("duration_ms")
+        payload = _audit_tool_payload(entry)
         payloads.append(payload)
     return payloads
+
+
+def _audit_tool_payload(entry: dict[str, Any]) -> dict[str, Any]:
+    """Map one internal audit entry to the public ``tool_result`` payload."""
+    payload: dict[str, Any] = {"tool": entry.get("tool") or entry.get("server_id")}
+    phase = entry.get("phase")
+    code = str(entry.get("code") or "")
+    if phase == "mcp_unavailable":
+        payload["status"] = "mcp_server_unavailable"
+    elif phase == "denied":
+        payload["status"] = "denied"
+        payload["reason"] = entry.get("code")
+    elif phase == "authorized":
+        payload["status"] = "authorized"
+    elif entry.get("status") == "outcome_unknown" or code == "outcome_unknown":
+        payload["status"] = "outcome_unknown"
+    else:
+        payload["status"] = "ok" if entry.get("ok") else str(entry.get("code") or "error")
+        payload["duration_ms"] = entry.get("duration_ms")
+    for key in (
+        "capability_id",
+        "policy_hash",
+        "projection_hash",
+        "run_id",
+        "source",
+    ):
+        if entry.get(key):
+            payload[key] = entry[key]
+    if entry.get("server_id"):
+        payload["server_id"] = entry.get("server_id")
+    if payload["status"] == "outcome_unknown":
+        payload["content"] = _MCP_UNCONFIRMED_RESULT
+    else:
+        payload["content"] = _tool_result_summary(entry)
+    if isinstance(entry.get("evidence"), dict):
+        payload["evidence"] = entry["evidence"]
+    return payload
+
+
+def _service_from_tool_name(tool_name: str) -> str:
+    """The MCP server scope inside ``mcp__<server>__<tool>``."""
+    parts = str(tool_name or "").split("__", 2)
+    return parts[1] if len(parts) >= 3 and parts[0] == "mcp" else ""
+
+
+def _persisted_tool_result_keys(
+    runs_repo: RunRepository | None, run_id: str | None
+) -> set[tuple[str, str, str]]:
+    """Tool-result identities already durable for a resumed run."""
+    if runs_repo is None or not run_id:
+        return set()
+    try:
+        events = runs_repo.get_replay_events(run_id=run_id, from_seq=0)
+    except Exception:
+        logger.exception(
+            "run_orchestration: persisted tool_result scan failed for run_id=%s",
+            run_id,
+        )
+        return set()
+    keys: set[tuple[str, str, str]] = set()
+    for event in events:
+        if event.get("type") != "tool_result":
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        keys.add((
+            str(payload.get("tool") or ""),
+            str(payload.get("status") or ""),
+            str(payload.get("content") or ""),
+        ))
+    return keys
 
 
 def _effect_meta(
@@ -1491,10 +1634,12 @@ def compose_chat_system_prompt(req: ChatFlowRequest, profile: CapabilityProfile)
     """
     lines = [
         "你是一名专业的徒步助手，用简体中文回答。",
-        "职责范围：徒步装备、路线知识、风险评估、户外安全与相关自然知识。",
-        "回答保持简洁、实用；用户消息不涉及徒步相关话题时，礼貌说明你的专长并引导回主题。",
-        "事实依据：回答徒步相关事实前，必须先调用 hiking_knowledge_search。路线、距离、海拔、耗时、天气、补给、营地、法规和风险等只能使用检索返回的可追溯片段；若没有片段，只说明资料不足，不得补充任何未经资料支持的事实、数字或通用经验。",
+        "职责范围：徒步装备、路线知识、风险评估、户外安全与相关自然知识。用户提出其他领域的通用问题时，直接用通用知识正常回答，不要强行把话题拉回徒步。",
+        "回答保持简洁、实用；不确定或对时效敏感的信息要说明局限。",
+        "事实依据（仅适用于徒步相关事实）：回答徒步相关事实前，必须先调用 hiking_knowledge_search。路线、距离、海拔、耗时、天气、补给、营地、法规和风险等只能使用检索返回的可追溯片段；若没有片段，只说明资料不足，不得补充任何未经资料支持的事实、数字或通用经验。",
         "对话历史仅用于理解用户此前已说明的约束（如出发日期、人数、目的地）；历史中助手的旧回答不是本轮事实依据，不得据此输出任何路线事实或数字，路线事实仍必须来自本轮检索。",
+        "用户明确要求生成图片时：若未指定主题、张数或比例，不要只反问；用最低成本默认（1 张、16:9、平台默认图片模型、标准清晰度）继续完成工具流程，不要停在查模型、查能力或查余额等只读步骤后把 JSON 当最终结果；计费工具的审批就是用户确认，余额不足或生成失败时再说明。",
+        "景点定位：当且仅当本轮对话明确锁定一个具体景点且用户表达要去或了解该景点时，调用 focus_map，参数为景点全名；列举、比较、假设、泛泛提及多个景点或不确定时不要调用，一轮最多一次。",
         "不得透露任何内部系统、工具或框架信息。",
     ]
     if req.current_location is not None:
@@ -1526,6 +1671,20 @@ _GREETING_TOKENS = (
     "早上好", "上午好", "下午好", "晚上好",
 )
 _CLARIFICATION_MARKERS = ("请问", "请补充", "请提供", "需要知道", "缺少")
+
+# Chat is a hiking assistant, but general questions must not be force-replaced
+# by the insufficiency template. This marker list identifies messages whose
+# facts genuinely need retrieval; messages outside it are answered as general
+# conversation unless a knowledge search was actually attempted this turn.
+_HIKING_MESSAGE_MARKERS = (
+    "徒步", "登山", "爬山", "露营", "野营", "扎营", "营地", "户外", "越野",
+    "路线", "轨迹", "步道", "穿越", "海拔", "爬升", "坡度", "下降",
+    "装备", "背包", "帐篷", "睡袋", "冲锋衣", "登山鞋", "徒步鞋", "登山杖",
+    "补给", "水源", "高反", "高原", "失温", "中暑", "救援", "迷路", "向导",
+    "雪山", "山峰", "山顶", "山区", "峡谷", "珠峰", "鳌太", "五台山",
+    "泰山", "华山", "黄山", "武功山", "峨眉山", "长白山", "四姑娘山",
+    "雨崩", "虎跳峡", "稻城", "亚丁", "贡嘎", "喀纳斯", "香山", "海坨", "箭扣",
+)
 
 # Ticket 02 AC5 (D6): the risk rendering states its limitation like the
 # gear rendering does. Fixed product copy — never model output.
@@ -1681,6 +1840,24 @@ def _is_clarification_request(model_text: str) -> bool:
     )
 
 
+def _is_hiking_message(message: str) -> bool:
+    text = (message or "").strip()
+    return any(marker in text for marker in _HIKING_MESSAGE_MARKERS)
+
+
+def _knowledge_retrieval_attempted(
+    audit_entries: list[dict[str, Any]], *, run_id: str | None = None
+) -> bool:
+    for entry in audit_entries:
+        if entry.get("tool") != "hiking_knowledge_search":
+            continue
+        entry_run = entry.get("run_id")
+        if run_id is not None and entry_run is not None and entry_run != run_id:
+            continue
+        return True
+    return False
+
+
 def apply_chat_turn_evidence_gate(
     model_text: str,
     audit_entries: list[dict[str, Any]],
@@ -1697,12 +1874,17 @@ def apply_chat_turn_evidence_gate(
     2. a valid controlled domain result (gear/risk) → deterministic
        rendering of the controlled fields (AC5/AC6);
     3. a greeting user message → controlled greeting template (AC4);
-    4. a clarifying model question → controlled clarification template
-       whose fields are the canonical request items (AC4);
-    5. otherwise → the insufficiency template (AC1).
+    4. general conversation (no knowledge retrieval attempted this turn
+       and no hiking markers in the message) → the model's free reply
+       passes, so non-hiking questions are not force-replaced;
+    5. a clarifying model question in a hiking turn → controlled
+       clarification template (AC4);
+    6. otherwise → the insufficiency template (AC1).
 
-    The result is what the stream emits, what the client finally sees, and
-    what gets persisted — one shared decision, no second path (AC2).
+    ``strict`` keeps the RAG knowledge-QA page fully grounded: every turn
+    without evidence is gated regardless of topic. RAG is detected from
+    ``req.profile_id``, so callers and the regression-injection harness
+    keep the original gate signature.
     """
     if has_hiking_knowledge_evidence(audit_entries, run_id=run_id):
         return model_text
@@ -1711,6 +1893,18 @@ def apply_chat_turn_evidence_gate(
         return controlled
     if _is_greeting_message(req.message):
         return _CONTROLLED_GREETING_RESPONSE
+    strict = getattr(req, "profile_id", ProfileId.CHAT) == ProfileId.RAG
+    if not strict:
+        override = decision_overrides_keywords(
+            getattr(req, "retrieval_decision", None)
+        )
+        if override is False:
+            return model_text
+        if override is None and not (
+            _is_hiking_message(req.message)
+            or _knowledge_retrieval_attempted(audit_entries, run_id=run_id)
+        ):
+            return model_text
     if _is_clarification_request(model_text):
         return _CONTROLLED_CLARIFICATION_RESPONSE
     return _NO_KNOWLEDGE_EVIDENCE_RESPONSE
@@ -1749,6 +1943,7 @@ def compose_route_plan_system_prompt(
         "证据纪律：路线里程/爬升/耗时必须来自 route_research 或地图工具；",
         "天气与预警必须来自天气工具或 web_search；引用来源名称。",
         "关键证据（路线事实、天气）缺失时明确说明缺失项并给出保守建议，禁止编造数据。",
+        "景点定位：当本轮目的地明确且只聚焦一个景点时，调用 focus_map 记录景点全名；列举或比较多条路线/多个景点时不要调用。",
         "不得透露内部系统、工具名或框架信息。",
     ]
     if req.current_location is not None:
@@ -2470,7 +2665,8 @@ class RunOrchestrator:
                         yield envelope
                 finally:
                     await _aclose_quietly(route_flow)
-                mark_terminal_safe(runs_repo, run_id, "done")
+                if stream.terminal_type != "run.paused":
+                    mark_terminal_safe(runs_repo, run_id, "done")
                 return
 
             if profile.profile_id == ProfileId.RAG:
@@ -3412,6 +3608,7 @@ class RunOrchestrator:
         *,
         run_id: str,
         from_seq: int = 0,
+        subject_id: str | None = None,
     ) -> AsyncGenerator[EventEnvelope, None]:
         """Resume stream wrapper: closes silently on a failed finalize fence.
 
@@ -3419,7 +3616,7 @@ class RunOrchestrator:
         the assistant + terminal durability fence. When that fence fails
         the stream closes without a terminal; snapshot/replay explain it.
         """
-        impl = self._stream_resume_impl(run_id=run_id, from_seq=from_seq)
+        impl = self._stream_resume_impl(run_id=run_id, from_seq=from_seq, subject_id=subject_id)
         try:
             async for envelope in impl:
                 yield envelope
@@ -3442,6 +3639,7 @@ class RunOrchestrator:
         *,
         run_id: str,
         from_seq: int = 0,
+        subject_id: str | None = None,
     ) -> AsyncGenerator[EventEnvelope, None]:
         """Produce the resume event stream — spec AC4, AC5, AC7.
 
@@ -3675,7 +3873,7 @@ class RunOrchestrator:
 
             # Look up the resolved approval that authorized this resume.
             approvals = runs_repo.list_approvals_for_run(run_id)
-            resolved = next((a for a in approvals if a.is_terminal), None)
+            resolved = next((a for a in reversed(approvals) if a.is_terminal), None)
             if resolved is None:
                 yield emit("error", {
                     "code": "no_resolved_approval",
@@ -3699,7 +3897,11 @@ class RunOrchestrator:
             # This is the spec AC5 idempotency guard: if a step's event is already
             # in the log, we skip the step entirely — no tool re-execution.
             stored_types = {evt["type"] for evt in all_events}
-            has_approval_resolved = "approval.resolved" in stored_types
+            has_approval_resolved = any(
+                evt["type"] == "approval.resolved"
+                and evt["payload"].get("approval_id") == resolved.approval_id
+                for evt in all_events
+            )
             has_tool_call = "tool_call" in stored_types
             # Ticket 13: ``has_tool_result_ok`` is per-tool — the resume flow
             # dispatches on ``resolved.tool_name`` (``generate_pdf`` or
@@ -3734,6 +3936,38 @@ class RunOrchestrator:
                     "message": "用户已拒绝操作，运行结束。",
                 })
                 mark_terminal_safe(runs_repo, run_id, "done")
+                return
+
+            if resolved.tool_name.startswith("mcp__"):
+                if not has_approval_resolved:
+                    yield emit("approval.resolved", {
+                        "approval_id": resolved.approval_id, "tool": resolved.tool_name,
+                        "decision": "approve", "status": resolved.status,
+                        "message": "用户已批准操作，继续执行。",
+                    })
+                user_message = next(
+                    (item["content"] for item in reversed(snapshot.messages)
+                     if item["run_id"] == run_id and item["role"] == "user"), ""
+                ) if snapshot else ""
+                req = ChatFlowRequest(
+                    message=user_message, request_id=run.request_id,
+                    profile_id=run.profile_id, conversation_id=run.conversation_id,
+                )
+                continuation = self._stream_kernel_turn(
+                    req, resolved_policy.profile(), run_id=run_id, emit=emit,
+                    memory=self._memory, subject_id=subject_id,
+                    settings=freeze_settings(self._settings, resolved_policy.policy),
+                    projection=resume_projection, resume=True,
+                    resume_interrupt_id=json.loads(resolved.args_canonical)["interrupt_id"],
+                )
+                try:
+                    async for envelope in continuation:
+                        yield envelope
+                finally:
+                    await _aclose_quietly(continuation)
+                if not stream.terminal_emitted:
+                    yield emit("done", {})
+                    mark_terminal_safe(runs_repo, run_id, "done")
                 return
 
             # Approved path — the tool may or may not have executed yet.
@@ -4506,7 +4740,7 @@ class RunOrchestrator:
         # already destroyed, fail closed — do NOT resume into a new
         # sandbox.
         lease = runs_repo.get_sandbox_lease(approval.run_id)
-        if lease is None or lease.status != "active":
+        if not approval.tool_name.startswith("mcp__") and (lease is None or lease.status != "active"):
             return ApprovalDecisionOutcome(
                 status="sandbox_lease_lost",
                 payload={
@@ -4521,7 +4755,7 @@ class RunOrchestrator:
         # BCDEF ticket 06: an expired lease cannot authorize a resume;
         # surface a stable lease_expired reason and leave the decision
         # unrecorded (the run stays paused for reconciliation).
-        if lease.is_expired():
+        if lease is not None and lease.is_expired():
             runs_repo.expire_sandbox_lease(approval.run_id)
             return ApprovalDecisionOutcome(
                 status="sandbox_lease_lost",
@@ -4663,6 +4897,8 @@ class RunOrchestrator:
         subject_id: str | None = None,
         settings: Any | None = None,
         projection: CapabilityProjection | None = None,
+        resume: bool = False,
+        resume_interrupt_id: str | None = None,
     ) -> AsyncGenerator[EventEnvelope, None]:
         """Shared T26/T28/T29 kernel turn used by chat and route_plan profiles."""
         kernel_settings = settings if settings is not None else self._settings
@@ -4670,7 +4906,7 @@ class RunOrchestrator:
             projection = legacy_capability_projection(
                 profile, run_id=run_id or ""
             )
-        from agent_v2.kernel import KernelModelFailure
+        from agent_v2.kernel import KernelApprovalPending, KernelModelFailure
         from agent_v2.kernel_tools import (
             build_chat_extra_tools,
             build_chat_kernel_gate,
@@ -4679,13 +4915,76 @@ class RunOrchestrator:
         )
 
         audit_entries: list[dict[str, Any]] = []
+        custom_tool_names: set[str] = set()
+        setup_audit_count = 0
+        published_audits: set[int] = set()
+        # Resume replays the durable log first; setup audits that already
+        # reached that log must not be appended a second time.
+        persisted_audit_keys = (
+            _persisted_tool_result_keys(self._runs_repo, run_id) if resume else set()
+        )
+
+        def pending_audit_events() -> Iterator[EventEnvelope]:
+            for index, entry in enumerate(audit_entries):
+                marker = id(entry)
+                if marker in published_audits:
+                    continue
+                payload = _audit_tool_payload(entry)
+                if resume and index < setup_audit_count:
+                    key = (
+                        str(payload.get("tool") or ""),
+                        str(payload.get("status") or ""),
+                        str(payload.get("content") or ""),
+                    )
+                    if key in persisted_audit_keys:
+                        published_audits.add(marker)
+                        continue
+                published_audits.add(marker)
+                yield emit("tool_result", payload)
+
+        # Agent process tracking ticket 02: live activity facts (tool starts,
+        # model round boundaries) produced while the kernel turn runs. The
+        # channel is drained by the polling loop below and MUST be empty
+        # before any terminal leaves this generator.
+        activity = _ActivityChannel()
+
+        def publish_activity() -> Iterator[EventEnvelope]:
+            for kind, payload in activity.drain():
+                if kind == "tool_start":
+                    tool = str(payload.get("tool") or "")
+                    if not tool:
+                        continue
+                    # ``step`` is additive for pairing/ordering; old clients
+                    # ignore it.
+                    yield emit("tool_call", {
+                        "tool": tool,
+                        "args": _public_tool_args(payload.get("args")),
+                        "step": payload.get("step"),
+                    })
+                elif kind == "model_round":
+                    # Ticket 03: model rounds ride the existing ``progress``
+                    # type. The start carries ``message`` for the legacy
+                    # progress label; the finish carries the duration and
+                    # must never overwrite that label.
+                    state = str(payload.get("state") or "")
+                    round_payload: dict[str, Any] = {
+                        "stage": "model",
+                        "step": payload.get("step"),
+                        "state": state,
+                    }
+                    if state == "finished":
+                        round_payload["duration_ms"] = payload.get("duration_ms")
+                    else:
+                        round_payload["message"] = f"模型第 {payload.get('index')} 轮"
+                    yield emit("progress", round_payload)
+
         mcp_servers: dict[str, Any] = {}
         mcp_required = getattr(profile, "allowed_mcp_servers", None)
         if mcp_required or projection.mcp_services:
             mcp_servers, mcp_audits = build_profile_mcp_servers(
                 profile, kernel_settings, projection=projection
             )
-            if not mcp_servers:
+            if profile.profile_id == ProfileId.ROUTE_PLAN and not mcp_servers:
                 # Every allowlisted evidence source is unavailable → fail
                 # closed instead of fabricating a plan (Ticket 29 AC5).
                 yield emit("error", {
@@ -4698,31 +4997,34 @@ class RunOrchestrator:
             # BCDEF ticket 10: replayable discovery/describe evidence for
             # every frozen MCP service. Lazy discovery may describe these
             # schemas later, but it can never widen the projected set.
-            for service in projection.mcp_services:
-                if service.server_id not in mcp_servers:
-                    continue
-                discovery = projection.discover_mcp_tools(
-                    service.server_id, service.tools
-                )
-                payload: dict[str, Any] = {
-                    "tool": f"mcp__{service.server_id}__discovery",
-                    "status": "ok",
-                    "source": "mcp",
-                    "server_id": service.server_id,
-                    "discovered_tools": [
-                        entry["tool"] for entry in discovery.discovered
-                    ],
-                    "denied_tools": [
-                        entry["tool"] for entry in discovery.denied
-                    ],
-                    "capability_ids": [
-                        entry["capability_id"] for entry in discovery.discovered
-                    ],
-                    "policy_hash": projection.policy_hash,
-                    "projection_hash": projection.projection_hash,
-                    "run_id": run_id or "",
-                }
-                yield emit("tool_result", payload)
+            # A resume replays the already-persisted discovery event instead
+            # of appending a duplicate.
+            if not resume:
+                for service in projection.mcp_services:
+                    if service.server_id not in mcp_servers:
+                        continue
+                    discovery = projection.discover_mcp_tools(
+                        service.server_id, service.tools
+                    )
+                    payload: dict[str, Any] = {
+                        "tool": f"mcp__{service.server_id}__discovery",
+                        "status": "ok",
+                        "source": "mcp",
+                        "server_id": service.server_id,
+                        "discovered_tools": [
+                            entry["tool"] for entry in discovery.discovered
+                        ],
+                        "denied_tools": [
+                            entry["tool"] for entry in discovery.denied
+                        ],
+                        "capability_ids": [
+                            entry["capability_id"] for entry in discovery.discovered
+                        ],
+                        "policy_hash": projection.policy_hash,
+                        "projection_hash": projection.projection_hash,
+                        "run_id": run_id or "",
+                    }
+                    yield emit("tool_result", payload)
 
         try:
             extra_tools = build_chat_extra_tools(
@@ -4733,6 +5035,24 @@ class RunOrchestrator:
                 subject_id=subject_id,
                 projection=projection,
             )
+            custom_services = [service for service in projection.mcp_services if service.revision]
+            custom_tool_names = {
+                f"mcp__{service.server_id}__{name}"
+                for service in custom_services
+                for name in service.tools
+            }
+            if custom_services:
+                if not self._runs_repo or not self._kernel_checkpoints:
+                    yield emit("error", {"code": "checkpoint_unavailable", "message": "MCP 审批所需的运行存储不可用。"})
+                    mark_terminal_safe(self._runs_repo, run_id, "error")
+                    return
+                from agent_v2.custom_mcp_tools import build_custom_mcp_tools
+                try:
+                    extra_tools.extend(build_custom_mcp_tools(projection, self._runs_repo, audit_entries.append))
+                except ValueError:
+                    yield emit("error", {"code": "mcp_config_changed", "message": "MCP 配置已改变，请重新发起请求。"})
+                    mark_terminal_safe(self._runs_repo, run_id, "error")
+                    return
             kernel_gate = build_chat_kernel_gate(
                 profile,
                 run_id=run_id,
@@ -4750,6 +5070,7 @@ class RunOrchestrator:
                 available_mcp_servers=set(mcp_servers),
             )
             audit_entries.extend(sub_audits)
+            setup_audit_count = len(audit_entries)
 
             system_prompt = (
                 compose_route_plan_system_prompt(req, profile)
@@ -4798,23 +5119,55 @@ class RunOrchestrator:
 
             deltas: asyncio.Queue[tuple[str, str]] = asyncio.Queue(maxsize=1)
             streamed_text = ""
+            # Once THIS turn enters a custom MCP call, later model text may
+            # reference image aliases the backend rewrites. Buffer it and
+            # publish the composed segment once instead of leaking preview/
+            # origin URLs token by token.
+            mcp_call_entered = False
             thoughts_enabled = bool(
                 getattr(kernel_settings, "agent_v2_thoughts_enabled", True)
             )
+            # Decision endpoints run in parallel with the kernel turn; their
+            # result is consumed by the evidence gate after the turn. Off
+            # mode creates no task at all.
+            decision_task: asyncio.Task[RetrievalDecision | None] | None = None
+            if (
+                profile.profile_id in (ProfileId.CHAT, ProfileId.RAG)
+                and decision_mode(kernel_settings) != "off"
+            ):
+                decision_task = asyncio.create_task(
+                    run_retrieval_decision(
+                        req.message,
+                        history,
+                        settings=kernel_settings,
+                        run_id=run_id,
+                    )
+                )
 
             async def on_text(delta: str, kernel_audits: list[dict[str, Any]]) -> None:
+                nonlocal mcp_call_entered
                 combined_audits = audit_entries + kernel_audits
+                if not mcp_call_entered and any(
+                    entry.get("tool") in custom_tool_names
+                    for entry in combined_audits
+                ):
+                    mcp_call_entered = True
                 # A search may still happen later in the first model step.
                 # Never publish text which the existing evidence gate could retract.
                 if profile.profile_id in (ProfileId.CHAT, ProfileId.RAG):
                     if not has_hiking_knowledge_evidence(combined_audits, run_id=run_id):
                         return
-                if delta:
+                if delta and not mcp_call_entered:
                     await deltas.put(("text", delta))
 
             async def on_thought(delta: str) -> None:
                 if delta:
                     await deltas.put(("thought", delta))
+
+            async def approval_callback(tool_name: str, args: dict[str, Any], prompt: str | None) -> bool:
+                from langgraph.types import interrupt
+                from agent_v2.custom_mcp_tools import current_mcp_call_id
+                return bool(interrupt({"tool": tool_name, "args": args, "call_id": current_mcp_call_id()}))
 
             task = asyncio.create_task(self._kernel_turn(
                 system_prompt=system_prompt,
@@ -4830,6 +5183,9 @@ class RunOrchestrator:
                 compaction_threshold=profile.model.compaction_threshold,
                 on_text=on_text,
                 on_thought=on_thought if thoughts_enabled else None,
+                on_activity=activity.push,
+                **({"approval_callback": approval_callback, "resume": resume,
+                    "resume_interrupt_id": resume_interrupt_id} if custom_services else {}),
             ))
             try:
                 heartbeat_at = time.monotonic()
@@ -4837,6 +5193,19 @@ class RunOrchestrator:
                     if is_cancelled(self._runs_repo, run_id):
                         yield emit("cancelled", {"code": "cancelled", "message": "运行已被取消。"})
                         return
+                    # Activity facts come first: a tool that started AND
+                    # finished inside one tick must still publish its
+                    # ``tool_call`` before its ``tool_result``.
+                    for envelope in publish_activity():
+                        yield envelope
+                    # Agent process tracking ticket 01: a tool that already
+                    # finished has its audit record in ``audit_entries`` NOW.
+                    # Publishing on every polling tick makes the result line
+                    # appear while the model is still working instead of in
+                    # the turn-end batch; the flush below stays as the
+                    # backstop and ``published_audits`` keeps it once-only.
+                    for envelope in pending_audit_events():
+                        yield envelope
                     try:
                         kind, delta = await asyncio.wait_for(deltas.get(), timeout=0.25)
                     except TimeoutError:
@@ -4853,15 +5222,65 @@ class RunOrchestrator:
                     streamed_text += delta
                     yield emit("text", {"content": delta})
                 response_text, kernel_audit_entries = await task
+                if decision_task is not None:
+                    req.retrieval_decision = await await_decision(decision_task)
             finally:
                 if not task.done():
                     task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+                if decision_task is not None:
+                    if not decision_task.done():
+                        decision_task.cancel()
+                    await asyncio.gather(decision_task, return_exceptions=True)
             audit_entries.extend(kernel_audit_entries)
+        except KernelApprovalPending as exc:
+            audit_entries.extend(getattr(exc, "audit_entries", []))
+            tool_name = exc.details["tool"]
+            args = exc.details["args"]
+            verdict = projection.authorize(tool_name, args)
+            if verdict.decision != PermissionDecision.NEEDS_APPROVAL or not run_id or self._runs_repo is None:
+                # A completed call before the pause is still evidence; publish
+                # it before the terminal closes the stream.
+                for envelope in publish_activity():
+                    yield envelope
+                for envelope in pending_audit_events():
+                    yield envelope
+                yield emit("error", {"code": "tool_not_authorized", "message": "MCP 工具未获授权。"})
+                mark_terminal_safe(self._runs_repo, run_id, "error")
+                return
+            call_args = {"call_id": exc.details["call_id"], "arguments": args}
+            approval_id = compute_approval_id(run_id=run_id, tool_name=tool_name, args=call_args)
+            created_at = _now_iso()
+            expires_at = compute_expiry(created_at)
+            run_record = self._runs_repo.get_run(run_id)
+            self._runs_repo.insert_approval(
+                approval_id=approval_id, run_id=run_id, conversation_id=run_record.conversation_id,
+                tool_name=tool_name,
+                args_canonical=canonical_args({**call_args, "interrupt_id": exc.details["interrupt_id"]}),
+                risk_level="high",
+                impact=f"执行 MCP 工具 {tool_name}", created_at=created_at, expires_at=expires_at,
+            )
+            self._runs_repo.mark_run_paused(run_id)
+            for envelope in publish_activity():
+                yield envelope
+            for envelope in pending_audit_events():
+                yield envelope
+            yield emit("approval.required", {
+                "approval_id": approval_id, "tool": tool_name, "args": args, "risk_level": "high",
+                "impact": f"执行 MCP 工具 {tool_name}", "expires_at": expires_at,
+                "message": "需要批准后才能执行 MCP 工具。",
+            })
+            yield emit("run.paused", {"code": "awaiting_approval", "approval_id": approval_id, "message": "等待批准。"})
+            return
         except KernelModelFailure as exc:
+            audit_entries.extend(getattr(exc, "audit_entries", []))
             logger.warning(
                 "chat_v2: kernel failure code=%s request_id=%s", exc.code, req.request_id
             )
+            for envelope in publish_activity():
+                yield envelope
+            for envelope in pending_audit_events():
+                yield envelope
             yield emit("error", {
                 "code": exc.code,
                 "message": exc.message,
@@ -4894,47 +5313,58 @@ class RunOrchestrator:
                 req=req,
                 run_id=run_id,
             )
+        if profile.profile_id == ProfileId.CHAT and custom_services and self._runs_repo and run_id:
+            outputs: list[tuple[str, str]] = []
+            unknown = False
+            for effect in self._runs_repo.list_effects_for_run(run_id):
+                if effect.tool_name not in custom_tool_names:
+                    continue
+                if effect.status == "outcome_unknown":
+                    unknown = True
+                    continue
+                if effect.status == "committed" and effect.result_json:
+                    result = json.loads(effect.result_json)
+                    if result.get("output") and not result.get("error"):
+                        outputs.append((
+                            _service_from_tool_name(effect.tool_name),
+                            result["output"],
+                        ))
+            if outputs:
+                prior_text = ""
+                if resume and self._runs_repo and run_id:
+                    # The pre-pause segment is already public; it only tells
+                    # composition which assets were shown before the pause.
+                    try:
+                        prior_text = "".join(
+                            str(event["payload"].get("content") or "")
+                            for event in self._runs_repo.get_replay_events(
+                                run_id=run_id, from_seq=0
+                            )
+                            if event.get("type") == "text"
+                            and isinstance(event.get("payload"), dict)
+                        )
+                    except Exception:
+                        logger.exception(
+                            "run_orchestration: prior text scan failed for run_id=%s",
+                            run_id,
+                        )
+                response_text = compose_mcp_reply(
+                    response_text, outputs, prior_text=prior_text
+                )
+            elif unknown:
+                # No successful MCP output to publish: the model's preamble
+                # cannot describe a result that was never confirmed.
+                response_text = _MCP_UNCONFIRMED_REPLY
 
         # Public tool audits follow incremental text and precede completion.
-        for entry in audit_entries:
-            payload: dict[str, Any] = {"tool": entry.get("tool") or entry.get("server_id")}
-            if entry.get("phase") == "mcp_unavailable":
-                payload["status"] = "mcp_server_unavailable"
-            elif entry.get("phase") == "denied":
-                payload["status"] = "denied"
-                payload["reason"] = entry.get("code")
-            elif entry.get("phase") == "authorized":
-                payload["status"] = "authorized"
-            else:
-                payload["status"] = "ok" if entry.get("ok") else str(entry.get("code") or "error")
-                payload["duration_ms"] = entry.get("duration_ms")
-            # BCDEF ticket 10: MCP execute/authorization evidence carries
-            # the run/policy/projection/capability binding additively.
-            for key in (
-                "capability_id",
-                "policy_hash",
-                "projection_hash",
-                "run_id",
-                "source",
-            ):
-                if entry.get(key):
-                    payload[key] = entry[key]
-            # A08: the MCP source keeps its audit field name (server_id).
-            # The old ``server`` rename made the field vanish for the
-            # frontend, which reads server_id — "which source is down"
-            # was lost on the wire.
-            if entry.get("server_id"):
-                payload["server_id"] = entry.get("server_id")
-            # A08: human-readable one-liner so the trace panel shows what
-            # each step did instead of an empty row.
-            payload["content"] = _tool_result_summary(entry)
-            # Spec #13 phase 2 (T05): bounded evidence (has_chunks/sources/
-            # chunk summaries) rides on the public tool_result event so the
-            # frontend renders the 检索来源 block (A09); the legacy RAG-page
-            # adapter was removed in A11.
-            if isinstance(entry.get("evidence"), dict):
-                payload["evidence"] = entry["evidence"]
-            yield emit("tool_result", payload)
+        # The same publisher runs before a pause or failure exit so completed
+        # calls are never lost; each entry is published at most once.
+        # Activity facts are drained first so no ``tool_call`` can be left
+        # behind after the terminal.
+        for envelope in publish_activity():
+            yield envelope
+        for envelope in pending_audit_events():
+            yield envelope
 
         if is_cancelled(self._runs_repo, run_id):
             yield emit("cancelled", {"code": "cancelled", "message": "运行已被取消。"})

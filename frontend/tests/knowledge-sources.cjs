@@ -174,7 +174,8 @@ const json = (route, body, status = 200) =>
     })
 
     await page.goto(process.env.BASE_URL || 'http://localhost:5175')
-    await page.getByRole('button', { name: '知识源' }).click()
+    await page.getByRole('button', { name: '设置' }).click()
+    await page.getByRole('menuitem', { name: '知识源' }).click()
     await page.getByRole('dialog', { name: '知识源' }).waitFor()
     await page.getByRole('button', { name: '新建知识源' }).first().click()
     await page.getByPlaceholder('例如：徒步路线资料').fill('测试语雀')

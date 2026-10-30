@@ -233,6 +233,35 @@ def test_grounded_reply_passes_through(tmp_path: Path):
     assert _text_of(items) == expected
 
 
+# ---- General conversation is not forced through the hiking gate -------------
+
+
+def test_general_question_passes_without_knowledge_search(tmp_path: Path):
+    expected = "我目前不能直接生成图片，但可以帮你把想要的画面描述成提示词。"
+    items = _stream(
+        _orchestrator(tmp_path, [], kernel_result=(expected, [])),
+        _req("给我几张图片", "req-gate-general"),
+    )
+    assert _text_of(items) == expected
+
+
+def test_general_clarifying_question_is_not_replaced(tmp_path: Path):
+    expected = "请问你想看哪种风格的图片？"
+    items = _stream(
+        _orchestrator(tmp_path, [], kernel_result=(expected, [])),
+        _req("随便推荐点东西", "req-gate-general-clarify"),
+    )
+    assert _text_of(items) == expected
+
+
+def test_rag_general_question_still_requires_evidence(tmp_path: Path):
+    items = _stream(
+        _orchestrator(tmp_path, [], kernel_result=("通用回答", [])),
+        _req("给我几张图片", "req-gate-rag", profile_id="rag"),
+    )
+    assert "资料不足" in _text_of(items)
+
+
 # ---- AC2: stream / final / persisted history share the gated content ---------
 
 

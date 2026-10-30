@@ -137,6 +137,7 @@ _CHAT_ALLOWED_TOOLS: tuple[str, ...] = (
     "risk_assessment",
     "memory_save",
     "memory_search",
+    "focus_map",
 )
 
 
@@ -168,6 +169,7 @@ _ROUTE_PLAN_ALLOWED_TOOLS: tuple[str, ...] = (
     "route_research",
     "web_search",
     "web_scraping",
+    "focus_map",
 )
 
 _ROUTE_PLAN_PROFILE = CapabilityProfile(

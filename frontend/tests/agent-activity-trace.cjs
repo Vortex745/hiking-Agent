@@ -143,6 +143,28 @@ const messages = [
       event('thought', { step: 0 }, '检索知识库中的雪线注意事项，再给出保守建议。'),
     ],
   },
+  { role: 'user', content: 'Case 15 prompt' },
+  {
+    // A tool is running right now: the collapsed summary is that step.
+    role: 'assistant',
+    content: '',
+    isStreaming: true,
+    traceEvents: [searchCall],
+  },
+  { role: 'user', content: 'Case 16 prompt' },
+  {
+    // Two model rounds bracket one retrieval, in real SSE order.
+    role: 'assistant',
+    content: 'Case 16 answer',
+    traceEvents: [
+      event('model_round', { stage: 'model', step: 0, state: 'started', message: '模型第 1 轮' }, '模型第 1 轮'),
+      event('model_round', { stage: 'model', step: 0, state: 'finished', duration_ms: 900 }),
+      searchCall,
+      searchOk,
+      event('model_round', { stage: 'model', step: 2, state: 'started', message: '模型第 2 轮' }, '模型第 2 轮'),
+      event('model_round', { stage: 'model', step: 2, state: 'finished', duration_ms: 1500 }),
+    ],
+  },
 ];
 
 let passed = 0;
@@ -390,7 +412,7 @@ const contentLines = (page, index) =>
       await case10.getByText('已理解你的问题并生成回答', { exact: true }).count(),
       1,
     );
-    assert.equal(await page.locator('[data-slot="agent-activity"]').count(), 14);
+    assert.equal(await page.locator('[data-slot="agent-activity"]').count(), 16);
     ok('completed run without events keeps a collapsed thinking record');
 
     // 11. Paused approval while the run is still streaming: the wait state
@@ -459,6 +481,57 @@ const contentLines = (page, index) =>
     assert.match(reasoning, /检索知识库中的雪线注意事项/);
     ok('thought events merge into one reasoning paragraph');
 
+    // 15. A running tool call names itself in the collapsed summary.
+    const case15 = traceRoot(page, 29);
+    const case15Trigger = case15.getByRole('button', {
+      name: '正在检索徒步知识库',
+      exact: true,
+    });
+    assert.equal(await case15Trigger.count(), 1, 'summary is the current step');
+    assert.equal(
+      await case15.getByText('正在处理', { exact: true }).count(),
+      0,
+      'no generic running summary',
+    );
+    await case15Trigger.click();
+    assert.equal(await contentLines(page, 29).count(), 1);
+    assert.equal(
+      await case15.getByText('查询「雪线」', { exact: true }).count(),
+      1,
+      'the call line carries its redacted arguments',
+    );
+    ok('a running tool call is the collapsed summary and shows its args');
+
+    // 16. Model rounds bracket the tool, each with its own duration.
+    const case16 = traceRoot(page, 31);
+    const case16Trigger = case16.getByRole('button', {
+      name: '已完成 3 个步骤',
+      exact: true,
+    });
+    assert.equal(await case16Trigger.count(), 1, 'two rounds and one tool are three steps');
+    await case16Trigger.click();
+    assert.equal(await contentLines(page, 31).count(), 3);
+    assert.equal(await case16.getByText('模型第 1 轮', { exact: true }).count(), 1);
+    assert.equal(await case16.getByText('模型第 2 轮', { exact: true }).count(), 1);
+    assert.deepEqual(
+      await case16.locator('[data-slot="trace-description"]').allTextContents(),
+      ['900ms', '查询「雪线」 · 1.2s · 4 条', '1.5s'],
+      'model and tool rows keep their SSE interleaving',
+    );
+    ok('model rounds render with durations around the tool line');
+
+    // 17. The four-stage lifecycle panel and its trigger are gone.
+    assert.equal(
+      await page.getByRole('button', { name: '查看思考流程' }).count(),
+      0,
+      'no lifecycle trigger button',
+    );
+    assert.equal(await page.getByText('请求理解', { exact: false }).count(), 0);
+    assert.equal(await page.getByText('工具编排', { exact: false }).count(), 0);
+    assert.equal(await page.getByText('回答生成', { exact: false }).count(), 0);
+    assert.equal(await page.getByText('完成收尾', { exact: false }).count(), 0);
+    ok('the generic four-stage lifecycle panel is removed');
+
     // Old widgets are gone.
     assert.equal(await page.getByText('思考流程信息', { exact: false }).count(), 0);
     assert.equal(await page.getByText('模型思考中', { exact: false }).count(), 0);
@@ -526,6 +599,26 @@ const contentLines = (page, index) =>
     ok('reduced motion disables the collapse animation');
   } finally {
     await reduced.browser.close();
+  }
+
+  // 390px: the trace must not push the page horizontally.
+  const mobile = await launch({ colorScheme: 'light', viewport: { width: 390, height: 844 } });
+  try {
+    await seed(mobile.page);
+    await mobile.page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
+    await mobile.page.getByText('Case 10 answer', { exact: true }).waitFor();
+    const overflow = await mobile.page.evaluate(
+      () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    );
+    assert.ok(overflow <= 0, `390px: no horizontal overflow, got ${overflow}px`);
+    const case16 = traceRoot(mobile.page, 31);
+    await case16.getByRole('button', { name: '已完成 3 个步骤', exact: true }).click();
+    assert.equal(await contentLines(mobile.page, 31).count(), 3);
+    await mobile.page.waitForTimeout(150);
+    assert.deepEqual(mobile.errors, [], '390px: no page or console errors');
+    ok('390px renders the timeline without horizontal overflow');
+  } finally {
+    await mobile.browser.close();
   }
 
   console.log(`\nAll ${passed} agent activity trace checks passed.`);

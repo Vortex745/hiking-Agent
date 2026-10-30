@@ -57,11 +57,11 @@ DEFAULT_TARGET = REPO_ROOT / "third_party" / "uniharness"
 DEFAULT_PROVENANCE = REPO_ROOT / "third_party" / "uniharness-provenance.md"
 
 # Fixed operational pin (delta HEAD) and its vendored upstream base.
-PIN = "b026a26250487678aedc2beef0d0b6ae802de5c4"
+PIN = "aeceee7ea5bdb8c4dcaa7d1c54400afacabe5556"
 UPSTREAM_BASE = "757bf3d60f763706aae60b040d775e8563b9c577"
-# The pin's reachable history (upstream base + four controlled delta commits
+# The pin's reachable history (upstream base + five controlled delta commits
 # + their ancestry); a shallow/grafted history is rejected.
-MIN_COMMITS = 96
+MIN_COMMITS = 97
 
 _SHA256_IN_DOC = re.compile(r"bundle SHA-256\W+`([0-9a-f]{64})`")
 

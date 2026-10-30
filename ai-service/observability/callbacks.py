@@ -7,6 +7,7 @@ the old "trace everything through callbacks" design.
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any
 
@@ -14,6 +15,51 @@ from langchain_core.callbacks import BaseCallbackHandler
 
 from observability import llm_log, tracing
 from observability.redaction import scrub_text
+
+logger = logging.getLogger(__name__)
+
+
+class ToolActivityCallbackHandler(BaseCallbackHandler):
+    """Report each MAIN-graph tool start to the orchestrator's activity sink.
+
+    Agent process tracking ticket 02: the stream layer needs to know when a
+    tool actually begins so the user sees "正在检索…" instead of waiting for
+    the whole model turn. The sink is called synchronously from whichever
+    thread LangChain runs the callback on — the channel it feeds is
+    thread-safe and failures are swallowed so a reporting bug can never
+    break tool execution.
+    """
+
+    def __init__(self, sink: Any) -> None:
+        self._sink = sink
+
+    @staticmethod
+    def _tool_name(serialized: Any) -> str:
+        raw = ""
+        if isinstance(serialized, dict):
+            raw = str(serialized.get("name") or serialized.get("id") or "")
+        return raw.split(".")[-1] or "tool"
+
+    def on_tool_start(self, serialized, input_str=None, **kwargs) -> None:  # noqa: ANN001
+        try:
+            metadata = kwargs.get("metadata") or {}
+            namespace = str(metadata.get("langgraph_checkpoint_ns") or "")
+            if "|" in namespace:
+                # Subagent / nested graph: never part of the main timeline.
+                return
+            args = kwargs.get("inputs")
+            if args is None:
+                args = input_str
+            self._sink("tool_start", {
+                "tool": self._tool_name(serialized),
+                "args": args if isinstance(args, (dict, str)) else None,
+                "step": metadata.get("langgraph_step"),
+            })
+        except Exception:
+            logger.exception("tool activity sink failure (non-fatal)")
+
+    async def on_tool_start_async(self, serialized, input_str=None, **kwargs) -> None:  # noqa: ANN001
+        self.on_tool_start(serialized, input_str, **kwargs)
 
 
 class ToolSpanCallbackHandler(BaseCallbackHandler):

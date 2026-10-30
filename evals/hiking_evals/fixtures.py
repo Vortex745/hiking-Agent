@@ -32,11 +32,15 @@ if str(_AI_SERVICE) not in sys.path:
 
 
 def _load_env() -> None:
-    """加载 ai-service/.env（config.settings 导入时需要环境变量）。"""
+    """加载 ai-service/.env（config.settings 导入时需要环境变量）。
+
+    ``override=True``：从仓库根目录运行时，根 ``.env``（compose 用）可能已被
+    先加载；评测必须使用 ai-service 的模型配置，不能被根配置覆盖。
+    """
     try:
         from dotenv import load_dotenv
 
-        load_dotenv(_AI_SERVICE / ".env")
+        load_dotenv(_AI_SERVICE / ".env", override=True)
     except Exception:
         pass
 
@@ -303,6 +307,15 @@ class FixtureEnv:
         self.patch.set(settings, "agent_v2_enabled", True)
         self.patch.set(settings, "agent_v2_state_dir", str(self.env_dir))
         self.patch.set(settings, "agent_v2_sandbox_type", "local_native")
+        # 相对 RAG 路径按 ai-service 解析，避免从仓库根目录运行时指向
+        # 不存在的 ./data/rag.sqlite 而退化成"无证据"路径。
+        rag_path = Path(getattr(settings, "rag_sqlite_db_path", "") or "")
+        if rag_path and not rag_path.is_absolute():
+            self.patch.set(
+                settings,
+                "rag_sqlite_db_path",
+                str((_AI_SERVICE / rag_path).resolve()),
+            )
         # 编排层在内核回合前检查 API Key（run_orchestration 决策 #27）；
         # 评测用替身内核，这里放行该守卫。live 模式需要真实凭据，不放行。
         if not self.live and not getattr(settings, "openai_api_key", ""):

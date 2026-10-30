@@ -64,7 +64,7 @@ DATASET = EvaluationDataset()
 DATASET.add_goldens_from_json_file(file_path=str(Path(__file__).with_name(".dataset.json")))
 
 
-@observe(type="agent", metrics=TRACE_METRICS)
+@observe(type="agent")
 def run_traced_chat(prompt: str) -> str:
     """Execute one real Chat v2 request inside a DeepEval trace.
 

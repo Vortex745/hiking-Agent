@@ -159,6 +159,8 @@ try:
     app.include_router(approvals_v2_router, prefix="/api/v2")
     from api.memory_v2 import memory_v2_router
     app.include_router(memory_v2_router, prefix="/api/v2")
+    from api.mcp_router import mcp_router
+    app.include_router(mcp_router, prefix="/api/v2")
     logger.info("✓ Chat v2 router loaded")
 except ImportError as e:
     logger.warning(f"✗ Chat v2 router unavailable: {e}")

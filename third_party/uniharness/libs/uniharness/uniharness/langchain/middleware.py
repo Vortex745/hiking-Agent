@@ -11,6 +11,7 @@ pipeline runs: intercepts -> appenders -> image extraction -> annotators.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Literal, NotRequired
 
@@ -59,6 +60,48 @@ logger = logging.getLogger(__name__)
 # Minimum messages required before compaction can trigger.
 # A single summary message after compaction should not re-trigger.
 _MIN_MESSAGES_FOR_COMPACTION = 2
+
+# A run may ask the model to repair malformed tool arguments exactly once.
+# A second malformed reply is a stable failure, never another retry.
+_MAX_TOOL_ARGUMENT_REPAIRS = 1
+
+# Feedback is deliberately schema-shaped only: it never echoes the malformed
+# raw arguments, guessed values, or the model's prompt text.
+_TOOL_ARGUMENT_REPAIR_GUIDANCE = (
+    "Tool call {name} was rejected before execution because its arguments "
+    "are not valid JSON for the tool schema. Re-submit this tool call with "
+    "corrected arguments: every string value, including ratios and prompts, "
+    "must be quoted with valid JSON double quotes."
+)
+
+_SAFE_TOOL_NAME = re.compile(r"[^A-Za-z0-9_.:/-]")
+
+
+class InvalidToolArgumentsError(RuntimeError):
+    """The model's tool-call arguments cannot be executed as written.
+
+    Carries only the internal failure code, the number of invalid calls, and
+    their call ids — never raw arguments, prompts, or exception text. The
+    kernel maps this to the public ``invalid_tool_arguments`` failure.
+    """
+
+    def __init__(
+        self,
+        code: str,
+        *,
+        call_count: int,
+        call_ids: Sequence[str] = (),
+    ) -> None:
+        super().__init__(code)
+        self.code = code
+        self.call_count = call_count
+        self.call_ids = tuple(call_ids)
+
+
+def _safe_tool_name(value: Any) -> str:
+    """Redact a tool name for logs (length and charset bounded)."""
+    text = str(value) if value else "unknown"
+    return _SAFE_TOOL_NAME.sub("_", text)[:80]
 
 
 def _extract_text_content(content: str | list[Any]) -> str:
@@ -222,9 +265,16 @@ def _detect_skill_call(openai_msgs: Sequence[dict[str, Any]]) -> str | None:
 
 
 class UniHarnessState(AgentState):
-    """Extended agent state with compaction tracking."""
+    """Extended agent state with compaction and tool-argument repair tracking.
+
+    Both repair fields are optional so checkpoints written before this
+    contract remain readable: a missing count means "no repair used yet",
+    a missing flag means "not waiting for a repair".
+    """
 
     compaction_phase: NotRequired[CompactionPhase]
+    invalid_tool_call_repair_count: NotRequired[int]
+    awaiting_tool_call_repair: NotRequired[bool]
 
 
 class AgentMiddleware(LangChainAgentMiddleware):
@@ -461,15 +511,107 @@ class AgentMiddleware(LangChainAgentMiddleware):
 
         return None
 
+    def _check_invalid_tool_calls(self, state: AgentState) -> dict[str, Any] | None:
+        """Repair malformed tool arguments once, or fail before any execution.
+
+        LangChain's model-to-tools edge only counts valid ``tool_calls``; a
+        message whose arguments failed JSON parsing therefore ends the loop
+        unless middleware answers the invalid calls. This check runs before
+        compaction and before tools, so a mixed or unrepairable message can
+        never execute any call from that message.
+        """
+        messages = state.get("messages") or []
+        if not messages:
+            return None
+        last = messages[-1]
+        if not isinstance(last, AIMessage):
+            return None
+
+        invalid = list(last.invalid_tool_calls or ())
+        valid = list(last.tool_calls or ())
+        awaiting = bool(state.get("awaiting_tool_call_repair", False))
+        repaired = int(state.get("invalid_tool_call_repair_count", 0) or 0)
+
+        if not invalid:
+            if not awaiting:
+                return None
+            if valid:
+                # The repair produced executable calls: resume the normal
+                # schema / approval / effect path with the budget consumed.
+                return {"awaiting_tool_call_repair": False}
+            # The repair reply contains neither a tool call nor a replacement
+            # call: it is preamble-only, not a successful completion.
+            logger.warning("tool-argument repair reply had no tool call")
+            raise InvalidToolArgumentsError(
+                "tool_call_arguments_repair_failed",
+                call_count=0,
+            )
+
+        call_ids = tuple(str(call["id"]) for call in invalid if call.get("id"))
+        tool_names = ",".join(_safe_tool_name(call.get("name")) for call in invalid)
+        logger.warning(
+            "invalid tool arguments: calls=%d tools=%s ids=%s repaired=%d awaiting=%s",
+            len(invalid),
+            tool_names,
+            ",".join(call_ids) or "-",
+            repaired,
+            awaiting,
+        )
+
+        if valid:
+            raise InvalidToolArgumentsError(
+                "mixed_tool_call_arguments",
+                call_count=len(invalid),
+                call_ids=call_ids,
+            )
+        if awaiting or repaired >= _MAX_TOOL_ARGUMENT_REPAIRS:
+            raise InvalidToolArgumentsError(
+                "tool_call_arguments_repair_exhausted",
+                call_count=len(invalid),
+                call_ids=call_ids,
+            )
+        if len(call_ids) != len(invalid):
+            # Without an id there is no way to answer the call; the model
+            # cannot be asked to repair it safely.
+            raise InvalidToolArgumentsError(
+                "tool_call_arguments_missing_id",
+                call_count=len(invalid),
+                call_ids=call_ids,
+            )
+
+        feedback = [
+            ToolMessage(
+                content=_TOOL_ARGUMENT_REPAIR_GUIDANCE.format(
+                    name=_safe_tool_name(call.get("name")),
+                ),
+                tool_call_id=call_id,
+                status="error",
+            )
+            for call, call_id in zip(invalid, call_ids, strict=True)
+        ]
+        return {
+            "messages": feedback,
+            "invalid_tool_call_repair_count": repaired + 1,
+            "awaiting_tool_call_repair": True,
+            "jump_to": "model",
+        }
+
     @hook_config(can_jump_to=["model"])
     async def aafter_model(
         self,
         state: AgentState,
         _runtime: Runtime[Any] | None = None,
     ) -> dict[str, Any] | None:
-        """Compaction trigger — check token count after model response."""
+        """Repair invalid tool arguments, then check the compaction trigger."""
         messages = state["messages"]
         phase = CompactionPhase(state.get("compaction_phase", CompactionPhase.NONE))
+
+        # Compaction turns are summaries, not tool decisions; their repair
+        # state is left untouched and the state machine below owns them.
+        if phase == CompactionPhase.NONE:
+            repair = self._check_invalid_tool_calls(state)
+            if repair is not None:
+                return repair
 
         # Trigger compaction if threshold exceeded
         if phase == CompactionPhase.NONE and len(messages) >= _MIN_MESSAGES_FOR_COMPACTION:

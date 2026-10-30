@@ -754,6 +754,10 @@ class _RouteResearchParams(BaseModel):
     focus: str | None = None
 
 
+class _FocusMapParams(BaseModel):
+    name: str = Field(..., min_length=1, max_length=80)
+
+
 class _WebSearchParams(BaseModel):
     query: str = Field(..., min_length=1, max_length=200)
 
@@ -778,6 +782,24 @@ RouteResearchTool = _make_simple_adapter(
     _RouteResearchParams,
     "route_research",
 )
+class FocusMapTool(BoundedDomainTool):
+    """只记录景点名，不做外部调用；审计消息带出名称供前端定位。"""
+
+    name = "focus_map"
+    description = (
+        "当本轮对话明确锁定唯一景点且用户表达要去时，记录该景点全名；"
+        "列举、比较、假设或不确定时不要调用。"
+    )
+    args_schema = _FocusMapParams
+    delegate_name = "focus_map"
+
+    def _success_audit_fields(self, raw: Any) -> dict[str, Any]:
+        name = raw.get("name") if isinstance(raw, dict) else None
+        if isinstance(name, str) and name.strip():
+            return {"message": f"地图定位：{name.strip()[:80]}"}
+        return {}
+
+
 WebSearchTool = _make_simple_adapter("web_search", "通过产品 Tavily 通道执行网络搜索。", _WebSearchParams, "web_search")
 WebScrapingTool = _make_simple_adapter("web_scraping", "抓取指定网页正文（经产品通道清洗为文本）。", _WebScrapingParams, "web_scraping")
 
@@ -786,6 +808,7 @@ PROFILE_TOOL_ADAPTERS: dict[str, dict[str, type[BoundedDomainTool]]] = {
         GearChecklistTool.delegate_name: GearChecklistTool,
         RiskAssessmentTool.delegate_name: RiskAssessmentTool,
         HikingKnowledgeSearchTool.delegate_name: HikingKnowledgeSearchTool,
+        FocusMapTool.delegate_name: FocusMapTool,
     },
     "route_plan": {
         GearChecklistTool.delegate_name: GearChecklistTool,
@@ -794,6 +817,7 @@ PROFILE_TOOL_ADAPTERS: dict[str, dict[str, type[BoundedDomainTool]]] = {
         RouteResearchTool.delegate_name: RouteResearchTool,
         WebSearchTool.delegate_name: WebSearchTool,
         WebScrapingTool.delegate_name: WebScrapingTool,
+        FocusMapTool.delegate_name: FocusMapTool,
     },
     # Spec #13 phase 2: rag profile — knowledge search is the only tool;
     # retrieval planning lives inside the delegate, not in the tool surface.
@@ -877,6 +901,10 @@ def _unwrapped_delegate(tool_name: str) -> Callable[..., Any]:
         from tools.hiking_domain import route_research
 
         return _unwrap_langchain_tool(route_research)
+    if tool_name == "focus_map":
+        from tools.hiking_domain import focus_map
+
+        return _unwrap_langchain_tool(focus_map)
     if tool_name == "web_search":
         from tools.web_search import web_search
 
@@ -917,7 +945,7 @@ def build_profile_mcp_servers(
 
     if projection is not None:
         allowed = tuple(
-            service.server_id for service in projection.mcp_services
+            service.server_id for service in projection.mcp_services if not service.revision
         )
     else:
         allowed = getattr(profile, "allowed_mcp_servers", None)
@@ -1152,6 +1180,14 @@ class ProductGateRule(KernelSafetyRule):
             )
             return PermissionDecision(
                 result=PermissionResult.DENIED, reason=authorization.reason
+            )
+        parsed = _split_mcp_tool_name(tool_name)
+        service = self._projection.mcp_service(parsed[0]) if parsed else None
+        if service is not None and service.revision:
+            return PermissionDecision(
+                result=PermissionResult.NEEDS_APPROVAL,
+                reason=authorization.reason,
+                approval_prompt=f"调用 MCP 工具 {tool_name}",
             )
         # needs_approval: the product flow owns the durable approval; the
         # kernel turn itself never executes an unapproved high-risk tool.

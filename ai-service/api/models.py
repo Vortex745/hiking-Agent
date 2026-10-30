@@ -5,7 +5,8 @@ from pydantic import BaseModel, ConfigDict
 
 class ModelsFetchRequest(BaseModel):
     base_url: str
-    api_key: str
+    api_key: str = ""
+    section: Literal["llm", "embedding", "rerank", "decision"] | None = None
 
 
 class ModelsFetchResponse(BaseModel):
@@ -23,10 +24,15 @@ class LlmConfigEmbeddingSectionResponse(LlmConfigSectionResponse):
     dimensions: int
 
 
+class LlmConfigDecisionSectionResponse(LlmConfigSectionResponse):
+    mode: str
+
+
 class LlmConfigResponse(BaseModel):
     llm: LlmConfigSectionResponse
     embedding: LlmConfigEmbeddingSectionResponse
     rerank: LlmConfigSectionResponse
+    decision: LlmConfigDecisionSectionResponse
     updated_at: str | None
     index_dimensions: int | None
 
@@ -45,12 +51,17 @@ class LlmConfigEmbeddingSectionUpdate(LlmConfigSectionUpdate):
     dimensions: int | None = None
 
 
+class LlmConfigDecisionSectionUpdate(LlmConfigSectionUpdate):
+    mode: str | None = None
+
+
 class LlmConfigUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     llm: LlmConfigSectionUpdate | None = None
     embedding: LlmConfigEmbeddingSectionUpdate | None = None
     rerank: LlmConfigSectionUpdate | None = None
+    decision: LlmConfigDecisionSectionUpdate | None = None
 
 
 class LlmConfigUpdateResponse(LlmConfigResponse):
@@ -60,9 +71,10 @@ class LlmConfigUpdateResponse(LlmConfigResponse):
 class LlmConfigTestRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    section: Literal["llm", "embedding", "rerank"]
+    section: Literal["llm", "embedding", "rerank", "decision"]
     base_url: str | None = None
     api_key: str | None = None
+    model: str | None = None
 
 
 class LlmConfigTestResponse(BaseModel):

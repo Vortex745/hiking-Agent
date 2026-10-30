@@ -201,6 +201,7 @@ _STREAM_ERROR_CODES = frozenset({
     "empty_model_output",
     "evidence_unavailable",
     "internal_error",
+    "invalid_tool_arguments",
     "kernel_model_build_failed",
     "kernel_run_failed",
     "kernel_unavailable",
@@ -1223,7 +1224,10 @@ async def chat_v2_resume(
         # agent-lifecycle-repair ticket 02: the connection owns the resume
         # generator; close it deterministically on every exit so the
         # execution token is released and cleanup finallys run.
-        stream = orchestrator.stream_resume(run_id=run_id, from_seq=from_seq)
+        stream = orchestrator.stream_resume(
+            run_id=run_id, from_seq=from_seq,
+            subject_id=getattr(request.state, "subject_id", None),
+        )
         try:
             with tracing.start_span(
                 "chat.resume",

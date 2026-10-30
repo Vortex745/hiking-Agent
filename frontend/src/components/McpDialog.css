@@ -1,0 +1,24 @@
+.mcp-panel { display: flex; flex-direction: column; gap: 1.25rem; }
+.mcp-toolbar, .mcp-form-toolbar, .mcp-row, .mcp-actions, .mcp-form-actions { display: flex; align-items: center; }
+.mcp-toolbar { justify-content: space-between; color: var(--text-secondary); font-size: var(--text-sm); }
+.mcp-form-toolbar { justify-content: space-between; gap: var(--space-2); flex-wrap: wrap; }
+.mcp-json { font-family: var(--font-mono, monospace); }
+.mcp-import-options { min-width: 0; overflow-wrap: anywhere; }
+.mcp-list { border-top: 1px solid var(--border); }
+.mcp-row { gap: .75rem; min-height: 4.25rem; padding: .75rem 0; border-bottom: 1px solid var(--border); color: var(--foreground); }
+.mcp-row-main { flex: 1; min-width: 0; }
+.mcp-row-name { font-size: var(--text-sm); font-weight: 500; overflow-wrap: anywhere; }
+.mcp-row-meta, .mcp-builtin, .mcp-note { color: var(--text-secondary); font-size: var(--text-xs); }
+.mcp-row-meta { margin-top: .25rem; }
+.mcp-actions { gap: .35rem; flex-shrink: 0; }
+.mcp-icon { display: grid; place-items: center; width: var(--control-height-md); height: var(--control-height-md); border: 0; border-radius: .25rem; color: var(--text-secondary); background: transparent; cursor: pointer; }
+.mcp-icon:hover { background: var(--surface-muted); color: var(--foreground); }
+.mcp-back { display: flex; align-items: center; gap: .35rem; align-self: flex-start; min-height: var(--control-height-md); color: var(--text-secondary); font-size: var(--text-sm); background: transparent; border: 0; cursor: pointer; }
+.mcp-confirm { display: flex; align-items: center; gap: .5rem; color: var(--foreground); font-size: var(--text-sm); }
+.mcp-note { margin: 0; }
+.mcp-error { margin: 0; color: var(--danger); font-size: var(--text-sm); overflow-wrap: anywhere; }
+.mcp-success { margin: 0; color: var(--success); font-size: var(--text-sm); }
+.mcp-form-actions { justify-content: flex-end; gap: .5rem; }
+.mcp-auth { display: flex; flex-direction: column; align-items: flex-start; gap: .6rem; padding: .75rem; border: 1px solid var(--border); border-radius: .5rem; background: var(--surface-muted); }
+.mcp-loading { display: flex; justify-content: center; align-items: center; gap: .5rem; padding: 2rem; color: var(--text-secondary); }
+@media (max-width: 400px) { .mcp-row { flex-wrap: wrap; } .mcp-actions { margin-left: auto; } }

@@ -779,7 +779,12 @@ def test_health_distinguishes_chat_remote_unavailable_and_trusted_local(tmp_path
 # ---- AC7: trusted local + chat unaffected -------------------------------------
 
 
-def test_local_native_and_chat_contracts_unaffected(tmp_path: Path):
+def test_local_native_and_chat_contracts_unaffected(tmp_path: Path, monkeypatch):
+    # load_servers() reads the global config settings, not the runtime
+    # SimpleNamespace passed to the orchestrator — isolate live MCP state.
+    from config import settings as app_settings
+
+    monkeypatch.setattr(app_settings, "agent_v2_state_dir", str(tmp_path))
     # Explicitly configured local_native keeps working (development only).
     computer = create_computer("local_native")
     assert isinstance(computer, LocalNativeComputer)

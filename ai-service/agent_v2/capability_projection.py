@@ -236,6 +236,7 @@ class ProjectedMcpService:
     timeout_seconds: float = 0.0
     max_output_bytes: int = 0
     description: str = ""
+    revision: str = ""
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -251,6 +252,8 @@ class ProjectedMcpService:
             payload["max_output_bytes"] = self.max_output_bytes
         if self.description:
             payload["description"] = self.description
+        if self.revision:
+            payload["revision"] = self.revision
         return payload
 
 
@@ -818,6 +821,7 @@ def _normalize_mcp_service(
         timeout_seconds=float(raw.get("timeout_seconds") or 0.0),
         max_output_bytes=int(raw.get("max_output_bytes") or 0),
         description=str(raw.get("description") or ""),
+        revision=str(raw.get("revision") or ""),
     )
 
 
@@ -961,7 +965,12 @@ def build_capability_projection(
             tool_name=tool_name,
             source=source,
             risk=risk,
-            requires_approval=_RISK_ORDER[risk] >= _RISK_ORDER[threshold],
+            # MCP calls execute directly: the product no longer pauses the
+            # run for approval, regardless of the frozen risk level.
+            requires_approval=(
+                source != SOURCE_MCP
+                and _RISK_ORDER[risk] >= _RISK_ORDER[threshold]
+            ),
             description=description,
             server_id=server_id,
             mcp_tool=mcp_tool,

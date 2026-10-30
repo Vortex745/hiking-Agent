@@ -37,14 +37,25 @@ import type {
 } from './chatV2'
 import { TERMINAL_V2_EVENT_TYPES, STREAM_TERMINAL_V2_EVENT_TYPES, V2_TERMINAL_RUN_STATUSES } from './chatV2'
 
-export interface V2ToolTrace {
-  type: 'tool_call' | 'tool_result' | 'artifact_progress'
-  tool: string
-  server_id?: string
-  status?: string
-  content?: string
-  args?: Record<string, unknown>
+export interface V2TraceEntry {
+  /**
+   * The timeline event type the activity view model understands. Live
+   * events and recovery both speak this one vocabulary.
+   */
+  type:
+    | 'tool_call'
+    | 'tool_result'
+    | 'artifact_progress'
+    | 'model_round'
+    | 'thought'
+    | 'approval_required'
+    | 'approval_resolved'
+  /** Wire sequence of the source event; recovery replays in this order. */
   sequence: number
+  /** The original wire payload, so recovery renders the same metadata. */
+  payload: Record<string, unknown>
+  /** Text that is not carried by the payload (thought text, labels). */
+  content?: string
 }
 
 export type V2RunStatus =
@@ -83,8 +94,8 @@ export interface V2ConversationState {
   assistantText: string
   /** Human-readable progress message from the latest `progress` event. */
   progressMessage: string
-  /** Tool trace events for the lifecycle panel. */
-  toolTrace: V2ToolTrace[]
+  /** Timeline entries for the inline activity trace, in arrival order. */
+  traceEntries: V2TraceEntry[]
   /** Highest sequence number observed. Used as the reconnect cursor. */
   sequenceCursor: number
   /** Current run status. Terminal states are sticky. */
@@ -151,7 +162,7 @@ export interface V2ConversationState {
 export const initialV2State: V2ConversationState = {
   assistantText: '',
   progressMessage: '',
-  toolTrace: [],
+  traceEntries: [],
   sequenceCursor: 0,
   status: 'idle',
   errorMessage: '',
@@ -222,12 +233,29 @@ export function reduceV2Event(
         status: 'running',
       }
 
-    case 'progress':
+    case 'progress': {
+      // A model round boundary (agent process tracking ticket 03) is also a
+      // timeline entry; every other progress event only updates the label.
+      const isModelRound =
+        readString(event.payload, 'stage') === 'model' &&
+        readString(event.payload, 'state') !== ''
       return {
         ...base,
         status: 'running',
         progressMessage: readString(event.payload, 'message') || base.progressMessage,
+        traceEntries: isModelRound
+          ? [
+              ...base.traceEntries,
+              {
+                type: 'model_round' as const,
+                sequence: event.sequence,
+                payload: event.payload,
+                content: readString(event.payload, 'message'),
+              },
+            ]
+          : base.traceEntries,
       }
+    }
 
     case 'progress.gap': {
       // BCDEF ticket 11: droppable progress left a hole in the durable
@@ -261,10 +289,22 @@ export function reduceV2Event(
 
     case 'thought':
       // Reasoning side channel: it never touches the public answer text, but
-      // it does prove the run is still active.
+      // it does prove the run is still active. The text is kept so a refresh
+      // can rebuild the reasoning line (ticket 06).
       return {
         ...base,
         status: 'running',
+        traceEntries: readString(event.payload, 'content')
+          ? [
+              ...base.traceEntries,
+              {
+                type: 'thought' as const,
+                sequence: event.sequence,
+                payload: event.payload,
+                content: readString(event.payload, 'content'),
+              },
+            ]
+          : base.traceEntries,
       }
 
     case 'heartbeat':
@@ -278,14 +318,12 @@ export function reduceV2Event(
       return {
         ...base,
         status: 'running',
-        toolTrace: [
-          ...base.toolTrace,
+        traceEntries: [
+          ...base.traceEntries,
           {
-            type: 'tool_call',
-            tool: readString(event.payload, 'tool'),
-            server_id: readString(event.payload, 'server_id'),
-            args: readObject(event.payload, 'args'),
+            type: 'tool_call' as const,
             sequence: event.sequence,
+            payload: event.payload,
           },
         ],
       }
@@ -294,15 +332,12 @@ export function reduceV2Event(
       return {
         ...base,
         status: 'running',
-        toolTrace: [
-          ...base.toolTrace,
+        traceEntries: [
+          ...base.traceEntries,
           {
-            type: 'tool_result',
-            tool: readString(event.payload, 'tool'),
-            server_id: readString(event.payload, 'server_id'),
-            status: readString(event.payload, 'status'),
-            content: readString(event.payload, 'content'),
+            type: 'tool_result' as const,
             sequence: event.sequence,
+            payload: event.payload,
           },
         ],
       }
@@ -314,14 +349,13 @@ export function reduceV2Event(
       return {
         ...base,
         status: 'running',
-        toolTrace: [
-          ...base.toolTrace,
+        traceEntries: [
+          ...base.traceEntries,
           {
-            type: 'artifact_progress',
-            tool: readString(event.payload, 'tool') || 'artifact',
-            content:
-              readString(event.payload, 'message') || '正在生成产物…',
+            type: 'artifact_progress' as const,
             sequence: event.sequence,
+            payload: event.payload,
+            content: readString(event.payload, 'message') || '正在生成产物…',
           },
         ],
       }
@@ -362,6 +396,14 @@ export function reduceV2Event(
         pendingApproval: readApprovalRequest(event.payload),
         lastApprovalDecision: null,
         resumeErrorMessage: '',
+        traceEntries: [
+          ...base.traceEntries,
+          {
+            type: 'approval_required' as const,
+            sequence: event.sequence,
+            payload: event.payload,
+          },
+        ],
       }
 
     case 'approval.resolved':
@@ -376,6 +418,14 @@ export function reduceV2Event(
         pendingApproval: null,
         lastApprovalDecision: readApprovalDecision(event.payload),
         resumeErrorMessage: '',
+        traceEntries: [
+          ...base.traceEntries,
+          {
+            type: 'approval_resolved' as const,
+            sequence: event.sequence,
+            payload: event.payload,
+          },
+        ],
       }
 
     case 'memory.consent_required':
@@ -466,6 +516,34 @@ export function reduceV2Events(
 ): V2ConversationState {
   const sorted = [...events].sort((a, b) => a.sequence - b.sequence)
   return sorted.reduce(reduceV2Event, state)
+}
+
+/**
+ * One rebuilt timeline event, in the shape the activity view model reads.
+ * The page attaches these to the recovered assistant message.
+ */
+export interface V2TraceViewEvent {
+  type: string
+  content: string
+  metadata?: Record<string, unknown>
+}
+
+/**
+ * Rebuild the inline activity trace from reducer state (tickets 05/06).
+ *
+ * The reducer accumulates every trace-worthy event in wire order, so a
+ * refresh replays the SAME lines instead of an empty or duplicated trace.
+ * A legacy run whose replay only holds results degrades to that subset —
+ * no call or round line is invented.
+ */
+export function buildRecoveredTrace(state: V2ConversationState): V2TraceViewEvent[] {
+  return [...state.traceEntries]
+    .sort((left, right) => left.sequence - right.sequence)
+    .map(entry => ({
+      type: entry.type,
+      content: entry.content ?? '',
+      metadata: entry.payload,
+    }))
 }
 
 /** True when the run has reached a terminal state. */
@@ -679,18 +757,6 @@ function readString(payload: Record<string, unknown>, key: string): string {
 function readNumber(payload: Record<string, unknown>, key: string): number {
   const value = payload[key]
   return typeof value === 'number' && Number.isFinite(value) ? value : 0
-}
-
-/** Helper: read an object field, undefined → undefined. */
-function readObject(
-  payload: Record<string, unknown>,
-  key: string,
-): Record<string, unknown> | undefined {
-  const value = payload[key]
-  if (value && typeof value === 'object' && !Array.isArray(value)) {
-    return value as Record<string, unknown>
-  }
-  return undefined
 }
 
 /**

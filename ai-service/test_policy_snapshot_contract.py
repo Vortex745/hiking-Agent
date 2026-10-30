@@ -131,6 +131,7 @@ def test_admission_freezes_complete_policy_with_stable_hash(tmp_path: Path):
         "risk_assessment",
         "memory_save",
         "memory_search",
+        "focus_map",
     }
     assert policy["capability"]["allowed_mcp_servers"] is None
     assert isinstance(policy["capability"]["skills"], list)

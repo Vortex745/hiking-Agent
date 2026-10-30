@@ -9,7 +9,7 @@ restores the same controlled history without network access.
 
 This contract pins the restore path:
 
-* the bundle records exactly the fixed pin ``b026a2625…`` and its SHA-256
+* the bundle records exactly the fixed pin ``aeceee7ea…`` and its SHA-256
   matches the value recorded in ``third_party/uniharness-provenance.md``;
 * restoring (``git clone`` from the bundle) into a temp dir yields HEAD ==
   pin, with the vendored upstream base as a real ancestor;
@@ -39,7 +39,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 BUNDLE_PATH = REPO_ROOT / "third_party" / "uniharness-fork.bundle"
 PROVENANCE_PATH = REPO_ROOT / "third_party" / "uniharness-provenance.md"
 
-PIN = "b026a26250487678aedc2beef0d0b6ae802de5c4"
+PIN = "aeceee7ea5bdb8c4dcaa7d1c54400afacabe5556"
 UPSTREAM_BASE = "757bf3d60f763706aae60b040d775e8563b9c577"
 
 

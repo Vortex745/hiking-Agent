@@ -160,7 +160,7 @@ def test_kernel_assembly_forwards_approval_callback(tmp_path: Path, monkeypatch)
         openai_model = "fake"
         agent_v2_uniharness_pin = os.getenv(
             "AGENT_V2_UNIHARNESS_PIN",
-            "b026a26250487678aedc2beef0d0b6ae802de5c4",
+            "aeceee7ea5bdb8c4dcaa7d1c54400afacabe5556",
         )
 
     async def scenario():

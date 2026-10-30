@@ -57,6 +57,20 @@ def build_execution_policy(
     from agent_v2.capability_projection import frozen_mcp_server_summary
 
     mcp_summary = frozen_mcp_server_summary(profile.allowed_mcp_servers)
+    allowed_mcp_servers = list(profile.allowed_mcp_servers or ())
+    if profile.profile_id in (ProfileId.CHAT, ProfileId.ROUTE_PLAN):
+        from agent_v2.mcp_config_store import enabled_servers
+
+        for server in enabled_servers(settings):
+            allowed_mcp_servers.append(server["id"])
+            mcp_summary[server["id"]] = {
+                "transport": server["transport"],
+                "description": server["name"],
+                "revision": server["revision"],
+                "timeout_seconds": 15,
+                "max_output_bytes": 65536,
+                "tools": [{"name": name, "risk": "high"} for name in server["tools"]],
+            }
     policy: dict[str, Any] = {
         "schema_version": EXECUTION_SCHEMA_VERSION,
         "source_version": POLICY_SOURCE_VERSION,
@@ -77,9 +91,9 @@ def build_execution_policy(
         "capability": {
             "allowed_tools": list(profile.allowed_tools),
             "allowed_mcp_servers": (
-                None
-                if profile.allowed_mcp_servers is None
-                else list(profile.allowed_mcp_servers)
+                allowed_mcp_servers
+                if allowed_mcp_servers or profile.allowed_mcp_servers is not None
+                else None
             ),
             "tool_groups": ["task"] if getattr(
                 settings, "agent_v2_subagent_enabled", False

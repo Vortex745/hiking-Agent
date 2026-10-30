@@ -1,45 +1,9 @@
-import { Routes, Route, NavLink } from 'react-router-dom'
-import Hiking from 'reicon-react/icons/Hiking'
-import Sparkles from 'reicon-react/icons/Sparkles'
-import Settings2 from 'reicon-react/icons/Settings2'
+import { Routes, Route } from 'react-router-dom'
 import SuperAgent from './pages/SuperAgent'
-import LlmConfig from './pages/LlmConfig'
 
 function App() {
   return (
     <div className="relative flex h-[100dvh] w-full bg-bg-body overflow-hidden">
-      {/* Top Dock */}
-      <nav className="fixed top-6 left-1/2 -translate-x-1/2 z-[100] flex items-center gap-2 p-2 rounded-full bg-black/40 backdrop-blur-md border border-white/10 shadow-2xl transition-colors duration-150 ease-[var(--ease-out)] hover:bg-black/50">
-        <div className="flex items-center justify-center w-10 h-10 shrink-0 ml-2 mr-4">
-          <Hiking className="w-6 h-6 text-white" />
-        </div>
-        <div className="flex items-center gap-1 pr-2">
-          <NavLink
-            to="/"
-            className={({ isActive }) =>
-              `flex items-center justify-center w-10 h-10 rounded-full transition-[background-color,color,box-shadow] duration-150 ease-[var(--ease-out)] ${
-                isActive ? 'bg-white/20 text-white shadow-sm' : 'text-white/70 hover:bg-white/10 hover:text-white'
-              }`
-            }
-            title="Agent 模块"
-            end
-          >
-            <Sparkles className="w-5 h-5" />
-          </NavLink>
-          <NavLink
-            to="/llm-config"
-            className={({ isActive }) =>
-              `flex items-center justify-center w-10 h-10 rounded-full transition-[background-color,color,box-shadow] duration-150 ease-[var(--ease-out)] ${
-                isActive ? 'bg-white/20 text-white shadow-sm' : 'text-white/70 hover:bg-white/10 hover:text-white'
-              }`
-            }
-            title="模型配置"
-          >
-            <Settings2 className="w-5 h-5" />
-          </NavLink>
-        </div>
-      </nav>
-
       {/* Main Content */}
       <div className="flex-1 flex flex-col w-full h-full relative overflow-hidden">
 
@@ -47,7 +11,6 @@ function App() {
         <main className="flex-1 overflow-y-auto flex flex-col relative w-full h-full">
           <Routes>
             <Route path="/" element={<SuperAgent />} />
-            <Route path="/llm-config" element={<LlmConfig />} />
           </Routes>
         </main>
       </div>
