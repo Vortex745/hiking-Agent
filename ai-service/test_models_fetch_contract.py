@@ -70,6 +70,7 @@ def _restore_process_state(monkeypatch):
 
 @pytest.fixture()
 def fake_upstream(monkeypatch):
+    monkeypatch.setattr(models_router.socket, "getaddrinfo", lambda *a, **kw: [(2, 1, 6, "", ("8.8.8.8", 443))])
     _FakeAsyncClient.response = _FakeResponse()
     _FakeAsyncClient.last_request = {}
     monkeypatch.setattr(models_router.httpx, "AsyncClient", _FakeAsyncClient)

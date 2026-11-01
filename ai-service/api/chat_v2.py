@@ -85,12 +85,20 @@ from agent_v2.permissions import (
 from agent_v2.sandbox_lifecycle import (
     SandboxCleanupResult,
     run_sandbox_cleanup,
+    settle_terminal_cleanup,
 )
 from agent_v2.user_scope import current_owner_id, current_user_settings
 from auth.user_config import effective_settings as load_user_settings
+from agent_v2.plan_workflow import (
+    PlanDraftInput,
+    PlanIntent,
+    PlanType,
+    RouteSelectionInput,
+)
 from agent_v2.run_orchestration import (
     ChatFlowRequest,
     RunOrchestrator,
+    append_reconciled_terminal,
 )
 from agent_v2.runs import (
     RunRepository,
@@ -163,6 +171,22 @@ class ChatV2Request(BaseModel):
     rejected with HTTP 400. This is what prevents clients from injecting
     ``model``, ``api_key``, ``tools``, ``mcp_servers``, or any other
     configuration that the server owns.
+
+    Ticket 01 adds the plan-book entry contract — still a whitelist, not
+    an open bag: ``intent`` is annotated with
+    :data:`agent_v2.plan_workflow.PlanIntent`, so an intent outside
+    ``plan_create`` / ``plan_confirm`` / ``plan_cancel`` /
+    ``plan_regenerate`` fails validation with 422 **before** the stream
+    starts (spec AC5: 服务端拒绝未知 intent). Routing on it is
+    deterministic — the LLM never decides whether a plan book is created.
+
+    ``plan_input`` is the dialog's three collected fields, annotated with
+    :class:`agent_v2.plan_workflow.PlanDraftInput` (also ``extra="forbid"``
+    with strict bounds), so a malformed date, a non-integer headcount or a
+    smuggled fourth field is a 422 at the boundary rather than a draft row
+    (spec AC6). It is only meaningful with a field-collecting intent;
+    :func:`agent_v2.plan_workflow.evaluate_plan_intent` still rejects it on
+    any other intent, in depth.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -178,6 +202,31 @@ class ChatV2Request(BaseModel):
         description="Capability profile id. Server-defined; clients cannot add profiles.",
     )
     current_location: Optional[CurrentLocationV2] = None
+    intent: Optional[PlanIntent] = Field(
+        default=None,
+        description="Whitelisted structured intent. Unknown values are rejected.",
+    )
+    plan_input: Optional[PlanDraftInput] = Field(
+        default=None,
+        description="Minimal plan draft fields collected by the entry dialog.",
+    )
+    route_selection: Optional[RouteSelectionInput] = Field(
+        default=None,
+        description=(
+            "Ticket 03: a reference (comparison_id + candidate_id) into an existing "
+            "route-comparison result. Verified facts are re-read server-side from it; "
+            "nothing else about a route can be sent."
+        ),
+    )
+    plan_type: Optional[PlanType] = Field(
+        default=None,
+        description=(
+            "Ticket 04: the draft type a user chooses when route research found nothing "
+            "verifiable. Only 'generic_draft' is ever accepted, and only on "
+            "plan_generic_draft — 'route_plan' is a claim about server-held evidence and "
+            "is rejected by the state machine, never by name lookup."
+        ),
+    )
 
 
 # ---- Response helpers -----------------------------------------------------
@@ -426,6 +475,10 @@ async def chat_v2_sse(req: ChatV2Request, request: Request):
         profile_id=req.profile_id,
         conversation_id=req.conversation_id,
         current_location=req.current_location,
+        intent=req.intent,
+        plan_input=req.plan_input,
+        route_selection=req.route_selection,
+        plan_type=req.plan_type,
     )
 
     async def guarded_stream() -> AsyncGenerator[str, None]:
@@ -766,21 +819,55 @@ async def chat_v2_cancel(run_id: str, body: CancelRequest, request: Request):
     if outcome.accepted:
         sandbox = runs_repo.get_sandbox_lease(resolved_run_id)
         if sandbox is not None and sandbox.status == "active":
+            # Ticket 10 AC4: a run that PRESERVED its sandbox (the deliberate
+            # ``preserve_sandbox`` leak on pause / evidence-persistence failure)
+            # must have the sandbox actually destroyed on cancel, not only have
+            # its lease row flipped — otherwise the workspace bytes outlive the
+            # run nobody will ever resume. ``_cleanup_sandbox`` is this module's
+            # single cleanup implementation (same Computer + same lease
+            # recording as the flow's ``finally``), so a removal that raises is
+            # still recorded as ``failed`` for operators instead of being
+            # reported as clean.
+            computer = None
             try:
-                runs_repo.destroy_sandbox_lease(
-                    run_id=resolved_run_id,
-                    failure_reason="run cancelled",
-                )
+                computer = _build_artifact_computer(sandbox.sandbox_type)
             except Exception:
                 logger.exception(
-                    "chat_v2: sandbox cleanup failed for cancelled run_id=%s",
+                    "chat_v2: no computer available to clean the cancelled run's "
+                    "sandbox run_id=%s; lease marked failed instead",
                     resolved_run_id,
                 )
+            if computer is not None:
+                cleanup_outcome = _cleanup_sandbox(
+                    computer, sandbox.workspace_path, runs_repo, resolved_run_id,
+                )
+                settle_terminal_cleanup(
+                    runs_repo, computer=computer,
+                    workspace_path=sandbox.workspace_path,
+                    run_id=resolved_run_id, outcome=cleanup_outcome,
+                )
             else:
-                runtime = getattr(request.app.state, "agent_v2_runtime", None)
-                capacity = getattr(runtime, "capacity", None)
-                if capacity is not None:
-                    capacity.release_sandbox(run.request_id)
+                try:
+                    runs_repo.destroy_sandbox_lease(
+                        run_id=resolved_run_id,
+                        failure_reason="run cancelled",
+                    )
+                except Exception:
+                    logger.exception(
+                        "chat_v2: sandbox cleanup failed for cancelled run_id=%s",
+                        resolved_run_id,
+                    )
+            # The capacity slot is released whatever the removal did: the run is
+            # terminal, so nothing will ever reuse the sandbox again.
+            runtime = getattr(request.app.state, "agent_v2_runtime", None)
+            capacity = getattr(runtime, "capacity", None)
+            if capacity is not None:
+                capacity.release_sandbox(run.request_id)
+            # Ticket 10 AC5: a run that paused closed its stream on ``run.paused``
+            # long before this cancel, so no flow is left to emit the matching
+            # terminal. Reconcile the log with the run row — a replay must not
+            # answer ``run.paused`` for a run the client just cancelled.
+            append_reconciled_terminal(runs_repo, resolved_run_id)
     status_code = 200 if outcome.accepted else 409
     return JSONResponse(
         status_code=status_code,

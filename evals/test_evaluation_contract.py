@@ -519,7 +519,7 @@ def test_scenario_controlled_tool_reply_renders_controlled_fields(tmp_path: Path
 
 def test_scenario_multi_turn_replay_consistency(tmp_path: Path) -> None:
     messages = [
-        "帮我规划周末两天的武功山行程。",
+        "武功山徒步有哪些注意事项？",
         "那装备需要注意什么？",
     ]
     records, env = _run_chat_turns(

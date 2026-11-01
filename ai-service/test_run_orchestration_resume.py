@@ -115,6 +115,7 @@ def _resume_orchestrator(
     computer: _FakeComputer,
     cleanups: list[Any],
     export_calls: list[dict[str, Any]] | None = None,
+    kernel_turn=None,
 ):
     async def fake_kernel(**kwargs: Any) -> tuple[str, list[dict[str, Any]]]:
         return ("# 计划", [])
@@ -140,7 +141,7 @@ def _resume_orchestrator(
     return RunOrchestrator(
         settings=_settings(),
         runs_repo=repo,
-        kernel_turn=fake_kernel,
+        kernel_turn=kernel_turn or fake_kernel,
         artifact_export=fake_export,
         computer_factory=lambda *a, **k: computer,
         sandbox_cleanup=cleanup,
@@ -244,12 +245,37 @@ def test_approved_pdf_resume_executes_and_completes_with_cleanup(tmp_path):
     assert len(computer.pdfs) == 1
     ws, content, filename = computer.pdfs[0]
     assert ws == "/ws/" + run_id and filename == "hiking-plan.pdf"
+    assert content == "# 计划"  # Render the generated plan, never the original request.
     assert export_calls[0]["workspace_path"] == ws
     assert len(cleanups) == 1
     run = repo.get_run(run_id)
     assert run is not None and run.status == "done"
     effect = repo.list_effects_for_run(run_id)[0]
     assert effect.status == EffectStatus.COMMITTED.value
+
+
+def test_plan_generation_failure_does_not_export_request_text_or_repeat_model(tmp_path):
+    from agent_v2.kernel import KernelModelFailure
+
+    calls = []
+    async def failing_kernel(**kwargs):
+        calls.append(kwargs)
+        raise KernelModelFailure("model_failed", "模型失败")
+
+    repo = _repo(tmp_path)
+    computer = _FakeComputer()
+    orch = _resume_orchestrator(repo, computer, [], kernel_turn=failing_kernel)
+    req = ChatFlowRequest(message="出 PDF", request_id="pdf-model-failed", profile_id="artifact")
+    async def collect():
+        return [event async for event in orch.stream_chat(req)]
+    first = asyncio.run(collect())
+    assert first[-1].type == "error"
+    assert first[-1].payload["code"] == "model_failed"
+    assert "approval.required" not in [event.type for event in first]
+    assert computer.pdfs == []
+    assert repo.list_effects_for_run(first[-1].run_id) == []
+    assert asyncio.run(collect())[-1].type == "error"
+    assert len(calls) == 1
 
 
 def test_resume_with_lost_sandbox_lease_fails_closed(tmp_path):
@@ -318,6 +344,7 @@ def test_concurrent_resume_with_executing_effect_converges_unknown_without_liven
     cleanups: list[Any] = []
     orch = _resume_orchestrator(repo, computer, cleanups)
     run_id, approval_id = _run_pause_flow(orch, repo, "req-40conc")
+    approved_args = json.loads(repo.get_approval(approval_id).args_canonical)
     repo.resolve_approval(
         approval_id=approval_id, status="approved", decision_request_id="dec-40conc"
     )
@@ -325,14 +352,14 @@ def test_concurrent_resume_with_executing_effect_converges_unknown_without_liven
     # A crashed CAS winner: an effect left EXECUTING plus a persisted
     # tool_call that is BRAND NEW (the old heuristic called this "live").
     effect_key = compute_effect_key(
-        run_id=run_id, tool_name="generate_pdf", args={"filename": "hiking-plan.pdf"}
+        run_id=run_id, tool_name="generate_pdf", args=approved_args
     )
     repo.insert_effect(
         effect_key=effect_key,
         run_id=run_id,
         conversation_id="conv",
         tool_name="generate_pdf",
-        args_canonical='{"filename": "hiking-plan.pdf"}',
+        args_canonical=json.dumps(approved_args, sort_keys=True, separators=(",", ":")),
         external_idempotency_key=f"ext-{effect_key}",
     )
     _record, won = repo.transition_effect_to_executing(effect_key)
@@ -341,7 +368,7 @@ def test_concurrent_resume_with_executing_effect_converges_unknown_without_liven
         run_id=run_id,
         sequence=100,
         event_type="tool_call",
-        payload={"tool": "generate_pdf", "args": {"filename": "hiking-plan.pdf"}},
+        payload={"tool": "generate_pdf", "args": approved_args},
         request_id="req-40conc",
         conversation_id="conv",
         timestamp=_now_iso(),
@@ -375,15 +402,18 @@ def test_crashed_executing_effect_becomes_outcome_unknown_on_resume(tmp_path):
     )
 
     # Crash between CAS and commit: EXECUTING effect, NO live tool_call.
+    # Args come from the approval row (see the concurrent-resume test above
+    # for why — Ticket 09's plan_revision rides in args_canonical).
+    approved_args = json.loads(repo.get_approval(approval_id).args_canonical)
     effect_key = compute_effect_key(
-        run_id=run_id, tool_name="generate_pdf", args={"filename": "hiking-plan.pdf"}
+        run_id=run_id, tool_name="generate_pdf", args=approved_args
     )
     repo.insert_effect(
         effect_key=effect_key,
         run_id=run_id,
         conversation_id="conv",
         tool_name="generate_pdf",
-        args_canonical='{"filename": "hiking-plan.pdf"}',
+        args_canonical=json.dumps(approved_args, sort_keys=True, separators=(",", ":")),
         external_idempotency_key=f"ext-{effect_key}",
     )
     _record, won = repo.transition_effect_to_executing(effect_key)

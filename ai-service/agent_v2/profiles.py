@@ -151,23 +151,26 @@ _CHAT_PROFILE = CapabilityProfile(
 
 # ---- route_plan profile (Ticket 05) ---------------------------------------
 #
-# route_plan extends chat with route research, Web search/scraping, and
+# route_plan extends chat with route research and controlled Web scraping, and
 # two allowlisted AMap MCP servers (weather + map). It does NOT include
-# Bash, Write, Edit, or any file-operation tool — those belong to the
-# ``artifact`` and ``cowork`` profiles (later tickets).
+# Bash, Write, or Edit. PDF generation is a deferred product capability,
+# reached only through report_export and explicit approval.
 #
 # ``allowed_mcp_servers`` is a tuple of server ids registered in
 # :mod:`agent_v2.mcp_registry`. The MCP registry is the single source
 # of truth for connection parameters and tool allowlists; the profile
 # only declares which servers it may reach.
 _ROUTE_PLAN_ALLOWED_TOOLS: tuple[str, ...] = (
-    # Inherits chat's low-risk hiking surface…
+    "route_compare",
+    "report_export",
+    "generate_pdf",
+    # Narrow hiking surface for route planning. Risk assessment remains a
+    # chat-level preliminary hint; route planning uses route_compare's
+    # structured evidence and safety gate.
     "hiking_knowledge_search",
     "gear_checklist",
-    "risk_assessment",
-    # …then adds route research and Web for evidence-grounded planning.
+    # …then adds route research and source-page retrieval.
     "route_research",
-    "web_search",
     "web_scraping",
     "focus_map",
 )

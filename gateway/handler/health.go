@@ -40,9 +40,14 @@ func (h *HealthHandler) Health(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"status":     "ok",
-		"service":    "gateway",
+	statusCode := http.StatusOK
+	if aiStatus != "ok" {
+		statusCode = http.StatusServiceUnavailable
+	}
+
+	c.JSON(statusCode, gin.H{
+		"status":    map[bool]string{true: "ok", false: "degraded"}[aiStatus == "ok"],
+		"service":   "gateway",
 		"ai_service": aiStatus,
 	})
 }

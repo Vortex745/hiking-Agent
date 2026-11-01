@@ -39,3 +39,9 @@ workspace/
 !README.md
 .git/
 .gitignore
+# The AI image restores the fork from this tracked offline provenance.
+!third_party/uniharness-provenance.md
+.scratch/
+ai-service/data/
+ai-service/agent_state/
+ai-service/logs/

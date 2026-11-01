@@ -5,9 +5,11 @@ import {
   MessagePrimitive,
   useMessage,
 } from "@assistant-ui/react";
-import { ArrowUp, Check, Copy, Download, Paperclip, RotateCw } from 'lucide-react';
+import { ArrowUp, Check, Copy, Download, Grid2X2 as Grid, Paperclip, RotateCw } from 'lucide-react';
 import { getConversationMemoryProgress } from '../../../api/conversationMemory';
 import { API } from '../../../api/config';
+import { RouteComparisonCard } from '../../RouteComparison';
+import type { RouteSelection } from '../../../api/routeComparison';
 import { splitLegacyMcpOutput } from '../../../lib/chatOutput';
 import { StreamingText, useStreamingText } from '../../StreamingText';
 import { AgentActivityTrace } from '../../agent-activity/AgentActivityTrace';
@@ -25,6 +27,21 @@ import { useGSAP } from '@gsap/react';
 gsap.registerPlugin(useGSAP);
 
 interface GeminiThreadProps {
+  onExportRoute?: (comparisonId: string) => void;
+  /**
+   * Ticket 03 AC1: carry a recommended or alternative route from an existing
+   * comparison into the plan draft. The payload is the two-id reference only —
+   * the page sends it as the ``plan_select_route`` intent, so no route fact ever
+   * travels from the client.
+   */
+  onSelectRoute?: (selection: RouteSelection) => void;
+  /**
+   * Ticket 01: the 生成行程 quick action. It sends the structured
+   * ``plan_create`` intent — never a sentence stuffed with a pseudo id,
+   * which is the anti-pattern ``onExportRoute`` still uses.
+   */
+  onGeneratePlan?: () => void;
+  isSending?: boolean;
   emptyTitle: string;
   /** Called when user clicks "regenerate" — parent should resend the last user prompt */
   onRegenerate?: () => void;
@@ -39,15 +56,19 @@ interface GeminiThreadProps {
 
 /** Context to pass callbacks down to ChatMessage without prop drilling */
 const ThreadActionsContext = createContext<{
+  onExportRoute?: (comparisonId: string) => void;
+  onSelectRoute?: (selection: RouteSelection) => void;
+  onGeneratePlan?: () => void;
+  isSending?: boolean;
   onRegenerate?: () => void;
   realMessageCount: number;
 }>({ realMessageCount: 0 });
 
-export const GeminiThread = ({ emptyTitle, onRegenerate, onUploadClick, realMessageCount = 0, mapFocus, mapSessionKey }: GeminiThreadProps) => (
-  <ThreadActionsContext.Provider value={{ onRegenerate, realMessageCount }}>
+export const GeminiThread = ({ emptyTitle, onRegenerate, onUploadClick, onExportRoute, onSelectRoute, onGeneratePlan, isSending, realMessageCount = 0, mapFocus, mapSessionKey }: GeminiThreadProps) => (
+  <ThreadActionsContext.Provider value={{ onRegenerate, onExportRoute, onSelectRoute, onGeneratePlan, isSending, realMessageCount }}>
     <ThreadPrimitive.Root className="h-full bg-[#fdfcfc] dark:bg-[#131314] flex flex-col overflow-hidden w-full relative">
       <AuiIf condition={(s) => s.thread.isEmpty}>
-        <EmptyState emptyTitle={emptyTitle} onUploadClick={onUploadClick} />
+        <EmptyState emptyTitle={emptyTitle} onUploadClick={onUploadClick} onGeneratePlan={onGeneratePlan} isSending={isSending} />
       </AuiIf>
       <AuiIf condition={(s) => !s.thread.isEmpty}>
         <div className="flex-1 overflow-hidden flex flex-col relative w-full">
@@ -66,7 +87,12 @@ export const GeminiThread = ({ emptyTitle, onRegenerate, onUploadClick, realMess
   </ThreadActionsContext.Provider>
 );
 
-const EmptyState = ({ emptyTitle, onUploadClick }: { emptyTitle: string; onUploadClick?: () => void }) => (
+const EmptyState = ({ emptyTitle, onUploadClick, onGeneratePlan, isSending }: {
+  emptyTitle: string;
+  onUploadClick?: () => void;
+  onGeneratePlan?: () => void;
+  isSending?: boolean;
+}) => (
   <div className="relative flex grow h-full items-center justify-center">
     <div
       aria-hidden="true"
@@ -79,6 +105,23 @@ const EmptyState = ({ emptyTitle, onUploadClick }: { emptyTitle: string; onUploa
         text={emptyTitle}
       />
       <Composer onUploadClick={onUploadClick} />
+      {onGeneratePlan && (
+        // Ticket 01: the plan-book quick action. A structured intent
+        // entry, so it is not the orphaned quickTags/selectedScenario
+        // dead code — clicking sends ``plan_create`` with no text.
+        <div className="mt-6 flex w-full flex-wrap justify-center gap-2">
+          <button
+            type="button"
+            onClick={onGeneratePlan}
+            disabled={isSending}
+            className="press-scale inline-flex items-center gap-1.5 rounded-lg border border-black/10 bg-white px-3 py-2 text-sm text-[#1f1f1f] transition-colors hover:bg-black/5 disabled:pointer-events-none disabled:opacity-45 dark:border-white/10 dark:bg-[#1e1f20] dark:text-[#e3e3e3] dark:hover:bg-white/5"
+            title="生成行程计划书"
+          >
+            <Grid className="size-4" aria-hidden="true" />
+            生成行程
+          </button>
+        </div>
+      )}
     </div>
   </div>
 );
@@ -152,6 +195,27 @@ const imageFromMarkdown = (segment: string): ChatImage | null => {
   if (imageMatch) return { alt: imageMatch[1] || '图片', src: imageMatch[2] };
   return null;
 };
+
+const wordSegmenter = typeof Intl.Segmenter === 'function'
+  ? new Intl.Segmenter('zh', { granularity: 'word' })
+  : null;
+
+function streamText(text: string, keyPrefix: string) {
+  const segments = wordSegmenter
+    ? Array.from(wordSegmenter.segment(text), ({ segment }) => segment)
+    : text.match(/\s+|[^\s]+/g) || [];
+  return segments.map((segment, index) =>
+    /^\s+$/.test(segment)
+      ? segment
+      : <span
+          key={`${keyPrefix}-${index}`}
+          className="t-stream-w"
+          data-stream-key={`${keyPrefix}-${index}`}
+        >
+          {segment}
+        </span>
+  );
+}
 
 const MarkdownText = (part: any) => {
   const raw = part.text || part.part?.text || '';
@@ -359,6 +423,8 @@ const ChatMessage = () => {
   const messageStatusType = useMessage((state) => state.status?.type);
   const artifactArgs = getToolArgs(messageContent, "artifacts");
   const messageArtifacts = Array.isArray(artifactArgs) ? artifactArgs : [];
+  const routeResults = messageContent.filter(part => part.type === 'tool-call' && part.toolName === 'routeComparison');
+  const { onExportRoute, onSelectRoute, isSending: routeExportBusy } = useContext(ThreadActionsContext);
   const isMessageRunning = messageStatusType === 'running';
   const activityModel = buildAgentActivity({
     events: readActivityEvents(messageContent),
@@ -421,6 +487,7 @@ const ChatMessage = () => {
               <AgentActivityTrace model={activityModel} className="mb-3" />
               <MessagePrimitive.Parts components={{ Text: MarkdownText, ToolCall: CustomToolCall } as any} />
               {messageArtifacts.length > 0 && <ArtifactList artifacts={messageArtifacts} />}
+              {routeResults.map(part => <RouteComparisonCard key={part.toolCallId} value={part.args} onExport={onExportRoute} onSelect={onSelectRoute} busy={routeExportBusy} />)}
             </div>
             
             {/* Action Bar — only show when not streaming */}

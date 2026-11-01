@@ -84,6 +84,9 @@ _TOOL_RISK: dict[str, RiskLevel] = {
     "focus_map": RiskLevel.LOW,
     # ---- route_plan profile ----
     "route_research": RiskLevel.MEDIUM,
+    "route_compare": RiskLevel.MEDIUM,
+    # Read-only preparation; actual PDF generation retains HIGH risk.
+    "report_export": RiskLevel.LOW,
     "web_search": RiskLevel.MEDIUM,
     "web_scraping": RiskLevel.HIGH,
     # ---- artifact profile ----

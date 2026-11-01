@@ -315,6 +315,9 @@ class MemoryStore:
             return None
         if row["status"] != "pending":
             if row["decision_request_id"] == decision_request_id:
+                expected_status = "approved" if decision == "approve" else "rejected"
+                if row["status"] != expected_status:
+                    raise ValueError("decision_request_conflict")
                 return self._candidate_result(row), True
             raise ValueError(f"candidate_{row['status']}")
 

@@ -13,6 +13,7 @@
     "test:browser:llm-config": "node tests/llm-config-decision.cjs",
     "test:browser:auth": "node tests/auth.cjs",
     "test:browser:map": "node tests/map-account-isolation.cjs",
+    "test:browser:plan": "node tests/plan-account-workflow.cjs",
     "test:browser:llm-config-account": "node tests/llm-config-account.cjs"
   },
   "dependencies": {

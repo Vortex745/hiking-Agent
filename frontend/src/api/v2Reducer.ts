@@ -34,8 +34,29 @@ import type {
   V2MemoryCandidate,
   V2Artifact,
   V2RunSnapshot,
+  V2PlanDraftState,
+  V2PlanDraftStage,
+  V2PlanRouteReference,
+  V2PlanType,
+  V2PlanMissingField,
+  V2PlanArrangementFields,
+  V2PlanCompletenessRules,
+  V2PlanSafety,
+  V2PlanEvidenceMatch,
+  V2PlanFormatIssue,
+  V2PlanReviewReason,
+  V2PlanRuleGap,
 } from './chatV2'
-import { TERMINAL_V2_EVENT_TYPES, STREAM_TERMINAL_V2_EVENT_TYPES, V2_TERMINAL_RUN_STATUSES } from './chatV2'
+import {
+  TERMINAL_V2_EVENT_TYPES,
+  STREAM_TERMINAL_V2_EVENT_TYPES,
+  V2_TERMINAL_RUN_STATUSES,
+  V2_PLAN_ARRANGEMENT_KEYS,
+  V2_PLAN_DRAFT_STAGES,
+  V2_PLAN_SAFETY_CODES,
+  V2_PLAN_TYPES,
+  V2_PLAN_VERDICTS,
+} from './chatV2'
 
 export interface V2TraceEntry {
   /**
@@ -157,6 +178,13 @@ export interface V2ConversationState {
    * here so the anomaly stays observable.
    */
   duplicateTerminalCount: number
+  /**
+   * Ticket 01: the conversation's plan-book draft state, set by
+   * ``plan.draft_state``. ``null`` means no plan flow has been opened. The
+   * UI opens the dialog only from ``awaiting_input``; ``awaiting_confirmation``
+   * is the ambiguous-intent prompt and must leave the dialog closed.
+   */
+  planDraft: V2PlanDraftState | null
 }
 
 export const initialV2State: V2ConversationState = {
@@ -176,6 +204,7 @@ export const initialV2State: V2ConversationState = {
   reviewNotices: [],
   progressGaps: [],
   duplicateTerminalCount: 0,
+  planDraft: null,
 }
 
 /**
@@ -369,6 +398,17 @@ export function reduceV2Event(
         return artifact
           ? { ...base, status: 'running', artifacts: [...base.artifacts, artifact] }
           : { ...base, status: 'running', droppedCount: base.droppedCount + 1 }
+      }
+
+    case 'plan.draft_state':
+      // Ticket 01 AC8: the server moved this conversation's plan draft to
+      // a new stage. The reducer only records it — deciding whether that
+      // means "open the dialog" or "ask for confirmation" is the UI's
+      // reading of ``stage``, and an unreadable payload counts as dropped
+      // instead of guessing.
+      {
+        const draft = readPlanDraftState(event.payload)
+        return draft ? { ...base, status: 'running', planDraft: draft } : base
       }
 
     case 'effect.outcome_unknown':
@@ -760,6 +800,275 @@ function readNumber(payload: Record<string, unknown>, key: string): number {
 }
 
 /**
+ * The one shape test every wire reader shares: is this an object we can index,
+ * or nothing at all? ``null`` for a non-object, an array, ``null``/``undefined``
+ * or any other falsy — a plain (non-array) object comes back as a record. Every
+ * reader used to re-spell the same "falsy-or-not-an-object-or-is-an-array" check
+ * inline (code-review finding 11(b)); one helper means a new reader cannot drop
+ * the array check and start treating a hostile localStorage mirror's ``[]`` as a
+ * payload.
+ */
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  return value as Record<string, unknown>
+}
+
+/** Helper: read an object field, undefined → undefined. */
+function readObject(
+  payload: Record<string, unknown>,
+  key: string,
+): Record<string, unknown> | undefined {
+  return asRecord(payload[key]) ?? undefined
+}
+
+/**
+ * Helper: read the ``plan.draft_state`` payload (Ticket 01) into a typed
+ * ``V2PlanDraftState``. Returns null when the stage is missing or outside
+ * the shared vocabulary — an unknown stage must never open a dialog on a
+ * guess.
+ */
+/**
+ * Ticket 03: read a draft's route reference. ``null`` unless BOTH ids are
+ * non-empty strings — a partial pointer would let the UI name a route the
+ * server never issued, which is the thing spec AC4 forbids.
+ */
+function readRouteSelection(
+  value: unknown,
+): V2PlanRouteReference | null {
+  const raw = asRecord(value)
+  if (!raw) return null
+  const comparisonId = raw['comparison_id']
+  const candidateId = raw['candidate_id']
+  if (typeof comparisonId !== 'string' || !comparisonId) return null
+  if (typeof candidateId !== 'string' || !candidateId) return null
+  return { comparison_id: comparisonId, candidate_id: candidateId }
+}
+
+/**
+ * Ticket 04: read the draft's declared type. Only the two known values are
+ * ever honoured; anything else (a corrupted mirror, an older server, a value a
+ * client invented) falls back to what the draft demonstrably is — a route
+ * reference means a basis was re-read and passed the gate on the turn that
+ * wrote this payload, no reference means there is nothing to verify against.
+ * The fallback can never upgrade a draft to `route_plan` on its own, because a
+ * half-read reference already came out `null` above.
+ */
+function readPlanType(value: unknown, reference: V2PlanRouteReference | null): V2PlanType {
+  if (typeof value === 'string' && V2_PLAN_TYPES.has(value as V2PlanType)) {
+    return value as V2PlanType
+  }
+  return reference ? 'route_plan' : 'generic_draft'
+}
+
+/**
+ * Ticket 05 AC1: read the server's 缺失字段清单. Each entry must carry the key,
+ * the label and the status as non-empty strings, or it is dropped — a field
+ * this reader cannot name is a field the UI would have to guess a marker for,
+ * and guessing whether something is 待确认 or 待核验 is the AC4 failure mode.
+ * A payload from a server that predates the list is an empty list, never a
+ * fabricated one.
+ */
+function readMissingPlanFields(value: unknown): V2PlanMissingField[] {
+  if (!Array.isArray(value)) return []
+  const fields: V2PlanMissingField[] = []
+  for (const raw of value) {
+    const entry = asRecord(raw)
+    if (!entry) continue
+    const key = entry['key']
+    const label = entry['label']
+    const status = entry['status']
+    if (typeof key !== 'string' || !key) continue
+    if (typeof label !== 'string' || !label) continue
+    if (typeof status !== 'string' || !status) continue
+    fields.push({ key, label, status })
+  }
+  return fields
+}
+
+/**
+ * Ticket 06 AC1/AC5: read the collected supplementary arrangements. Only the
+ * eight enumerated keys are taken, and only as strings — an absent, malformed
+ * or hand-edited entry yields the empty string for that field, which is the
+ * server's own 待确认 state rather than a guessed value. A key outside the
+ * enumeration (a smuggled distance or budget total) is dropped, not drawn.
+ */
+function readPlanArrangements(value: unknown): V2PlanArrangementFields {
+  const record = asRecord(value) ?? {}
+  const arrangements = {} as V2PlanArrangementFields
+  for (const key of V2_PLAN_ARRANGEMENT_KEYS) {
+    const entry = record[key]
+    arrangements[key] = typeof entry === 'string' ? entry : ''
+  }
+  return arrangements
+}
+
+function readStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+}
+
+/**
+ * Ticket 06 AC4/AC5: read the completeness verdict. An unknown verdict is
+ * ``null`` — the panel then says nothing — because guessing a verdict would be
+ * re-deciding a rule client-side. Reason/gap/format entries need their stable
+ * code/key as a non-empty string or they are dropped, exactly like
+ * ``readMissingPlanFields``: a code this reader cannot name is a code no UI
+ * copy exists for.
+ */
+function readPlanRules(value: unknown): V2PlanCompletenessRules | null {
+  const rules = asRecord(value)
+  if (!rules) return null
+  const verdict = rules['verdict']
+  if (typeof verdict !== 'string' || !V2_PLAN_VERDICTS.has(verdict as V2PlanCompletenessRules['verdict'])) {
+    return null
+  }
+  const reasons: V2PlanReviewReason[] = []
+  if (Array.isArray(rules['reasons'])) {
+    for (const raw of rules['reasons']) {
+      const entry = asRecord(raw)
+      if (!entry) continue
+      if (typeof entry['code'] !== 'string' || !entry['code']) continue
+      if (typeof entry['message'] !== 'string' || !entry['message']) continue
+      reasons.push({ code: entry['code'], message: entry['message'] })
+    }
+  }
+  const gaps = (key: string): V2PlanRuleGap[] => {
+    const out: V2PlanRuleGap[] = []
+    const rawList = Array.isArray(rules[key]) ? rules[key] as unknown[] : []
+    for (const raw of rawList) {
+      const entry = asRecord(raw)
+      if (!entry) continue
+      if (typeof entry['key'] !== 'string' || !entry['key']) continue
+      out.push({ key: entry['key'], label: typeof entry['label'] === 'string' ? entry['label'] : entry['key'] })
+    }
+    return out
+  }
+  const formatIssues: V2PlanFormatIssue[] = []
+  const rawIssues = Array.isArray(rules['format_issues']) ? rules['format_issues'] as unknown[] : []
+  for (const raw of rawIssues) {
+    const entry = asRecord(raw)
+    if (!entry) continue
+    if (typeof entry['key'] !== 'string' || !entry['key']) continue
+    if (typeof entry['message'] !== 'string' || !entry['message']) continue
+    formatIssues.push({
+      key: entry['key'],
+      label: typeof entry['label'] === 'string' ? entry['label'] : entry['key'],
+      message: entry['message'],
+    })
+  }
+  const matches: V2PlanEvidenceMatch[] = []
+  const rawMatches = Array.isArray(rules['matches']) ? rules['matches'] as unknown[] : []
+  for (const raw of rawMatches) {
+    const entry = asRecord(raw)
+    if (!entry) continue
+    if (typeof entry['arrangement_key'] !== 'string' || !entry['arrangement_key']) continue
+    if (typeof entry['status'] !== 'string' || !entry['status']) continue
+    matches.push({
+      arrangement_key: entry['arrangement_key'],
+      arrangement_label: typeof entry['arrangement_label'] === 'string' ? entry['arrangement_label'] : entry['arrangement_key'],
+      fact_fields: readStringArray(entry['fact_fields']),
+      status: entry['status'],
+      source_ids: readStringArray(entry['source_ids']),
+    })
+  }
+  return {
+    verdict: verdict as V2PlanCompletenessRules['verdict'],
+    reasons,
+    missing_core: gaps('missing_core'),
+    missing_non_core: gaps('missing_non_core'),
+    format_issues: formatIssues,
+    matches,
+  }
+}
+
+/**
+ * Ticket 07 AC2/AC5: read the gate's refusal. An unknown or malformed record is
+ * `null` — the panel then says nothing about safety, because guessing a block
+ * reason would be re-deciding the gate client-side (and guessing the *absence* of
+ * one would silently un-block a dangerous draft). Codes outside
+ * ``V2_PLAN_SAFETY_CODES`` are dropped rather than rendered as an unexplained
+ * string, and the gate's own reason lines are kept only as strings.
+ */
+function readPlanSafety(value: unknown): V2PlanSafety | null {
+  const safety = asRecord(value)
+  if (!safety) return null
+  const rawCodes = Array.isArray(safety['codes']) ? safety['codes'] as unknown[] : []
+  const codes = rawCodes.filter(
+    (code): code is string => typeof code === 'string' && V2_PLAN_SAFETY_CODES.includes(code),
+  )
+  if (codes.length === 0) return null
+  return {
+    codes,
+    hard_stop: safety['hard_stop'] === true,
+    formal_route_plan_allowed: safety['formal_route_plan_allowed'] !== false,
+    message: typeof safety['message'] === 'string' ? safety['message'] : '',
+    comparison_id: typeof safety['comparison_id'] === 'string' ? safety['comparison_id'] : '',
+    comparison_status:
+      typeof safety['comparison_status'] === 'string' ? safety['comparison_status'] : '',
+    gate_reasons: readStringArray(safety['gate_reasons']),
+    required_action: typeof safety['required_action'] === 'string' ? safety['required_action'] : '',
+  }
+}
+
+export function readPlanDraftState(  payload: Record<string, unknown>,
+): V2PlanDraftState | null {
+  const stage = payload['stage']
+  if (typeof stage !== 'string' || !V2_PLAN_DRAFT_STAGES.has(stage as V2PlanDraftStage)) {
+    return null
+  }
+  const rawDraft = payload['draft']
+  const draft = (rawDraft && typeof rawDraft === 'object' ? rawDraft : {}) as Record<string, unknown>
+  const participants = draft['participants']
+  const routeSelection = readRouteSelection(payload['route_selection'])
+  return {
+    stage: stage as V2PlanDraftStage,
+    draft_id: typeof payload['draft_id'] === 'string' ? payload['draft_id'] : '',
+    conversation_id: typeof payload['conversation_id'] === 'string' ? payload['conversation_id'] : '',
+    source: payload['source'] === 'natural_language' ? 'natural_language' : 'structured_intent',
+    intent: typeof payload['intent'] === 'string' ? payload['intent'] : '',
+    // Ticket 02 AC3: the rendered draft summary. Absent on an older payload,
+    // which is an empty summary — never a guess and never a dropped event.
+    summary: typeof payload['summary'] === 'string' ? payload['summary'] : '',
+    // Ticket 04 AC5: the draft type. A payload that names one must name a known
+    // value; a payload from a server that predates the field is answered by the
+    // same rule the server uses — a draft pointing at nothing verified is a
+    // generic draft — so the reader never guesses a route plan into existence.
+    plan_type: readPlanType(payload['plan_type'], routeSelection),
+    // Ticket 03: the route reference. Both ids must be non-empty strings or the
+    // draft has no reference — a half-read pointer would render a route the
+    // server never issued, which is the AC4 failure this reader exists to stop.
+    route_selection: routeSelection,
+    // Ticket 05 AC1: the server's missing-field enumeration. This is the SAME
+    // reader for the SSE payload and for the durable localStorage mirror, so a
+    // checklist that survived a refresh is still the checklist the summary
+    // spells out — and a malformed entry is dropped rather than guessed into a
+    // 待确认 / 待核验 state the server never claimed.
+    missing_fields: readMissingPlanFields(payload['missing_fields']),
+    // Ticket 06 AC5: the verdict, read by the same strict reader for the SSE
+    // payload and the durable mirror. Unknown verdict → null (say nothing),
+    // never a guessed one.
+    rules: readPlanRules(payload['rules']),
+    // Ticket 07 AC5: the gate's refusal, read by the same strict reader for the
+    // SSE payload and the durable mirror, so a safety block explained in the
+    // thread is still explained after a refresh — and an unknown code never
+    // becomes an invented reason.
+    safety: readPlanSafety(payload['safety']),
+    draft: {
+      destination_or_route:
+        typeof draft['destination_or_route'] === 'string' ? draft['destination_or_route'] : '',
+      activity_date: typeof draft['activity_date'] === 'string' ? draft['activity_date'] : '',
+      participants: typeof participants === 'number' && Number.isFinite(participants)
+        ? participants
+        : null,
+      // Ticket 06 AC1/AC5: the collected supplementary arrangements. Absent on
+      // a server that predates them, malformed in a hand-edited mirror, or
+      // simply not filled in — all read as the all-empty record, never as a
+      // partially guessed one.
+      arrangements: readPlanArrangements(draft['arrangements']),
+    },
+  }
+}
+
+/**
  * Helper: read the ``artifact.available`` payload into a typed
  * ``V2Artifact``. Returns null unless the two identity fields are
  * present — a malformed artifact payload must not crash the reducer.
@@ -771,6 +1080,8 @@ export function readArtifact(payload: Record<string, unknown>): V2Artifact | nul
   if (typeof artifactId !== 'string' || !artifactId) return null
   if (typeof filename !== 'string' || !filename) return null
   const size = payload['size_bytes']
+  const revision = payload['plan_revision']
+  const previous = payload['previous_artifact_id']
   return {
     artifact_id: artifactId,
     public_filename: filename,
@@ -779,6 +1090,14 @@ export function readArtifact(payload: Record<string, unknown>): V2Artifact | nul
     sha256: typeof payload['sha256'] === 'string' ? payload['sha256'] : undefined,
     expires_at: typeof payload['expires_at'] === 'string' ? payload['expires_at'] : undefined,
     message: typeof payload['message'] === 'string' ? payload['message'] : undefined,
+    // Ticket 10: the version relation, read strictly. A revision that is not a
+    // positive integer is no revision at all — the card stays an ordinary
+    // artifact instead of being numbered by a guess (and the plan-book panel
+    // below hides rather than inventing 第 1 版 for a payload that said nothing).
+    plan_revision: typeof revision === 'number' && Number.isInteger(revision) && revision > 0
+      ? revision
+      : undefined,
+    previous_artifact_id: typeof previous === 'string' ? previous : undefined,
   }
 }
 

@@ -356,7 +356,7 @@ def test_clarification_uses_controlled_template(tmp_path: Path):
             "请问您的出行时间和路线对象是什么？",
             [],
         )),
-        _req("帮我规划一条路线", "req-gate-clarify"),
+        _req("这条徒步路线怎么走", "req-gate-clarify"),
     )
     text = _text_of(items)
     assert "请补充" in text

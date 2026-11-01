@@ -40,6 +40,10 @@ TOOL_RISK_MAP: dict[str, RiskLevel] = {
     "get_weather_forecast": RiskLevel.LOW,
     "search_poi": RiskLevel.LOW,
     "plan_route": RiskLevel.LOW,
+    "maps_weather": RiskLevel.LOW,
+    "maps_geo": RiskLevel.LOW,
+    "maps_direction_walking": RiskLevel.LOW,
+    "maps_text_search": RiskLevel.LOW,
     "geocode": RiskLevel.LOW,
 }
 

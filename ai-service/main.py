@@ -7,6 +7,7 @@ from pathlib import Path
 import uvicorn
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from agent_v2.repositories.memory import MemoryStore
 from auth.deps import get_current_user
@@ -148,8 +149,8 @@ app.add_middleware(RequestContextMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=settings.cors_origins,
+    allow_credentials=bool(settings.cors_origins),
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -166,6 +167,33 @@ async def health():
     v2_status = v2_health_status(app.state, settings)
     return {
         "status": "ok",
+        "service": "ai-service",
+        "agent_v2": v2_status,
+    }
+
+
+@app.get("/ready")
+async def ready():
+    """Report whether the configured chat runtime can accept traffic.
+
+    ``/health`` is a liveness endpoint and remains successful while a
+    dependency is being assembled. ``/ready`` is used by production probes
+    and fails when v2 is enabled but its persistent runtime did not assemble.
+    """
+    from agent_v2.health import v2_health_status
+
+    v2_status = v2_health_status(app.state, settings)
+    if settings.agent_v2_enabled and v2_status.get("status") != "ready":
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "not_ready",
+                "service": "ai-service",
+                "agent_v2": v2_status,
+            },
+        )
+    return {
+        "status": "ready",
         "service": "ai-service",
         "agent_v2": v2_status,
     }

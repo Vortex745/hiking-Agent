@@ -55,6 +55,7 @@ Replay keeps serving persisted envelopes directly
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import threading
@@ -129,7 +130,21 @@ from agent_v2.policy_adapters import policy_error_payload
 from agent_v2.memory_tools import extract_sensitive_memory
 from agent_v2.mcp_output_render import compose_mcp_reply
 from agent_v2.observability import CapacityExceeded
-from agent_v2.permissions import PermissionDecision
+from agent_v2.permissions import PermissionDecision, PermissionGate
+from agent_v2.plan_workflow import (
+    ARRANGEMENT_FIELDS,
+    BLOCK_MESSAGE,
+    SUPPLEMENT_ARRANGEMENT_KEYS,
+    PlanBlockReason,
+    PlanDraftStage,
+    RecordedCompleteness,
+    classify_plan_request,
+    draft_summary,
+    evaluate_plan_completeness,
+    evaluate_plan_intent,
+    missing_plan_fields,
+    pdf_approval_block_reason,
+)
 from agent_v2.profiles import (
     CapabilityProfile,
     ProfileId,
@@ -162,6 +177,26 @@ class ChatFlowRequest:
     exactly what the flows consume; ``current_location`` carries the
     adapter's validated ``CurrentLocationV2`` object (only
     ``model_dump`` is called on it).
+
+    Ticket 01: ``intent`` is the whitelisted structured plan-book intent
+    (already validated at the wire boundary) and ``plan_input`` the
+    adapter-validated :class:`agent_v2.plan_workflow.PlanDraftInput`.
+    Both must be mirrored here or the flow sees ``None`` for every
+    request.
+
+    Ticket 03 adds the third plan input the same way: ``route_selection`` is
+    the adapter-validated
+    :class:`agent_v2.plan_workflow.RouteSelectionInput` — a reference
+    (``comparison_id`` + ``candidate_id``) into an existing comparison
+    result. Forgetting it here is a silent bug, not a 422: the wire model
+    would accept the field and the flow would never see it.
+
+    Ticket 04 adds the last plan input the same way: ``plan_type`` is the
+    adapter-validated draft-type *claim* a client may attach to
+    ``plan_generic_draft`` — the only value the state machine accepts there.
+    What a draft actually IS is never taken from this field: the flow derives it
+    from the route basis the comparison leaf re-read, so forgetting the field
+    here would only lose the user's choice, never fake a route plan.
     """
 
     message: str
@@ -173,6 +208,10 @@ class ChatFlowRequest:
     # new gate parameter) so the regression-injection harness can keep
     # monkeypatching the historical gate signature.
     retrieval_decision: RetrievalDecision | None = None
+    intent: str | None = None
+    plan_input: Any | None = None
+    route_selection: Any | None = None
+    plan_type: str | None = None
 
 
 # Kernel entry: ``agent_v2.kernel.run_chat_turn`` and test fakes with the
@@ -211,6 +250,69 @@ ArtifactExporter = Callable[..., dict[str, Any]]
 GateFactory = Callable[[], Any]
 
 
+@dataclass(frozen=True, slots=True)
+class PlanEntry:
+    """Deterministic plan-flow entry decision (Ticket 01).
+
+    ``route`` is the only thing the flow trusts:
+
+    * ``intent`` — the client sent a whitelisted structured intent
+      (quick-action button, dialog submit, confirm/cancel).
+    * ``open_form`` — the rules found an unambiguous plan-book ask in the
+      free text, so the dialog opens (spec AC1).
+    * ``ask_confirmation`` — the text is planning-shaped but ambiguous:
+      the server asks first and the dialog stays closed (spec AC2).
+
+    ``source`` records whether a structured intent or the rule classifier
+    produced the entry, which is what the draft-state event carries for
+    audit.
+    """
+
+    route: Literal["intent", "open_form", "ask_confirmation"]
+    source: Literal["structured_intent", "natural_language"]
+    intent: str | None = None
+
+
+#: Profiles a *structured* plan intent may enter the plan flow from. ``chat``
+#: is ticket 01's entry; ``route_plan`` is ticket 03's widening: the route
+#: comparison the user selects from is produced by a ``route_plan`` run, so a
+#: "select this route into my plan draft" click arrives with that profile.
+#: Without it the plan intent would fall through to the kernel, which is the
+#: one thing the plan path must never do (spec AC4/AC5).
+_PLAN_INTENT_PROFILES: frozenset[str] = frozenset({
+    ProfileId.CHAT.value,
+    ProfileId.ROUTE_PLAN.value,
+})
+
+
+def _resolve_plan_entry(req: ChatFlowRequest, profile: CapabilityProfile) -> PlanEntry | None:
+    """Decide whether this request belongs to the plan flow — rules only.
+
+    Returns ``None`` for everything else. Natural-language entry stays
+    ``chat``-only: the plan entry must never hijack a route_plan / rag /
+    artifact / cowork run on the strength of a sentence, and it must never be
+    decided by a model.
+
+    A *whitelisted structured intent* is honoured on ``chat`` and ``route_plan``
+    only (ticket 03). The client cannot use this to skip the kernel for a
+    route question: :data:`_PLAN_INTENT_PROFILES` is server-side and the intent
+    set is the :data:`agent_v2.plan_workflow.PLAN_INTENTS` whitelist, so any
+    other profile_id keeps its normal flow.
+    """
+    if req.intent and profile.profile_id.value in _PLAN_INTENT_PROFILES:
+        return PlanEntry("intent", "structured_intent", req.intent)
+
+    if profile.profile_id != ProfileId.CHAT:
+        return None
+
+    outcome = classify_plan_request(req.message).outcome
+    if outcome == "clear_plan_intent":
+        return PlanEntry("open_form", "natural_language", "plan_create")
+    if outcome == "ambiguous":
+        return PlanEntry("ask_confirmation", "natural_language")
+    return None
+
+
 @dataclass
 class ApprovalDecisionOutcome:
     """Transport-neutral result of an approval decision (Ticket 38).
@@ -241,6 +343,49 @@ async def _production_kernel_turn(**kwargs: Any) -> tuple[str, list[dict[str, An
     from agent_v2.kernel import run_chat_turn  # heavy import stays lazy
 
     return await run_chat_turn(**kwargs)
+
+
+# ---- Plan-draft persistence helpers ----------------------------------------
+#
+# Every plan turn writes its draft state through the same two rules, which
+# tickets 01-10 each re-spelled inline (code-review finding 11(c)): a row can
+# only be read or written when there is a repository AND a conversation key to
+# store it against (drafts live on the conversation axis, not the run axis),
+# and a persistence failure must NEVER break the stream — the draft state has
+# already travelled on ``plan.draft_state``, so the row is a best-effort mirror.
+# The predicate names the first rule once; the wrapper names the second.
+
+
+def _plan_persistence_available(runs_repo: Any, conversation_id: str | None) -> bool:
+    """Whether plan rows can be read or written for this turn."""
+    return runs_repo is not None and bool(conversation_id)
+
+
+def _persist_plan_write(
+    runs_repo: Any,
+    conversation_id: str | None,
+    *,
+    label: str,
+    action: Callable[[], Any],
+) -> Any:
+    """Run one plan-state write behind the persistence guard, swallowing failure.
+
+    Returns ``action()`` when there is a repository and a conversation to write
+    against, and ``None`` when the guard is not met or the write raised. The
+    raised case is logged (with the caller's ``label`` so the log line names
+    which row failed) and never re-raised: losing the durable mirror must not
+    abort a stream that already emitted its ``plan.draft_state`` frame.
+    """
+    if not _plan_persistence_available(runs_repo, conversation_id):
+        return None
+    try:
+        return action()
+    except Exception:
+        logger.exception(
+            "chat_v2: plan %s persistence failed for conversation=%s",
+            label, conversation_id,
+        )
+        return None
 
 
 # ---- Terminal-status helpers -----------------------------------------------
@@ -640,6 +785,77 @@ def synthesize_terminal_type(snapshot: RunSnapshot | None) -> str | None:
     return None
 
 
+def append_reconciled_terminal(runs_repo: RunRepository | None, run_id: str | None) -> bool:
+    """Close a PAUSED run's event log when the run reached a terminal offline.
+
+    Ticket 10 AC5. A run that paused ended its stream on ``run.paused`` and
+    returned, so nobody is left to emit the matching terminal when the run is
+    later finished by ``POST /chat/cancel`` or by the expired-paused sweep: the
+    run row turns terminal while the log still reads ``run.paused`` as its last
+    frame. A client replaying ``GET /chat/events/{run_id}`` would then be told
+    the run is waiting for a decision it no longer has — the terminal event, the
+    run row and (for the plan book) the draft/artifact records have to agree
+    after every interruption, so the log gets the one frame the run's own status
+    says it ended with.
+
+    Narrow on purpose:
+    * a run still ``running`` keeps its live stream as the only author of its
+      terminal (appending here would collide with it on ``UNIQUE(run_id,
+      sequence)``);
+    * a log that already holds ``done``/``error``/``cancelled`` is untouched;
+    * the frame is written at a sequence strictly past the stored cursor and a
+      write failure is swallowed — a missing reconciliation must never make the
+      cancel or the sweep itself fail.
+
+    Returns True when a terminal frame was appended.
+    """
+    if runs_repo is None or not run_id:
+        return False
+    run = runs_repo.get_run(run_id)
+    if run is None or not run.is_terminal:
+        return False
+    stored = runs_repo.get_events_since(run_id=run_id, from_seq=0)
+    if any(evt["type"] in {"done", "error", "cancelled"} for evt in stored):
+        return False
+    if not any(evt["type"] == "run.paused" for evt in stored):
+        return False
+    terminal_type = synthesize_terminal_type(runs_repo.get_snapshot(run_id))
+    if terminal_type is None:
+        return False
+
+    stream = EventStream(
+        request_id=run.request_id,
+        conversation_id=run.conversation_id,
+        run_id=run_id,
+    )
+    stream.advance_to(max((evt["sequence"] for evt in stored), default=0))
+    reason = {
+        "cancelled": "运行已取消。",
+        "error": "运行已结束。",
+        "done": "运行已结束。",
+    }[terminal_type]
+    envelope = stream.build(terminal_type, {"code": terminal_type, "message": reason})
+    try:
+        runs_repo.persist_event(
+            run_id=run_id,
+            sequence=envelope.sequence,
+            event_type=envelope.type,
+            payload=envelope.payload,
+            request_id=run.request_id,
+            conversation_id=run.conversation_id,
+            event_id=envelope.event_id,
+            timestamp=envelope.timestamp,
+        )
+    except Exception:
+        logger.exception(
+            "run_orchestration: could not reconcile the terminal event for "
+            "run_id=%s; the run row is terminal but the log still ends at run.paused",
+            run_id,
+        )
+        return False
+    return True
+
+
 # ---- Unified effect CAS ledger (Ticket 39) ----------------------------------
 #
 # The SINGLE implementation of the side-effect ledger state machine:
@@ -655,6 +871,155 @@ def synthesize_terminal_type(snapshot: RunSnapshot | None) -> str | None:
 
 # Artifact profile plan filename (was adapter-global ``_ARTIFACT_FILENAME``).
 _ARTIFACT_FILENAME = "hiking-plan.pdf"
+
+
+def pdf_generate_args(*, revision: int) -> dict[str, Any]:
+    """Canonical ``generate_pdf`` tool args for ONE plan-book generation (Ticket 09 AC3).
+
+    Approvals and effects are keyed ``(run_id, tool_name, args_canonical)`` and a
+    committed effect is replayed from ``result_json``, never re-executed: inside
+    one run two identical ``generate_pdf`` calls are the SAME logical side
+    effect, so a regeneration that kept these args byte-identical would return
+    the OLD artifact instead of producing a new one. The plan-book revision
+    therefore travels inside the canonical args — a new generation is a new
+    approval and a new effect by construction.
+
+    The filename stays ``_ARTIFACT_FILENAME``: it is duplicated in
+    ``api/chat_v2.py`` and ``test_route_report_export.py``/
+    ``test_run_orchestration_artifact.py`` derive ids and pins from it, and only
+    the discriminator is added next to it. Removing ``plan_revision`` here is a
+    mutation the AC3 tests in ``test_artifact_versioned_generation.py`` fail —
+    the second drive of the same run recovers the committed effect and never
+    re-executes.
+    """
+    return {"filename": _ARTIFACT_FILENAME, "plan_revision": int(revision)}
+
+
+def _next_plan_revision(runs_repo: Any, conversation_id: str) -> int:
+    """The generation number the NEXT plan-book publication takes (AC3/AC4).
+
+    Read from the version-history rows (AC4), not from run state: the history is
+    the only thing that knows how many books this conversation has published,
+    and it outlives every run. Best-effort: no repository, no conversation or a
+    failed read is revision 1 — a wrong-but-unique discriminator cannot
+    resurrect the replay hazard within one run (keys carry run_id anyway) and
+    the publication below re-derives the authoritative revision from the table.
+    """
+    if runs_repo is None or not conversation_id:
+        return 1
+    try:
+        current = runs_repo.get_current_plan_artifact_version(conversation_id)
+    except Exception:
+        logger.exception(
+            "run_orchestration: artifact version history unread for conversation=%s; "
+            "defaulting to revision 1", conversation_id,
+        )
+        return 1
+    return (current.revision + 1) if current is not None else 1
+
+
+def _record_plan_artifact_version(
+    runs_repo: Any,
+    *,
+    conversation_id: str,
+    artifact_id: str,
+    run_id: str | None,
+) -> dict[str, Any]:
+    """Publish one generation into the version history (AC4) after a real export.
+
+    Returns the public relation for the ``artifact.available`` payload:
+    ``plan_revision`` and ``previous_artifact_id``. The artifact bytes, size and
+    expiry stay owned by the ``artifacts`` row and its download rules — this row
+    only records the relation, per the ticket's reuse-not-reinvent rule.
+    Best-effort: a history write must never un-publish an artifact that already
+    exists on disk and in ``artifacts``; on failure the event simply carries no
+    revision and the error is logged for operators.
+    """
+    relation: dict[str, Any] = {}
+    if runs_repo is None or not artifact_id or not conversation_id:
+        return relation
+    try:
+        draft = runs_repo.get_plan_draft(conversation_id)
+        record = runs_repo.publish_plan_artifact_version(
+            conversation_id=conversation_id,
+            artifact_id=artifact_id,
+            draft_id=draft.draft_id if draft is not None else "",
+            published_by_run_id=run_id or "",
+        )
+        relation["plan_revision"] = record.revision
+        relation["previous_artifact_id"] = record.previous_artifact_id
+    except Exception:
+        logger.exception(
+            "run_orchestration: could not record artifact version for "
+            "conversation=%s artifact=%s; the artifact itself is published",
+            conversation_id, artifact_id,
+        )
+    return relation
+
+
+def _pdf_plan_status_inputs(runs_repo: Any, conversation_id: str) -> dict[str, Any]:
+    """The plan side of the PDF cover, read from the rows the plan flow wrote.
+
+    Ticket 08's layout states a status, so this reads only what is on record and
+    each read is best-effort — a row that is not there leaves the cover line at
+    待核验 instead of becoming a claim:
+
+    * 草案类型 is ``route_plan`` because the book is built from a comparison the
+      gate has just re-run (``render_report`` is called before this at both
+      sites); it is the one thing the document itself can evidence;
+    * the rule verdict counts only while it belongs to the draft on record, so a
+      stale row cannot describe a newer plan (ticket 07's discipline);
+    * the arrangement record is merged over ``plan_details`` by the document
+      builder, which is where an absent field stays 待确认.
+
+    Nothing here reads or implies ``report_allowed`` — eligibility stays
+    :func:`route_compare.service.render_report`'s alone. The 安全门 line reads
+    the stored safety row (ticket 07's payload, given a table by ticket 09);
+    no row — or a row from another draft — keeps the line at ``UNVERIFIED``.
+
+    ``arrangement_labels`` is handed down rather than reached for: the document
+    builder lives in ``route_compare``, BELOW this layer, and reading
+    :data:`ARRANGEMENT_FIELDS` there would be an upward import (the inversion the
+    review named). One export helper means both PDF call sites pass the same record
+    the draft and the checklist render from, so the labels still cannot drift.
+    """
+    inputs: dict[str, Any] = {
+        "plan_type": "route_plan",
+        "arrangement_labels": dict(ARRANGEMENT_FIELDS),
+    }
+    if runs_repo is None or not conversation_id:
+        return inputs
+    merged: dict[str, str] = {}
+    try:
+        draft = runs_repo.get_plan_draft(conversation_id)
+        check = runs_repo.get_completeness_check(conversation_id)
+        if draft is not None:
+            merged["destination_or_route"] = draft.destination_or_route or ""
+            merged["activity_date"] = draft.activity_date or ""
+            merged["participants"] = f"{draft.participants} 人" if draft.participants else ""
+            if check is not None and check.draft_id == draft.draft_id:
+                inputs["completeness"] = check.verdict
+            # Ticket 09: the gate's own answer, read from the row ticket 07's
+            # payload now lives in. Same staleness discipline as the verdict —
+            # a refusal from a previous draft must not describe this book, and
+            # an absent row leaves the cover at 待核验 instead of becoming a
+            # claim. The payload shape is what ``build_report_document``'s
+            # ``safety=`` parameter already expects; ``_safety_status`` only
+            # copies it, no sentence is derived here or downstream.
+            safety_row = runs_repo.get_plan_safety(conversation_id)
+            if safety_row is not None and safety_row.draft_id == draft.draft_id:
+                inputs["safety"] = safety_row.to_payload()
+        arrangements = runs_repo.get_plan_arrangements(conversation_id)
+        if arrangements is not None:
+            merged.update(arrangements.as_values())
+    except Exception:
+        logger.exception(
+            "chat_v2: plan status rows unread for the PDF cover (conversation=%s); "
+            "the cover renders them as 待核验", conversation_id)
+        return inputs
+    if any(merged.values()):
+        inputs["arrangements"] = merged
+    return inputs
 
 # cowork resume filenames + caps (were adapter globals; Ticket 40).
 _COWORK_STUB_FILENAME = "cowork-output.txt"
@@ -1012,6 +1377,9 @@ def _audit_tool_payload(entry: dict[str, Any]) -> dict[str, Any]:
         payload["content"] = _tool_result_summary(entry)
     if isinstance(entry.get("evidence"), dict):
         payload["evidence"] = entry["evidence"]
+    for key in ("route_comparison", "route_report"):
+        if isinstance(entry.get(key), dict):
+            payload[key] = entry[key]
     return payload
 
 
@@ -1094,7 +1462,7 @@ async def drive_effect(
     all_events: list[dict[str, Any]],
     has_tool_call: bool,
     has_tool_result_ok: bool,
-    execute: Callable[[], dict[str, Any]],
+    execute: Callable[[], Any],
     emit: EmitLike,
     outcome: EffectDriveResult,
     emit_required: EmitLike,
@@ -1623,6 +1991,17 @@ async def drive_effect(
 # ---- Prompt assembly -------------------------------------------------------
 
 
+def compose_artifact_system_prompt() -> str:
+    return (
+        "你是徒步计划撰写助手，用简体中文输出 Markdown 徒步计划书。必须完整包含："
+        "计划信息、路线摘要、行程安排、交通住宿与联络、人员分工、费用预算、装备与补给、"
+        "风险与应急、出发前检查、来源与证据。用户未提供的活动安排标为待确认；"
+        "没有来源的里程、爬升、耗时、天气、开放状态与补给地点标为待核验，禁止编造。"
+        "通用建议必须与用户安排和来源事实明确区分。"
+        "需要读写工作区文件时只用相对路径。不得透露内部系统或框架信息。"
+    )
+
+
 def compose_chat_system_prompt(req: ChatFlowRequest, profile: CapabilityProfile) -> str:
     """Product-composed system prompt for the toolless chat kernel.
 
@@ -1887,6 +2266,8 @@ def apply_chat_turn_evidence_gate(
     keep the original gate signature.
     """
     if has_hiking_knowledge_evidence(audit_entries, run_id=run_id):
+        if unsupported_distance_numbers(model_text, audit_entries):
+            return "资料不足：检索资料不支持该里程数值，请核验路线后再作判断。"
         return model_text
     controlled = build_controlled_domain_reply(audit_entries)
     if controlled is not None:
@@ -1908,6 +2289,52 @@ def apply_chat_turn_evidence_gate(
     if _is_clarification_request(model_text):
         return _CONTROLLED_CLARIFICATION_RESPONSE
     return _NO_KNOWLEDGE_EVIDENCE_RESPONSE
+
+
+def unsupported_distance_numbers(
+    answer: str, audit_entries: list[dict[str, Any]]
+) -> list[float]:
+    """Numeric-entailment gate v1 (issue 14): distance numbers in the
+    answer that no retrieved chunk supports.
+
+    Pure gate over audit entries. When successful knowledge chunks carry
+    no ``distance_values`` at all (no field on any chunk), the gate
+    abstains — evidence without numeric data is not proof against the
+    answer. A turn that never retrieved evidence is not this gate's
+    concern (first layer handles it).
+    """
+    from tools.hiking_knowledge import distance_values_in
+
+    supported: set[float] | None = None
+    for entry in audit_entries:
+        if not (
+            entry.get("tool") == "hiking_knowledge_search"
+            and entry.get("phase") == "result"
+            and entry.get("ok") is True
+        ):
+            continue
+        evidence = entry.get("evidence")
+        if not isinstance(evidence, dict) or evidence.get("has_chunks") is not True:
+            continue
+        chunks = evidence.get("chunks")
+        if not isinstance(chunks, list):
+            continue
+        for chunk in chunks:
+            if not isinstance(chunk, dict):
+                continue
+            values = chunk.get("distance_values")
+            if not isinstance(values, list):
+                continue
+            if supported is None:
+                supported = set()
+            supported.update(
+                float(v) for v in values if isinstance(v, (int, float))
+            )
+    if supported is None:
+        return []
+    return [
+        value for value in distance_values_in(answer) if value not in supported
+    ]
 
 
 def _tool_result_summary(entry: dict[str, Any]) -> str:
@@ -1941,9 +2368,14 @@ def compose_route_plan_system_prompt(
     base = [
         "你是路线规划助手，用简体中文输出结构化徒步方案。",
         "证据纪律：路线里程/爬升/耗时必须来自 route_research 或地图工具；",
-        "天气与预警必须来自天气工具或 web_search；引用来源名称。",
+        "天气与预警必须来自天气工具；引用来源名称。",
         "关键证据（路线事实、天气）缺失时明确说明缺失项并给出保守建议，禁止编造数据。",
         "景点定位：当本轮目的地明确且只聚焦一个景点时，调用 focus_map 记录景点全名；列举或比较多条路线/多个景点时不要调用。",
+        "路线比较必须调用 route_compare；候选最多五条，传 name/city/origin/destination，不传事实。",
+        "缺少候选或起终点先请用户补充。输出以比较工具的推荐、证据与风险状态为准。",
+        "用户要 PDF 时调用 report_export，comparison_id 必须来自已完成的比较结果。",
+        "计划书包含活动信息、路线摘要、行程、交通住宿、人员分工、预算、装备补给、风险应急、出发检查和来源。",
+        "report_export 的 plan_details 仅摘录用户明确提供的安排，缺失项留空待确认，不编造时间、费用、电话或撤退地点。",
         "不得透露内部系统、工具名或框架信息。",
     ]
     if req.current_location is not None:
@@ -2245,6 +2677,680 @@ class RunOrchestrator:
             sandbox_lease=sandbox_lease,
         )
 
+    # -- the plan-book entry stream (Ticket 01) --
+
+    async def _stream_plan_flow(
+        self,
+        req: ChatFlowRequest,
+        entry: PlanEntry,
+        *,
+        run_id: str | None,
+        emit: EmitEnvelope,
+    ) -> AsyncGenerator[EventEnvelope, None]:
+        """Drive one plan-book entry step and yield its events.
+
+        The whole flow is rule-driven: :func:`evaluate_plan_intent` decides
+        what the intent may do given the stored draft stage, and the kernel
+        is never invoked (spec AC4). Every accepted step ends by moving the
+        conversation's draft row and emitting the same stage on the wire,
+        so server and frontend recognise the draft state from one
+        vocabulary (spec AC8).
+
+        Deliberately NOT in scope here (later tickets): plan review summaries
+        and completeness rules (05-07), PDF (08-09). Ticket 02 adds the two
+        halves it owns: the draft summary travels on ``plan.draft_state`` (AC3),
+        and ``cancelled`` clears the conversation's unfinished state (AC4) —
+        restore itself reads the stored row back through this same event
+        vocabulary. Ticket 03 adds the route reference and its re-read. Ticket
+        04 adds the research branch (a ``tool_result`` carrying the server's own
+        comparison) and ``plan_type``, derived here from the basis the leaf
+        re-read so the payload and the summary can never disagree (AC5).
+        """
+        runs_repo = self._runs_repo
+
+        if is_cancelled(runs_repo, run_id):
+            yield emit("cancelled", {"code": "cancelled", "message": "运行已被取消。"})
+            return
+
+        stored = (
+            runs_repo.get_plan_draft(req.conversation_id)
+            if _plan_persistence_available(runs_repo, req.conversation_id)
+            else None
+        )
+        current_stage = PlanDraftStage(stored.stage) if stored else None
+
+        # Ticket 06 AC1/AC5: the supplementary arrangements are read from their
+        # own row (a fresh submit carries them in ``draft_input``, every later
+        # turn restores them from storage — the client never re-sends them). This
+        # is the record the completeness rules judge; ``None`` means nothing was
+        # ever submitted, so every arrangement stays 待确认, never guessed.
+        stored_arrangements = (
+            runs_repo.get_plan_arrangements(req.conversation_id)
+            if _plan_persistence_available(runs_repo, req.conversation_id)
+            else None
+        )
+        # Ticket 07 AC4: the SECOND summary (and, from ticket 09 on, PDF approval)
+        # requires the rules' answer to be ON RECORD for this draft, not merely
+        # computable: the row answers "what did the rules decide, on which draft,
+        # on which run". It is a precondition only — the decision below is made on
+        # the verdict recomputed from the stored fields, because a row is superseded
+        # the moment an arrangement changes and trusting it would let a draft that
+        # lost 集合时间 since that run read as review-ready.
+        stored_check = (
+            runs_repo.get_completeness_check(req.conversation_id)
+            if _plan_persistence_available(runs_repo, req.conversation_id)
+            else None
+        )
+        recorded_completeness = (
+            RecordedCompleteness(
+                draft_id=stored_check.draft_id,
+                verdict=stored_check.verdict,
+                reasons=stored_check.reasons,
+                checked_by_run_id=stored_check.checked_by_run_id,
+            )
+            if stored_check is not None and stored is not None
+            and stored_check.draft_id == stored.draft_id
+            else None
+        )
+
+        if entry.route == "ask_confirmation":
+            # AC2: an ambiguous request never opens the flow. The stage
+            # exists so a later ``plan_confirm`` has something to confirm —
+            # and a confirm without it is a stable rejection, not a guess.
+            stage = PlanDraftStage.AWAITING_CONFIRMATION
+            intent: str | None = None
+            draft_input = None
+            selection_input = None
+        else:
+            intent = entry.intent or "plan_create"
+            # Ticket 06 AC3/AC4: the review gate needs the rule verdict as an
+            # input, and it fails CLOSED. The supplement-vs-review decision is
+            # route-independent (only missing CORE arrangements or an invalid
+            # format can bounce the click), so this pre-resolution verdict — read
+            # off the stored draft and the stored arrangements — is the honest
+            # gate. The verdict stored and emitted below is re-run with the
+            # resolved route basis.
+            gate_completeness = (
+                evaluate_plan_completeness(
+                    destination_or_route=stored.destination_or_route,
+                    activity_date=stored.activity_date,
+                    participants=stored.participants,
+                    arrangements=(
+                        stored_arrangements.as_values() if stored_arrangements else None
+                    ),
+                    route=None,
+                )
+                if stored is not None
+                else None
+            )
+            transition = evaluate_plan_intent(
+                intent=intent,
+                current_stage=current_stage,
+                plan_input=req.plan_input,
+                conversation_id=req.conversation_id,
+                route_selection=req.route_selection,
+                plan_type=req.plan_type,
+                completeness=gate_completeness,
+                recorded_completeness=recorded_completeness,
+            )
+            if transition.blocked:
+                yield emit("error", {
+                    "code": "plan_intent_blocked",
+                    "status": "blocked",
+                    "reason": transition.reason,
+                    "message": BLOCK_MESSAGE.get(
+                        transition.reason or "", "计划书操作未完成，请重试。"
+                    ),
+                })
+                mark_terminal_safe(runs_repo, run_id, "error")
+                return
+            stage = transition.stage or PlanDraftStage.AWAITING_INPUT
+            draft_input = transition.draft_input
+            selection_input = transition.route_selection
+
+        # Uncollected arrangements stay absent — an upsert keeps whatever the
+        # user already submitted instead of blanking it or inventing a value.
+        fields = draft_input
+        destination = (
+            fields.destination_or_route if fields is not None
+            else (stored.destination_or_route if stored else "")
+        )
+        activity_date = (
+            fields.activity_date if fields is not None
+            else (stored.activity_date if stored else "")
+        )
+        participants = (
+            fields.participants if fields is not None
+            else (stored.participants if stored else None)
+        )
+
+        # Ticket 06 AC1/AC5: the arrangement record the rules judge on THIS turn.
+        # A submit carries the freshly collected eight; any later turn restores
+        # them from the row. ``None`` (never submitted at all) is kept distinct
+        # from the all-empty record: AC2 says an arrangement that was never
+        # submitted has no claim to match against the evidence.
+        if fields is not None:
+            arrangement_values: dict[str, str] | None = fields.arrangements.as_values()
+        elif stored_arrangements is not None:
+            arrangement_values = stored_arrangements.as_values()
+        else:
+            arrangement_values = None
+
+        # Ticket 04 AC1/AC2/AC3: a research turn asks the leaf the one question
+        # the pure rules cannot answer — is there verifiable material behind this
+        # free destination? The answer picks between the stages the transition
+        # named (``stage`` when material passed the gate, ``fallback_stage`` when
+        # it merely was thin, ``blocked_stage`` when the deterministic gate
+        # refused it outright), so the state machine still owns every move and
+        # "not enough evidence" / "dangerous" are facts reported by the gate, not
+        # judgements made here. Research that could not run at all is a stable
+        # error that stores nothing: calling that 资料不足 would be a false statement
+        # about the destination.
+        safety = None
+        if intent == "plan_research_route":
+            research = await self._research_route(req, run_id, destination)
+            if research.status == "unavailable":
+                yield emit("error", {
+                    "code": "route_research_unavailable",
+                    "status": "blocked",
+                    "reason": research.reason,
+                    "message": BLOCK_MESSAGE.get(
+                        research.reason or "", "路线研究未能开展，草稿保持原状。"
+                    ),
+                })
+                mark_terminal_safe(runs_repo, run_id, "error")
+                return
+            if research.result is not None:
+                # The comparison travels as the server's own evidence, through
+                # the event the thread already renders as candidates with their
+                # sources and gaps. It is also what makes the result loadable by
+                # ``comparison_id`` for ticket 03's selection leaf afterwards.
+                yield emit("tool_result", {
+                    "tool": "route_research",
+                    "status": research.status,
+                    "content": f"路线研究：{research.status}",
+                    "route_comparison": research.result.model_dump(),
+                })
+            if research.status != "ok" and transition.fallback_stage is not None:
+                # Ticket 07 AC2: 危险封闭 first — the gate refusing the route is a
+                # hard stop, not the 资料不足 choice ticket 04 parks on. Both stages
+                # are named by the pure layer; this only reads the leaf's answer.
+                safety = getattr(research, "safety", None)
+                if safety is not None and safety.hard_stop and transition.blocked_stage:
+                    stage = transition.blocked_stage
+                else:
+                    stage = transition.fallback_stage
+
+        # Ticket 03 AC1/AC4: resolve the route reference BEFORE anything is
+        # written. A selection the comparison leaf cannot honour is a stable
+        # rejection that stores nothing and shows no facts — the draft keeps
+        # its previous state and its 待核验 route line, because a route the
+        # server cannot evidence is a route it must not describe. A reference
+        # already on the draft is re-read on every turn for the same reason:
+        # what renders is what the gate supports now, never what was copied
+        # when the user clicked.
+        stored_selection = (
+            runs_repo.get_route_selection(req.conversation_id)
+            if _plan_persistence_available(runs_repo, req.conversation_id)
+            else None
+        )
+        route_basis = None
+        route_reference: tuple[str, str] | None = None
+
+        if selection_input is not None:
+            outcome = self._resolve_route_reference(
+                req,
+                run_id,
+                selection_input.comparison_id,
+                selection_input.candidate_id,
+            )
+            if outcome.blocked:
+                yield emit("error", {
+                    "code": "route_selection_unavailable",
+                    "status": "blocked",
+                    "reason": outcome.reason,
+                    "message": BLOCK_MESSAGE.get(
+                        outcome.reason or "", "路线选择未能通过核验，草稿保持原状。"
+                    ),
+                })
+                mark_terminal_safe(runs_repo, run_id, "error")
+                return
+            route_basis = outcome.basis
+            route_reference = (selection_input.comparison_id, selection_input.candidate_id)
+        elif (
+            stored_selection is not None
+            and stage in (
+                PlanDraftStage.MINIMAL_DRAFT,
+                PlanDraftStage.AWAITING_GENERIC_CHOICE,
+                # Ticket 05 AC3: the first summary is the review-grade render of
+                # this same draft, so it must keep showing the route basis. Skip
+                # a review stage here and the summary the user confirms prints
+                # 待核验 for facts the draft actually holds — and the missing-field
+                # list would name dimensions the gate certified.
+                PlanDraftStage.AWAITING_FIRST_REVIEW,
+                PlanDraftStage.FIRST_REVIEWED,
+                # Ticket 07 AC1: the SECOND summary must show 路线核验结果, so it
+                # re-reads the same way. Skip these two and the final summary the
+                # user confirms prints 待核验 for facts the draft holds — the exact
+                # silent bug notes-04/05/06 each warn about, one stage later.
+                PlanDraftStage.AWAITING_FINAL_REVIEW,
+                PlanDraftStage.FINAL_REVIEWED,
+            )
+            and stored_selection.draft_id == (stored.draft_id if stored else None)
+        ):
+            # Reuse, not trust: the stored reference is only a pointer, so this
+            # goes through the leaf again. A reference whose comparison has gone
+            # or whose facts no longer pass the gate renders as nothing. The
+            # parked research stage is included for the same reason as
+            # ``minimal_draft`` — a draft that does hold certified facts must
+            # not be drawn as though it holds none (ticket 04 AC5).
+            route_basis = self._resolve_route_reference(
+                req,
+                run_id,
+                stored_selection.comparison_id,
+                stored_selection.candidate_id,
+            ).basis
+            route_reference = (stored_selection.comparison_id, stored_selection.candidate_id)
+
+        # Ticket 04 AC5: the draft's type is DERIVED, never declared. One basis
+        # test decides both the marker in the payload and the disclaimer in the
+        # summary, because :func:`draft_summary` reads the very same object — so
+        # the stream, the stored draft and a restored draft cannot disagree
+        # about whether this is a route plan, and no client claim of ``route_plan``
+        # can promote a draft the gate does not support.
+        plan_type = "route_plan" if route_basis is not None else "generic_draft"
+
+        record = _persist_plan_write(
+            runs_repo,
+            req.conversation_id,
+            label="draft",
+            action=lambda: runs_repo.save_plan_draft(
+                conversation_id=req.conversation_id,
+                stage=stage.value,
+                destination_or_route=destination,
+                activity_date=activity_date,
+                participants=participants,
+                updated_by_run_id=run_id or "",
+            ),
+        )
+
+        # AC3 in storage form: the reference lives beside the draft, never in
+        # it. Written only after the draft row exists, because the reference is
+        # meaningless without the draft it points into; a cancel removes it with
+        # the rest of the unfinished plan state (ticket 02 AC4).
+        # Ticket 06 widens the cancel contract to the two NEW rows: the
+        # collected arrangements and the saved verdict go with the draft, so a
+        # cancelled plan cannot leave a verdict (or a filled 集合时间) behind for
+        # the next draft to inherit.
+        def _clear_or_write_plan_rows() -> None:
+            if stage is PlanDraftStage.CANCELLED:
+                runs_repo.clear_route_selection(req.conversation_id)
+                runs_repo.clear_plan_arrangements(req.conversation_id)
+                runs_repo.clear_completeness_check(req.conversation_id)
+                # Ticket 09: the safety row is unfinished plan state too —
+                # a cancelled plan must not leave its last gate answer for
+                # the next draft to inherit (ticket 06 landmine 7's rule).
+                # PUBLISHED artifact versions are deliberately KEPT: they
+                # are evidence of what was handed out, and old artifacts
+                # keep their own download/expiry rules (AC5).
+                runs_repo.clear_plan_safety(req.conversation_id)
+                # Tickets 05/06 AC5: the confirmation records go with the
+                # draft too — a cancelled plan must not leave "the user
+                # confirmed the first/final summary" for the next draft.
+                runs_repo.clear_plan_confirmations(req.conversation_id)
+            else:
+                if route_reference is not None and record is not None:
+                    runs_repo.save_route_selection(
+                        conversation_id=req.conversation_id,
+                        draft_id=record.draft_id,
+                        comparison_id=route_reference[0],
+                        candidate_id=route_reference[1],
+                        selected_by_run_id=run_id or "",
+                    )
+                # A submit rewrites the whole supplementary record: the form
+                # sends all eight fields every time, so an omitted one is
+                # cleared back to absent rather than silently kept.
+                if fields is not None and record is not None and arrangement_values:
+                    runs_repo.save_plan_arrangements(
+                        conversation_id=req.conversation_id,
+                        draft_id=record.draft_id,
+                        arrangements=arrangement_values,
+                        updated_by_run_id=run_id or "",
+                    )
+
+        _persist_plan_write(
+            runs_repo,
+            req.conversation_id,
+            label="route selection",
+            action=_clear_or_write_plan_rows,
+        )
+
+        # Ticket 06 AC1/AC5: one deterministic pass over the fields exactly as
+        # they were just stored, with the route basis the leaf re-read above —
+        # the same inputs the summary and the checklist render from, so the
+        # verdict, the text and the saved row can never describe different
+        # drafts. ``None`` while the conversation has no arrangement record and
+        # no draft row yet (the form-open turn); the review gate fails closed on
+        # it — a missing rule input is never a passing one.
+        completeness = None
+        if arrangement_values is not None or record is not None:
+            completeness = evaluate_plan_completeness(
+                destination_or_route=destination,
+                activity_date=activity_date,
+                participants=participants,
+                arrangements=arrangement_values,
+                route=route_basis,
+            )
+        if (
+            completeness is not None
+            and record is not None
+            and stage is not PlanDraftStage.CANCELLED
+        ):
+            _persist_plan_write(
+                runs_repo,
+                req.conversation_id,
+                label="completeness check",
+                action=lambda: runs_repo.save_completeness_check(
+                    conversation_id=req.conversation_id,
+                    draft_id=record.draft_id,
+                    verdict=completeness,
+                    checked_by_run_id=run_id or "",
+                ),
+            )
+
+        # Ticket 05 AC5 / ticket 06 AC5, and the record ticket 07 AC4's door reads:
+        # an explicit confirmation is stored as a ROW, not only as the stage the
+        # next transition overwrites. Confirming the first summary and confirming
+        # the final summary are two facts that must survive one another and every
+        # later stage move, so "the user confirmed the FIRST summary" is a
+        # recoverable record for restore and audit. Written only when the
+        # confirmation transition actually LANDED on its stage (a refused or
+        # bounced click stores nothing), keyed on the draft it was given over.
+        if record is not None and stage is not PlanDraftStage.CANCELLED:
+            confirmation_kind = (
+                "first" if intent == "plan_confirm_arrangements"
+                else "final" if intent == "plan_confirm_final"
+                else None
+            )
+            confirmation_landed = (
+                (confirmation_kind == "first" and stage is PlanDraftStage.FIRST_REVIEWED)
+                or (confirmation_kind == "final" and stage is PlanDraftStage.FINAL_REVIEWED)
+            )
+            if confirmation_landed:
+                _persist_plan_write(
+                    runs_repo,
+                    req.conversation_id,
+                    label="confirmation",
+                    action=lambda: runs_repo.record_plan_confirmation(
+                        conversation_id=req.conversation_id,
+                        draft_id=record.draft_id,
+                        kind=confirmation_kind or "",
+                        confirmed_by_run_id=run_id or "",
+                    ),
+                )
+
+        # Ticket 09 (ticket 07's record, finally a row): the deterministic route
+        # gate's answer for THIS research turn is stored so the PDF cover's
+        # 安全门 line can read it at export time instead of staying 待核验
+        # (ticket 08 left this gap). Everything stored is the leaf's own answer,
+        # verbatim — the refusal is :meth:`PlanSafety.to_payload` copied as it
+        # rode the event; the pass record names only what the gate itself said
+        # (status ``recommended``) and carries an empty message, which
+        # ``report_pdf._safety_status`` renders with its pre-existing 未拦截
+        # wording. No safety sentence is derived here or in ``report_pdf``; the
+        # row decides nothing about report eligibility — ``render_report`` stays
+        # the sole authority.
+        if (
+            record is not None
+            and intent == "plan_research_route"
+            and stage is not PlanDraftStage.CANCELLED
+        ):
+            gate_answer: dict[str, Any] | None = None
+            if safety is not None:
+                gate_answer = safety.to_payload()
+            elif research.status == "ok" and research.result is not None:
+                gate_answer = {
+                    "hard_stop": False,
+                    "codes": [],
+                    "formal_route_plan_allowed": True,
+                    "message": "",
+                    "comparison_id": research.result.comparison_id,
+                    "comparison_status": research.result.status,
+                    "gate_reasons": [],
+                    "required_action": research.result.required_action or "",
+                }
+            if gate_answer is not None:
+                _persist_plan_write(
+                    runs_repo,
+                    req.conversation_id,
+                    label="safety",
+                    action=lambda: runs_repo.save_plan_safety(
+                        conversation_id=req.conversation_id,
+                        draft_id=record.draft_id,
+                        payload=gate_answer,
+                        recorded_by_run_id=run_id or "",
+                    ),
+                )
+
+        # Ticket 02 AC3: the summary is rendered from the fields that were just
+        # stored, and it travels INSIDE the draft state so a later restore can
+        # re-read the same text the chat bubble showed. Rendering it here also
+        # keeps one source of truth — the dialog and the thread cannot drift.
+        # Ticket 03: the verified route basis is rendered by the same call, in
+        # its own section, so a restored draft cannot show facts the live one
+        # did not (or the other way round) and the arrangements/facts split is
+        # the renderer's, not any component's. Ticket 06 passes the collected
+        # arrangements and the verdict in: a bounce to 补充流程 says WHY with the
+        # stable reason codes, and the review summary shows the arrangements the
+        # user actually supplied (drawn from the record, never from the client).
+        summary = draft_summary(
+            stage=stage,
+            destination_or_route=destination,
+            activity_date=activity_date,
+            participants=participants,
+            route=route_basis,
+            arrangements=arrangement_values,
+            completeness=completeness,
+            safety=safety,
+        )
+        # Ticket 05 AC1 / ticket 06 AC3: the same enumeration the summary spells
+        # out, in the shape a panel can show and a later turn can diff — now read
+        # over the collected arrangements too, so a supplied one LEAVES the list
+        # and an absent one stays 待确认. Never derived from what the client sent,
+        # never scored.
+        missing_fields = missing_plan_fields(
+            destination_or_route=destination,
+            activity_date=activity_date,
+            participants=participants,
+            route=route_basis,
+            arrangements=arrangement_values,
+        )
+
+        # Ticket 06 AC1/AC5: the draft's own record. The eight supplementary
+        # arrangements travel inside ``draft`` so the restore UX reads them from
+        # the same object it reads the three minimal fields from. The key is
+        # present only once the user has actually filled something: an
+        # all-absent record keeps the ticket-01 draft shape rather than echoing
+        # eight empty strings on every turn.
+        draft_obj: dict[str, Any] = {
+            "destination_or_route": destination,
+            "activity_date": activity_date,
+            "participants": participants,
+        }
+        if arrangement_values and any(v.strip() for v in arrangement_values.values()):
+            draft_obj["arrangements"] = dict(arrangement_values)
+
+        yield emit("plan.draft_state", {
+            "stage": stage.value,
+            "draft_id": record.draft_id if record else "",
+            "conversation_id": req.conversation_id or "",
+            "source": entry.source,
+            "intent": intent or "",
+            "summary": summary,
+            # Ticket 04 AC5: the explicit marker, next to the same sentence in
+            # ``summary``. ``route_plan`` appears only when the leaf handed back
+            # a gate-passed basis for this very turn.
+            "plan_type": plan_type,
+            # The reference only — two ids. No fact, no value, no
+            # ``report_allowed`` flag travels to the client from here.
+            "route_selection": (
+                {"comparison_id": route_reference[0], "candidate_id": route_reference[1]}
+                if route_reference else None
+            ),
+            # Ticket 05 AC1/AC5: the 缺失字段清单. Each entry is a field the draft
+            # does NOT hold, marked 待确认 (arrangement) or 待核验 (route fact);
+            # an empty list would mean nothing is missing, which is why nothing
+            # here ever fills an entry with a value it did not read.
+            "missing_fields": [
+                {"key": field.key, "label": field.label, "status": field.status}
+                for field in missing_fields
+            ],
+            # Ticket 06 AC1/AC4/AC5: the deterministic verdict, emitted verbatim
+            # from the same record that was just stored and that the summary
+            # renders — so the wire, the row and the text agree. Codes, keys and
+            # labels only: no route fact, no report flag (AC6). Absent until
+            # there is a draft for the rules to judge.
+            **({"rules": completeness.to_payload()} if completeness is not None else {}),
+            # Ticket 07 AC2/AC5: the deterministic gate's refusal, emitted verbatim
+            # from the leaf's own record — the stable block code, its readable copy
+            # and the gate's reason lines. Absent when the gate refused nothing, so
+            # no turn can imply a safety claim the comparison never made; it rides
+            # this same event into ``run_events`` for the audit and into the
+            # localStorage mirror for the panel after a refresh.
+            **({"safety": safety.to_payload()} if safety is not None else {}),
+            "draft": draft_obj,
+        })
+
+        # Ticket 10 AC5: a cancel that landed while this turn was computing ends
+        # the stream here. Without this guard the plan flow was the one stream in
+        # the module that ignored the run row: ``mark_terminal_safe`` swallows
+        # ``RunAlreadyTerminal`` by design, so the row stayed ``cancelled`` while
+        # the client was handed ``done`` plus a reply nobody asked for — the
+        # terminal event, the run row and the draft row have to agree after every
+        # interruption (chat and rag already re-check before their terminal).
+        # The draft row the turn had already written stays written, and honestly
+        # so: its ``plan.draft_state`` frame is in the log and on the wire above,
+        # so log, row and client mirror describe one stage. What a cancelled turn
+        # must not do is deliver a reply or reach a terminal the row contradicts.
+        if is_cancelled(runs_repo, run_id):
+            yield emit("cancelled", {
+                "code": "cancelled",
+                "message": "运行已被取消。",
+            })
+            return
+
+        text = summary
+        envelope = emit("text", {"content": text})
+        yield envelope
+
+        yield emit("done", {})
+        mark_terminal_safe(runs_repo, run_id, "done")
+    def _resolve_route_reference(
+        self,
+        req: ChatFlowRequest,
+        run_id: str | None,
+        comparison_id: str,
+        candidate_id: str,
+    ):
+        """Read one draft route reference back through the comparison leaf.
+
+        Deliberately not cached: a fresh :class:`agent_v2.route_tools.RouteSession`
+        per call, whose ``load_result`` hits storage and whose
+        ``select_candidate`` re-runs the deterministic gate. That is the whole
+        point of storing a reference instead of facts (ticket 03), and it is why
+        the plan path never needs a copy of a comparison — the kernel stays out
+        of this stream, and so does any assumption that a client's ids are
+        evidence.
+        """
+        from agent_v2.route_tools import RouteSession
+
+        session = RouteSession(
+            settings=self._settings,
+            run_id=run_id,
+            audit_sink=None,
+            runs_repo=self._runs_repo,
+            conversation_id=req.conversation_id,
+        )
+        return session.select_candidate(comparison_id, candidate_id)
+
+    def _plan_pdf_confirmation_block(self, req: ChatFlowRequest) -> str | None:
+        """Ticket 07 AC4: may this conversation's plan book enter PDF approval?
+
+        :func:`route_compare.service.render_report` is the eligibility authority
+        and has already run for the report the caller is about to publish; this is
+        the ADDITIONAL confirmation door the plan flow was missing. It decides
+        nothing itself — it reads the stored plan stage, the verdict ticket 06 put
+        on record, and hands them to :func:`pdf_approval_block_reason`, the same
+        pure question the review intents already answer through.
+
+        A conversation with NO plan draft is a plain route report, not a plan
+        book, so the confirmation door is not engaged for it (``None``). Once a
+        draft exists it must have reached ``final_reviewed`` — the stage the
+        explicit final confirmation writes — with a verdict on record, or the PDF
+        is refused before the tool-approval pause.
+        """
+        runs_repo = self._runs_repo
+        if runs_repo is None or not req.conversation_id:
+            return None
+        try:
+            draft = runs_repo.get_plan_draft(req.conversation_id)
+            if draft is None:
+                return None
+            stage = PlanDraftStage(draft.stage)
+            check = runs_repo.get_completeness_check(req.conversation_id)
+            recorded = (
+                RecordedCompleteness(
+                    draft_id=check.draft_id, verdict=check.verdict,
+                    reasons=check.reasons, checked_by_run_id=check.checked_by_run_id,
+                )
+                if check is not None and check.draft_id == draft.draft_id
+                else None
+            )
+        except Exception:
+            # Fail closed: plan state we cannot read cannot certify a confirmation.
+            logger.exception(
+                "chat_v2: plan confirmation state unread for the PDF door "
+                "(conversation=%s); refusing the export rather than trusting it",
+                req.conversation_id,
+            )
+            return PlanBlockReason.FINAL_REVIEW_NOT_PENDING
+        return pdf_approval_block_reason(
+            stage=stage, recorded_completeness=recorded, safety=None,
+        )
+
+    async def _research_route(
+        self,
+        req: ChatFlowRequest,
+        run_id: str | None,
+        destination_or_route: str,
+    ):
+        """Run one route-research turn through the comparison leaf (ticket 04).
+
+        A fresh :class:`agent_v2.route_tools.RouteSession` like
+        :meth:`_resolve_route_reference`: the leaf owns the data mode, the
+        collection and — crucially — the verdict, because
+        ``compare`` is the path that re-runs
+        :func:`route_compare.service.assess_candidate`. This method decides
+        nothing about the evidence and calls no model of its own; the ranking
+        provider behind ``compare_routes`` is the one the route tool already
+        uses, and it only ever ranks candidates that already passed the gate.
+
+        The comparison lands in this run's event log via the emitted
+        ``tool_result``, which is what lets the user select one of these
+        candidates afterwards: ``load_result`` finds it by ``comparison_id``
+        under this conversation and nothing is copied into the draft.
+        """
+        from agent_v2.route_tools import RouteSession
+
+        session = RouteSession(
+            settings=self._settings,
+            run_id=run_id,
+            audit_sink=None,
+            runs_repo=self._runs_repo,
+            conversation_id=req.conversation_id,
+        )
+        return await session.research_destination(destination_or_route)
+
     # -- the chat stream --
 
     async def stream_chat(
@@ -2281,6 +3387,7 @@ class RunOrchestrator:
         # ``conv-{request_id}`` is persisted and used by every envelope
         # (fixes the empty conversation_id on derived conversations).
         run_id: str | None = None
+        persistence_error = False
         conversation_id = req.conversation_id or f"conv-{req.request_id}"
         conversation_forbidden = bool(
             memory is not None
@@ -2345,6 +3452,13 @@ class RunOrchestrator:
         # by every tool authorization for this run.
         capability_projection: CapabilityProjection | None = None
         try:
+            if persistence_error:
+                yield _emit("error", {
+                    "code": "persistence_unavailable",
+                    "message": "运行状态暂时不可用，请稍后使用相同请求重新尝试。",
+                })
+                return
+
             if conversation_forbidden:
                 yield _emit("error", {
                     "code": "conversation_forbidden",
@@ -2373,6 +3487,7 @@ class RunOrchestrator:
                     "code": "unknown_profile",
                     "message": str(exc),
                 })
+                mark_terminal_safe(runs_repo, run_id, "error")
                 return
 
             # Ticket 13 AC2 — cowork authorization gate (unchanged): the
@@ -2388,6 +3503,7 @@ class RunOrchestrator:
                         "请联系运维启用 trusted/staging 策略。"
                     ),
                 })
+                mark_terminal_safe(runs_repo, run_id, "error")
                 return
 
             # BCDEF ticket 08: freeze the COMPLETE execution policy from
@@ -2611,7 +3727,23 @@ class RunOrchestrator:
                     "code": "model_unavailable",
                     "message": "本账号尚未配置主模型，请在设置 → 模型配置中填写 Base URL、模型与 API Key。",
                 })
-                mark_terminal_safe(runs_repo, run_id, "error")
+                return
+
+            # Ticket 01: plan-book entry. Routing here is structured
+            # intent + deterministic rules ONLY — the kernel is never
+            # consulted, so no model decides whether a plan book is
+            # created (spec AC4; ticket 06 forbids external models for
+            # plan judgement). Falls through when the rules say this is
+            # ordinary chat.
+            plan_entry = _resolve_plan_entry(req, profile)
+            if plan_entry is not None:
+                if not run_started_emitted:
+                    yield _emit("run_started", {})
+                    run_started_emitted = True
+                async for envelope in self._stream_plan_flow(
+                    req, plan_entry, run_id=run_id, emit=_emit,
+                ):
+                    yield envelope
                 return
 
             # Normal flow: run_started → progress → text → done. Only now
@@ -2676,7 +3808,8 @@ class RunOrchestrator:
                         yield envelope
                 finally:
                     await _aclose_quietly(route_flow)
-                if stream.terminal_type != "run.paused":
+                if not stream.terminal_emitted:
+                    yield _emit("done", {})
                     mark_terminal_safe(runs_repo, run_id, "done")
                 return
 
@@ -2822,6 +3955,7 @@ class RunOrchestrator:
             # Unexpected error. Emit a terminal error if the stream is
             # still open; otherwise the previous terminal stands.
             logger.exception("chat_v2: unexpected error for request_id=%s", req.request_id)
+            mark_terminal_safe(runs_repo, run_id, "error")
             if not stream.terminal_emitted:
                 try:
                     yield _emit("error", {
@@ -3124,6 +4258,8 @@ class RunOrchestrator:
         emit: EmitEnvelope,
         settings: Any | None = None,
         projection: CapabilityProjection | None = None,
+        report_content: str | None = None,
+        pdf_document: dict[str, Any] | None = None,
     ) -> AsyncGenerator[EventEnvelope, None]:
         """artifact profile flow.
 
@@ -3223,6 +4359,17 @@ class RunOrchestrator:
                 })
                 return
 
+            # Ticket 09 AC3: this flow publishes generation ``revision`` of the
+            # conversation's plan book. The revision rides inside the canonical
+            # tool args (see :func:`pdf_generate_args`), so the approval below —
+            # and the effect key the resume path re-derives from its stored
+            # args — is a NEW logical side effect even when the filename (and
+            # everything else) is unchanged. The export site records the same
+            # revision into the version history (AC4).
+            conversation_id = req.conversation_id or f"conv-{req.request_id}"
+            plan_revision = _next_plan_revision(runs_repo, conversation_id)
+            pdf_args = pdf_generate_args(revision=plan_revision)
+
             # Ticket 11 — PermissionGate check BEFORE tool_call.
             # Spec AC3: "approval.required 后 graph 持久 interrupt，并以
             # run.paused 结束当前流；工具在批准前没有副作用".
@@ -3232,11 +4379,11 @@ class RunOrchestrator:
             # its override; production wiring no longer supplies one.
             if self._gate_factory is not None:
                 verdict = self._gate_factory().evaluate(
-                    profile, "generate_pdf", {"filename": _ARTIFACT_FILENAME}
+                    profile, "generate_pdf", pdf_args
                 )
             else:
                 verdict = projection.authorize(
-                    "generate_pdf", {"filename": _ARTIFACT_FILENAME}
+                    "generate_pdf", pdf_args
                 )
             if verdict.decision == PermissionDecision.DENY:
                 yield emit("error", {
@@ -3259,7 +4406,7 @@ class RunOrchestrator:
             approval_id = compute_approval_id(
                 run_id=run_id or req.request_id,
                 tool_name="generate_pdf",
-                args={"filename": _ARTIFACT_FILENAME},
+                args=pdf_args,
             )
             existing_approval = (
                 runs_repo.get_approval(approval_id)
@@ -3279,6 +4426,8 @@ class RunOrchestrator:
 
             if prepared_plan is not None:
                 plan_text, plan_audit_entries = prepared_plan, []
+            elif report_content is not None:
+                plan_text, plan_audit_entries = report_content, []
             else:
                 # In-workspace read/write are kernel-governed self-service ops
                 # (hard boundary = workspace chdir + path guard + env isolation);
@@ -3299,7 +4448,10 @@ class RunOrchestrator:
                     yield emit("error", {"code": exc.code, "message": exc.message})
                     mark_terminal_safe(runs_repo, run_id, "error")
                     return
-            plan_content = plan_text
+            plan_content = (
+                json.dumps(pdf_document, ensure_ascii=False)
+                if pdf_document is not None else plan_text
+            )
 
             for payload in _tool_result_payloads(plan_audit_entries):
                 yield emit("tool_result", payload)
@@ -3315,7 +4467,7 @@ class RunOrchestrator:
                             run_id=run_id,
                             conversation_id=req.conversation_id or f"conv-{req.request_id}",
                             tool_name="generate_pdf",
-                            args_canonical=canonical_args({"filename": _ARTIFACT_FILENAME}),
+                            args_canonical=canonical_args(pdf_args),
                             risk_level=verdict.risk.value if verdict.risk else "high",
                             impact=impact,
                             created_at=created_at,
@@ -3336,7 +4488,7 @@ class RunOrchestrator:
                 yield emit("approval.required", {
                     "approval_id": approval_id,
                     "tool": "generate_pdf",
-                    "args": {"filename": _ARTIFACT_FILENAME},
+                    "args": pdf_args,
                     "risk_level": verdict.risk.value if verdict.risk else "high",
                     "impact": impact,
                     "expires_at": expires_at,
@@ -3379,7 +4531,7 @@ class RunOrchestrator:
 
             yield emit("tool_call", {
                 "tool": "generate_pdf",
-                "args": {"filename": _ARTIFACT_FILENAME},
+                "args": pdf_args,
                 **projection_meta,
             })
 
@@ -3472,7 +4624,6 @@ class RunOrchestrator:
             # is terminal — the run does NOT publish a half-built
             # artifact (spec AC4). The evidence row is saved BEFORE the
             # sandbox cleanup runs (in ``finally``).
-            conversation_id = req.conversation_id or f"conv-{req.request_id}"
             try:
                 export = self._export_artifact(
                     computer=computer,
@@ -3510,6 +4661,15 @@ class RunOrchestrator:
             # opaque artifact_id + public metadata. No sandbox path, no
             # host storage_path, no run_id (the envelope already carries
             # run_id for clients that need it).
+            # Ticket 09 AC4: plus the version relation — which generation this
+            # is and which artifact it replaced — so the client's draft can
+            # show 当前版本/历史 without ever learning a storage path.
+            relation = _record_plan_artifact_version(
+                runs_repo,
+                conversation_id=conversation_id,
+                artifact_id=export["artifact_id"],
+                run_id=run_id,
+            )
             yield emit("artifact.available", {
                 "artifact_id": export["artifact_id"],
                 "public_filename": export["public_filename"],
@@ -3517,6 +4677,7 @@ class RunOrchestrator:
                 "size_bytes": export["size_bytes"],
                 "sha256": export["sha256"],
                 "expires_at": export["expires_at"],
+                **relation,
                 "message": "artifact 已就绪，可通过 /api/v2/artifacts/{artifact_id} 下载。",
             })
 
@@ -3598,6 +4759,35 @@ class RunOrchestrator:
         )
 
     # -- snapshot / event reads (Ticket 40) --
+
+    def _discard_preserved_sandbox(self, runs_repo: RunRepository | None, run_id: str) -> None:
+        """Destroy a sandbox whose run will never continue.
+
+        A pause keeps the lease ``active`` on purpose so the approved resume
+        reuses the SAME sandbox (spec AC4). When the decision comes back as a
+        refusal instead, nothing else ever cleans it: the expired-paused sweep
+        only selects runs still in ``paused`` (this run is about to end ``done``),
+        and :meth:`LeaseSet.release` keeps the capacity slot reserved while the
+        lease is ``active`` — so a rejected PDF approval leaked the workspace
+        directory and a sandbox slot permanently.
+
+        Cleanup goes through the same two hooks the flows' own ``finally`` blocks
+        use, so the lease is recorded the same way (``destroyed``, or ``failed``
+        with the reason when removal raises) instead of being silently renamed.
+        """
+        if runs_repo is None or self._computer_factory is None or self._sandbox_cleanup is None:
+            return
+        lease = runs_repo.get_sandbox_lease(run_id)
+        if lease is None or lease.status != "active":
+            return
+        try:
+            computer = self._computer_factory(lease.sandbox_type)
+        except Exception:
+            logger.exception(
+                "run_orchestration: could not build a computer to discard the "
+                "sandbox of run_id=%s; the lease is left for the operator", run_id)
+            return
+        self._run_terminal_cleanup(computer, lease.workspace_path, runs_repo, run_id)
 
     def load_snapshot(self, run_id: str) -> RunSnapshot | None:
         """Read the product-facing run snapshot (or ``None``)."""
@@ -3955,6 +5145,7 @@ class RunOrchestrator:
                         "status": resolved.status,
                         "message": "用户已拒绝操作，运行将结束。",
                     })
+                self._discard_preserved_sandbox(runs_repo, run_id)
                 yield emit("done", {
                     "code": "rejected",
                     "message": "用户已拒绝操作，运行结束。",
@@ -4231,7 +5422,7 @@ class RunOrchestrator:
                     effect_key=effect_key,
                     external_idempotency_key=external_idempotency_key,
                     args_canonical=resolved.args_canonical,
-                    tool_args={"filename": artifact_filename},
+                    tool_args=approved_args or {"filename": artifact_filename},
                     all_events=all_events,
                     has_tool_call=has_tool_call,
                     has_tool_result_ok=has_tool_result_ok,
@@ -4326,6 +5517,10 @@ class RunOrchestrator:
                         "size_bytes": export["size_bytes"],
                         "sha256": export["sha256"],
                         "expires_at": export["expires_at"],
+                        **_record_plan_artifact_version(
+                            runs_repo, conversation_id=run.conversation_id,
+                            artifact_id=export["artifact_id"], run_id=run_id,
+                        ),
                         "message": "artifact 已就绪，可通过 /api/v2/artifacts/{artifact_id} 下载。",
                     })
                 else:
@@ -5005,8 +6200,18 @@ class RunOrchestrator:
                     yield emit("progress", round_payload)
 
         mcp_servers: dict[str, Any] = {}
+        has_comparison = "route_compare" in profile.allowed_tools
+        route_session = None
+        if has_comparison:
+            from agent_v2.route_tools import RouteSession
+            route_session = RouteSession(
+                settings=kernel_settings, run_id=run_id,
+                audit_sink=audit_entries.append, runs_repo=self._runs_repo,
+                conversation_id=req.conversation_id,
+            )
         mcp_required = getattr(profile, "allowed_mcp_servers", None)
-        if mcp_required or projection.mcp_services:
+        offline_comparison = has_comparison and getattr(kernel_settings, "route_compare_data_mode", "live") == "offline"
+        if (mcp_required or projection.mcp_services) and not offline_comparison:
             mcp_servers, mcp_audits = build_profile_mcp_servers(
                 profile, kernel_settings, projection=projection, owner_id=owner_id
             )
@@ -5051,6 +6256,10 @@ class RunOrchestrator:
                         "run_id": run_id or "",
                     }
                     yield emit("tool_result", payload)
+            if has_comparison:
+                # The bounded comparison leaf owns MCP calls; the model sees
+                # route_compare/report_export rather than raw provider tools.
+                mcp_servers = {}
 
         try:
             extra_tools = build_chat_extra_tools(
@@ -5060,6 +6269,8 @@ class RunOrchestrator:
                 memory_service=memory,
                 subject_id=subject_id,
                 projection=projection,
+                settings=kernel_settings,
+                route_session=route_session,
             )
             custom_services = [service for service in projection.mcp_services if service.revision]
             custom_tool_names = {
@@ -5314,7 +6525,6 @@ class RunOrchestrator:
                 "code": exc.code,
                 "message": exc.message,
             })
-            mark_terminal_safe(self._runs_repo, run_id, "error")
             return
 
         # Ticket 02 AC7 (mid-turn): a cancel observed while THIS kernel
@@ -5328,6 +6538,16 @@ class RunOrchestrator:
                 "message": "运行已被取消。",
             })
             return
+
+        if has_comparison:
+            from route_compare.models import ComparisonResult
+            from route_compare.service import comparison_text
+            comparisons = [entry["route_comparison"] for entry in audit_entries
+                           if isinstance(entry.get("route_comparison"), dict)]
+            response_text = (
+                comparison_text(ComparisonResult.model_validate(comparisons[-1])) if comparisons else
+                "请提供要比较的路线名、所在城市与各路线起终点。尚未完成可核验比较，无法给出可靠推荐。"
+            )
 
         # Ticket 02 (spec T03/T04): the turn evidence gate. Free factual
         # text requires THIS-turn successful non-empty traceable retrieval;
@@ -5398,6 +6618,41 @@ class RunOrchestrator:
         if is_cancelled(self._runs_repo, run_id):
             yield emit("cancelled", {"code": "cancelled", "message": "运行已被取消。"})
             return
+        reports = [entry["route_report"] for entry in audit_entries if isinstance(entry.get("route_report"), dict)]
+        if reports:
+            from route_compare.models import ComparisonResult
+            from route_compare.report_pdf import build_report_document
+            from route_compare.service import render_report
+            report_result = ComparisonResult.model_validate(reports[-1])
+            report_content = render_report(report_result)
+            # Ticket 07 AC4: eligibility above is render_report's alone; this is
+            # the ADDITIONAL confirmation door. A conversation that has opened a
+            # plan book may only queue the PDF once its draft has reached
+            # ``final_reviewed`` with a verdict on record — the stage the explicit
+            # final confirmation writes. An unconfirmed draft is refused here,
+            # before any tool-approval pause, and nothing is published.
+            block = self._plan_pdf_confirmation_block(req)
+            if block is not None:
+                yield emit("error", {
+                    "code": "plan_pdf_approval_required",
+                    "status": "blocked",
+                    "reason": block,
+                    "message": BLOCK_MESSAGE.get(
+                        block, "请先确认最终摘要，再导出计划书 PDF。"
+                    ),
+                })
+                mark_terminal_safe(self._runs_repo, run_id, "error")
+                return
+            async for envelope in self._stream_artifact_flow(req, resolve_profile("artifact"),
+                run_id=run_id, emit=emit, report_content=report_content,
+                settings=kernel_settings,
+                projection=projection,
+                pdf_document=build_report_document(
+                    report_result,
+                    **_pdf_plan_status_inputs(self._runs_repo, req.conversation_id))):
+                yield envelope
+            return
+
         if response_text.startswith(streamed_text):
             remaining = response_text[len(streamed_text):]
         else:
@@ -5461,6 +6716,10 @@ def sweep_expired_paused_runs(runtime: Any) -> int:
                 run.run_id,
             )
             continue
+        # Ticket 10 AC5: the swept run has no live stream either, so its log
+        # would otherwise keep ending at ``run.paused`` while the row says
+        # ``error``. Same reconciliation cancel uses.
+        append_reconciled_terminal(runs_repo, run.run_id)
         if capacity is not None:
             capacity.release_sandbox(run.request_id)
         reclaimed += 1

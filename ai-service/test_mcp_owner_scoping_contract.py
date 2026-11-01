@@ -187,7 +187,7 @@ def test_builtin_credentials_are_account_scoped_and_never_echoed(
     assert set(before) == {"amap_weather", "amap_map"}
     assert {server["status"] for server in before.values()} == {"unconfigured"}
     assert before["amap_weather"]["command"] == "npx"
-    assert "@amap/amap-weather-mcp" in before["amap_weather"]["args"]
+    assert "@amap/amap-maps-mcp-server@0.0.8" in before["amap_weather"]["args"]
     assert before["amap_weather"]["env_names"] == ["AMAP_API_KEY"]
 
     saved = client.put(
@@ -212,7 +212,7 @@ def test_builtin_credentials_are_account_scoped_and_never_echoed(
         profile, SimpleNamespace(), owner_id=OWNER_A
     )
     assert audits_a == []
-    assert servers_a["amap_map"]["env"] == {"AMAP_API_KEY": "ak-account-a"}
+    assert servers_a["amap_map"]["env"] == {"AMAP_API_KEY": "ak-account-a", "AMAP_MAPS_API_KEY": "ak-account-a"}
 
     servers_b, audits_b = build_profile_mcp_servers(
         profile, SimpleNamespace(), owner_id=OWNER_B

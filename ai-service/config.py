@@ -12,10 +12,23 @@ from dotenv import dotenv_values, load_dotenv, set_key
 
 
 if not os.getenv("VERCEL"):
+    # README and Docker Compose use the repository root as the canonical
+    # configuration location. Keep the service-local file as a fallback for
+    # developers who run the service from ``ai-service/`` directly; exported
+    # environment variables always take precedence.
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
     load_dotenv(Path(__file__).with_name(".env"))
 
 
 class Settings:
+    route_decision_provider: str = "llm"
+    route_decision_timeout_seconds: float = 15.0
+    route_compare_data_mode: str = "live"
+    route_compare_demo_scenario: str = "complete"
+    route_decision_external_adapter: str = "route_compare.typesafe_adapter:TypeSafeProvider"
+    route_decision_external_model: str = "jev-latest"
+    route_decision_external_url: str = "https://api.typesafe.ai/v1/systemone"
+    typesafe_api_key: str = ""
     openai_base_url: str = ""
     openai_api_key: str = ""
     openai_model: str = "deepseek-v4-flash"
@@ -104,6 +117,7 @@ class Settings:
     # 本地 Agent 执行日志（LLM_LOG）：默认关闭，仅本地调试开启。
     llm_log_enabled: bool = False
     llm_log_path: str = "./logs/llm.log"
+    ai_service_allowed_origins: str = "http://localhost:3000,http://localhost:5173,http://127.0.0.1:5173"
 
     def _default_runtime_dir(self, name: str) -> str:
         if os.getenv("VERCEL"):
@@ -139,6 +153,14 @@ class Settings:
         return self._expand_env_refs(parsed) if isinstance(parsed, dict) else {}
 
     def load(self) -> "Settings":
+        self.route_decision_provider = os.getenv("ROUTE_DECISION_PROVIDER", "llm")
+        self.route_decision_timeout_seconds = float(os.getenv("ROUTE_DECISION_TIMEOUT_SECONDS", "15"))
+        self.route_compare_data_mode = os.getenv("ROUTE_COMPARE_DATA_MODE", "live")
+        self.route_compare_demo_scenario = os.getenv("ROUTE_COMPARE_DEMO_SCENARIO", "complete")
+        self.route_decision_external_adapter = os.getenv("ROUTE_DECISION_EXTERNAL_ADAPTER", self.route_decision_external_adapter)
+        self.route_decision_external_model = os.getenv("ROUTE_DECISION_EXTERNAL_MODEL", "jev-latest")
+        self.route_decision_external_url = os.getenv("ROUTE_DECISION_EXTERNAL_URL", self.route_decision_external_url)
+        self.typesafe_api_key = os.getenv("TYPESAFE_API_KEY", "")
         self.openai_base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
         self.openai_api_key = os.getenv("OPENAI_API_KEY", "")
         self.openai_model = os.getenv("OPENAI_MODEL", "deepseek-v4-flash")
@@ -276,6 +298,13 @@ class Settings:
         self.llm_log_path = os.getenv(
             "LLM_LOG_PATH", self._default_runtime_dir("logs/llm.log")
         )
+        self.ai_service_allowed_origins = os.getenv(
+            "AI_SERVICE_ALLOWED_ORIGINS",
+            os.getenv(
+                "ALLOWED_ORIGINS",
+                "http://localhost:3000,http://localhost:5173,http://127.0.0.1:5173",
+            ),
+        )
 
         return self
 
@@ -304,6 +333,15 @@ class Settings:
     @property
     def feishu_default_configured(self) -> bool:
         return bool(self.feishu_default_space_id or self.feishu_default_folder_token)
+
+    @property
+    def cors_origins(self) -> list[str]:
+        """Return explicit CORS origins, never a wildcard."""
+        return [
+            origin.strip()
+            for origin in self.ai_service_allowed_origins.split(",")
+            if origin.strip() and origin.strip() != "*"
+        ]
 
 
 settings = Settings().load()

@@ -65,12 +65,16 @@ from agent_v2.persistence import (
     ArtifactRecord,
     AssistantMessagePersistenceError,
     CheckpointsStore,
+    CompletenessCheckRecord,
     ControlStore,
     EffectRecord,
     FinalizeRecord,
     JanitorTaskRecord,
     PolicySnapshotRecord,
     PolicySnapshotWrite,
+    PlanArrangementsRecord,
+    PlanDraftRecord,
+    RouteSelectionRecord,
     RunAlreadyTerminal,
     RunNotFound,
     RunRecord,
@@ -1167,6 +1171,255 @@ class RunRepository:
 
     def mark_artifact_expired(self, artifact_id: str) -> ArtifactRecord | None:
         return self.control.mark_artifact_expired(artifact_id)
+
+    # -- plan drafts (Ticket 01) ----------------------------------------
+
+    def save_plan_draft(
+        self,
+        *,
+        conversation_id: str,
+        stage: str,
+        destination_or_route: str = "",
+        activity_date: str = "",
+        participants: int | None = None,
+        updated_by_run_id: str = "",
+    ) -> PlanDraftRecord:
+        """Upsert the conversation's single plan draft (Ticket 01 AC8).
+
+        Adapters and flows go through this facade, never through
+        :class:`ControlStore` directly — the two-database split stays the
+        repository's business. The draft is keyed by ``conversation_id``
+        and deliberately NOT run-scoped, so it outlives the run that
+        wrote it (``run_events``/``artifacts`` cascade on run delete).
+        """
+        return self.control.upsert_plan_draft(
+            conversation_id=conversation_id,
+            stage=stage,
+            destination_or_route=destination_or_route,
+            activity_date=activity_date,
+            participants=participants,
+            updated_by_run_id=updated_by_run_id,
+        )
+
+    def get_plan_draft(self, conversation_id: str) -> PlanDraftRecord | None:
+        """Read the current draft state, or ``None`` when no draft exists.
+
+        ``None`` is a state, not an error: it means the plan flow has
+        never been opened in this conversation, which is what
+        :func:`agent_v2.plan_workflow.evaluate_plan_intent` needs in order
+        to reject ``plan_confirm`` / ``plan_cancel`` / ``plan_regenerate``
+        with a stable reason.
+        """
+        return self.control.get_plan_draft(conversation_id)
+
+    # -- route selections (Ticket 03) ---------------------------------
+
+    def save_route_selection(
+        self,
+        *,
+        conversation_id: str,
+        draft_id: str,
+        comparison_id: str,
+        candidate_id: str,
+        selected_by_run_id: str = "",
+    ) -> RouteSelectionRecord:
+        """Point the conversation's draft at one candidate of a comparison.
+
+        Ticket 03's facade over the reference row: flows go through here, never
+        through :class:`ControlStore` directly. The row holds two ids on
+        purpose — verified facts are re-read through
+        :class:`agent_v2.route_tools.RouteSession`, so the draft can never hold
+        a copy that outlives its evidence (spec AC3, and docs/plan-pdf-format.md
+        内容边界).
+        """
+        return self.control.upsert_route_selection(
+            conversation_id=conversation_id,
+            draft_id=draft_id,
+            comparison_id=comparison_id,
+            candidate_id=candidate_id,
+            selected_by_run_id=selected_by_run_id,
+        )
+
+    def get_route_selection(self, conversation_id: str) -> RouteSelectionRecord | None:
+        """The conversation's route reference, or ``None`` (no facts may show)."""
+        return self.control.get_route_selection(conversation_id)
+
+    def clear_route_selection(self, conversation_id: str) -> int:
+        """Drop the conversation's route reference (cancelled / replaced draft)."""
+        return self.control.clear_route_selection(conversation_id)
+
+    # -- supplementary arrangements (Ticket 06) ---------------------
+
+    def save_plan_arrangements(
+        self,
+        *,
+        conversation_id: str,
+        draft_id: str,
+        arrangements: dict[str, str],
+        updated_by_run_id: str = "",
+    ) -> PlanArrangementsRecord:
+        """Upsert the conversation's eight collected supplementary arrangements.
+
+        Ticket 06 gave the 待确认 list real input and real storage; the row lives
+        in its own table (an added ``plan_drafts`` column would silently not
+        exist on a pre-existing database) and flows reach it only through here,
+        never through :class:`ControlStore`. The mapping is read only for the
+        enumerated keys, so a route fact or a derived value cannot be stored
+        alongside the user's own arrangements (spec AC6).
+        """
+        return self.control.upsert_plan_arrangements(
+            conversation_id=conversation_id,
+            draft_id=draft_id,
+            arrangements=arrangements,
+            updated_by_run_id=updated_by_run_id,
+        )
+
+    def get_plan_arrangements(self, conversation_id: str) -> PlanArrangementsRecord | None:
+        """The collected arrangements, or ``None`` before any supplementary submit."""
+        return self.control.get_plan_arrangements(conversation_id)
+
+    def clear_plan_arrangements(self, conversation_id: str) -> int:
+        """Drop the conversation's arrangement row (cancelled / replaced draft)."""
+        return self.control.clear_plan_arrangements(conversation_id)
+
+    # -- completeness verdict (Ticket 06 AC5) -----------------------
+
+    def save_completeness_check(
+        self,
+        *,
+        conversation_id: str,
+        draft_id: str,
+        verdict: Any,
+        checked_by_run_id: str = "",
+    ) -> CompletenessCheckRecord:
+        """Persist a deterministic completeness verdict (spec AC5).
+
+        ``verdict`` is an :class:`agent_v2.plan_workflow.PlanCompleteness`; the
+        facade unpacks its stable codes and ordered keys into the row, keeping
+        the domain object out of the storage layer. The stored row is what makes
+        the rule result restorable and auditable — a fresh repository over the
+        same database reads the same verdict back, with no model in the loop.
+        """
+        return self.control.upsert_completeness_check(
+            conversation_id=conversation_id,
+            draft_id=draft_id,
+            verdict=verdict.verdict,
+            reasons=list(verdict.reasons),
+            missing_core_keys=list(verdict.missing_core_keys),
+            missing_non_core_keys=list(verdict.missing_non_core_keys),
+            invalid_format_keys=list(verdict.invalid_format_keys),
+            checked_by_run_id=checked_by_run_id,
+        )
+
+    def get_completeness_check(self, conversation_id: str) -> CompletenessCheckRecord | None:
+        """The saved verdict, or ``None`` before the rules first ran for this draft."""
+        return self.control.get_completeness_check(conversation_id)
+
+    def clear_completeness_check(self, conversation_id: str) -> int:
+        """Drop the conversation's saved verdict (cancelled / replaced draft)."""
+        return self.control.clear_completeness_check(conversation_id)
+
+    # -- plan-book artifact versions (Ticket 09 AC4) -----------------
+
+    def publish_plan_artifact_version(
+        self,
+        *,
+        conversation_id: str,
+        artifact_id: str,
+        draft_id: str = "",
+        published_by_run_id: str = "",
+    ):
+        """Append one published plan-book generation to the conversation's history.
+
+        Ticket 09's facade over the version table: flows reach the history only
+        through here, never through :class:`ControlStore`. The row is what makes
+        the draft able to answer "which artifact is current" and "what came
+        before"; the chain and the revision number are derived by the storage
+        layer, and the revision is also the version discriminator that keeps a
+        regeneration from replaying a committed effect.
+        """
+        return self.control.publish_plan_artifact_version(
+            conversation_id=conversation_id,
+            artifact_id=artifact_id,
+            draft_id=draft_id,
+            published_by_run_id=published_by_run_id,
+        )
+
+    def get_current_plan_artifact_version(self, conversation_id: str):
+        """The current published artifact's version row, or ``None``."""
+        return self.control.get_current_plan_artifact_version(conversation_id)
+
+    def list_plan_artifact_versions(self, conversation_id: str) -> list:
+        """The full generation history, oldest first."""
+        return self.control.list_plan_artifact_versions(conversation_id)
+
+    # -- safety record (Ticket 09; ticket 07's gate answer, stored) --
+
+    def save_plan_safety(
+        self,
+        *,
+        conversation_id: str,
+        draft_id: str,
+        payload: dict,
+        recorded_by_run_id: str = "",
+    ):
+        """Store the deterministic gate's safety answer for this draft.
+
+        ``payload`` is :meth:`agent_v2.plan_workflow.PlanSafety.to_payload` —
+        stored verbatim so the PDF cover can read the same shape the event
+        already carried. The row records what the gate ANSWERED; it decides
+        nothing: :func:`route_compare.service.render_report` stays the only
+        eligibility authority (ticket 06 AC6's split, kept).
+        """
+        return self.control.upsert_plan_safety_record(
+            conversation_id=conversation_id,
+            draft_id=draft_id,
+            payload=payload,
+            recorded_by_run_id=recorded_by_run_id,
+        )
+
+    def get_plan_safety(self, conversation_id: str):
+        """The conversation's safety row, or ``None`` when the gate never answered."""
+        return self.control.get_plan_safety_record(conversation_id)
+
+    def clear_plan_safety(self, conversation_id: str) -> int:
+        """Drop the conversation's safety row (cancelled plan)."""
+        return self.control.clear_plan_safety_record(conversation_id)
+
+    # -- confirmations (ticket 05 AC5 / ticket 06 AC5; ticket 07's door) --
+
+    def record_plan_confirmation(
+        self,
+        *,
+        conversation_id: str,
+        draft_id: str,
+        kind: str,
+        confirmed_by_run_id: str = "",
+    ):
+        """Record that the user confirmed one summary of the draft.
+
+        ``kind`` is ``"first"`` (the arrangements summary) or ``"final"`` (the
+        whole-book summary). This is the durable answer to "did the user confirm
+        the FIRST summary", which ``plan_drafts.stage`` cannot give once the next
+        transition overwrites it. Decides nothing — :func:`evaluate_plan_intent`
+        stays the only transition decider and
+        :func:`agent_v2.plan_workflow.pdf_approval_block_reason` the only PDF
+        question; this only stores the fact that a confirmation click landed.
+        """
+        return self.control.upsert_plan_confirmation_record(
+            conversation_id=conversation_id,
+            draft_id=draft_id,
+            kind=kind,
+            confirmed_by_run_id=confirmed_by_run_id,
+        )
+
+    def get_plan_confirmation(self, conversation_id: str, kind: str):
+        """The conversation's confirmation row for ``kind``, or ``None``."""
+        return self.control.get_plan_confirmation_record(conversation_id, kind)
+
+    def clear_plan_confirmations(self, conversation_id: str) -> int:
+        """Drop the conversation's confirmation rows (cancelled plan)."""
+        return self.control.clear_plan_confirmation_records(conversation_id)
 
     def mark_run_done(self, run_id: str) -> None:
         """Transition a running run to ``done`` terminal.

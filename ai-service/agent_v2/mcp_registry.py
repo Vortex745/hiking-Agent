@@ -91,20 +91,17 @@ class McpServerConfig:
 # ---- Server registry ------------------------------------------------------
 #
 # Ticket 05 ships the two AMap MCP servers the route_plan profile needs.
-# Real connection parameters live in deployment config; the stub uses
-# these declarative entries to prove the contract: profile → server →
-# tool allowlist → credential key names. The host connector (Ticket 09+
-# for real LLM integration) reads ``expand_credentials`` to obtain the
-# actual env/headers values at call time.
+# Both bounded surfaces use the official AMap server, pinned to the
+# reviewed npm version. Credentials are expanded only on the host.
 _AMAP_WEATHER = McpServerConfig(
     server_id="amap_weather",
     description="高德天气 MCP — 提供实时与预报天气数据",
     transport="stdio",
     command_or_url="npx",
-    args=("-y", "@amap/amap-weather-mcp"),
+    args=("-y", "@amap/amap-maps-mcp-server@0.0.8"),
     env_key_names=("AMAP_API_KEY",),
     headers_key_names=(),
-    tool_allowlist=("get_current_weather", "get_weather_forecast"),
+    tool_allowlist=("maps_weather",),
     timeout_seconds=8.0,
     max_output_bytes=32 * 1024,  # 32 KiB — weather payloads are small
 )
@@ -114,13 +111,13 @@ _AMAP_MAP = McpServerConfig(
     description="高德地图 MCP — 提供路线规划、POI 检索与地理编码",
     transport="stdio",
     command_or_url="npx",
-    args=("-y", "@amap/amap-map-mcp"),
+    args=("-y", "@amap/amap-maps-mcp-server@0.0.8"),
     env_key_names=("AMAP_API_KEY",),
     headers_key_names=(),
     tool_allowlist=(
-        "search_poi",
-        "plan_route",
-        "geocode",
+        "maps_text_search",
+        "maps_direction_walking",
+        "maps_geo",
     ),
     timeout_seconds=12.0,
     max_output_bytes=64 * 1024,  # 64 KiB — route plans can be larger
@@ -230,6 +227,10 @@ def expand_credentials(
             missing.append(key_name)
         else:
             env_dict[key_name] = value
+            if key_name == "AMAP_API_KEY":
+                # Preserve the deployment input name; the official server
+                # reads this variable instead.
+                env_dict["AMAP_MAPS_API_KEY"] = value
 
     headers_dict: dict[str, str] = {}
     for header_name in config.headers_key_names:

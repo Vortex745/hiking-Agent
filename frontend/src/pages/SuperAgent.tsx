@@ -10,11 +10,18 @@ import {
   submitV2MemoryDecision,
   planV2Recovery,
   V2_TERMINAL_RUN_STATUSES,
+  V2_STREAM_CLOSED_WITHOUT_TERMINAL,
   type V2EventEnvelope,
   type V2RunSnapshot,
   type V2ApprovalRequest,
   type V2ApprovalDecisionResponse,
   type V2MemoryCandidate,
+  type V2PlanIntent,
+  type V2PlanDraftStage,
+  type V2PlanDraftState,
+  type V2PlanDraftFields,
+  type V2PlanRouteReference,
+  type V2PlanType,
 } from '../api/chatV2'
 import {
   reduceV2Event,
@@ -26,10 +33,20 @@ import {
   assistantTextFromSnapshot,
   buildRecoveredTrace,
   readArtifact as readArtifactFromPayload,
+  readPlanDraftState,
   type V2ConversationState,
 } from '../api/v2Reducer'
+import {
+  clearPlanDraft,
+  isReopenablePlanDraftStage,
+  isSamePlanDraft,
+  loadPlanDraft,
+  savePlanDraft,
+} from '../api/planDraftStore'
 import { useExternalStoreRuntime, AssistantRuntimeProvider, type ExternalStoreAdapter, type ThreadMessage } from "@assistant-ui/react"
 import { GeminiThread } from '../components/assistant-ui/gemini/GeminiThread'
+import PlanDraftDialog from '../components/PlanDraftDialog'
+import Button from '../components/Button'
 import { GeminiSidebar } from '../components/assistant-ui/gemini/GeminiSidebar'
 import { useAuth } from '../auth/AuthContext'
 import { storageKey } from '../lib/userStorage'
@@ -39,12 +56,15 @@ import { MemoryDialog } from '../components/MemoryDialog'
 import { McpDialog } from '../components/McpDialog'
 import KnowledgeSourcesDialog from './KnowledgeSources'
 import LlmConfigDialog from './LlmConfig'
+import ApprovalCard, { DEFAULT_APPROVAL_QUESTIONS } from '../components/ApprovalCard'
 
 interface Message {
   role: 'user' | 'assistant'
   content: string
   time?: string
   isStreaming?: boolean
+  /** Runtime-only marker so a fast SSE response still gets the word reveal. */
+  hasStreamed?: boolean
   traceEvents?: AgentTraceEvent[]
   artifacts?: AgentArtifact[]
 }
@@ -134,6 +154,11 @@ type AgentArtifact = {
   size_bytes: number
   sha256?: string
   expires_at?: string
+  // Ticket 10: the plan book's version relation, verbatim from
+  // ``artifact.available`` (``readArtifact`` keeps it only when the server sent
+  // a positive integer revision). Absent for anything that is not a generation.
+  plan_revision?: number
+  previous_artifact_id?: string
 }
 type BrowserLocation = {
   latitude: number
@@ -162,6 +187,141 @@ const quickTags = [
   { icon: TriangleAlert, text: '风险提醒', scenario: 'risk_assessment' as AgentScenario },
   { icon: Map, text: '推荐路线', scenario: 'route_plan' as AgentScenario },
 ]
+
+/**
+ * Ticket 01: human labels for the whitelisted plan intents. Only used to
+ * render the user's own bubble when a send carries structured intent and
+ * no typed text — routing never reads these strings; the server reads
+ * ``intent``.
+ */
+const PLAN_INTENT_LABELS: Record<V2PlanIntent, string> = {
+  plan_create: '生成行程',
+  plan_confirm: '确认生成计划书',
+  plan_cancel: '取消生成计划书',
+  plan_regenerate: '重新生成草稿',
+  plan_select_route: '选用该路线进入计划书草稿',
+  plan_research_route: '研究该目的地的路线资料',
+  plan_generic_draft: '继续生成通用草案',
+  plan_first_review: '直接生成草案',
+  plan_more_input: '继续补充缺失字段',
+  plan_confirm_arrangements: '确认我提供的安排',
+  /* Ticket 07 AC1/AC4: the second summary and its explicit confirmation. */
+  plan_final_review: '查看最终摘要',
+  plan_confirm_final: '确认最终摘要并进入 PDF 审批',
+}
+
+/**
+ * Ticket 04 AC5: the draft's type, in the user's words. Keyed by the type union
+ * the same way the stage and intent maps are, so TS forces a label for any type
+ * a later ticket adds. The text is a *translation* of the server's marker — the
+ * server's own sentence lives in ``plan_workflow.draft_summary``, and the
+ * summary block below shows that verbatim.
+ */
+const PLAN_TYPE_LABELS: Record<V2PlanType, string> = {
+  route_plan: '正式路线计划草案（依据已核验路线事实）',
+  generic_draft: '通用草案（无已核验路线依据）',
+}
+
+/**
+ * The one box class the four plan notice panels share — the 确认 prompt, the
+ * 通用草案 choice, the 危险封闭 hard stop, and the 恢复草稿 panel. They rendered
+ * a byte-identical 16-utility string, which is a drift trap: adjust the shadow
+ * or the dark surface on three and the fourth silently disagrees. Named here so
+ * the box has one home. Kept in this file (not a component) so the class tokens
+ * stay in the source Tailwind scans, and `dark:` companions are preserved for
+ * the hardcoded light `border-border` / `bg-white` (media-query dark mode).
+ */
+const PLAN_NOTICE_PANEL_CLASS =
+  'absolute left-4 right-4 top-16 z-50 ml-auto max-w-sm rounded-md border border-border bg-white p-4 text-sm text-text-primary shadow-xl dark:border-white/10 dark:bg-[#1e1f20]'
+
+/**
+ * Ticket 02: what a restored draft is waiting for. Keyed by the stage union,
+ * so TypeScript forces a label for every stage a future ticket adds — the
+ * same trick ``PLAN_INTENT_LABELS`` uses to keep the vocabulary from drifting.
+ */
+const PLAN_STAGE_LABELS: Record<V2PlanDraftStage, string> = {
+  awaiting_confirmation: '等你确认是否生成计划书',
+  awaiting_input: '等你填写基本信息',
+  minimal_draft: '最小草稿已生成，可继续修改',
+  awaiting_generic_choice: '路线资料不足，等你选择通用草案或取消',
+  awaiting_first_review: '第一次摘要等你确认，可继续补充缺失字段',
+  first_reviewed: '第一次摘要已确认（只含你本人提供的安排）',
+  /* Ticket 07: the second summary, its confirmation, and the safety hard stop. */
+  awaiting_final_review: '最终摘要等你确认，确认后才会进入 PDF 审批',
+  final_reviewed: '最终摘要已确认，可进入 PDF 审批（仍需审批通过才生成）',
+  blocked_safety: '安全门判定危险封闭，已阻止正式路线计划',
+  cancelled: '已取消',
+}
+
+/**
+ * Ticket 06 AC3/AC4: the completeness verdict, translated for the panel from
+ * the server's stable value. The reason CODES stay untranslated (they are the
+ * machine vocabulary, ``PlanReviewReason``), and this copy deliberately says
+ * nothing about safety or report eligibility — that stays with the comparison
+ * gate (AC6), never with a rule verdict.
+ */
+const PLAN_RULE_VERDICT_LABELS: Record<'complete' | 'confirmation_required' | 'supplement_required', string> = {
+  complete: '字段与格式规则均已通过（仍不代表安全放行）',
+  confirmation_required: '可生成草案，但仍有待确认/待核验清单',
+  supplement_required: '缺少核心安排，请先在表单补齐',
+}
+
+/**
+ * Ticket 10: the plan book's version chain, read from the artifacts this
+ * conversation already holds.
+ *
+ * The numbers are the SERVER's, copied: ``artifact.available`` carries
+ * ``plan_revision`` / ``previous_artifact_id`` straight from the
+ * ``plan_artifact_versions`` transaction that derived them, so the panel never
+ * counts cards or re-reads run rows (they cascade-delete; the history does not).
+ * An artifact with no revision is simply not a plan-book generation — a chat
+ * attachment or a payload from a server that predates versioning renders
+ * nothing here, because "no record" is not "version 0".
+ *
+ * It is derived over the messages rather than held in extra state, because the
+ * message list is what the session store persists: after a refresh the chain is
+ * rebuilt from the same artifacts the thread already showed, which is the client
+ * half of AC1 (断线后可以通过快照或事件恢复) for the artifact surface.
+ */
+type PlanArtifactVersion = {
+  artifactId: string
+  revision: number
+  previousArtifactId: string
+  filename: string
+  /** Absent means unknown, which renders no expiry claim at all. */
+  expiresAt?: string
+}
+
+function readPlanArtifactVersions(messages: Message[]): PlanArtifactVersion[] {
+  const byId = new globalThis.Map<string, PlanArtifactVersion>()
+  for (const message of messages) {
+    for (const artifact of message.artifacts || []) {
+      const revision = artifact.plan_revision
+      if (typeof revision !== 'number' || !artifact.artifact_id) continue
+      byId.set(artifact.artifact_id, {
+        artifactId: artifact.artifact_id,
+        revision,
+        previousArtifactId: artifact.previous_artifact_id || '',
+        filename: artifact.public_filename,
+        expiresAt: artifact.expires_at,
+      })
+    }
+  }
+  return [...byId.values()].sort((a, b) => a.revision - b.revision)
+}
+
+/**
+ * Whether a published generation is still downloadable. The server's own rule
+ * is the artifact row's ``expires_at`` (TTL, and 410 once past it), so an expired
+ * entry is labelled 已过期/不可用 rather than repaired or hidden — and a missing
+ * timestamp is not treated as expired, only as unknown.
+ */
+function isPlanArtifactUnavailable(version: PlanArtifactVersion): boolean {
+  if (!version.expiresAt) return false
+  const expires = Date.parse(version.expiresAt)
+  if (Number.isNaN(expires)) return false
+  return expires <= Date.now()
+}
 
 const STORAGE_KEY = 'ai-hiking-agent-chat'
 const SESSIONS_KEY = 'ai-hiking-agent-sessions'
@@ -210,6 +370,12 @@ interface V2PersistedRun {
   // first-class terminal statuses — recovery trusts them locally and
   // never re-executes (they are NON-continuable; only ``paused`` resumes).
   v2_status?: 'running' | 'paused' | 'done' | 'error' | 'cancelled' | 'outcome_unknown' | 'admission_failed'
+  // Ticket 01: the last plan-draft STATE this conversation reached, mirrored
+  // from ``plan.draft_state``. ``stage`` is what a later turn (or a refresh)
+  // reads to know a draft exists; ``draft`` is what the dialog re-seeds from.
+  // This is the localStorage mirror only — ticket 02 owns the restore/revise
+  // UX that consumes it.
+  plan_draft?: V2PlanDraftState
 }
 const V2_RUN_KEY = 'ai-hiking-agent-v2-active-run'
 function loadV2PersistedRun(): V2PersistedRun | null {
@@ -271,13 +437,25 @@ function sanitizeStoredValue(value: unknown): unknown {
 }
 
 function serializeMessages(messages: Message[]) {
-  return JSON.stringify(sanitizeStoredValue(messages))
+  return JSON.stringify(sanitizeStoredValue(messages.map(stripTransientMessageState)))
+}
+
+function stripTransientMessageState(message: Message): Message {
+  const { hasStreamed: _hasStreamed, ...stored } = message
+  return stored
+}
+
+function restoreStoredMessages(value: unknown): Message[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .filter((message): message is Message => Boolean(message && typeof message === 'object'))
+    .map(stripTransientMessageState)
 }
 
 function sanitizeSessionForStorage(session: ChatSession): ChatSession {
   return {
     ...session,
-    messages: sanitizeStoredValue(session.messages) as Message[],
+    messages: sanitizeStoredValue(session.messages.map(stripTransientMessageState)) as Message[],
   }
 }
 
@@ -300,7 +478,7 @@ function loadSessions(): ChatSession[] {
       chatId: session.chatId || createChatId(),
       title: session.title || '新对话',
       date: session.date || getTodayDate(),
-      messages: Array.isArray(session.messages) ? session.messages : [],
+      messages: restoreStoredMessages(session.messages),
     }))
   } catch { return [] }
 }
@@ -353,6 +531,16 @@ const convertMessage = (msg: Message, index: number): ThreadMessage => {
       args: msg.artifacts
     });
   }
+  const comparisons = new globalThis.Map<string, Record<string, unknown>>();
+  for (const event of msg.traceEvents || []) {
+    const result = event.metadata?.route_comparison;
+    if (result && typeof result === 'object' && typeof (result as Record<string, unknown>).comparison_id === 'string') {
+      comparisons.set((result as Record<string, unknown>).comparison_id as string, result as Record<string, unknown>);
+    }
+  }
+  for (const [id, result] of comparisons) {
+    content.push({ type: 'tool-call', toolCallId: id, toolName: 'routeComparison', args: result });
+  }
 
   // A09: aggregate retrieval evidence from tool_result payloads into a
   // message-level 检索来源 part (dedup by source+preview).
@@ -404,7 +592,7 @@ const convertMessage = (msg: Message, index: number): ThreadMessage => {
     content: content,
     status: (msg.isStreaming ? { type: "running" } : { type: "complete" }),
     createdAt: new Date(),
-    metadata: {},
+    metadata: { streamed: msg.hasStreamed === true },
   } as unknown as ThreadMessage;
 };
 
@@ -425,7 +613,7 @@ function SuperAgent() {
   const [messages, setMessages] = useState<Message[]>(() => {
     try {
       const saved = localStorage.getItem(storageKey(STORAGE_KEY))
-      return saved ? JSON.parse(saved) : []
+      return saved ? restoreStoredMessages(JSON.parse(saved)) : []
     } catch { return [] }
   })
   const mapFocus = useMemo(() => extractMapFocus(messages), [messages])
@@ -499,6 +687,87 @@ function SuperAgent() {
     setMcpDialogOpen(false)
     window.requestAnimationFrame(() => settingsTriggerRef.current?.focus())
   }, [])
+  // Ticket 01: plan-book entry state. ``planDraft`` mirrors the server's
+  // draft stage (from ``plan.draft_state``); the dialog opens ONLY for
+  // ``awaiting_input`` — an ``awaiting_confirmation`` stage renders the
+  // confirm prompt instead, because an ambiguous request must be confirmed
+  // before the flow opens (spec AC2).
+  //
+  // Seeded from the persisted run so a refresh mid-run still knows a draft
+  // exists; ticket 02 adds the durable half (the conversation-keyed store
+  // below), which is what survives a refresh *after* a run terminal. Neither
+  // path auto-opens the dialog — restoring shows the 恢复草稿 panel and the
+  // user decides, so a page load can never look like an action it did not
+  // take (spec AC2 + AC5).
+  const [planDraft, setPlanDraft] = useState<V2PlanDraftState | null>(
+    () => v2RunRef.current?.plan_draft ?? null,
+  )
+  const [planDialogOpen, setPlanDialogOpen] = useState(false)
+
+  // Ticket 10: the plan book's published generations, as this client knows them
+  // — from the ``artifact.available`` payloads it has already received (and
+  // re-reads from the persisted session after a refresh). Pure derivation over
+  // ``messages``, so there is no second copy of the version state to keep in
+  // sync, and nothing here re-derives versions from run rows.
+  const planVersions = readPlanArtifactVersions(messages)
+  const currentPlanVersion = planVersions.length > 0
+    ? planVersions[planVersions.length - 1]
+    : null
+
+  // StrictMode rule (see the messages-updater comment below): state
+  // transitions stay in event handlers, durable writes happen here.
+  // Only while a run is persisted — a terminal has already cleared the run
+  // record, and resurrecting it would re-trigger stream recovery on reload.
+  useEffect(() => {
+    if (!planDraft) return
+    const persisted = v2RunRef.current
+    if (!persisted) return
+    if (persisted.plan_draft?.stage === planDraft.stage
+      && persisted.plan_draft.draft.destination_or_route === planDraft.draft.destination_or_route
+      && persisted.plan_draft.draft.activity_date === planDraft.draft.activity_date
+      && persisted.plan_draft.draft.participants === planDraft.draft.participants) {
+      return
+    }
+    v2RunRef.current = { ...persisted, plan_draft: planDraft }
+    saveV2PersistedRun(v2RunRef.current)
+  }, [planDraft])
+
+  // Ticket 02 AC1/AC2/AC4: the durable mirror, keyed by CONVERSATION rather
+  // than by the run. Written from this effect only (never from a `setMessages`
+  // updater), and a `cancelled` draft clears the conversation's slot instead
+  // of storing it — that is what "取消流程会清理未完成的计划状态" means on the
+  // client, and it is why re-entering the conversation shows nothing to
+  // restore after a cancel.
+  useEffect(() => {
+    if (!planDraft) return
+    const conversationId = planDraft.conversation_id || chatIdRef.current
+    if (!conversationId) return
+    if (planDraft.stage === 'cancelled') {
+      clearPlanDraft(conversationId)
+      return
+    }
+    savePlanDraft({ ...planDraft, conversation_id: conversationId })
+  }, [planDraft])
+
+  // Ticket 02 AC2: restore on entry — page load and conversation switch.
+  // ``V2PersistedRun`` is nulled at every run terminal, so the run record
+  // cannot be the restore source; this store is. Skipped while a request is
+  // in flight, because the live stream owns the draft state then, and the
+  // mid-run refresh path already replays ``plan.draft_state`` through
+  // ``applyReplay``.
+  useEffect(() => {
+    if (isSending) return
+    const conversationId = chatIdRef.current
+    const stored = loadPlanDraft(conversationId)
+    // Returning the same object identity when nothing changed keeps this
+    // idempotent under StrictMode's double invoke.
+    setPlanDraft(current => {
+      if (isSamePlanDraft(current, stored)) return current
+      if (current && (current.conversation_id || conversationId) === conversationId) return current
+      return stored
+    })
+  }, [activeSessionId, isSending])
+
 
   const handleMemoryDecision = useCallback(async (decision: 'approve' | 'reject') => {
     if (!pendingMemoryConsent || memoryDecisionPending) return
@@ -590,6 +859,16 @@ function SuperAgent() {
     if (event.type === 'memory.consent_required') {
       setPendingMemoryConsent(next.pendingMemoryConsent)
     }
+    // Ticket 01 AC8: the conversation's plan draft moved stage. Read it from
+    // the reducer's validated state, never off the raw payload — an unknown
+    // stage keeps the previous state instead of opening a dialog on a guess.
+    // ``awaiting_input`` is the ONLY stage that opens the dialog (spec AC1);
+    // ``awaiting_confirmation`` must leave it closed until the user confirms
+    // (spec AC2), and ``minimal_draft``/``cancelled`` close it.
+    if (event.type === 'plan.draft_state') {
+      setPlanDraft(next.planDraft)
+      setPlanDialogOpen(next.planDraft?.stage === 'awaiting_input')
+    }
 
     if (event.type === 'progress' && event.payload.stage === 'model') {
       // Agent process tracking ticket 03: a model round boundary rides the
@@ -610,7 +889,7 @@ function SuperAgent() {
         const updated = [...prev]
         const last = updated[updated.length - 1]
         if (last && last.role === 'assistant') {
-          updated[updated.length - 1] = { ...last, content: last.content + delta, isStreaming: true }
+          updated[updated.length - 1] = { ...last, content: last.content + delta, isStreaming: true, hasStreamed: true }
         }
         return updated
       })
@@ -1199,6 +1478,12 @@ function SuperAgent() {
         if (fallback) next = { ...next, assistantText: fallback }
       }
       v2StateRef.current = next
+      // Ticket 01 AC8: a refresh mid-run replays ``plan.draft_state`` through
+      // the pure reducer, which writes the reducer state only — the page's
+      // own mirror has to be re-seeded here or the dialog loses the draft it
+      // had already opened. Mirroring the stage is all this does: the dialog
+      // is NOT auto-reopened from a replay (ticket 02 owns restore UX).
+      if (next.planDraft) setPlanDraft(next.planDraft)
 
       // Tickets 05/06: rebuild the timeline from reducer state. A replay
       // that carries no trace-worthy events (legacy run, or a run whose
@@ -1517,8 +1802,9 @@ function SuperAgent() {
     setActiveSessionId(target.id)
     chatIdRef.current = target.chatId
     localStorage.setItem(storageKey(CHAT_ID_KEY), target.chatId)
-    setMessages(target.messages)
-    try { localStorage.setItem(storageKey(STORAGE_KEY), serializeMessages(target.messages)) } catch { /* ignore */ }
+    const restoredMessages = restoreStoredMessages(target.messages)
+    setMessages(restoredMessages)
+    try { localStorage.setItem(storageKey(STORAGE_KEY), serializeMessages(restoredMessages)) } catch { /* ignore */ }
   }, [activeSessionId, messages, teardownActiveStream])
 
   const selectSession = useCallback((sessionId: string) => {
@@ -1542,10 +1828,36 @@ function SuperAgent() {
 
   const handleSend = useCallback(async (
     textOverride?: string,
-    options: { replaceFromIndex?: number } = {},
+    options: {
+      replaceFromIndex?: number
+      profileId?: 'route_plan'
+      /**
+       * Ticket 01: a whitelisted structured intent. Plan routing is
+       * intent-driven, so an intent send needs no typed text — the old
+       * `if (!text) return` guard silently no-oped quick actions.
+       */
+      intent?: V2PlanIntent
+      /** The dialog's validated fields; only sent with plan_create/regenerate. */
+      planInput?: V2PlanDraftFields
+      /**
+       * Ticket 03: the two-id route reference; only sent with plan_select_route.
+       * There is no place in this payload for a distance, an ascent or a weather
+       * claim — the server re-reads the verified facts from the reference, so the
+       * client cannot supply one (spec AC3/AC4).
+       */
+      routeSelection?: V2PlanRouteReference
+      /**
+       * Ticket 04 AC4: the draft type the user chose when research found nothing
+       * verifiable. Only ever 'generic_draft' — declaring 'route_plan' is refused
+       * by the server, and this page never sends it (the label the user reads is
+       * derived from the basis the server re-read, not from here).
+       */
+      planType?: V2PlanType
+    } = {},
   ) => {
     const text = typeof textOverride === 'string' ? textOverride.trim() : input.trim()
-    if (!text || isSending) return
+    if (isSending) return
+    if (!text && !options.intent) return
 
     if (!activeSessionId) {
       setActiveSessionId(generateId())
@@ -1562,8 +1874,17 @@ function SuperAgent() {
     const contextMessages = typeof replaceFromIndex === 'number'
       ? messages.slice(0, Math.max(0, replaceFromIndex))
       : messages
-    const nextUserMessage: Message = { role: 'user', content: text, time: timeStr }
-    const nextAssistantMessage: Message = { role: 'assistant', content: '', isStreaming: true }
+    // An intent send may carry no typed text. ``ChatV2Request.message`` is
+    // ``min_length=1``, so a bare intent would 422 at the wire boundary —
+    // the intent's human label travels instead. Routing never reads it:
+    // the server branches on ``intent`` before the classifier runs.
+    const requestText = text || (options.intent ? PLAN_INTENT_LABELS[options.intent] : '')
+    const nextUserMessage: Message = {
+      role: 'user',
+      content: requestText,
+      time: timeStr,
+    }
+    const nextAssistantMessage: Message = { role: 'assistant', content: '', isStreaming: true, hasStreamed: true }
 
     setMessages(prev => {
       const base = typeof replaceFromIndex === 'number'
@@ -1573,8 +1894,8 @@ function SuperAgent() {
     })
 
     // Ticket 08: v2 是唯一 chat 链路。Spec AC1 requires an independent v2
-    // client and v2 event reducer. v2 does NOT use a typewriter queue —
-    // text deltas are written directly to the messages array. The v2
+    // client and v2 event reducer. Text deltas are written directly to the
+    // messages array; the presentation layer handles word reveal. The v2
     // request body is strict: only message, request_id, conversation_id,
     // profile_id, and current_location are allowed (server rejects
     // everything else).
@@ -1589,21 +1910,34 @@ function SuperAgent() {
         request_id: requestId,
         conversation_id: conversationId,
         sequence_cursor: 0,
-        user_message: text,
+        user_message: requestText,
       }
       saveV2PersistedRun(v2RunRef.current)
 
       try {
         const v2Payload: Record<string, unknown> = {
-          message: text,
+          message: requestText,
           request_id: requestId,
           conversation_id: conversationId,
-          profile_id: selectedScenario === 'route_plan' ? 'route_plan' : 'chat',
+          profile_id: options.profileId || (selectedScenario === 'route_plan' ? 'route_plan' : 'chat'),
+        }
+        // Ticket 01: the plan entry travels as structured data. The strict
+        // server model rejects anything outside its whitelist, so an intent
+        // here is the only way in — never a sentence carrying a pseudo id.
+        if (options.intent) {
+          v2Payload.intent = options.intent
+          if (options.planInput) v2Payload.plan_input = options.planInput
+          if (options.routeSelection) v2Payload.route_selection = options.routeSelection
+          if (options.planType) v2Payload.plan_type = options.planType
         }
         const needsRouteFollowupLocation = shouldRequestRouteFollowupLocation(text, contextMessages)
-        const cachedRouteLocation = needsRouteFollowupLocation ? lastLocationRef.current : null
-        const currentLocation = cachedRouteLocation
-          || await getBrowserLocation((shouldRequestCurrentLocation(text) || needsRouteFollowupLocation) ? 10000 : 3000)
+        // A plan send must not trigger a geolocation prompt: the draft flow
+        // is field-driven and profile `chat`.
+        const cachedRouteLocation = !options.intent && needsRouteFollowupLocation ? lastLocationRef.current : null
+        const currentLocation = options.intent
+          ? null
+          : cachedRouteLocation
+            || await getBrowserLocation((shouldRequestCurrentLocation(text) || needsRouteFollowupLocation) ? 10000 : 3000)
         if (currentLocation) {
           lastLocationRef.current = currentLocation
           v2Payload.current_location = currentLocation
@@ -1628,20 +1962,33 @@ function SuperAgent() {
               return
             }
             setConnectionStatus('error')
+            // Ticket 10 AC1: transport closure without a terminal is
+            // outcome_unknown, never success and never a completed run. The
+            // notice says so, and the run identifier stays persisted so the
+            // mount-time recovery (``planV2Recovery`` → /snapshot → /events or
+            // poll) can reconcile what actually happened — clearing it here is
+            // what orphaned a live server-side run after a dropped connection.
+            const closedWithoutTerminal = error === V2_STREAM_CLOSED_WITHOUT_TERMINAL
             setMessages(prev => {
               const updated = [...prev]
               const last = updated[updated.length - 1]
               if (last && last.role === 'assistant') {
                 updated[updated.length - 1] = {
                   ...last,
-                  content: `${last.content}\n\n[连接错误] ${error}`,
+                  content: `${last.content}\n\n${
+                    closedWithoutTerminal
+                      ? '[结果未确认] 连接已中断且未收到终端事件，可在恢复后查看运行状态。'
+                      : `[连接错误] ${error}`
+                  }`,
                   isStreaming: false,
                 }
               }
               return updated
             })
-            v2RunRef.current = null
-            saveV2PersistedRun(null)
+            if (!closedWithoutTerminal) {
+              v2RunRef.current = null
+              saveV2PersistedRun(null)
+            }
             setIsSending(false)
             cleanupRef.current = null
           },
@@ -1749,6 +2096,159 @@ function SuperAgent() {
     }
   };
 
+  // 问答框（ApprovalCard）提交后，把所选选项拼成一句偏好描述，作为一条
+  // 用户消息发回对话流，让 agent 基于答案继续规划。
+  const handleClarificationSubmitted = useCallback((answers: Record<number, number[]>) => {
+    const parts: string[] = []
+    DEFAULT_APPROVAL_QUESTIONS.forEach((question, qi) => {
+      const picked = answers[qi] ?? []
+      if (picked.length > 0) {
+        parts.push(`${question.q}${picked.map(i => question.options[i]).join('、')}`)
+      }
+    })
+    if (parts.length > 0) {
+      void handleSend(`我的偏好：${parts.join('；')}`)
+    }
+  }, [handleSend])
+
+  // ---- Ticket 01: plan-book entry sends ------------------------------------
+  // Each one is an ordinary conversational turn that carries a whitelisted
+  // ``intent`` (seam-contract ruling), NOT the tool-approval pause machinery
+  // and NOT prose the server has to re-parse the way
+  // ``handleClarificationSubmitted`` above does.
+  //
+  // They are rebuilt with ``handleSend`` on purpose: ``handleSend`` closes
+  // over ``input``/``messages``/``isSending`` and is recreated whenever those
+  // change, so a dialog that stays open across several turns must submit
+  // through the current closure. Memoising these behind a stable identity (or
+  // stashing ``handleSend`` in a ref set once) would hand the long-lived
+  // dialog a stale ``isSending`` and silently no-op or double-send.
+  const handleGeneratePlan = useCallback(() => {
+    // The dialog is opened by the server's ``awaiting_input`` event, not
+    // optimistically: a blocked intent must leave it closed.
+    void handleSend('', { intent: 'plan_create' })
+  }, [handleSend])
+
+  const handlePlanDialogSubmit = useCallback((fields: V2PlanDraftFields) => {
+    // Ticket 01 whitelisted ``plan_regenerate`` for the one act this dialog can
+    // do twice: reopen the form on a draft that is already ``minimal_draft``
+    // (02's 「恢复草稿」 / 「修改安排」, which re-seeds from the stored fields) and
+    // re-submit edited arrangements. That is a re-render of the draft the user
+    // already has — the server's own guard allows ``plan_regenerate`` only from
+    // ``minimal_draft`` and rewrites the arrangement record just like a create,
+    // so no new wire field travels (``plan_input`` already does). A first
+    // submit — no draft yet, or the form-open stage — still creates. It fires
+    // only on this explicit click, never on reopen, so regeneration stays a
+    // USER act (there is no auto-regenerate anywhere on this path).
+    const intent: V2PlanIntent =
+      planDraft?.stage === 'minimal_draft' ? 'plan_regenerate' : 'plan_create'
+    void handleSend('', { intent, planInput: fields })
+  }, [handleSend, planDraft])
+
+  // Ticket 03 AC1: pick the recommendation or an alternative from a comparison
+  // the thread already shows. The send carries the two-id reference and nothing
+  // else — the verified facts come back from the server, re-read through
+  // RouteSession, so a click cannot invent a distance or a weather claim (AC4).
+  // Profile ``route_plan`` is the widened entry: a plan intent on it joins the
+  // plan flow instead of being handed to the kernel.
+  const handleSelectRoute = useCallback((selection: V2PlanRouteReference) => {
+    void handleSend('', {
+      intent: 'plan_select_route',
+      routeSelection: selection,
+      profileId: 'route_plan',
+    })
+  }, [handleSend])
+
+  // Ticket 04 AC1: ask the server to research the destination this draft
+  // already holds. The send carries the intent ALONE — no search term, no
+  // distance, no weather claim — because the query is the stored 目的地或路线
+  // and every fact comes back from the server's own collection through the
+  // deterministic gate. It is a plain conversational turn like every other plan
+  // step, never the tool-approval pause (that machinery has a 300 s TTL and
+  // holds a sandbox lease; a user reading research results for six minutes
+  // would expire it).
+  const handleResearchRoute = useCallback(() => {
+    void handleSend('', { intent: 'plan_research_route' })
+  }, [handleSend])
+
+  // Ticket 04 AC4: the first of the two answers a parked research turn asks
+  // for. 「继续生成通用草案」is the only place this page ever names a draft
+  // type, and it names the generic one: whether a draft is a route plan is the
+  // server's derivation, so there is no affordance here that could claim it.
+  const handleContinueAsGenericDraft = useCallback(() => {
+    void handleSend('', { intent: 'plan_generic_draft', planType: 'generic_draft' })
+  }, [handleSend])
+
+  // Ticket 05 AC2: the two answers to the missing-field list, and the answer to
+  // the first summary. All three are plain conversational turns that carry a
+  // whitelisted intent and NOTHING else — no fields (the server reads the
+  // stored arrangements), no route reference, no draft type, and never the
+  // tool-approval pause with its 300 s TTL and sandbox lease. A click here must
+  // not be able to hand the server a date, a cost, a phone number or a retreat
+  // point it would then present as the user's (AC4), which is why these sends
+  // have no place to put one.
+  const handleGenerateDraftNow = useCallback(() => {
+    void handleSend('', { intent: 'plan_first_review' })
+  }, [handleSend])
+
+  const handleContinueSupplementing = useCallback(() => {
+    void handleSend('', { intent: 'plan_more_input' })
+  }, [handleSend])
+
+  const handleConfirmArrangements = useCallback(() => {
+    void handleSend('', { intent: 'plan_confirm_arrangements' })
+  }, [handleSend])
+
+  // Ticket 07 AC1/AC4: the second summary and its confirmation. Same discipline
+  // as ticket 05's — a whitelisted intent ALONE, no fields, no draft type, no
+  // route reference, and never the tool-approval pause (that machinery is ticket
+  // 09's PDF approval, with its 300 s TTL and sandbox lease; a user reading a
+  // final summary for six minutes would expire it). This click enters 进入 PDF
+  // 审批 by moving the draft's stage; it generates no PDF of its own.
+  const handleShowFinalSummary = useCallback(() => {
+    void handleSend('', { intent: 'plan_final_review' })
+  }, [handleSend])
+
+  const handleConfirmFinalSummary = useCallback(() => {
+    void handleSend('', { intent: 'plan_confirm_final' })
+  }, [handleSend])
+
+  const handlePlanDialogDismiss = useCallback(() => {    // AC2: closing the dialog parks the draft — nothing leaves the page, so
+    // the conversation keeps its stored stage and the 恢复草稿 panel takes
+    // over. Cancelling has its own action below; conflating the two would
+    // destroy the draft the moment the user stepped away.
+    setPlanDialogOpen(false)
+  }, [])
+
+  // AC4: the one exit that clears the plan state. Only a stage the user
+  // actually reached can be cancelled — cancelling ``awaiting_confirmation``
+  // (nothing open) or an already-cancelled draft would come back as
+  // ``cancel_without_active_draft``. The shared stage set is also what the
+  // restore panel is keyed on, so the two cannot drift.
+  const handlePlanDialogCancel = useCallback(() => {
+    setPlanDialogOpen(false)
+    if (planDraft && isReopenablePlanDraftStage(planDraft.stage)) {
+      void handleSend('', { intent: 'plan_cancel' })
+    }
+  }, [handleSend, planDraft])
+
+  // Ticket 02 AC2: reopen the dialog from the draft this conversation already
+  // has. Deliberately local — no request leaves the page, so restoring a
+  // draft cannot start a route comparison, a plan judgement, or a PDF (AC5).
+  // The form re-seeds from the stored fields, and the read-only summary block
+  // from the stored summary, on the dialog's own open effect.
+  const handleRestorePlanDraft = useCallback(() => {
+    setPlanDialogOpen(true)
+  }, [])
+
+  const handlePlanConfirm = useCallback(() => {
+    void handleSend('', { intent: 'plan_confirm' })
+  }, [handleSend])
+
+  const handlePlanDecline = useCallback(() => {
+    void handleSend('', { intent: 'plan_cancel' })
+  }, [handleSend])
+
   return (
     <SessionRuntimeProvider key={chatIdRef.current} adapter={runtimeAdapter}>
       <div className="flex h-full w-full overflow-hidden relative">
@@ -1775,6 +2275,13 @@ function SuperAgent() {
               <div className="mt-2 break-words text-white/75">{v2StateRef.current.resumeErrorMessage}</div>
             </div>
           )}
+          {/* 问答框：agent 向用户收集偏好/确认，内嵌在主线程区右上角 */}
+          <div className="absolute right-4 top-16 z-40">
+            <ApprovalCard
+              questions={DEFAULT_APPROVAL_QUESTIONS}
+              onSubmitted={handleClarificationSubmitted}
+            />
+          </div>
           {pendingApproval && v2ApprovalState !== 'resolved' && (
             <div className="absolute left-4 right-4 top-16 z-50 ml-auto max-w-sm rounded-md border border-amber-400/30 bg-zinc-950 p-4 text-sm text-white shadow-xl">
               <div className="font-medium">
@@ -1865,12 +2372,280 @@ function SuperAgent() {
               </div>
             </div>
           )}
+          {/* Ticket 01 AC2: an ambiguous planning request parks the draft in
+              ``awaiting_confirmation`` and the dialog stays shut. This prompt
+              is the confirmation affordance; both answers travel as a
+              whitelisted intent, never as text the server re-parses. */}
+          {planDraft?.stage === 'awaiting_confirmation' && (
+            <div className={PLAN_NOTICE_PANEL_CLASS}>
+              <div className="font-medium">是否生成计划书？</div>
+              <p className="mt-1 text-xs text-text-muted">
+                你的请求还不够明确。确认后才会打开填写弹窗，未确认前不会生成任何计划内容。
+              </p>
+              <div className="mt-3 flex justify-end gap-2">
+                <Button variant="ghost" size="sm" disabled={isSending} onClick={handlePlanDecline}>
+                  暂不生成
+                </Button>
+                <Button variant="accent" size="sm" disabled={isSending} onClick={handlePlanConfirm}>
+                  确认生成
+                </Button>
+              </div>
+            </div>
+          )}
+          {/* Ticket 04 AC3/AC4: research ran and the material did not pass the
+              gate, so NO formal route plan was produced — the draft is parked
+              here and the user picks. Both answers are ordinary conversational
+              turns with a whitelisted intent; 取消 is the same single
+              plan_cancel exit the confirmation prompt above uses, and closing
+              this prompt is not an action at all (ticket 02's park/cancel
+              split: only 取消 cancels). */}
+          {planDraft?.stage === 'awaiting_generic_choice' && (
+            <div className={PLAN_NOTICE_PANEL_CLASS}>
+              <div className="font-medium">路线资料不足，无法形成正式路线计划</div>
+              <p className="mt-1 text-xs text-text-muted">
+                已针对「{planDraft.draft.destination_or_route || '未填写的目的地'}」发起路线研究，
+                但没有资料通过确定性核验。继续只会得到一份通用草案：未核验的路线事实仍为待核验。
+              </p>
+              <div className="mt-3 flex justify-end gap-2">
+                <Button variant="ghost" size="sm" disabled={isSending} onClick={handlePlanDecline}>
+                  取消
+                </Button>
+                <Button variant="accent" size="sm" disabled={isSending} onClick={handleContinueAsGenericDraft}>
+                  继续生成通用草案
+                </Button>
+              </div>
+            </div>
+          )}
+          {/* Ticket 07 AC2/AC5: 危险封闭 is a hard stop, not a choice. The gate
+              refused the route outright (no_go / 严重天气 / 路线关闭), so there is
+              NO 继续生成通用草案 affordance here — that is ticket 04's answer to
+              thin material, and offering it for a dangerous route would launder
+              the refusal into an advancing plan. The block reason is shown from
+              the server's own record (stable code + its copy + the gate's own
+              reason lines), never from a sentence this page writes, and both
+              exits are the ones the state machine honours: 取消 sends
+              plan_cancel, 修改安排 reopens the form locally (inert, ticket 02) so
+              a different destination can be judged again. */}
+          {planDraft?.stage === 'blocked_safety' && (
+            <div className={PLAN_NOTICE_PANEL_CLASS}>
+              <div className="font-medium">安全门已阻止正式路线计划</div>
+              <p className="mt-1 text-xs text-text-muted">
+                {PLAN_STAGE_LABELS.blocked_safety}
+                {planDraft.draft.destination_or_route
+                  ? `：${planDraft.draft.destination_or_route}`
+                  : ''}
+              </p>
+              {planDraft.safety && (
+                <p className="mt-1 text-xs text-text-muted">
+                  阻止原因：{planDraft.safety.codes.join('、')}
+                  {planDraft.safety.message ? ` · ${planDraft.safety.message}` : ''}
+                  {planDraft.safety.comparison_status
+                    ? ` · 比较结果：${planDraft.safety.comparison_status}`
+                    : ''}
+                  {planDraft.safety.required_action
+                    ? ` · 需要采取的行动：${planDraft.safety.required_action}`
+                    : ''}
+                </p>
+              )}
+              {planDraft.safety && planDraft.safety.gate_reasons.length > 0 && (
+                <p className="mt-1 text-xs text-text-muted">
+                  核验给出的原因：{planDraft.safety.gate_reasons.join('；')}
+                </p>
+              )}
+              <div className="mt-3 flex justify-end gap-2">
+                <Button variant="ghost" size="sm" disabled={isSending} onClick={handlePlanDecline}>
+                  取消
+                </Button>
+                <Button variant="accent" size="sm" onClick={handleRestorePlanDraft}>
+                  修改安排
+                </Button>
+              </div>
+            </div>
+          )}
+          {/* Ticket 02 AC2: the restore affordance. A draft in an open stage
+              survives a refresh or a conversation switch (conversation-keyed
+              store), and this panel is how the user gets it back — reopening
+              is a local action, so nothing is compared, judged, or rendered.
+              It stays hidden while the dialog itself is open, and
+              ``awaiting_confirmation`` has its own prompt above instead. */}
+          {planDraft && !planDialogOpen && isReopenablePlanDraftStage(planDraft.stage) && (
+            <div className={PLAN_NOTICE_PANEL_CLASS}>
+              <div className="font-medium">本会话有未完成的行程草稿</div>
+              <p className="mt-1 text-xs text-text-muted">
+                草稿 {planDraft.draft_id ? planDraft.draft_id.slice(0, 8) : '—'}：
+                {PLAN_STAGE_LABELS[planDraft.stage]}
+                {planDraft.draft.destination_or_route
+                  ? ` · ${planDraft.draft.destination_or_route}`
+                  : ''}
+                {planDraft.draft.activity_date ? ` · ${planDraft.draft.activity_date}` : ''}
+                {planDraft.draft.participants != null ? ` · ${planDraft.draft.participants} 人` : ''}
+              </p>
+              {/* Ticket 04 AC5: the draft's type, marked in the plan data and
+                  shown here. Translated from the server's own marker, which
+                  ``planDraft.summary`` above/below carries verbatim. */}
+              <p className="mt-1 text-xs text-text-muted">
+                草案类型：{PLAN_TYPE_LABELS[planDraft.plan_type]}
+              </p>
+              {/* Ticket 05 AC1: the 缺失字段清单, shown as the server enumerated
+                  it. Labels and markers come from the payload, never from a list
+                  this page keeps — the same two vocabularies the summary is
+                  rendered from (plan_workflow.ARRANGEMENT_FIELDS /
+                  FACT_DIMENSIONS), so panel and summary cannot disagree. */}
+              {planDraft.missing_fields.length > 0 && (
+                <p className="mt-1 text-xs text-text-muted">
+                  缺失字段：
+                  {planDraft.missing_fields
+                    .map(field => `${field.label}（${field.status}）`)
+                    .join('、')}
+                </p>
+              )}
+              {/* Ticket 06 AC3/AC4/AC5: the deterministic verdict, shown exactly
+                  as the server decided and stored it. The stable reason codes
+                  travel beside their readable copy so what the panel shows, the
+                  summary prints and the audit row holds are one render — and the
+                  直接生成草案 bounce to the form explains itself. */}
+              {planDraft.rules && (
+                <p className="mt-1 text-xs text-text-muted">
+                  规则结论：{PLAN_RULE_VERDICT_LABELS[planDraft.rules.verdict]}
+                  {planDraft.rules.format_issues.length > 0 &&
+                    ` · 格式未通过：${planDraft.rules.format_issues
+                      .map(issue => `${issue.label}（${issue.message}）`)
+                      .join('；')}`}
+                  {planDraft.rules.reasons.length > 0 &&
+                    ` · 需人工确认：${planDraft.rules.reasons
+                      .map(reason => `${reason.code}（${reason.message}）`)
+                      .join('；')}`}
+                </p>
+              )}
+              {/* Ticket 07 AC2/AC5: the gate's refusal, beside the draft it
+                  refused. Shown verbatim from the payload the server emitted (and
+                  re-read from the durable mirror after a refresh), so a
+                  正式路线计划 that is NOT possible explains itself instead of just
+                  failing to appear. No record, no claim: an absent safety object
+                  renders nothing, and this page never infers a block from a
+                  missing one. */}
+              {planDraft.safety && (
+                <p className="mt-1 text-xs text-text-muted">
+                  安全门：{planDraft.safety.codes.join('、')}
+                  {planDraft.safety.message ? ` · ${planDraft.safety.message}` : ''}
+                  {planDraft.safety.hard_stop ? ' · 已阻止正式路线计划' : ''}
+                </p>
+              )}
+              {/* Ticket 10 AC5's surface: 当前版本 / 历史, read from the version
+                  relation the server published with each artifact. A cancelled
+                  draft keeps this list on purpose — the rows are evidence of
+                  what was handed out, and superseded generations stay
+                  downloadable under their own id until their own TTL says
+                  otherwise (labelled 已过期/不可用, never repaired or hidden). */}
+              {planVersions.length > 0 && (
+                <p className="mt-1 text-xs text-text-muted">
+                  计划书版本：当前第 {currentPlanVersion?.revision} 版
+                  {currentPlanVersion && isPlanArtifactUnavailable(currentPlanVersion)
+                    ? '（已过期/不可用）'
+                    : ''}
+                  {planVersions.length > 1 && (
+                    <>
+                      {' · 历史：'}
+                      {planVersions
+                        .slice(0, -1)
+                        .map(version => `第 ${version.revision} 版${
+                          isPlanArtifactUnavailable(version) ? '（已过期/不可用）' : ''}`)
+                        .join('、')}
+                    </>
+                  )}
+                </p>
+              )}
+              <div className="mt-3 flex flex-wrap justify-end gap-2">
+                {/* Ticket 04 AC1: research only makes sense once the free
+                    destination exists, i.e. on a submitted draft with no route
+                    basis attached yet. A draft already backed by a selected,
+                    gate-passed route has nothing left to ask for. */}
+                {planDraft.stage === 'minimal_draft' && planDraft.draft.destination_or_route
+                  && !planDraft.route_selection && (
+                  <Button variant="ghost" size="sm" disabled={isSending} onClick={handleResearchRoute}>
+                    研究路线资料
+                  </Button>
+                )}
+                {/* Ticket 05 AC2: the two answers to the missing-field list.
+                    直接生成草案 moves to the first summary; 继续补充 reopens the
+                    form through the server, so the decision is recorded rather
+                    than being a local click. */}
+                {planDraft.stage === 'minimal_draft' && (
+                  <Button variant="ghost" size="sm" disabled={isSending} onClick={handleGenerateDraftNow}>
+                    直接生成草案
+                  </Button>
+                )}
+                {planDraft.stage === 'awaiting_first_review' && (
+                  <Button variant="ghost" size="sm" disabled={isSending} onClick={handleContinueSupplementing}>
+                    继续补充
+                  </Button>
+                )}
+                <Button variant="ghost" size="sm" disabled={isSending} onClick={handlePlanDialogCancel}>
+                  取消草稿
+                </Button>
+                {/* Ticket 05 AC3: the affirmative at the review stage confirms
+                    only the arrangements the user supplied — the server refuses
+                    this intent unless a first summary is actually pending, and
+                    the summary it confirms lists every field still 待确认. */}
+                {planDraft.stage === 'awaiting_first_review' && (
+                  <Button variant="accent" size="sm" disabled={isSending} onClick={handleConfirmArrangements}>
+                    确认我提供的安排
+                  </Button>
+                )}
+                {/* Ticket 07 AC1/AC4: the second summary is asked for only once the
+                    first one is confirmed, and the explicit confirmation is offered
+                    only while that second summary is pending — the server refuses
+                    both otherwise, so a click can never record approval of a plan
+                    the user was never shown, and can never reach PDF approval
+                    without reading it. */}
+                {planDraft.stage === 'first_reviewed' && (
+                  <Button variant="accent" size="sm" disabled={isSending} onClick={handleShowFinalSummary}>
+                    查看最终摘要
+                  </Button>
+                )}
+                {planDraft.stage === 'awaiting_final_review' && (
+                  <Button variant="accent" size="sm" disabled={isSending} onClick={handleConfirmFinalSummary}>
+                    确认最终摘要
+                  </Button>
+                )}
+                <Button
+                  variant={
+                    planDraft.stage === 'awaiting_first_review'
+                    || planDraft.stage === 'awaiting_final_review'
+                      ? 'ghost' : 'accent'
+                  }
+                  size="sm"
+                  onClick={handleRestorePlanDraft}
+                >
+                  恢复草稿
+                </Button>
+              </div>
+            </div>
+          )}
           <GeminiThread
+            onExportRoute={comparisonId => { void handleSend(`请导出带来源的路线比较 PDF，comparison_id=${comparisonId}`, { profileId: 'route_plan' }) }}
+            onSelectRoute={handleSelectRoute}
+            onGeneratePlan={handleGeneratePlan}
+            isSending={isSending}
             emptyTitle="告诉我你的徒步计划，我将为你规划路线、安排任务，并提供安全建议。"
             mapFocus={mapFocus}
             mapSessionKey={activeSessionId ?? 'new'}
             onRegenerate={handleRegenerate}
             realMessageCount={messages.length}
+          />
+          {/* Ticket 01 AC1/AC6: the entry dialog. Opens only from the
+              server's ``awaiting_input`` stage, and re-seeds from the stored
+              draft so a second entry does not discard what the user typed.
+              Ticket 02: the same stored draft carries its summary, shown
+              read-only above the form so an edit and its summary stay in sync. */}
+          <PlanDraftDialog
+            open={planDialogOpen}
+            busy={isSending}
+            initial={planDraft?.draft}
+            summary={planDraft?.summary}
+            onDismiss={handlePlanDialogDismiss}
+            onCancel={handlePlanDialogCancel}
+            onSubmit={handlePlanDialogSubmit}
           />
         </div>
       </div>

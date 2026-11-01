@@ -52,15 +52,29 @@ services:
       OBSERVABILITY_SAMPLE_RATIO: ${OBSERVABILITY_SAMPLE_RATIO:-1.0}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LOG_FORMAT: ${LOG_FORMAT:-json}
+      AGENT_V2_ENABLED: ${AGENT_V2_ENABLED:-true}
+      AGENT_V2_UNIHARNESS_PIN: ${AGENT_V2_UNIHARNESS_PIN:-aeceee7ea5bdb8c4dcaa7d1c54400afacabe5556}
+      AGENT_V2_STATE_DIR: ${AGENT_V2_STATE_DIR:-/app/agent_state}
+      AGENT_V2_SANDBOX_TYPE: ${AGENT_V2_SANDBOX_TYPE:-remote_e2b}
+      AGENT_V2_COWORK_POLICY: ${AGENT_V2_COWORK_POLICY:-disabled}
+      AI_SERVICE_ALLOWED_ORIGINS: ${AI_SERVICE_ALLOWED_ORIGINS:-http://localhost:3000}
+      E2B_API_KEY: ${E2B_API_KEY:-}
     volumes:
       - ai-memory:/app/memory_store
       - ai-rag-docs:/app/rag_docs
       - ai-workspace:/app/workspace
+      - ai-agent-state:/app/agent_state
     depends_on:
       postgres:
         condition: service_healthy
     expose:
       - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=5)"]
+      interval: 10s
+      timeout: 8s
+      start_period: 30s
+      retries: 6
     networks:
       - ai-hiking-net
     restart: unless-stopped
@@ -76,7 +90,8 @@ services:
       # the real client IP; otherwise all users share one rate-limit bucket.
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-172.16.0.0/12}
     depends_on:
-      - ai-service
+      ai-service:
+        condition: service_healthy
     expose:
       - "8080"
     networks:
@@ -99,6 +114,7 @@ volumes:
   ai-memory:
   ai-rag-docs:
   ai-workspace:
+  ai-agent-state:
 
 networks:
   ai-hiking-net:

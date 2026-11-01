@@ -293,6 +293,7 @@ class Durability(str, Enum):
 # Gate events (approval, memory consent) are durable with the effect floor:
 # they authorize or interrupt a tool effect and must be replayable.
 EVENT_DURABILITY: dict[str, Durability] = {
+    "plan.draft_state": Durability.EFFECT,
     "run_started": Durability.ADMISSION,
     "progress": Durability.PROGRESS,
     "progress.gap": Durability.PROGRESS,

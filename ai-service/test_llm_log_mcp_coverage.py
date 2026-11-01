@@ -26,12 +26,7 @@ from agent_v2.kernel import run_chat_turn  # noqa: E402
 from config import settings  # noqa: E402
 from observability import llm_log, tracing  # noqa: E402
 
-STUB_SERVER = (
-    Path(__file__).resolve().parent.parent
-    / ".scratch"
-    / "logging-observability-closeout"
-    / "stub_mcp_server.py"
-)
+STUB_SERVER = Path(__file__).resolve().parent / "test_fixtures" / "logging_mcp_server.py"
 REAL_CHATOPENAI = ChatOpenAI
 
 

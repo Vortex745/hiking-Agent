@@ -197,6 +197,7 @@ def test_terminal_uniqueness_is_idempotent_for_same_event() -> None:
 # ---------------------------------------------------------------------------
 
 EXPECTED_DURABILITY = {
+    "plan.draft_state": contract.Durability.EFFECT,
     "run_started": contract.Durability.ADMISSION,
     "progress": contract.Durability.PROGRESS,
     "progress.gap": contract.Durability.PROGRESS,

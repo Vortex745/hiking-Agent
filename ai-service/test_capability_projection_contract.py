@@ -91,11 +91,11 @@ def test_projection_inventory_covers_builtin_skills_mcp_and_sandbox():
     ids = {tool.capability_id for tool in route.tools}
 
     assert "builtin:hiking_knowledge_search" in ids
-    assert "builtin:web_search" in ids
-    assert "mcp:amap_weather:get_current_weather" in ids
-    assert "mcp:amap_map:plan_route" in ids
+    assert "builtin:route_research" in ids
+    assert "mcp:amap_weather:maps_weather" in ids
+    assert "mcp:amap_map:maps_direction_walking" in ids
     assert "skill:pdf-report" in ids
-    assert route.tool("mcp__amap_map__plan_route").source == "mcp"
+    assert route.tool("mcp__amap_map__maps_direction_walking").source == "mcp"
     assert route.tool("hiking_knowledge_search").source == "builtin"
 
     artifact = _projection("artifact")
@@ -154,7 +154,7 @@ def test_capability_ids_do_not_depend_on_registration_order():
 def test_authorization_uses_frozen_risk_and_threshold():
     projection = _projection("route_plan")
 
-    allow = projection.authorize("web_search", {"query": "x"})
+    allow = projection.authorize("route_research", {"query": "x"})
     assert allow.decision is PermissionDecision.ALLOW
     assert allow.risk is RiskLevel.MEDIUM
     assert allow.reason == "low_risk_allowed"
@@ -172,9 +172,9 @@ def test_authorization_uses_frozen_risk_and_threshold():
     assert unknown.decision is PermissionDecision.DENY
     assert unknown.reason == "unknown_tool"
 
-    mcp_ok = projection.authorize("mcp__amap_map__plan_route", {"destination": "杭州"})
+    mcp_ok = projection.authorize("mcp__amap_map__maps_direction_walking", {"destination": "杭州"})
     assert mcp_ok.decision is PermissionDecision.ALLOW
-    assert mcp_ok.capability_id == "mcp:amap_map:plan_route"
+    assert mcp_ok.capability_id == "mcp:amap_map:maps_direction_walking"
 
     mcp_rogue = projection.authorize("mcp__amap_map__shell_exec", {})
     assert mcp_rogue.decision is PermissionDecision.DENY
@@ -192,7 +192,7 @@ def test_legacy_projection_from_profile_keeps_same_authorization_semantics():
     assert projection.authorize("hiking_knowledge_search").decision is (
         PermissionDecision.ALLOW
     )
-    assert projection.authorize("mcp__amap_map__plan_route").decision is (
+    assert projection.authorize("mcp__amap_map__maps_direction_walking").decision is (
         PermissionDecision.ALLOW
     )
     assert projection.authorize("mcp__amap_map__shell_exec").decision is (
@@ -209,13 +209,13 @@ def test_lazy_mcp_discovery_only_grants_projected_tools():
     projection = _projection("route_plan")
 
     result = projection.discover_mcp_tools(
-        "amap_map", ["plan_route", "shell_exec", "geocode"]
+        "amap_map", ["maps_direction_walking", "shell_exec", "maps_geo"]
     )
 
     discovered_ids = {entry["capability_id"] for entry in result.discovered}
     assert discovered_ids == {
-        mcp_capability_id("amap_map", "plan_route"),
-        mcp_capability_id("amap_map", "geocode"),
+        mcp_capability_id("amap_map", "maps_direction_walking"),
+        mcp_capability_id("amap_map", "maps_geo"),
     }
     denied = {entry["tool"]: entry for entry in result.denied}
     assert denied["mcp__amap_map__shell_exec"]["reason"] == "not_projected"
@@ -230,7 +230,7 @@ def test_lazy_mcp_discovery_only_grants_projected_tools():
     assert projection.authorize("mcp__amap_map__shell_exec", {}).decision is (
         PermissionDecision.DENY
     )
-    assert projection.authorize("mcp__amap_map__plan_route", {}).decision is (
+    assert projection.authorize("mcp__amap_map__maps_direction_walking", {}).decision is (
         PermissionDecision.ALLOW
     )
 
@@ -241,9 +241,9 @@ def test_lazy_mcp_discovery_only_grants_projected_tools():
 
 def test_describe_exposes_stable_identity_and_deferred_schema():
     projection = _projection("route_plan")
-    described = projection.describe("mcp__amap_map__plan_route")
+    described = projection.describe("mcp__amap_map__maps_direction_walking")
     assert described["projected"] is True
-    assert described["capability_id"] == "mcp:amap_map:plan_route"
+    assert described["capability_id"] == "mcp:amap_map:maps_direction_walking"
     assert described["schema_summary"]["deferred"] is True
     assert described["policy_hash"] == projection.policy_hash
 
@@ -596,8 +596,8 @@ def test_snapshot_exposes_projection_summary_from_frozen_policy(
     summary = snapshot.capability_projection
     assert summary is not None
     assert summary["policy_hash"] == policy_hash(policy)
-    assert "builtin:web_search" in summary["capability_ids"]
-    assert "mcp:amap_map:plan_route" in summary["capability_ids"]
+    assert "builtin:route_research" in summary["capability_ids"]
+    assert "mcp:amap_map:maps_direction_walking" in summary["capability_ids"]
     assert summary["capability_count"] == len(summary["capability_ids"])
     assert {s["server_id"] for s in summary["mcp_services"]} == {
         "amap_map",
@@ -612,12 +612,12 @@ def test_snapshot_exposes_projection_summary_from_frozen_policy(
     # Current global config drift cannot change what the snapshot reports:
     # the summary is derived from the frozen policy, not the live risk map.
     monkeypatch.setitem(
-        permissions_module._TOOL_RISK, "web_search", RiskLevel.HIGH
+        permissions_module._TOOL_RISK, "route_research", RiskLevel.HIGH
     )
-    assert permissions_module.tool_risk_policy()["web_search"] == "high"
+    assert permissions_module.tool_risk_policy()["route_research"] == "high"
     drifted = repo.get_snapshot(run_id).capability_projection
     assert drifted == summary
-    assert drifted["risk_policy"]["tool_risk"]["web_search"] == "medium"
+    assert drifted["risk_policy"]["tool_risk"]["route_research"] == "medium"
     repo.close()
 
 
@@ -779,8 +779,8 @@ def test_mcp_discovery_events_are_replayable_and_policy_bound(
         assert entry["projection_hash"]
         assert all("mcp:" in cid for cid in entry["capability_ids"])
     amap = next(d for d in discovery if d["server_id"] == "amap_map")
-    assert "mcp:amap_map:plan_route" in amap["capability_ids"]
-    assert "mcp__amap_map__plan_route" in amap["discovered_tools"]
+    assert "mcp:amap_map:maps_direction_walking" in amap["capability_ids"]
+    assert "mcp__amap_map__maps_direction_walking" in amap["discovered_tools"]
     # Envelope shape unchanged: additive keys inside existing event types.
     assert {e.type for e in items} <= {
         "run_started", "progress", "heartbeat", "text", "tool_result",

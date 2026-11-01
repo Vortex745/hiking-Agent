@@ -1177,17 +1177,18 @@ def test_restart_claimed_effect_converges_unknown_without_rerun(tmp_path, monkey
     # Durable post-crash state: the executor claimed the effect and its
     # tool_call WAS persisted moments ago. The in-process owner died with
     # the "restart"; the recent tool_call must no longer imply liveness.
+    approved_args = json.loads(harness.repo.get_approval(approval_id).args_canonical)
     identity = compute_effect_identity(
         run_id=run_id,
         tool_name="generate_pdf",
-        args={"filename": "hiking-plan.pdf"},
+        args=approved_args,
     )
     harness.repo.insert_effect(
         effect_key=identity.effect_id,
         run_id=run_id,
         conversation_id=f"conv-{run_id}",
         tool_name="generate_pdf",
-        args_canonical='{"filename": "hiking-plan.pdf"}',
+        args_canonical=json.dumps(approved_args, sort_keys=True, separators=(",", ":")),
         external_idempotency_key=identity.idempotency_key,
         effect_id=identity.effect_id,
         idempotency_key=identity.idempotency_key,
@@ -1200,7 +1201,7 @@ def test_restart_claimed_effect_converges_unknown_without_rerun(tmp_path, monkey
         event_type="tool_call",
         payload={
             "tool": "generate_pdf",
-            "args": {"filename": "hiking-plan.pdf"},
+            "args": approved_args,
         },
         request_id="req-owner-9",
         conversation_id=f"conv-{run_id}",

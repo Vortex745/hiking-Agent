@@ -427,6 +427,183 @@ CREATE TABLE IF NOT EXISTS raw_sampling_audit (
 
 CREATE INDEX IF NOT EXISTS idx_raw_sampling_expiry
 ON raw_sampling_audit(disabled_at, expires_at);
+
+-- Ticket 01: the plan-book draft. Keyed by ``conversation_id`` (the
+-- existing ownership axis), NOT by run_id: runs, artifacts, events and
+-- sandbox leases are run-scoped with ON DELETE CASCADE, and a draft must
+-- outlive the run that created it so tickets 02/05 can restore and revise
+-- it. ``stage`` is the same vocabulary the ``plan.draft_state`` event
+-- carries, so server and frontend read one state. ``destination_or_route``
+-- / ``activity_date`` / ``participants`` stay empty until the dialog
+-- submits them — an uncollected arrangement is absent, never invented.
+CREATE TABLE IF NOT EXISTS plan_drafts (
+    conversation_id TEXT PRIMARY KEY,
+    draft_id TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    destination_or_route TEXT NOT NULL DEFAULT '',
+    activity_date TEXT NOT NULL DEFAULT '',
+    participants INTEGER,
+    updated_by_run_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_drafts_stage ON plan_drafts(stage);
+
+-- Ticket 03: the route reference a plan draft points at — its own table, on
+-- purpose. ``ControlStore.__init__`` only ever runs ``CREATE TABLE IF NOT
+-- EXISTS``, which creates a missing table on an existing database but never
+-- alters a present one: a ``comparison_id`` column added to ``plan_drafts``
+-- above would silently not exist on a developer's DB and surface later as
+-- ``sqlite3.OperationalError: no such column``. A new table needs no migration
+-- machinery. It is also AC3 in storage form: the user's arrangements stay on
+-- the draft row, a verified route is only ever *referenced* here — no fact
+-- column, so no copy of a fact can drift out of sync with its source.
+CREATE TABLE IF NOT EXISTS plan_route_selections (
+    conversation_id TEXT PRIMARY KEY,
+    draft_id TEXT NOT NULL,
+    comparison_id TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    selected_by_run_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_route_selections_draft
+ON plan_route_selections(draft_id);
+
+-- Ticket 06: the supplementary arrangements the entry dialog now collects
+-- (集合时间/集合地点/领队/交通/住宿/费用预算/应急联络/撤退方案). Its own table
+-- for the same reason ticket 03's reference is: ``ControlStore.__init__`` only
+-- runs ``CREATE TABLE IF NOT EXISTS``, so eight new ``plan_drafts`` columns
+-- would silently not exist on an existing database. Every column defaults to
+-- the empty string — an arrangement the user never filled stays absent, never
+-- invented (docs/plan-pdf-format.md: 未知安排留空显示"待确认"). There is no
+-- column for a route fact, a derived time or a computed cost: the shape of the
+-- table is AC6, so a value outside the arrangement vocabulary cannot be stored
+-- here even by mistake.
+CREATE TABLE IF NOT EXISTS plan_arrangements (
+    conversation_id TEXT PRIMARY KEY,
+    draft_id TEXT NOT NULL,
+    meeting_time TEXT NOT NULL DEFAULT '',
+    meeting_point TEXT NOT NULL DEFAULT '',
+    leader TEXT NOT NULL DEFAULT '',
+    transport TEXT NOT NULL DEFAULT '',
+    accommodation TEXT NOT NULL DEFAULT '',
+    budget TEXT NOT NULL DEFAULT '',
+    emergency_contact TEXT NOT NULL DEFAULT '',
+    retreat_plan TEXT NOT NULL DEFAULT '',
+    updated_by_run_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_arrangements_draft
+ON plan_arrangements(draft_id);
+
+-- Ticket 06 AC5: the deterministic completeness verdict is a ROW, not a render.
+-- Stored beside the draft it judged (draft_id) and the run that computed it
+-- (checked_by_run_id) so a restore or an audit can answer "what did the rules
+-- decide, on which draft, on which turn" without re-running anything and
+-- without a model. Only codes, keys and the verdict travel: no route fact, no
+-- value, no report-eligibility flag — the safety gate stays with
+-- :func:`route_compare.service.render_report` (AC6). JSON arrays hold the
+-- stable reason codes and the missing/format keys in their verdict order.
+CREATE TABLE IF NOT EXISTS plan_completeness_checks (
+    conversation_id TEXT PRIMARY KEY,
+    draft_id TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    reasons_json TEXT NOT NULL DEFAULT '[]',
+    missing_core_json TEXT NOT NULL DEFAULT '[]',
+    missing_non_core_json TEXT NOT NULL DEFAULT '[]',
+    invalid_format_json TEXT NOT NULL DEFAULT '[]',
+    checked_by_run_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_completeness_checks_draft
+ON plan_completeness_checks(draft_id);
+
+-- Ticket 09 AC4: the plan book's artifact version history. A NEW table, never
+-- a ``plan_drafts`` column (``ControlStore.__init__`` only runs CREATE TABLE IF
+-- NOT EXISTS, so an added column silently never exists on an existing database).
+-- One row per PUBLISHED generation, keyed by ``(conversation_id, revision)``:
+-- the draft's answer to "which artifact is current" (MAX revision) and "what
+-- came before" (the ascending list, each row naming the artifact it replaced).
+-- Deliberately NOT FK'd to ``run_id``: events/artifacts/approvals/effects
+-- cascade-delete with the run (persistence.py runs/FK notes above), and this
+-- relation must outlive the run that produced the artifact or a deleted run
+-- would silently rewrite the draft's history. ``published_by_run_id`` is a
+-- plain audit string for the same reason.
+CREATE TABLE IF NOT EXISTS plan_artifact_versions (
+    conversation_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    draft_id TEXT NOT NULL DEFAULT '',
+    artifact_id TEXT NOT NULL,
+    previous_artifact_id TEXT NOT NULL DEFAULT '',
+    published_by_run_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (conversation_id, revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_artifact_versions_conv
+ON plan_artifact_versions(conversation_id);
+
+-- Ticket 09 (gap ticket 08 left open): the deterministic gate's safety record
+-- as a ROW, so the PDF cover's 安全门 line reads what the gate answered instead
+-- of staying 待核验 in real exports. Ticket 07's :class:`PlanSafety` only rode
+-- the ``plan.draft_state.safety`` event payload; this stores that payload
+-- verbatim (the stable codes, the gate's own booleans, its own message string
+-- and the comparison it speaks for). Nothing is derived here: the row exists
+-- only because a plan turn ran the route gate, and it is superseded with the
+-- draft it belongs to (``draft_id``), cleared with the rest of the unfinished
+-- plan state on cancel. New table for the same CREATE-TABLE-IF-NOT-EXISTS
+-- reason as above.
+CREATE TABLE IF NOT EXISTS plan_safety_records (
+    conversation_id TEXT PRIMARY KEY,
+    draft_id TEXT NOT NULL,
+    hard_stop INTEGER NOT NULL CHECK (hard_stop IN (0, 1)),
+    codes_json TEXT NOT NULL DEFAULT '[]',
+    formal_route_plan_allowed INTEGER NOT NULL CHECK (formal_route_plan_allowed IN (0, 1)),
+    message TEXT NOT NULL DEFAULT '',
+    comparison_id TEXT NOT NULL DEFAULT '',
+    comparison_status TEXT NOT NULL DEFAULT '',
+    gate_reasons_json TEXT NOT NULL DEFAULT '[]',
+    required_action TEXT NOT NULL DEFAULT '',
+    recorded_by_run_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_safety_records_draft
+ON plan_safety_records(draft_id);
+
+-- Ticket 05 AC5 / ticket 06 AC5, enforced by ticket 07: an explicit confirmation
+-- is a RECORD, not only a stage. ``plan_drafts.stage`` is overwritten by the next
+-- transition, so "the user confirmed the FIRST summary" and "the user confirmed
+-- the FINAL summary" are not recoverable from it — yet AC4's PDF door and the
+-- audit both need them back. One row per (conversation, kind), ``kind`` in
+-- {first, final}: the first summary and the second summary are two distinct
+-- confirmations that must survive one another and every later stage move. A NEW
+-- table (never a ``plan_drafts`` column — ``ControlStore.__init__`` only runs
+-- CREATE TABLE IF NOT EXISTS, so an added column silently never exists on an
+-- existing database). Deliberately NOT FK'd to ``run_id``: run-scoped tables
+-- cascade-delete with the run, and a confirmation must outlive the turn that
+-- recorded it; ``confirmed_by_run_id`` is a plain audit string for the same reason.
+CREATE TABLE IF NOT EXISTS plan_confirmations (
+    conversation_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('first', 'final')),
+    draft_id TEXT NOT NULL,
+    confirmed_by_run_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (conversation_id, kind)
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_confirmations_draft
+ON plan_confirmations(draft_id);
 """
 
 
@@ -575,8 +752,230 @@ class ArtifactRecord:
     expires_at: str
 
 
-# ---- Approval statuses (Ticket 11) ---------------------------------------
+# ---- Plan draft (Ticket 01) ----------------------------------------------
 
+#: Stages a stored draft may hold. Mirrors
+#: :class:`agent_v2.plan_workflow.PlanDraftStage`; written as literals here
+#: so the persistence layer does not import the domain module.
+#: Ticket 04 adds ``awaiting_generic_choice`` — a research turn whose material
+#: did not pass the deterministic gate parks HERE for the user's choice, and
+#: needs no column: the draft keeps its arrangements, and the fact that it is
+#: not a route plan is derived from the absence of a route basis rather than
+#: stored as a claim (see ``plan_route_selections`` above for why a new column
+#: is not free on an existing database).
+_VALID_PLAN_DRAFT_STAGES: frozenset[str] = frozenset(
+    {
+        "awaiting_confirmation",
+        "awaiting_input",
+        "minimal_draft",
+        "awaiting_generic_choice",
+        "awaiting_first_review",
+        "first_reviewed",
+        # Ticket 07: the second summary and its explicit confirmation, plus the
+        # hard stop the deterministic gate's no_go answer parks on. Same reason as
+        # above for listing them here: the store is the boundary that refuses a
+        # stage this build does not know, so a new member has to arrive in all six
+        # places at once (see test_plan_draft_restore.py's pinned cross-checks).
+        "awaiting_final_review",
+        "final_reviewed",
+        "blocked_safety",
+        "cancelled",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PlanDraftRecord:
+    """Snapshot of a plan_drafts row (Ticket 01).
+
+    ``stage`` is the shared draft-state vocabulary. The three arrangement
+    fields hold whatever the user has submitted so far — an unsubmitted
+    dialog leaves them empty/``None``, which is how "待确认" stays honest
+    downstream: nothing is invented to fill a gap.
+    """
+
+    conversation_id: str
+    draft_id: str
+    stage: str
+    destination_or_route: str
+    activity_date: str
+    participants: int | None
+    updated_by_run_id: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class RouteSelectionRecord:
+    """Snapshot of a plan_route_selections row (Ticket 03 AC1/AC3).
+
+    Two ids and the draft they belong to. There is deliberately no field for
+    a distance, an ascent, a duration, a weather string or an open status:
+    verified facts are read back through
+    :meth:`agent_v2.route_tools.RouteSession.load_result`, which re-runs the
+    deterministic gate, so a stale copy cannot exist in the first place.
+    """
+
+    conversation_id: str
+    draft_id: str
+    comparison_id: str
+    candidate_id: str
+    selected_by_run_id: str
+    created_at: str
+    updated_at: str
+
+
+#: The eight supplementary arrangements ticket 06 collects, in the checklist
+#: order :data:`agent_v2.plan_workflow.ARRANGEMENT_FIELDS` uses for them. Kept
+#: here (not imported) so the storage boundary owns its own column list and a
+#: key outside it is refused rather than silently dropped.
+_PLAN_ARRANGEMENT_KEYS: tuple[str, ...] = (
+    "meeting_time", "meeting_point", "leader", "transport",
+    "accommodation", "budget", "emergency_contact", "retreat_plan",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PlanArrangementsRecord:
+    """Snapshot of a plan_arrangements row (Ticket 06 AC1/AC5).
+
+    A value per supplementary arrangement, empty string when the user never
+    filled it in — which is exactly the 待确认 state, and never an invented one.
+    There are deliberately no fields for a route fact, a derived time or a
+    computed cost: the record's shape is the AC6 boundary, so nothing outside
+    the arrangement vocabulary can be stored here even by a mistaken caller.
+    """
+
+    conversation_id: str
+    draft_id: str
+    meeting_time: str
+    meeting_point: str
+    leader: str
+    transport: str
+    accommodation: str
+    budget: str
+    emergency_contact: str
+    retreat_plan: str
+    updated_by_run_id: str
+    created_at: str
+    updated_at: str
+
+    def as_values(self) -> dict[str, str]:
+        """The eight arrangements as the completeness rules read them."""
+        return {key: getattr(self, key) for key in _PLAN_ARRANGEMENT_KEYS}
+
+
+@dataclass(frozen=True, slots=True)
+class CompletenessCheckRecord:
+    """Snapshot of a plan_completeness_checks row (Ticket 06 AC5).
+
+    The saved verdict as data: the code, the ordered reason codes and the
+    ordered missing/format keys. ``reasons`` and the key tuples are the stable
+    machine values, so a restore can re-show the reasons without re-deciding
+    anything and an auditor can grep them. No field carries a route fact or a
+    report-eligibility flag (AC6).
+    """
+
+    conversation_id: str
+    draft_id: str
+    verdict: str
+    reasons: tuple[str, ...]
+    missing_core_keys: tuple[str, ...]
+    missing_non_core_keys: tuple[str, ...]
+    invalid_format_keys: tuple[str, ...]
+    checked_by_run_id: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class PlanArtifactVersionRecord:
+    """Snapshot of a plan_artifact_versions row (Ticket 09 AC4).
+
+    One published generation of the plan book: the revision number (also the
+    discriminator inside ``generate_pdf``'s canonical args), the artifact it
+    points at, and the artifact it replaced. ``artifact_id`` is an id, not a
+    copy: bytes, size and expiry stay owned by the ``artifacts`` row and its
+    download rules (AC5), so the history can never contradict them.
+    """
+
+    conversation_id: str
+    revision: int
+    draft_id: str
+    artifact_id: str
+    previous_artifact_id: str
+    published_by_run_id: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class PlanSafetyRecord:
+    """Snapshot of a plan_safety_records row (Ticket 09, ticket 07's record).
+
+    The gate's answer as data, stored verbatim from
+    :meth:`agent_v2.plan_workflow.PlanSafety.to_payload`: booleans, stable
+    codes, the gate's own message, and the comparison it speaks for. There is
+    no field for a re-derived sentence or a report-eligibility flag — the cover
+    copy comes from the payload ``report_pdf`` already knows how to read, and
+    ``render_report`` stays the only eligibility authority.
+    """
+
+    conversation_id: str
+    draft_id: str
+    hard_stop: bool
+    codes: tuple[str, ...]
+    formal_route_plan_allowed: bool
+    message: str
+    comparison_id: str
+    comparison_status: str
+    gate_reasons: tuple[str, ...]
+    required_action: str
+    recorded_by_run_id: str
+    created_at: str
+    updated_at: str
+
+    def to_payload(self) -> dict[str, Any]:
+        """The :meth:`PlanSafety.to_payload` shape, rebuilt from the row.
+
+        Read back by :func:`agent_v2.run_orchestration._pdf_plan_status_inputs`
+        and passed to ``build_report_document(safety=...)`` — the same shape the
+        cover already expects, with no new keys and no new sentences.
+        """
+        return {
+            "hard_stop": self.hard_stop,
+            "codes": list(self.codes),
+            "formal_route_plan_allowed": self.formal_route_plan_allowed,
+            "message": self.message,
+            "comparison_id": self.comparison_id,
+            "comparison_status": self.comparison_status,
+            "gate_reasons": list(self.gate_reasons),
+            "required_action": self.required_action,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PlanConfirmationRecord:
+    """Snapshot of a plan_confirmations row (ticket 05 AC5 / ticket 06 AC5).
+
+    One explicit confirmation the user gave — the FIRST summary (their own
+    arrangements) or the FINAL summary (the whole book) — as a durable record.
+    ``kind`` is ``"first"`` or ``"final"``; ``draft_id`` names the draft it was
+    given on and ``confirmed_by_run_id`` the turn that carried it. Nothing is
+    derived here: it stores only that a confirmation click landed, which is what
+    the ``plan_drafts.stage`` (overwritten by the next transition) cannot answer
+    after the fact.
+    """
+
+    conversation_id: str
+    kind: str
+    draft_id: str
+    confirmed_by_run_id: str
+    created_at: str
+    updated_at: str
+
+
+# ---- Approval statuses (Ticket 11) ---------------------------------------
 
 ApprovalStatus = Literal["pending", "approved", "rejected", "expired"]
 
@@ -2587,6 +2986,738 @@ class ControlStore:
             created_at=row["created_at"],
             expires_at=row["expires_at"],
         )
+
+    # -- plan drafts (Ticket 01) ---------------------------------------
+
+    def upsert_plan_draft(
+        self,
+        *,
+        conversation_id: str,
+        stage: str,
+        draft_id: str | None = None,
+        destination_or_route: str = "",
+        activity_date: str = "",
+        participants: int | None = None,
+        updated_by_run_id: str = "",
+    ) -> PlanDraftRecord:
+        """Insert or replace the conversation's single plan draft.
+
+        Ticket 01 spec AC8: the draft is one-per-conversation and lives on
+        the conversation axis, so an entry click, a dialog submit and a
+        later cancel all overwrite the same row instead of accumulating
+        history. ``draft_id`` is preserved across upserts so the frontend
+        can tell that the draft it is looking at is still the same draft.
+
+        Raises ``ValueError`` for a stage outside the shared vocabulary —
+        a typo must not become an unrenderable draft state.
+        """
+        if stage not in _VALID_PLAN_DRAFT_STAGES:
+            raise ValueError(f"invalid plan draft stage: {stage!r}")
+        if participants is not None and not 1 <= participants <= 10000:
+            raise ValueError(f"invalid plan draft participants: {participants!r}")
+
+        now = _now_iso()
+        existing = self.get_plan_draft(conversation_id)
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute(
+                "INSERT INTO plan_drafts "
+                "(conversation_id, draft_id, stage, destination_or_route, "
+                " activity_date, participants, updated_by_run_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(conversation_id) DO UPDATE SET "
+                " stage = excluded.stage, "
+                " destination_or_route = excluded.destination_or_route, "
+                " activity_date = excluded.activity_date, "
+                " participants = excluded.participants, "
+                " updated_by_run_id = excluded.updated_by_run_id, "
+                " updated_at = excluded.updated_at",
+                (
+                    conversation_id,
+                    draft_id or (existing.draft_id if existing else str(uuid.uuid4())),
+                    stage,
+                    destination_or_route,
+                    activity_date,
+                    participants,
+                    updated_by_run_id,
+                    existing.created_at if existing else now,
+                    now,
+                ),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        record = self.get_plan_draft(conversation_id)
+        assert record is not None  # just wrote it
+        return record
+
+    def get_plan_draft(self, conversation_id: str) -> PlanDraftRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM plan_drafts WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        return self._row_to_plan_draft(row) if row is not None else None
+
+    def _row_to_plan_draft(self, row: sqlite3.Row) -> PlanDraftRecord:
+        return PlanDraftRecord(
+            conversation_id=row["conversation_id"],
+            draft_id=row["draft_id"],
+            stage=row["stage"],
+            destination_or_route=row["destination_or_route"],
+            activity_date=row["activity_date"],
+            participants=row["participants"],
+            updated_by_run_id=row["updated_by_run_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    # -- route selections (Ticket 03) ----------------------------------
+
+    def upsert_route_selection(
+        self,
+        *,
+        conversation_id: str,
+        draft_id: str,
+        comparison_id: str,
+        candidate_id: str,
+        selected_by_run_id: str = "",
+    ) -> RouteSelectionRecord:
+        """Point the conversation's draft at one candidate of a comparison.
+
+        One row per conversation, replaced in place: choosing the alternative
+        instead of the recommendation is one draft's second thought, not a
+        second selection the user has to reconcile. ``draft_id`` travels with
+        it so a reference can only ever describe the draft it was made for.
+
+        Raises ``ValueError`` on an empty id — a reference that points at
+        nothing is exactly the fabricated route AC4 forbids, so it is refused
+        at the storage boundary too, never written as a row.
+        """
+        for name, value in (
+            ("draft_id", draft_id),
+            ("comparison_id", comparison_id),
+            ("candidate_id", candidate_id),
+        ):
+            if not (value or "").strip():
+                raise ValueError(f"invalid plan route selection {name}: {value!r}")
+
+        now = _now_iso()
+        existing = self.get_route_selection(conversation_id)
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute(
+                "INSERT INTO plan_route_selections "
+                "(conversation_id, draft_id, comparison_id, candidate_id, "
+                " selected_by_run_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(conversation_id) DO UPDATE SET "
+                " draft_id = excluded.draft_id, "
+                " comparison_id = excluded.comparison_id, "
+                " candidate_id = excluded.candidate_id, "
+                " selected_by_run_id = excluded.selected_by_run_id, "
+                " updated_at = excluded.updated_at",
+                (
+                    conversation_id,
+                    draft_id,
+                    comparison_id,
+                    candidate_id,
+                    selected_by_run_id,
+                    existing.created_at if existing else now,
+                    now,
+                ),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        record = self.get_route_selection(conversation_id)
+        assert record is not None  # just wrote it
+        return record
+
+    def get_route_selection(self, conversation_id: str) -> RouteSelectionRecord | None:
+        """The conversation's route reference, or ``None`` when it has none.
+
+        ``None`` is the honest AC4 state: no reference means no verified facts
+        may appear in the draft, and the render path treats it that way.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM plan_route_selections WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return RouteSelectionRecord(
+            conversation_id=row["conversation_id"],
+            draft_id=row["draft_id"],
+            comparison_id=row["comparison_id"],
+            candidate_id=row["candidate_id"],
+            selected_by_run_id=row["selected_by_run_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def clear_route_selection(self, conversation_id: str) -> int:
+        """Drop the conversation's route reference; return the removed count.
+
+        Used when a draft is cancelled (ticket 02 AC4: cancelling clears the
+        unfinished plan state) and when a draft is replaced by a fresh one, so
+        a reference cannot outlive the draft that earned it.
+        """
+        self._conn.execute("BEGIN")
+        try:
+            cursor = self._conn.execute(
+                "DELETE FROM plan_route_selections WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return cursor.rowcount
+
+    # -- supplementary arrangements (Ticket 06) ------------------------
+
+    def upsert_plan_arrangements(
+        self,
+        *,
+        conversation_id: str,
+        draft_id: str,
+        arrangements: dict[str, str],
+        updated_by_run_id: str = "",
+    ) -> PlanArrangementsRecord:
+        """Store the conversation's eight supplementary arrangements.
+
+        One row per conversation, replaced whole (AC3): a submit that omits a
+        field clears it back to the empty string rather than keeping an older
+        value, because the entry form re-sends the full record every time and a
+        stale arrangement would be a claim the user did not just make. Only
+        :data:`_PLAN_ARRANGEMENT_KEYS` are read from the mapping and every value
+        is coerced to ``str`` — a non-string (a number, a flag) is refused, never
+        quietly stringified into the checklist. An empty ``conversation_id`` or
+        ``draft_id`` is refused so a row can never point at nothing.
+        """
+        if not (conversation_id or "").strip():
+            raise ValueError("invalid plan arrangements conversation_id")
+        if not (draft_id or "").strip():
+            raise ValueError("invalid plan arrangements draft_id")
+        for key in arrangements:
+            if key not in _PLAN_ARRANGEMENT_KEYS:
+                raise ValueError(f"unknown plan arrangement key: {key!r}")
+        for key, value in arrangements.items():
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"plan arrangement {key!r} must be a string, got {type(value).__name__}"
+                )
+
+        now = _now_iso()
+        existing = self.get_plan_arrangements(conversation_id)
+        values = [arrangements.get(key, "") for key in _PLAN_ARRANGEMENT_KEYS]
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute(
+                "INSERT INTO plan_arrangements "
+                "(conversation_id, draft_id, meeting_time, meeting_point, leader, transport, "
+                " accommodation, budget, emergency_contact, retreat_plan, updated_by_run_id, "
+                " created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(conversation_id) DO UPDATE SET "
+                " draft_id = excluded.draft_id, "
+                " meeting_time = excluded.meeting_time, "
+                " meeting_point = excluded.meeting_point, "
+                " leader = excluded.leader, "
+                " transport = excluded.transport, "
+                " accommodation = excluded.accommodation, "
+                " budget = excluded.budget, "
+                " emergency_contact = excluded.emergency_contact, "
+                " retreat_plan = excluded.retreat_plan, "
+                " updated_by_run_id = excluded.updated_by_run_id, "
+                " updated_at = excluded.updated_at",
+                (conversation_id, draft_id, *values, updated_by_run_id,
+                 existing.created_at if existing else now, now),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        record = self.get_plan_arrangements(conversation_id)
+        assert record is not None  # just wrote it
+        return record
+
+    def get_plan_arrangements(self, conversation_id: str) -> PlanArrangementsRecord | None:
+        """The conversation's collected arrangements, or ``None`` when never submitted.
+
+        ``None`` is the honest pre-submit state: no row means the user has not
+        filled the supplementary record yet, so every arrangement is 待确认 and
+        the completeness rules read an absent record, never a guessed one.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM plan_arrangements WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return PlanArrangementsRecord(
+            conversation_id=row["conversation_id"],
+            draft_id=row["draft_id"],
+            **{key: row[key] for key in _PLAN_ARRANGEMENT_KEYS},
+            updated_by_run_id=row["updated_by_run_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def clear_plan_arrangements(self, conversation_id: str) -> int:
+        """Drop the conversation's arrangement row; return the removed count.
+
+        Ticket 02 AC4's cancel contract, widened to the new state: cancelling a
+        plan clears the unfinished arrangements with the rest, so a reopened
+        draft never inherits a value the user cancelled away.
+        """
+        self._conn.execute("BEGIN")
+        try:
+            cursor = self._conn.execute(
+                "DELETE FROM plan_arrangements WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return cursor.rowcount
+
+    # -- completeness verdict (Ticket 06 AC5) --------------------------
+
+    def upsert_completeness_check(
+        self,
+        *,
+        conversation_id: str,
+        draft_id: str,
+        verdict: str,
+        reasons: list[str],
+        missing_core_keys: list[str],
+        missing_non_core_keys: list[str],
+        invalid_format_keys: list[str],
+        checked_by_run_id: str = "",
+    ) -> CompletenessCheckRecord:
+        """Save the deterministic verdict so it is restorable and auditable.
+
+        The rules' answer travels as data (codes + ordered keys + the verdict
+        string), beside the ``draft_id`` it judged and the run that computed it.
+        Replaced in place per conversation: a draft has one current verdict, and
+        an older one is superseded the moment the fields change (spec AC5).
+        Nothing here is a route fact or a report decision (AC6) — those stay in
+        ``plan_route_selections`` and the comparison gate respectively.
+        """
+        if not (conversation_id or "").strip():
+            raise ValueError("invalid completeness check conversation_id")
+        if not (draft_id or "").strip():
+            raise ValueError("invalid completeness check draft_id")
+        if not (verdict or "").strip():
+            raise ValueError("invalid completeness check verdict")
+
+        now = _now_iso()
+        existing = self.get_completeness_check(conversation_id)
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute(
+                "INSERT INTO plan_completeness_checks "
+                "(conversation_id, draft_id, verdict, reasons_json, missing_core_json, "
+                " missing_non_core_json, invalid_format_json, checked_by_run_id, "
+                " created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(conversation_id) DO UPDATE SET "
+                " draft_id = excluded.draft_id, "
+                " verdict = excluded.verdict, "
+                " reasons_json = excluded.reasons_json, "
+                " missing_core_json = excluded.missing_core_json, "
+                " missing_non_core_json = excluded.missing_non_core_json, "
+                " invalid_format_json = excluded.invalid_format_json, "
+                " checked_by_run_id = excluded.checked_by_run_id, "
+                " updated_at = excluded.updated_at",
+                (
+                    conversation_id,
+                    draft_id,
+                    verdict,
+                    json.dumps(list(reasons), ensure_ascii=False),
+                    json.dumps(list(missing_core_keys), ensure_ascii=False),
+                    json.dumps(list(missing_non_core_keys), ensure_ascii=False),
+                    json.dumps(list(invalid_format_keys), ensure_ascii=False),
+                    checked_by_run_id,
+                    existing.created_at if existing else now,
+                    now,
+                ),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        record = self.get_completeness_check(conversation_id)
+        assert record is not None  # just wrote it
+        return record
+
+    def get_completeness_check(self, conversation_id: str) -> CompletenessCheckRecord | None:
+        """The conversation's saved verdict, or ``None`` before the rules first ran."""
+        row = self._conn.execute(
+            "SELECT * FROM plan_completeness_checks WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return CompletenessCheckRecord(
+            conversation_id=row["conversation_id"],
+            draft_id=row["draft_id"],
+            verdict=row["verdict"],
+            reasons=tuple(json.loads(row["reasons_json"])),
+            missing_core_keys=tuple(json.loads(row["missing_core_json"])),
+            missing_non_core_keys=tuple(json.loads(row["missing_non_core_json"])),
+            invalid_format_keys=tuple(json.loads(row["invalid_format_json"])),
+            checked_by_run_id=row["checked_by_run_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def clear_completeness_check(self, conversation_id: str) -> int:
+        """Drop the conversation's saved verdict (cancelled / replaced draft)."""
+        self._conn.execute("BEGIN")
+        try:
+            cursor = self._conn.execute(
+                "DELETE FROM plan_completeness_checks WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return cursor.rowcount
+
+    # -- plan-book artifact version history (Ticket 09 AC4) -------------
+
+    def publish_plan_artifact_version(
+        self,
+        *,
+        conversation_id: str,
+        artifact_id: str,
+        draft_id: str = "",
+        published_by_run_id: str = "",
+    ) -> PlanArtifactVersionRecord:
+        """Append one published generation to the conversation's history.
+
+        Revision = MAX(revision)+1 and ``previous_artifact_id`` = whatever held
+        that slot before, both read inside the same BEGIN/COMMIT as the INSERT,
+        so the chain is derived by the storage layer rather than claimed by the
+        caller — a flow that forgets (or mis-states) what came before cannot
+        make this table disagree with itself. The table is append-only by
+        design: history that could be overwritten in place would not be a
+        record of what came before. Empty ``conversation_id``/``artifact_id``
+        are refused at the boundary — a version row that points at nothing is
+        exactly the fabricated claim this ticket forbids.
+        """
+        if not (conversation_id or "").strip():
+            raise ValueError("invalid artifact version conversation_id")
+        if not (artifact_id or "").strip():
+            raise ValueError("invalid artifact version artifact_id")
+
+        now = _now_iso()
+        self._conn.execute("BEGIN")
+        try:
+            row = self._conn.execute(
+                "SELECT MAX(revision) AS max_rev FROM plan_artifact_versions "
+                "WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            revision = int(row["max_rev"]) + 1 if row and row["max_rev"] is not None else 1
+            previous_row = self._conn.execute(
+                "SELECT artifact_id FROM plan_artifact_versions "
+                "WHERE conversation_id = ? AND revision = ?",
+                (conversation_id, revision - 1),
+            ).fetchone()
+            previous_artifact_id = previous_row["artifact_id"] if previous_row else ""
+            self._conn.execute(
+                "INSERT INTO plan_artifact_versions "
+                "(conversation_id, revision, draft_id, artifact_id, previous_artifact_id, "
+                " published_by_run_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    conversation_id,
+                    revision,
+                    draft_id or "",
+                    artifact_id,
+                    previous_artifact_id,
+                    published_by_run_id or "",
+                    now,
+                    now,
+                ),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        record = self.get_plan_artifact_version(conversation_id, revision)
+        assert record is not None  # just wrote it
+        return record
+
+    def get_plan_artifact_version(
+        self, conversation_id: str, revision: int
+    ) -> PlanArtifactVersionRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM plan_artifact_versions WHERE conversation_id = ? AND revision = ?",
+            (conversation_id, int(revision)),
+        ).fetchone()
+        return self._row_to_artifact_version(row) if row is not None else None
+
+    def get_current_plan_artifact_version(
+        self, conversation_id: str
+    ) -> PlanArtifactVersionRecord | None:
+        """The draft's answer to "which artifact is current" — or ``None``.
+
+        ``None`` before any plan book was ever published: no row, no current
+        artifact, and the version discriminator starts at 1.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM plan_artifact_versions WHERE conversation_id = ? "
+            "ORDER BY revision DESC LIMIT 1",
+            (conversation_id,),
+        ).fetchone()
+        return self._row_to_artifact_version(row) if row is not None else None
+
+    def list_plan_artifact_versions(
+        self, conversation_id: str
+    ) -> list[PlanArtifactVersionRecord]:
+        """"What came before": the full history in generation order."""
+        rows = self._conn.execute(
+            "SELECT * FROM plan_artifact_versions WHERE conversation_id = ? "
+            "ORDER BY revision ASC",
+            (conversation_id,),
+        ).fetchall()
+        return [self._row_to_artifact_version(row) for row in rows]
+
+    def _row_to_artifact_version(self, row: sqlite3.Row) -> PlanArtifactVersionRecord:
+        return PlanArtifactVersionRecord(
+            conversation_id=row["conversation_id"],
+            revision=int(row["revision"]),
+            draft_id=row["draft_id"],
+            artifact_id=row["artifact_id"],
+            previous_artifact_id=row["previous_artifact_id"],
+            published_by_run_id=row["published_by_run_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    # -- safety record (Ticket 09; ticket 07's payload, stored) ----------
+
+    def upsert_plan_safety_record(
+        self,
+        *,
+        conversation_id: str,
+        draft_id: str,
+        payload: dict,
+        recorded_by_run_id: str = "",
+    ) -> PlanSafetyRecord:
+        """Store the gate's answer verbatim for the conversation's draft.
+
+        ``payload`` is :meth:`agent_v2.plan_workflow.PlanSafety.to_payload` —
+        this method reads ONLY that shape (booleans, stable codes, the gate's
+        own message and reason strings) and refuses anything else, so no
+        caller can smuggle a derived safety sentence or an eligibility flag
+        into the row. One row per conversation, replaced in place: the current
+        record is the latest gate answer for the draft on record.
+        """
+        if not (conversation_id or "").strip():
+            raise ValueError("invalid plan safety conversation_id")
+        if not (draft_id or "").strip():
+            raise ValueError("invalid plan safety draft_id")
+        allowed = {
+            "hard_stop", "codes", "formal_route_plan_allowed", "message",
+            "comparison_id", "comparison_status", "gate_reasons", "required_action",
+        }
+        unknown = set(payload) - allowed
+        if unknown:
+            raise ValueError(f"unknown plan safety payload keys: {sorted(unknown)}")
+        if not isinstance(payload.get("hard_stop"), bool):
+            raise ValueError("plan safety payload needs a boolean hard_stop")
+        if not isinstance(payload.get("formal_route_plan_allowed"), bool):
+            raise ValueError("plan safety payload needs a boolean formal_route_plan_allowed")
+
+        now = _now_iso()
+        existing = self.get_plan_safety_record(conversation_id)
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute(
+                "INSERT INTO plan_safety_records "
+                "(conversation_id, draft_id, hard_stop, codes_json, formal_route_plan_allowed, "
+                " message, comparison_id, comparison_status, gate_reasons_json, "
+                " required_action, recorded_by_run_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(conversation_id) DO UPDATE SET "
+                " draft_id = excluded.draft_id, "
+                " hard_stop = excluded.hard_stop, "
+                " codes_json = excluded.codes_json, "
+                " formal_route_plan_allowed = excluded.formal_route_plan_allowed, "
+                " message = excluded.message, "
+                " comparison_id = excluded.comparison_id, "
+                " comparison_status = excluded.comparison_status, "
+                " gate_reasons_json = excluded.gate_reasons_json, "
+                " required_action = excluded.required_action, "
+                " recorded_by_run_id = excluded.recorded_by_run_id, "
+                " updated_at = excluded.updated_at",
+                (
+                    conversation_id,
+                    draft_id,
+                    1 if payload["hard_stop"] else 0,
+                    json.dumps(list(payload.get("codes") or []), ensure_ascii=False),
+                    1 if payload["formal_route_plan_allowed"] else 0,
+                    str(payload.get("message") or ""),
+                    str(payload.get("comparison_id") or ""),
+                    str(payload.get("comparison_status") or ""),
+                    json.dumps(list(payload.get("gate_reasons") or []), ensure_ascii=False),
+                    str(payload.get("required_action") or ""),
+                    recorded_by_run_id or "",
+                    existing.created_at if existing else now,
+                    now,
+                ),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        record = self.get_plan_safety_record(conversation_id)
+        assert record is not None  # just wrote it
+        return record
+
+    def get_plan_safety_record(self, conversation_id: str) -> PlanSafetyRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM plan_safety_records WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return PlanSafetyRecord(
+            conversation_id=row["conversation_id"],
+            draft_id=row["draft_id"],
+            hard_stop=bool(row["hard_stop"]),
+            codes=tuple(json.loads(row["codes_json"])),
+            formal_route_plan_allowed=bool(row["formal_route_plan_allowed"]),
+            message=row["message"],
+            comparison_id=row["comparison_id"],
+            comparison_status=row["comparison_status"],
+            gate_reasons=tuple(json.loads(row["gate_reasons_json"])),
+            required_action=row["required_action"],
+            recorded_by_run_id=row["recorded_by_run_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def clear_plan_safety_record(self, conversation_id: str) -> int:
+        """Drop the conversation's safety row (cancelled plan).
+
+        Part of ticket 02 AC4's unfinished-state clearing, widened like
+        ticket 06's: a cancelled plan must not leave the last gate refusal
+        behind for the next draft to inherit. PUBLISHED artifact history is
+        deliberately NOT cleared here — it is evidence of what was handed out,
+        and old artifacts keep their own download/expiry rules (AC5).
+        """
+        self._conn.execute("BEGIN")
+        try:
+            cursor = self._conn.execute(
+                "DELETE FROM plan_safety_records WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return cursor.rowcount
+
+    # -- confirmations (ticket 05 AC5 / ticket 06 AC5) --------------------
+
+    _CONFIRMATION_KINDS = ("first", "final")
+
+    def upsert_plan_confirmation_record(
+        self,
+        *,
+        conversation_id: str,
+        draft_id: str,
+        kind: str,
+        confirmed_by_run_id: str = "",
+    ) -> PlanConfirmationRecord:
+        """Record that the user confirmed one summary of the conversation's draft.
+
+        ``kind`` is ``"first"`` (the arrangements summary, ticket 05 AC5) or
+        ``"final"`` (the whole-book summary, ticket 07 AC4). One row per
+        ``(conversation, kind)``: confirming the first summary is not overwritten
+        by the later final confirmation, and neither is erased by a stage move —
+        that is the whole point of the table, since ``plan_drafts.stage`` cannot
+        hold both facts. The row is keyed on the draft it was given over, so a
+        re-submitted (new) draft's confirmations never describe the previous one.
+        """
+        if not (conversation_id or "").strip():
+            raise ValueError("invalid plan confirmation conversation_id")
+        if not (draft_id or "").strip():
+            raise ValueError("invalid plan confirmation draft_id")
+        if kind not in self._CONFIRMATION_KINDS:
+            raise ValueError(f"invalid plan confirmation kind: {kind!r}")
+        now = _now_iso()
+        existing = self.get_plan_confirmation_record(conversation_id, kind)
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute(
+                "INSERT INTO plan_confirmations "
+                "(conversation_id, kind, draft_id, confirmed_by_run_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(conversation_id, kind) DO UPDATE SET "
+                " draft_id = excluded.draft_id, "
+                " confirmed_by_run_id = excluded.confirmed_by_run_id, "
+                " updated_at = excluded.updated_at",
+                (conversation_id, kind, draft_id, confirmed_by_run_id or "", now,
+                 existing["created_at"] if existing else now),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        record = self.get_plan_confirmation_record(conversation_id, kind)
+        assert record is not None  # just wrote it
+        return record
+
+    def get_plan_confirmation_record(
+        self, conversation_id: str, kind: str,
+    ) -> PlanConfirmationRecord | None:
+        if kind not in self._CONFIRMATION_KINDS:
+            raise ValueError(f"invalid plan confirmation kind: {kind!r}")
+        row = self._conn.execute(
+            "SELECT * FROM plan_confirmations WHERE conversation_id = ? AND kind = ?",
+            (conversation_id, kind),
+        ).fetchone()
+        if row is None:
+            return None
+        return PlanConfirmationRecord(
+            conversation_id=row["conversation_id"],
+            kind=row["kind"],
+            draft_id=row["draft_id"],
+            confirmed_by_run_id=row["confirmed_by_run_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def clear_plan_confirmation_records(self, conversation_id: str) -> int:
+        """Drop the conversation's confirmation rows (cancelled plan).
+
+        Part of ticket 02 AC4's unfinished-state clearing: a cancelled plan must
+        not leave "the user confirmed the first / final summary" behind for the
+        next draft to inherit, exactly like the arrangements, verdict and safety
+        rows it is cleared beside.
+        """
+        self._conn.execute("BEGIN")
+        try:
+            cursor = self._conn.execute(
+                "DELETE FROM plan_confirmations WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return cursor.rowcount
 
     # -- approvals (Ticket 11) -----------------------------------------
 

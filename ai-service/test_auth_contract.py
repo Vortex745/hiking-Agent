@@ -38,13 +38,16 @@ def _register(client: TestClient, login_id: str = "Abc1", password: str = "passw
 
 
 def test_register_logs_in_with_cookie_and_bearer(tmp_path: Path) -> None:
-    client, _ = _client(tmp_path)
+    client, service = _client(tmp_path)
     response = _register(client)
     assert response.status_code == 201, response.text
     body = response.json()
     assert body["login_id"] == "Abc1"
     assert body["access_token"]
     assert body["user_id"]
+    user = service.store.get_by_login_id("Abc1")
+    assert user is not None
+    assert service.memory_store.memory_enabled(user["subject_id"]) is False
 
     cookie = response.headers["set-cookie"]
     assert "hiking_auth=" in cookie

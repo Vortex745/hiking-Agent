@@ -71,6 +71,23 @@ EventVersion = Literal["2"]
 # carries ``from_sequence``, ``to_sequence`` and ``dropped`` so replay can
 # surface the hole instead of treating it as completion. It is additive: the
 # envelope shape and the terminal sets are unchanged.
+#
+# Ticket 01 adds the plan-book draft state:
+# * ``plan.draft_state`` — the conversation's plan draft moved to a new
+#   stage (``awaiting_confirmation`` / ``awaiting_input`` /
+#   ``minimal_draft`` / ``awaiting_generic_choice`` / ``cancelled``). It is how
+#   BOTH sides recognise the draft: the frontend opens its dialog from
+#   ``awaiting_input`` and never from ``awaiting_confirmation`` or
+#   ``awaiting_generic_choice`` (both are answered by a structured intent). The
+#   payload also carries ticket 04's ``plan_type``
+#   (``route_plan`` | ``generic_draft``), which the server derives from whether
+#   a gate-passed route basis backs the draft. The stage vocabulary is shared
+#   with ``plan_drafts.stage`` (:mod:`agent_v2.plan_workflow`). Adding a member
+#   here REQUIRES updating the frontend union + type guard
+#   (``frontend/src/api/chatV2.ts``), the pure reducer
+#   (``frontend/src/api/v2Reducer.ts``) and the UI side-effect chain
+#   (``frontend/src/pages/SuperAgent.tsx``) — otherwise the event is
+#   silently dropped as ``unknown_dropped``.
 EventType = Literal[
     "run_started",
     "progress",
@@ -84,6 +101,7 @@ EventType = Literal[
     "approval.required",
     "approval.resolved",
     "memory.consent_required",
+    "plan.draft_state",
     "run.paused",
     "effect.outcome_unknown",
     "error",
