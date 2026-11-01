@@ -95,7 +95,7 @@ progress.md
 # ============================================================
 # Root Temp / Doc Artifacts
 # ============================================================
-*.png
+/*.png
 .tmp/
 .tmp-*
 /live-*.txt
@@ -147,7 +147,7 @@ ai-service/hiking-review-inflight-*/
 *.sqlite-shm
 *.sqlite-wal
 writer.lock
-/.scratch/
+.scratch/
 /.tmp-ticket*/
 /.codegraph/
 /.qoder/
@@ -164,3 +164,32 @@ writer.lock
 
 # langfuse 本地编排的密钥不入库
 third_party/langfuse/.env
+
+# Additional generated test, coverage and compiler artifacts
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+junit.xml
+junit-*.xml
+test-results/
+blob-report/
+.test-*/
+*.tsbuildinfo
+/gateway/gateway
+
+# SQLite alternate suffixes and rollback journals
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite-journal
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.sqlite3-journal
