@@ -9,7 +9,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, model_validator
 
 from agent_v2.mcp_config_store import (
@@ -40,6 +40,7 @@ from auth.deps import current_user_id
 from config import settings
 
 logger = logging.getLogger(__name__)
+AMAP_BROWSER_ENV_NAMES = ("AMAP_JSAPI_KEY", "AMAP_JSAPI_SECURITY_CODE")
 
 
 def require_local_mcp(request: Request) -> None:
@@ -132,6 +133,8 @@ def _builtin_servers(owner_id: str) -> list[dict]:
             "command": cfg.command_or_url if cfg.transport == "stdio" else "",
             "args": list(cfg.args) if cfg.transport == "stdio" else [],
             "env_names": list(cfg.env_key_names),
+            **({"browser_configured": bool(env_source and env_source.get("AMAP_JSAPI_KEY"))}
+               if cfg.server_id == "amap_map" else {}),
         }
         for cfg in MCP_REGISTRY.values()
     ]
@@ -156,7 +159,20 @@ class BuiltinCredentialsInput(BaseModel):
 def _registry_env_names() -> set[str]:
     return {
         name for cfg in MCP_REGISTRY.values() for name in cfg.env_key_names
-    }
+    } | set(AMAP_BROWSER_ENV_NAMES)
+
+
+@mcp_router.get("/amap/browser-config")
+async def amap_browser_config(request: Request) -> JSONResponse:
+    owner_id = current_user_id(request)
+    if not owner_id:
+        raise HTTPException(status_code=401, detail="请先登录")
+    env = load_builtin_env(owner_id)
+    key = env.get("AMAP_JSAPI_KEY", "")
+    return JSONResponse(
+        {"key": key, "security_code": env.get("AMAP_JSAPI_SECURITY_CODE", "") if key else ""},
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @mcp_router.put("/builtin/credentials")

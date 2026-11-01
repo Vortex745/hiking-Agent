@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from 'react'
-import { Eye, EyeOff, Loader2, Mountain } from 'lucide-react'
+import { Eye, EyeOff, Loader2 } from 'lucide-react'
 import { AuthApiError } from '../api/auth'
 import { useAuth } from '../auth/AuthContext'
 
@@ -73,23 +73,21 @@ export default function LoginPage() {
 
       <div className="relative w-full max-w-[420px]">
         <div className="flex flex-col items-center text-center">
-          <span className="flex size-12 items-center justify-center rounded-2xl bg-[#1a3c2a] text-[#f0f4f9] shadow-sm dark:bg-[#c2e7ff] dark:text-[#001d35]">
-            <Mountain className="size-6" aria-hidden="true" />
-          </span>
-          <h1 className="mt-3 text-xl font-semibold text-[#1f1f1f] dark:text-[#e3e3e3]">
-            AI Hiking
-          </h1>
-          <p className="mt-1 text-xs text-[#5e6063] dark:text-[#9aa0a6]">
-            登录后使用你的知识库、MCP 与模型配置
-          </p>
+          <h1 className="text-2xl font-bold text-[#1f1f1f] dark:text-[#e3e3e3]">AI Hiking</h1>
         </div>
 
         <div className="mt-7 rounded-[28px] border border-black/5 bg-white/95 p-6 shadow-[0_24px_60px_-30px_rgba(15,40,25,0.45)] backdrop-blur dark:border-white/10 dark:bg-[#1e1f20]/95">
           <div
             role="tablist"
             aria-label="登录或注册"
-            className="flex rounded-xl bg-black/[0.04] p-1 dark:bg-white/[0.06]"
+            className="relative flex rounded-xl bg-black/[0.04] p-1 dark:bg-white/[0.06]"
           >
+            <span
+              aria-hidden="true"
+              className={`pointer-events-none absolute inset-y-1 left-1 w-[calc(50%-4px)] rounded-lg bg-white shadow-sm transition-transform duration-200 ease-[var(--ease-out)] dark:bg-white/[0.12] ${
+                mode === 'register' ? 'translate-x-full' : ''
+              }`}
+            />
             {(['login', 'register'] as const).map((item) => (
               <button
                 key={item}
@@ -97,9 +95,9 @@ export default function LoginPage() {
                 role="tab"
                 aria-selected={mode === item}
                 onClick={() => switchMode(item)}
-                className={`flex-1 rounded-lg px-3 py-2 text-sm font-medium transition-colors ${
+                className={`relative flex-1 rounded-lg px-3 py-2 text-sm font-medium transition-colors ${
                   mode === item
-                    ? 'bg-white text-[#1f1f1f] shadow-sm dark:bg-white/12 dark:text-[#e3e3e3]'
+                    ? 'text-[#1f1f1f] dark:text-[#e3e3e3]'
                     : 'text-[#5e6063] hover:text-[#1f1f1f] dark:text-[#9aa0a6] dark:hover:text-[#e3e3e3]'
                 }`}
               >
@@ -128,9 +126,6 @@ export default function LoginPage() {
                 placeholder="2-6 位字母或数字"
                 className={inputClass}
               />
-              <p className="mt-1.5 text-[11px] text-[#7b8087] dark:text-[#8e918f]">
-                区分大小写，Abc 与 abc 是两个账号
-              </p>
             </div>
 
             <div>
@@ -156,9 +151,16 @@ export default function LoginPage() {
                   type="button"
                   onClick={() => setShowPassword((value) => !value)}
                   aria-label={showPassword ? '隐藏密码' : '显示密码'}
-                  className="absolute right-1.5 top-1/2 flex size-8 -translate-y-1/2 items-center justify-center rounded-lg text-[#5e6063] transition-colors hover:bg-black/5 dark:text-[#9aa0a6] dark:hover:bg-white/10"
+                  className="absolute right-1.5 top-1/2 flex size-8 -translate-y-1/2 items-center justify-center rounded-lg text-[#5e6063] transition-[color,background-color,transform] duration-150 ease-[var(--ease-out)] hover:bg-black/5 active:scale-[0.97] dark:text-[#9aa0a6] dark:hover:bg-white/10"
                 >
-                  {showPassword ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+                  <span
+                    className="t-icon-swap"
+                    data-state={showPassword ? 'b' : 'a'}
+                    aria-hidden="true"
+                  >
+                    <Eye className="t-icon size-4" data-icon="a" />
+                    <EyeOff className="t-icon size-4" data-icon="b" />
+                  </span>
                 </button>
               </div>
             </div>
@@ -188,7 +190,7 @@ export default function LoginPage() {
             {error && (
               <p
                 role="alert"
-                className="rounded-xl bg-[#fce8e6] px-3 py-2 text-xs leading-5 text-[#b3261e] dark:bg-[#5c1d18]/60 dark:text-[#f2b8b5]"
+                className="alert-in rounded-xl bg-[#fce8e6] px-3 py-2 text-xs leading-5 text-[#b3261e] dark:bg-[#5c1d18]/60 dark:text-[#f2b8b5]"
               >
                 {error}
               </p>
@@ -197,17 +199,13 @@ export default function LoginPage() {
             <button
               type="submit"
               disabled={submitting}
-              className="flex w-full items-center justify-center gap-2 rounded-xl bg-[#1a3c2a] px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-[#23543c] disabled:cursor-not-allowed disabled:opacity-60 dark:bg-[#c2e7ff] dark:text-[#001d35] dark:hover:bg-[#b3ddf7]"
+              className="flex w-full items-center justify-center gap-2 rounded-xl bg-[#1a3c2a] px-4 py-2.5 text-sm font-medium text-white transition-[transform,background-color] duration-150 ease-[var(--ease-out)] hover:bg-[#23543c] active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-60 dark:bg-[#c2e7ff] dark:text-[#001d35] dark:hover:bg-[#b3ddf7]"
             >
               {submitting && <Loader2 className="size-4 animate-spin" aria-hidden="true" />}
               {mode === 'login' ? '登录' : '创建账号'}
             </button>
           </form>
         </div>
-
-        <p className="mt-4 text-center text-[11px] text-[#7b8087] dark:text-[#8e918f]">
-          账号与配置只保存在本机；同一浏览器同时只保持一个登录账号
-        </p>
       </div>
     </div>
   )

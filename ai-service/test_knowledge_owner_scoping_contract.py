@@ -54,13 +54,14 @@ def test_datasource_rows_are_visible_only_to_their_owner(tmp_path: Path) -> None
         store.close()
 
 
-def test_legacy_rows_are_claimed_once(tmp_path: Path) -> None:
+def test_legacy_rows_are_invisible_to_accounts(tmp_path: Path) -> None:
     store = DatasourceStore(tmp_path / "datasource.sqlite")
     try:
         legacy = _create_datasource(store, "旧来源", "")
-        assert store.claim_legacy(OWNER_A) == 1
-        assert store.claim_legacy(OWNER_B) == 0
-        assert store.get_datasource(legacy["id"], OWNER_A) is not None
+        assert store.get_datasource(legacy["id"])["owner_id"] == ""
+        assert store.list_datasources(OWNER_A) == []
+        assert store.list_datasources(OWNER_B) == []
+        assert store.get_datasource(legacy["id"], OWNER_A) is None
         assert store.get_datasource(legacy["id"], OWNER_B) is None
     finally:
         store.close()

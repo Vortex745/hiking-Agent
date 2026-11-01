@@ -16,6 +16,7 @@ export interface McpServer {
   header_names?: string[]
   env_names?: string[]
   enabled?: boolean
+  browser_configured?: boolean
 }
 
 export interface McpDraft {
@@ -67,12 +68,24 @@ export interface McpOAuthStatus {
 }
 
 export const listMcpServers = () => request<{ servers: McpServer[] }>(base)
+export interface AMapBrowserConfig {
+  key: string
+  security_code: string
+}
+export const AMAP_CONFIG_CHANGED = 'amap-config-changed'
+export const getAMapBrowserConfig = () => request<AMapBrowserConfig>(`${root}/amap/browser-config`)
 export const testMcpServer = (draft: McpDraft) =>
   request<McpTestResult>(`${base}/test`, 'POST', draft)
-export const saveBuiltinMcpCredentials = (env: Record<string, string>) =>
-  request<{ servers: McpServer[] }>(`${root}/builtin/credentials`, 'PUT', { env })
-export const clearBuiltinMcpCredentials = () =>
-  request<{ servers: McpServer[] }>(`${root}/builtin/credentials`, 'DELETE')
+export const saveBuiltinMcpCredentials = async (env: Record<string, string>) => {
+  const result = await request<{ servers: McpServer[] }>(`${root}/builtin/credentials`, 'PUT', { env })
+  window.dispatchEvent(new Event(AMAP_CONFIG_CHANGED))
+  return result
+}
+export const clearBuiltinMcpCredentials = async () => {
+  const result = await request<{ servers: McpServer[] }>(`${root}/builtin/credentials`, 'DELETE')
+  window.dispatchEvent(new Event(AMAP_CONFIG_CHANGED))
+  return result
+}
 export const getMcpOAuthStatus = (flowId: string) =>
   request<McpOAuthStatus>(`${root}/oauth/status/${encodeURIComponent(flowId)}`)
 export const saveMcpServer = (draft: McpDraft, id?: string) =>

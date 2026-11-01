@@ -99,18 +99,3 @@ class AuthStore:
                 "UPDATE users SET last_login_at = ? WHERE user_id = ?",
                 (_now_iso(), user_id),
             )
-
-    def get_meta(self, key: str) -> str | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT value FROM auth_meta WHERE key = ?", (key,)
-            ).fetchone()
-        return str(row["value"]) if row else None
-
-    def set_meta(self, key: str, value: str) -> None:
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO auth_meta(key, value) VALUES (?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (key, value),
-            )

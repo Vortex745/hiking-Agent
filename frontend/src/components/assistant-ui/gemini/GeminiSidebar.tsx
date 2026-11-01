@@ -55,7 +55,7 @@ function AccountMenu({
           type="button"
           aria-label={`账号 ${loginId}，打开账号菜单`}
           title={collapsed ? loginId : undefined}
-          className={`flex w-full items-center gap-2.5 rounded-xl px-2 py-2 text-left transition-colors hover:bg-black/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1a3c2a]/30 dark:hover:bg-white/10 dark:focus-visible:ring-[#c2e7ff]/30 ${
+          className={`group flex w-full items-center gap-2.5 rounded-xl px-2 py-2 text-left transition-colors hover:bg-black/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1a3c2a]/30 dark:hover:bg-white/10 dark:focus-visible:ring-[#c2e7ff]/30 ${
             collapsed ? 'justify-center' : ''
           }`}
         >
@@ -70,7 +70,7 @@ function AccountMenu({
                   本机账号
                 </span>
               </span>
-              <ChevronUp className="size-3.5 shrink-0 text-[#5e6063] dark:text-[#9aa0a6]" aria-hidden="true" />
+              <ChevronUp className="size-3.5 shrink-0 text-[#5e6063] transition-transform duration-200 ease-[var(--ease-out)] group-data-[state=open]:rotate-180 dark:text-[#9aa0a6]" aria-hidden="true" />
             </>
           )}
         </button>
@@ -81,15 +81,12 @@ function AccountMenu({
           align="start"
           sideOffset={8}
           collisionPadding={12}
-          className="z-[120] w-[232px] rounded-2xl border border-black/5 bg-white p-1.5 shadow-xl dark:border-white/10 dark:bg-[#282a2c]"
+          className="account-menu z-[120] w-[232px] rounded-2xl border border-black/5 bg-white p-1.5 shadow-xl dark:border-white/10 dark:bg-[#282a2c]"
         >
           <div className="px-2.5 py-2">
             <div className="text-[11px] text-[#5e6063] dark:text-[#9aa0a6]">当前登录</div>
             <div className="mt-0.5 truncate text-sm font-medium text-[#1f1f1f] dark:text-[#e3e3e3]">
               {loginId}
-            </div>
-            <div className="mt-0.5 text-[11px] text-[#7b8087] dark:text-[#8e918f]">
-              知识库、MCP 与模型配置按账号隔离
             </div>
           </div>
           <DropdownPrimitive.Separator className="my-1 h-px bg-black/5 dark:bg-white/10" />

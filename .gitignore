@@ -11,6 +11,11 @@ __pycache__/
 dist/
 build/
 .env
+.env.*
+!.env.example
+*.bak
+*.cache
+*.key
 *.log
 
 # ============================================================
@@ -91,10 +96,36 @@ progress.md
 # Root Temp / Doc Artifacts
 # ============================================================
 *.png
-*.md
-!README.md
+.tmp/
+.tmp-*
+/live-*.txt
+/.pyprobe
 /ascii-art.mp4
 verify.json
+
+# ============================================================
+# Local Test / Analysis Artifacts
+# ============================================================
+.archify/
+.code-review-graph/
+.deepeval/
+.gstack/
+.screenshots/
+.trae-html-share-packages/
+.workbuddy/
+deepeval-chat-*/
+gui-test-screenshots/
+pytest-of-*/
+ai-service/logs/
+ai-service/pip-*/
+ai-service/probe*/
+ai-service/v2-sandbox-*/
+ai-service/tmp*/
+ai-service/hiking-review-inflight-*/
+/docs/agent-process-tracking-plan-20261028.html
+/docs/amap-view-on-map-feasibility.html
+/docs/bcdef-rollout-rollback.md
+/evals/deepeval/show-me.html
 
 # ============================================================
 # Local Agent / IDE Tooling
@@ -125,6 +156,11 @@ writer.lock
 /.wayfinder/
 /evals/promptfoo/node_modules/
 /evals/promptfoo/.runs/
+
+# Internal handoff and local planning files
+/HANDOFF.md
+/MEMORY.md
+/TODO.md
 
 # langfuse 本地编排的密钥不入库
 third_party/langfuse/.env

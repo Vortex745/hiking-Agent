@@ -162,9 +162,10 @@ http://localhost:5173
 
 - 登录 ID 为 2–6 位字母、数字或下划线，区分大小写且唯一；密码 8–15 个字符。
 - JWT 保存在 HttpOnly Cookie 中（同时接受 `Authorization: Bearer`），`AUTH_JWT_SECRET` 未配置时自动生成 `data/auth.key`。
-- 会话记录、长期记忆、知识库、自定义 MCP 和模型配置都按登录账号隔离；高德天气/地图的内置定义共享，但 API Key 由各账号在 MCP 接入中自行填写（保存在 `agent_state/users/<user_id>/mcp_builtin.json`，接口只返回是否已配置）。
+- 会话记录、长期记忆、知识库、自定义 MCP 和模型配置都按登录账号隔离；高德天气/地图的内置定义共享，但 API Key 由各账号在 MCP 接入中自行填写（保存在 `agent_state/users/<user_id>/mcp_builtin.json`，普通 MCP 管理接口只返回是否已配置）。
+- 悬浮地图在「设置 → MCP 接入 → 高德地图」填写当前账号的 JSAPI Key 和安全密钥，Web 服务 API Key 供天气/地图工具使用。悬浮地图不再读取全局 `VITE_AMAP_KEY` / `VITE_AMAP_SECURITY_CODE`，也不自动迁移旧全局配置；未配置时提示「请配置高德地图 API」，不加载地图或触发该入口的定位。专用登录接口仅向当前账号返回浏览器所需配置，并禁止缓存；普通 MCP 列表与保存响应不回传密钥。
 - 规则前置：本机管理接口仍只接受本机来源，因此远程访问的账号只能聊天，不能管理知识源/MCP/模型。
-- 首个注册账号会认领旧版单用户数据：旧 `rag.sqlite` 与 `mcp_servers.json` 只复制到该账号目录，不移动原文件；`datasource` 行直接归属该账号（不复制行，旧代码回滚后仍可见）。
+- 每个新账号（包括首个注册账号）的 MCP、知识库和模型配置均从空配置开始，需要自行配置；不自动认领旧版 `rag.sqlite`、`mcp_servers.json` 或未归属的知识来源。已有账号保存的配置和历史认领数据保留，切回该账号仍可使用。
 - 登录账号的模型配置完全自持：未配置即为空，不再继承 `ai-service/.env`；账号配置保存到 `data/users/<user_id>/llm_config.json`，API Key 加密落盘，接口只返回“已设置”而不回传任何密钥片段。`.env` 只服务无账号的旧单机模式与服务器自身配置。
 
 ### 常用健康检查

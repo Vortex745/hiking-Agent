@@ -415,6 +415,21 @@
   }
 }
 
+/* 账号菜单：从触发器方向展开，方向交给 Radix 的 transform-origin。 */
+.account-menu {
+  transform-origin: var(--radix-dropdown-menu-content-transform-origin);
+}
+.account-menu[data-state="open"] {
+  animation: account-menu-in var(--dropdown-open-dur) var(--dropdown-ease) both;
+}
+@keyframes account-menu-in {
+  from { opacity: 0; transform: translateY(5px) scale(var(--dropdown-pre-scale)); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .account-menu[data-state="open"] { animation: none; }
+}
+
 /* Arc 风格卡片：标题按钮铺满整卡，action 仅作视觉提示。 */
 .arc-card {
   position: relative;
@@ -647,6 +662,19 @@
     .press-scale:active {
       transform: scale(0.97);
     }
+  }
+}
+
+/* 登录/注册表单错误条：只做挂载入场，退场保持瞬时。 */
+.alert-in {
+  transition:
+    opacity 180ms var(--ease-out),
+    transform 180ms var(--ease-out);
+}
+@starting-style {
+  .alert-in {
+    opacity: 0;
+    transform: translate3d(0, -4px, 0);
   }
 }
 

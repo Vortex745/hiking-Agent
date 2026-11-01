@@ -25,7 +25,11 @@ const statusLabel: Record<McpServer['status'], string> = {
   configured: '已配置', unconfigured: '未配置', untested: '未测试', success: '测试成功', failed: '测试失败',
 }
 
-const CREDENTIAL_LABELS: Record<string, string> = { AMAP_API_KEY: '高德 API Key' }
+const CREDENTIAL_LABELS: Record<string, string> = {
+  AMAP_API_KEY: '高德 API Key',
+  AMAP_JSAPI_KEY: '地图 JSAPI Key',
+  AMAP_JSAPI_SECURITY_CODE: '地图安全密钥',
+}
 const credentialLabel = (name: string) => CREDENTIAL_LABELS[name] ?? name
 
 function asDraft(form: Form, server: McpServer | null, testId?: string): McpDraft {
@@ -68,6 +72,9 @@ export function McpDialog({ onClose }: { onClose: () => void }) {
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
   const [builtinEditing, setBuiltinEditing] = useState<McpServer | null>(null)
   const [builtinValues, setBuiltinValues] = useState<Record<string, string>>({})
+  const builtinFields = builtinEditing
+    ? [...(builtinEditing.env_names || []), ...(builtinEditing.id === 'amap_map' ? ['AMAP_JSAPI_KEY', 'AMAP_JSAPI_SECURITY_CODE'] : [])]
+    : []
 
   const refresh = useCallback(async () => {
     setLoading(true)
@@ -237,8 +244,9 @@ export function McpDialog({ onClose }: { onClose: () => void }) {
   async function saveBuiltin() {
     if (!builtinEditing) return
     const env: Record<string, string> = {}
-    for (const name of builtinEditing.env_names || []) {
-      env[name] = (builtinValues[name] || '').trim()
+    for (const name of builtinFields) {
+      const value = (builtinValues[name] || '').trim()
+      if (value) env[name] = value
     }
     setBusy(true)
     setError('')
@@ -287,24 +295,26 @@ export function McpDialog({ onClose }: { onClose: () => void }) {
         {builtinEditing ? (
           <div className="mcp-panel">
             <button className="mcp-back" onClick={() => { setBuiltinEditing(null); setError('') }}><ArrowLeft size={16} /> 返回服务列表</button>
-            {(builtinEditing.env_names || []).map(name => (
+            {builtinFields.map(name => (
               <Input key={name} label={credentialLabel(name)} type="password"
                 value={builtinValues[name] ?? ''}
                 onChange={event => setBuiltinValues(prev => ({ ...prev, [name]: event.target.value }))}
-                placeholder={builtinEditing.status === 'configured' ? '已设置，输入新值可替换' : '请填写服务 Key'}
+                placeholder="留空保留已有配置"
                 autoComplete="off" />
             ))}
             <p className="mcp-note">
               内置服务：{builtinEditing.transport.toUpperCase()} · {builtinEditing.command} {(builtinEditing.args || []).join(' ')}
             </p>
             <p className="mcp-note">工具：{builtinEditing.tools.join('、') || '—'}</p>
-            <p className="mcp-note">高德天气与高德地图共用同一个 Key；密钥只保存在当前账号的本机配置中。</p>
+            <p className="mcp-note">{builtinEditing.id === 'amap_map'
+              ? '悬浮地图使用 JSAPI Key 和安全密钥；地图工具使用 Web 服务 API Key。配置仅对当前账号生效。'
+              : '天气与地图工具共用 Web 服务 API Key，配置仅对当前账号生效。'}</p>
             {error && <p role="alert" className="mcp-error">{error}</p>}
             <div className="mcp-form-actions">
-              {builtinEditing.status === 'configured' && (
+              {(builtinEditing.status === 'configured' || builtinEditing.browser_configured) && (
                 <Button variant="secondary" loading={busy} onClick={() => { void clearBuiltin() }}>清除 Key</Button>
               )}
-              <Button loading={busy} disabled={busy || !(builtinEditing.env_names || []).every(name => (builtinValues[name] || '').trim())}
+              <Button loading={busy} disabled={busy || !builtinFields.some(name => (builtinValues[name] || '').trim())}
                 onClick={() => { void saveBuiltin() }}>保存</Button>
             </div>
           </div>
@@ -324,7 +334,7 @@ export function McpDialog({ onClose }: { onClose: () => void }) {
                     <Plug size={17} aria-hidden="true" />
                     <div className="mcp-row-main">
                       <div className="mcp-row-name">{server.name}</div>
-                      <div className="mcp-row-meta">{server.transport.toUpperCase()} · {statusLabel[server.status]} · {server.tools.length} 个工具</div>
+                      <div className="mcp-row-meta">{server.transport.toUpperCase()} · {statusLabel[server.status]}{server.browser_configured ? ' · 悬浮地图已配置' : ''} · {server.tools.length} 个工具</div>
                     </div>
                     {server.builtin ? (
                       <div className="mcp-actions">

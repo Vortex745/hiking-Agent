@@ -1,6 +1,8 @@
 import { AnimatePresence, animate, motion, useMotionValue, useReducedMotion } from 'motion/react'
 import { LoaderCircle, Map as MapIcon, MapPin, X } from 'lucide-react'
-import { useCallback, useEffect, useId, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
+import { useAuth } from '../../auth/AuthContext'
+import { AMAP_CONFIG_CHANGED, getAMapBrowserConfig, type AMapBrowserConfig } from '../../api/mcp'
 
 export interface ViewOnMapFocus {
   name: string
@@ -68,37 +70,9 @@ interface AMapNamespace {
   Geolocation: new (options?: Record<string, unknown>) => AMapGeolocation
 }
 
-const AMAP_KEY = import.meta.env.VITE_AMAP_KEY as string | undefined
-const AMAP_SECURITY_CODE = import.meta.env.VITE_AMAP_SECURITY_CODE as string | undefined
-
 const FALLBACK_BG =
   'radial-gradient(circle at 30% 20%, color-mix(in srgb, var(--primary-light) 14%, transparent), transparent 62%)'
 const FALLBACK_CENTER = { lng: 104.195397, lat: 35.86166 }
-
-let amapPromise: Promise<AMapNamespace> | null = null
-
-function loadAMap(): Promise<AMapNamespace> {
-  if (!amapPromise) {
-    amapPromise = import('@amap/amap-jsapi-loader')
-      .then(async ({ load }) => {
-        if (AMAP_SECURITY_CODE) {
-          (window as unknown as { _AMapSecurityConfig?: { securityJsCode: string } })._AMapSecurityConfig = {
-            securityJsCode: AMAP_SECURITY_CODE,
-          }
-        }
-        return load({
-          key: AMAP_KEY as string,
-          version: '2.0',
-          plugins: ['AMap.PlaceSearch', 'AMap.Geolocation'],
-        }) as Promise<AMapNamespace>
-      })
-      .catch((error: unknown) => {
-        amapPromise = null
-        throw error
-      })
-  }
-  return amapPromise
-}
 
 function readLngLat(value: unknown): { lng: number; lat: number } | null {
   if (Array.isArray(value) && value.length >= 2 && typeof value[0] === 'number' && typeof value[1] === 'number') {
@@ -153,96 +127,110 @@ function locateCurrent(AMap: AMapNamespace): Promise<{ lng: number; lat: number;
   })
 }
 
-function MapCanvas({ target, isDark }: { target: ResolvedTarget; isDark: boolean }) {
-  const containerRef = useRef<HTMLDivElement>(null)
-  const [ready, setReady] = useState(false)
+function MapCanvas({ config, focusName, isDark, onTarget, onState, onClose }: {
+  config: AMapBrowserConfig
+  focusName: string | null
+  isDark: boolean
+  onTarget: (target: ResolvedTarget) => void
+  onState: (state: ResolveState) => void
+  onClose: () => void
+}) {
+  const frameRef = useRef<HTMLIFrameElement>(null)
+  const [frameLoaded, setFrameLoaded] = useState(false)
 
-  useEffect(() => {
-    const container = containerRef.current
-    if (!container) return
+  useLayoutEffect(() => {
+    const frameWindow = frameRef.current?.contentWindow as (Window & {
+      AMap?: AMapNamespace
+      _AMapSecurityConfig?: { securityJsCode: string }
+      onAMapLoaded?: () => void
+    }) | null
+    const doc = frameWindow?.document
+    if (!frameLoaded || !frameWindow || !doc) return
 
     let disposed = false
     let map: AMapMap | null = null
     let observer: ResizeObserver | null = null
-    let frame = 0
     let readyTimer = 0
-
-    setReady(false)
-
-    void (async () => {
-      try {
-        const AMap = await loadAMap()
-        if (disposed) return
-
-        map = new AMap.Map(container, {
-          viewMode: '2D',
-          zoom: target.zoom,
-          center: [target.lng, target.lat],
-          mapStyle: isDark ? 'amap://styles/dark' : 'amap://styles/normal',
-        })
-        if (disposed) {
-          map.destroy()
-          return
-        }
-
-        if (target.kind === 'fallback') {
-          // 定位未授权时展示全国视图，不放置虚假的定位标记。
-        } else {
-          if (target.kind === 'current' && typeof target.accuracy === 'number' && target.accuracy > 0) {
-            map.add(new AMap.Circle({
-              center: [target.lng, target.lat],
-              radius: target.accuracy,
-              strokeColor: '#1a73e8',
-              strokeOpacity: 0.35,
-              strokeWeight: 1,
-              fillColor: '#1a73e8',
-              fillOpacity: 0.12,
-            }))
+    onState('loading')
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }
+    doc.addEventListener('keydown', onKeyDown)
+    // SDK globals live only in this frame. Removing the frame releases its Key and location.
+    frameWindow._AMapSecurityConfig = { securityJsCode: config.security_code }
+    const container = doc.createElement('div')
+    container.style.cssText = 'position:absolute;inset:0'
+    doc.body.appendChild(container)
+    const script = doc.createElement('script')
+    const timeout = window.setTimeout(() => {
+      if (!disposed) onState('error')
+    }, 20000)
+    const fail = () => {
+      window.clearTimeout(timeout)
+      if (!disposed) onState('error')
+    }
+    frameWindow.onAMapLoaded = () => {
+      void (async () => {
+        try {
+          const AMap = frameWindow.AMap!
+          let target: ResolvedTarget
+          if (focusName) {
+            const spot = await searchScenicSpot(AMap, focusName)
+            if (disposed) return
+            if (!spot) { fail(); return }
+            target = { kind: 'spot', ...spot, zoom: 14 }
+          } else {
+            const current = await locateCurrent(AMap)
+            if (disposed) return
+            target = current
+              ? { kind: 'current', name: '当前位置', ...current, zoom: 15 }
+              : { kind: 'fallback', name: '定位未授权', ...FALLBACK_CENTER, zoom: 4 }
           }
-          map.add(new AMap.Marker({ position: [target.lng, target.lat], title: target.name }))
-        }
-
-        const markReady = () => {
-          if (!disposed) setReady(true)
-        }
-        map.on('tilesloaded', markReady)
-        map.on('complete', () => {
-          // complete 可能早于瓦片绘制，留出短暂缓冲，避免露出空白底图。
-          readyTimer = window.setTimeout(markReady, 900)
-        })
-
-        observer = new ResizeObserver(() => {
-          window.cancelAnimationFrame(frame)
-          frame = window.requestAnimationFrame(() => {
-            if (!disposed) map?.resize()
+          onTarget(target)
+          map = new AMap.Map(container, {
+            viewMode: '2D', zoom: target.zoom, center: [target.lng, target.lat],
+            mapStyle: isDark ? 'amap://styles/dark' : 'amap://styles/normal',
           })
-        })
-        observer.observe(container)
-      } catch {
-        if (!disposed) setReady(false)
-      }
-    })()
-
+          observer = new ResizeObserver(() => map?.resize())
+          observer.observe(container)
+          if (target.kind !== 'fallback') {
+            if (target.kind === 'current' && target.accuracy && target.accuracy > 0) {
+              map.add(new AMap.Circle({
+                center: [target.lng, target.lat], radius: target.accuracy,
+                strokeColor: '#1a73e8', strokeOpacity: 0.35, strokeWeight: 1,
+                fillColor: '#1a73e8', fillOpacity: 0.12,
+              }))
+            }
+            map.add(new AMap.Marker({ position: [target.lng, target.lat], title: target.name }))
+          }
+          const ready = () => {
+            window.clearTimeout(timeout)
+            if (!disposed) onState('ready')
+          }
+          map.on('tilesloaded', ready)
+          map.on('complete', () => { readyTimer = window.setTimeout(ready, 900) })
+        } catch { fail() }
+      })()
+    }
+    script.src = `https://webapi.amap.com/maps?${new URLSearchParams({
+      v: '2.0', key: config.key, plugin: 'AMap.PlaceSearch,AMap.Geolocation', callback: 'onAMapLoaded',
+    })}`
+    script.onerror = fail
+    doc.head.appendChild(script)
     return () => {
       disposed = true
+      window.clearTimeout(timeout)
       window.clearTimeout(readyTimer)
-      window.cancelAnimationFrame(frame)
+      delete frameWindow.onAMapLoaded
+      doc.removeEventListener('keydown', onKeyDown)
       observer?.disconnect()
       map?.destroy()
+      script.remove()
+      container.remove()
     }
-  }, [isDark, target.accuracy, target.kind, target.lat, target.lng, target.name, target.zoom])
+  }, [config, focusName, frameLoaded, isDark, onClose, onState, onTarget])
 
-  return (
-    <>
-      <div ref={containerRef} className="absolute inset-0" />
-      {!ready && (
-        <div className="absolute inset-0 z-10 grid place-items-center bg-bg-card">
-          <LoaderCircle className="h-7 w-7 animate-spin text-text-muted" aria-hidden="true" />
-          <span className="sr-only">正在加载地图</span>
-        </div>
-      )}
-    </>
-  )
+  return <iframe ref={frameRef} title="高德地图" className="absolute inset-0 h-full w-full border-0"
+    srcDoc="<!doctype html><html><head><meta charset='utf-8'></head><body></body></html>"
+    allow="geolocation" onLoad={() => setFrameLoaded(true)} />
 }
 
 const BALL_SIZE = 56
@@ -347,6 +335,10 @@ function snapToEdge(position: BallPosition, width: number, height: number): Ball
  * 点击圆球在附近展开地图；有 AI 唯一景点时优先展示景点，否则首次打开请求当前位置。
  */
 export function ViewOnMap({ focus, sessionKey, className }: ViewOnMapProps) {
+  const { user } = useAuth()
+  const [accountConfig, setConfig] = useState<{ ownerId: string; value: AMapBrowserConfig } | null>(null)
+  const config = accountConfig?.ownerId === user?.user_id ? accountConfig?.value : null
+  const [configRevision, setConfigRevision] = useState(0)
   const [isOpen, setIsOpen] = useState(false)
   const [isDark, setIsDark] = useState(() => window.matchMedia('(prefers-color-scheme: dark)').matches)
   const [viewport, setViewport] = useState(() => ({ width: window.innerWidth, height: window.innerHeight }))
@@ -372,9 +364,7 @@ export function ViewOnMap({ focus, sessionKey, className }: ViewOnMapProps) {
   } | null>(null)
   const draggedRef = useRef(false)
   const snapControlsRef = useRef<Array<{ stop: () => void }>>([])
-  const resolveSeqRef = useRef(0)
   const previousFocusRef = useRef<string | null>(focusName)
-  const currentLocationRef = useRef<{ lng: number; lat: number; accuracy?: number } | null>(null)
   const reduced = useReducedMotion()
   const id = useId()
   const panelId = `view-on-map-panel-${id}`
@@ -420,65 +410,29 @@ export function ViewOnMap({ focus, sessionKey, className }: ViewOnMapProps) {
   }, [focusName, sessionKey, isOpen])
 
   useEffect(() => {
-    if (!isOpen) return
-    if (!AMAP_KEY) {
+    const invalidate = () => {
+      setConfig(null)
       setTarget(null)
-      setResolveState('unconfigured')
-      return
+      setResolveState('idle')
+      setConfigRevision(value => value + 1)
     }
+    window.addEventListener(AMAP_CONFIG_CHANGED, invalidate)
+    return () => window.removeEventListener(AMAP_CONFIG_CHANGED, invalidate)
+  }, [])
 
-    const seq = ++resolveSeqRef.current
+  useEffect(() => {
+    setConfig(null)
     setTarget(null)
+    if (!isOpen) return
+    let disposed = false
     setResolveState('loading')
-
-    void (async () => {
-      try {
-        const AMap = await loadAMap()
-        if (seq !== resolveSeqRef.current) return
-
-        if (focusName) {
-          const spot = await searchScenicSpot(AMap, focusName)
-          if (seq !== resolveSeqRef.current) return
-          if (!spot) {
-            setResolveState('error')
-            return
-          }
-          setTarget({ kind: 'spot', name: spot.name, lng: spot.lng, lat: spot.lat, zoom: 14 })
-          setResolveState('ready')
-          return
-        }
-
-        const current = currentLocationRef.current ?? await locateCurrent(AMap)
-        if (seq !== resolveSeqRef.current) return
-        if (current) {
-          currentLocationRef.current = current
-          setTarget({
-            kind: 'current',
-            name: '当前位置',
-            lng: current.lng,
-            lat: current.lat,
-            zoom: 15,
-            accuracy: current.accuracy,
-          })
-        } else {
-          setTarget({
-            kind: 'fallback',
-            name: '定位未授权',
-            lng: FALLBACK_CENTER.lng,
-            lat: FALLBACK_CENTER.lat,
-            zoom: 4,
-          })
-        }
-        setResolveState('ready')
-      } catch {
-        if (seq === resolveSeqRef.current) setResolveState('error')
-      }
-    })()
-
-    return () => {
-      resolveSeqRef.current += 1
-    }
-  }, [focusName, isOpen, sessionKey])
+    void getAMapBrowserConfig().then(next => {
+      if (disposed) return
+      if (!next.key) { setResolveState('unconfigured'); return }
+      setConfig({ ownerId: user!.user_id, value: next })
+    }, () => { if (!disposed) setResolveState('error') })
+    return () => { disposed = true }
+  }, [configRevision, focusName, isOpen, sessionKey, user?.user_id])
 
   const close = useCallback(() => {
     setIsOpen(false)
@@ -603,9 +557,9 @@ export function ViewOnMap({ focus, sessionKey, className }: ViewOnMapProps) {
   const loadingLabel = focusName ? `正在定位 ${focusName}…` : '正在获取当前位置…'
   const fallbackDetail =
     resolveState === 'unconfigured'
-      ? '配置高德 Key 后显示交互地图'
+      ? '在设置 → MCP 接入 → 高德地图中配置'
       : resolveState === 'error'
-        ? '无法定位该景点，请稍后重试'
+        ? '地图加载失败，请检查配置后重试'
         : ''
 
   return (
@@ -629,14 +583,14 @@ export function ViewOnMap({ focus, sessionKey, className }: ViewOnMapProps) {
           exit={{ opacity: 0, scale: 0.18, x: morphFrom.x, y: morphFrom.y }}
           transition={reduced ? { duration: 0 } : { type: 'spring' as const, stiffness: 380, damping: 32, mass: 0.8 }}
         >
-          {resolveState === 'ready' && target ? (
-            <MapCanvas isDark={isDark} target={target} />
-          ) : resolveState === 'loading' || resolveState === 'idle' ? (
+          {config && <MapCanvas key={`${user?.user_id}:${configRevision}:${sessionKey}:${focusName}:${isDark}`}
+            config={config} focusName={focusName} isDark={isDark} onTarget={setTarget} onState={setResolveState} onClose={close} />}
+          {resolveState === 'loading' || resolveState === 'idle' ? (
             <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-bg-card">
               <LoaderCircle className="h-7 w-7 animate-spin text-text-muted" aria-hidden="true" />
               <span className="text-xs text-text-secondary">{loadingLabel}</span>
             </div>
-          ) : (
+          ) : resolveState !== 'ready' ? (
             <div
               className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2.5 bg-bg-card px-8 text-center"
               style={{ backgroundImage: FALLBACK_BG }}
@@ -644,10 +598,10 @@ export function ViewOnMap({ focus, sessionKey, className }: ViewOnMapProps) {
               <span className="grid h-12 w-12 place-items-center rounded-full bg-primary-light/10 text-primary-light">
                 <MapPin className="h-6 w-6" aria-hidden="true" />
               </span>
-              <span className="text-base font-semibold text-text-primary">{focusName ?? '地图暂时不可用'}</span>
+              <span className="text-base font-semibold text-text-primary">{resolveState === 'unconfigured' ? '请配置高德地图 API' : '地图暂时不可用'}</span>
               <span className="text-xs leading-relaxed text-text-secondary">{fallbackDetail}</span>
             </div>
-          )}
+          ) : null}
           <span className="absolute left-3 top-3 z-20 max-w-[calc(100%-56px)] truncate rounded-full border border-border/70 bg-bg-card/90 px-3 py-1.5 text-xs font-medium text-text-primary shadow-sm backdrop-blur">
             {chipLabel}
           </span>
@@ -670,7 +624,7 @@ export function ViewOnMap({ focus, sessionKey, className }: ViewOnMapProps) {
           aria-label={title}
           title={title}
           className={[
-            'group fixed left-0 top-0 z-[90] grid cursor-grab select-none place-items-center rounded-full border border-white/25 text-white shadow-[0_10px_30px_rgba(0,0,0,0.22)] backdrop-blur-[10px] touch-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-light focus-visible:ring-offset-2',
+            'group fixed left-0 top-0 z-[90] grid cursor-grab select-none place-items-center rounded-full text-white/80 shadow-[0_10px_30px_rgba(0,0,0,0.22)] backdrop-blur-[10px] touch-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-light focus-visible:ring-offset-2',
             isDragging ? 'cursor-grabbing' : '',
             className ?? '',
           ]
@@ -691,13 +645,9 @@ export function ViewOnMap({ focus, sessionKey, className }: ViewOnMapProps) {
         >
           <span
             aria-hidden="true"
-            className={`absolute inset-0 rounded-full transition-opacity duration-200 ${
-              isDragging ? 'opacity-90' : 'opacity-70 group-hover:opacity-85'
+            className={`absolute inset-0 rounded-full transition-colors duration-150 ${
+              isDragging ? 'bg-black/70' : 'bg-black/50 group-hover:bg-black/60'
             }`}
-            style={{
-              background:
-                'radial-gradient(circle at 32% 26%, rgba(85, 169, 129, 0.92) 0%, rgba(45, 106, 79, 0.84) 45%, rgba(26, 60, 42, 0.88) 100%)',
-            }}
           />
           {pulse && (
             <span className="pointer-events-none absolute inset-0 rounded-full ring-2 ring-white/50 motion-safe:animate-ping motion-reduce:hidden" />

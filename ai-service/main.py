@@ -40,16 +40,11 @@ async def lifespan(app: FastAPI):
     )
     auth_store = AuthStore(settings.auth_db_path)
 
-    from auth.legacy import claim_legacy_data
-
     app.state.auth_service = AuthService(
         auth_store,
         MemoryStore(str(Path(settings.agent_v2_state_dir) / "agent_memory.sqlite")),
         secret=auth_secret,
         ttl_seconds=settings.auth_token_ttl_seconds,
-        on_register=lambda user_id: claim_legacy_data(
-            settings, auth_store, user_id
-        ),
     )
     logger.info("✓ Auth service assembled")
 

@@ -219,15 +219,6 @@ class DatasourceStore:
             rows = self._conn.execute(sql, params).fetchall()
         return [_datasource_row(row) for row in rows]
 
-    def claim_legacy(self, owner_id: str) -> int:
-        with self._lock:
-            cur = self._conn.execute(
-                "UPDATE datasource SET owner_id = ? WHERE owner_id = ''",
-                (owner_id,),
-            )
-            self._conn.commit()
-        return cur.rowcount
-
     def update_datasource(
         self, ds_id: str, *, owner_id: str | None = None, **fields: Any
     ) -> dict[str, Any] | None:

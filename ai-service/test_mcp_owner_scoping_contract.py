@@ -1,4 +1,4 @@
-"""自定义 MCP 按账号隔离：配置、工具构建、执行策略与旧数据认领。"""
+"""自定义 MCP 按账号隔离：配置、工具构建与执行策略。"""
 
 from __future__ import annotations
 
@@ -14,8 +14,6 @@ from agent_v2 import mcp_config_store
 from agent_v2.custom_mcp_tools import build_custom_mcp_tools
 from agent_v2.execution_policy import build_execution_policy
 from agent_v2.profiles import ProfileId, resolve_profile
-from auth.legacy import claim_legacy_data
-from auth.store import AuthStore
 
 OWNER_A = "a" * 32
 OWNER_B = "b" * 32
@@ -101,24 +99,20 @@ def test_execution_policy_and_tools_only_see_owner_servers(tmp_path, monkeypatch
         raise AssertionError("另一个账号不应看到 A 的 MCP 配置")
 
 
-def test_legacy_mcp_is_claimed_only_once(tmp_path) -> None:
-    settings = _settings(tmp_path)
-    state = Path(settings.agent_v2_state_dir)
-    state.mkdir(parents=True)
-    (state / "mcp_servers.json").write_text(
+def test_legacy_mcp_is_never_used_for_account_configuration(tmp_path, monkeypatch) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setattr(mcp_config_store.settings, "agent_v2_state_dir", str(state))
+    legacy_path = state / "mcp_servers.json"
+    legacy_path.write_text(
         json.dumps({"version": 1, "servers": [_server()]}), encoding="utf-8"
     )
-    store = AuthStore(tmp_path / "auth.sqlite")
-    try:
-        claim_legacy_data(settings, store, OWNER_A)
-        claim_legacy_data(settings, store, OWNER_B)
-        assert store.get_meta("legacy_owner_id") == OWNER_A
-    finally:
-        store.close()
+    legacy_bytes = legacy_path.read_bytes()
 
-    assert (state / "users" / OWNER_A / "mcp_servers.json").is_file()
-    assert not (state / "users" / OWNER_B / "mcp_servers.json").exists()
-    assert (state / "mcp_servers.json").is_file(), "旧文件只能复制，不能移动"
+    assert [s["id"] for s in mcp_config_store.load_servers()] == ["custom_1"]
+    assert mcp_config_store.load_servers(OWNER_A) == []
+    assert mcp_config_store.load_servers(OWNER_B) == []
+    assert legacy_path.read_bytes() == legacy_bytes
 
 
 def test_http_server_list_is_scoped_by_logged_in_account(tmp_path, monkeypatch) -> None:
@@ -248,6 +242,72 @@ def test_builtin_credentials_are_account_scoped_and_never_echoed(
     assert {s["status"] for s in cleared_servers if s["builtin"]} == {"unconfigured"}
     assert "custom_a" in {s["id"] for s in cleared_servers}
     assert load_env(OWNER_A) == {}
+
+
+def test_browser_map_credentials_follow_authenticated_account(tmp_path, monkeypatch) -> None:
+    from fastapi import Depends, FastAPI
+    from fastapi.testclient import TestClient
+
+    from agent_v2.repositories.memory import MemoryStore
+    from api.mcp_router import mcp_router
+    from auth.deps import get_current_user
+    from auth.router import auth_router
+    from auth.service import AuthService
+    from auth.store import AuthStore
+
+    monkeypatch.setattr(mcp_config_store.settings, "agent_v2_state_dir", str(tmp_path / "state"))
+    monkeypatch.setattr(mcp_config_store.settings, "agent_v2_sandbox_type", "local_native")
+    monkeypatch.setenv("AMAP_JSAPI_KEY", "legacy-global-js-key")
+    monkeypatch.setenv("VITE_AMAP_KEY", "legacy-vite-key")
+    app = FastAPI()
+    app.state.auth_service = AuthService(
+        AuthStore(str(tmp_path / "auth.sqlite")),
+        MemoryStore(str(tmp_path / "memory.sqlite")),
+        secret="test-map-secret-0123456789abcdef0123456789",
+        ttl_seconds=3600,
+    )
+    app.include_router(auth_router, prefix="/api")
+    app.include_router(mcp_router, prefix="/api/v2", dependencies=[Depends(get_current_user)])
+    clients = [TestClient(app, client=("127.0.0.1", 50000)) for _ in range(3)]
+    a, b, anonymous = clients
+    url = "/api/v2/mcp/amap/browser-config"
+    empty = {"key": "", "security_code": ""}
+    try:
+        for client, login_id in ((a, "MapA"), (b, "MapB")):
+            assert client.post("/api/auth/register", json={
+                "login_id": login_id, "password": "password123",
+            }).status_code == 201
+            assert client.get(url).json() == empty
+        assert anonymous.get(url).status_code == 401
+
+        env_a = {"AMAP_API_KEY": "web-secret-a", "AMAP_JSAPI_KEY": "js-a",
+                 "AMAP_JSAPI_SECURITY_CODE": "code-a"}
+        saved = a.put("/api/v2/mcp/builtin/credentials", json={"env": env_a})
+        assert saved.status_code == 200, saved.text
+        assert all(value not in saved.text for value in env_a.values())
+        assert next(s for s in saved.json()["servers"] if s["id"] == "amap_map")["browser_configured"] is True
+        response = a.get(url)
+        assert response.json() == {"key": "js-a", "security_code": "code-a"}
+        assert response.headers["cache-control"] == "no-store"
+        assert "web-secret-a" not in response.text
+        assert b.get(url).json() == empty
+
+        assert b.put("/api/v2/mcp/builtin/credentials", json={"env": {
+            "AMAP_JSAPI_KEY": "js-b", "AMAP_JSAPI_SECURITY_CODE": "code-b",
+        }}).status_code == 200
+        assert b.get(url).json() == {"key": "js-b", "security_code": "code-b"}
+        # Updating only the web-service Key preserves this account's map credentials.
+        assert a.put("/api/v2/mcp/builtin/credentials", json={"env": {
+            "AMAP_API_KEY": "web-secret-a-updated",
+        }}).status_code == 200
+        assert a.get(url).json() == {"key": "js-a", "security_code": "code-a"}
+
+        assert b.delete("/api/v2/mcp/builtin/credentials").status_code == 200
+        assert b.get(url).json() == empty
+        assert a.get(url).json() == {"key": "js-a", "security_code": "code-a"}
+    finally:
+        for client in clients:
+            client.close()
 
 
 def test_oauth_status_cannot_be_polled_by_another_account(tmp_path, monkeypatch) -> None:

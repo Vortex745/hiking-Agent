@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import hashlib
-import logging
 import threading
 import uuid
 from dataclasses import dataclass
-from typing import Callable
 
 from agent_v2.repositories.memory import MemoryStore
 
@@ -19,8 +17,6 @@ from auth.security import (
     verify_password,
 )
 from auth.store import AuthStore, DuplicateLoginIdError
-
-logger = logging.getLogger("ai-service.auth")
 
 # 未知 ID 也执行一次同成本校验，避免用响应时间枚举账号。
 _DUMMY_PASSWORD_HASH = hash_password("not-a-real-account-password")
@@ -86,13 +82,11 @@ class AuthService:
         *,
         secret: str,
         ttl_seconds: int,
-        on_register: Callable[[str], None] | None = None,
     ) -> None:
         self.store = store
         self.memory_store = memory_store
         self.secret = secret
         self.ttl_seconds = int(ttl_seconds)
-        self._on_register = on_register
         self._register_lock = threading.Lock()
 
     def close(self) -> None:
@@ -118,11 +112,6 @@ class AuthService:
                 )
             except DuplicateLoginIdError as exc:
                 raise DuplicateLoginId("该登录 ID 已被使用（区分大小写）") from exc
-            if self._on_register is not None:
-                try:
-                    self._on_register(user_id)
-                except Exception:
-                    logger.exception("legacy data claim failed user=%s", user_id)
             self.store.touch_login(user_id)
         return self._session(_user_from_row(row))
 

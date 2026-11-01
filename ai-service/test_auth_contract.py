@@ -5,6 +5,7 @@ Seam 是 HTTP 层（/api/auth/*）与账号身份（subject）本身，不触碰
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -163,6 +164,153 @@ def test_secret_file_is_created_once_and_reused(tmp_path: Path) -> None:
     second = load_or_create_secret(path)
     assert first == second
     assert path.read_text(encoding="utf-8").strip() == first
+
+
+def test_main_registration_never_inherits_legacy_configuration(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import main
+    from agent_v2 import mcp_config_store
+    from agent_v2.mcp_builtin_store import load_env, save_env
+    from auth.paths import user_rag_path
+    from auth.user_config import save_overrides
+    from config import settings
+    from datasource.store import DatasourceStore
+    from rag.sqlite_store import SQLiteStore
+
+    data = tmp_path / "data"
+    state = tmp_path / "state"
+    data.mkdir()
+    state.mkdir()
+    for name, value in {
+        "auth_db_path": str(data / "auth.sqlite"),
+        "auth_secret_path": str(data / "auth.key"),
+        "auth_jwt_secret": "fixture-secret-0123456789abcdef0123456789",
+        "rag_sqlite_db_path": str(data / "rag.sqlite"),
+        "datasource_db_path": str(data / "datasource.sqlite"),
+        "datasource_secret_key": "",
+        "agent_v2_state_dir": str(state),
+        "agent_v2_enabled": False,
+        "agent_v2_sandbox_type": "local_native",
+        "embedding_dimensions": 8,
+        "langfuse_enabled": False,
+        "openai_base_url": "https://global.invalid/v1",
+        "openai_model": "global-model",
+        "openai_api_key": "fixture-global-key",
+    }.items():
+        monkeypatch.setattr(settings, name, value)
+    monkeypatch.delenv("VERCEL", raising=False)
+    monkeypatch.setenv("AMAP_API_KEY", "fixture-global-amap")
+
+    legacy_server = {
+        "id": "legacy", "name": "旧 MCP", "transport": "stdio", "url": "",
+        "command": "python", "args": [], "env": {}, "headers": {},
+        "enabled": False, "status": "untested", "tools": [],
+        "tool_descriptors": [], "revision": "fixture-revision",
+    }
+    legacy_path = state / "mcp_servers.json"
+    legacy_path.write_text(
+        json.dumps({"version": 1, "servers": [legacy_server]}), encoding="utf-8"
+    )
+    legacy_bytes = legacy_path.read_bytes()
+    SQLiteStore(settings.rag_sqlite_db_path, embedding_dimensions=8).close()
+    store = DatasourceStore(settings.datasource_db_path)
+    legacy_source = store.create_datasource(
+        type="notion", name="旧知识来源", credentials_enc="fixture", owner_id=""
+    )
+    store.close()
+
+    with TestClient(main.app, client=("127.0.0.1", 50000)) as client:
+        first = _register(client, "Alice1")
+        assert first.status_code == 201, first.text
+        owner_a = first.json()["user_id"]
+        servers = client.get("/api/v2/mcp/servers").json()["servers"]
+        assert [s["id"] for s in servers if not s["builtin"]] == []
+        assert {s["status"] for s in servers if s["builtin"]} == {"unconfigured"}
+        assert client.get("/api/v1/datasources").json() == []
+        assert not user_rag_path(settings, owner_a).exists()
+        config = client.get("/api/v1/llm-config").json()
+        assert set(config["sources"].values()) == {"unset"}
+        assert config["llm"]["model"] == ""
+        assert config["llm"]["api_key_set"] is False
+
+        save_overrides(settings, owner_a, {"llm": {
+            "base_url": "https://alice.invalid/v1", "model": "alice-model",
+            "api_key": "fixture-alice-key",
+        }})
+        mcp_config_store.save_servers([{**legacy_server, "id": "alice", "name": "A 的 MCP"}], owner_a)
+        save_env(owner_a, {"AMAP_API_KEY": "fixture-alice-amap"})
+        store = main.app.state.datasource_service.store
+        owned_source = store.create_datasource(
+            type="notion", name="A 的知识来源", credentials_enc="fixture", owner_id=owner_a
+        )
+
+        assert client.post("/api/auth/logout").status_code == 200
+        second = _register(client, "Bob123")
+        assert second.status_code == 201, second.text
+        owner_b = second.json()["user_id"]
+        assert owner_a != owner_b
+        assert client.get("/api/v1/llm-config").json()["llm"]["model"] == ""
+        assert client.get("/api/v1/datasources").json() == []
+        assert client.get(f"/api/v1/datasources/{owned_source['id']}").status_code == 404
+        servers = client.get("/api/v2/mcp/servers").json()["servers"]
+        assert all(s["builtin"] for s in servers)
+        assert {s["status"] for s in servers} == {"unconfigured"}
+        assert load_env(owner_b) == {}
+        assert not user_rag_path(settings, owner_b).exists()
+        assert store.get_datasource(legacy_source["id"])["owner_id"] == ""
+
+        saved = client.put("/api/v1/llm-config", json={"llm": {
+            "base_url": "https://bob.invalid/v1", "model": "bob-model",
+            "api_key": "fixture-bob-key",
+        }})
+        assert saved.status_code == 200, saved.text
+        saved = client.post("/api/v2/mcp/servers", json={
+            "name": "B 的 MCP", "transport": "stdio", "command": "python",
+        })
+        assert saved.status_code == 200, saved.text
+        saved = client.put("/api/v2/mcp/builtin/credentials", json={
+            "env": {"AMAP_API_KEY": "fixture-bob-amap"},
+        })
+        assert saved.status_code == 200, saved.text
+        saved = client.post("/api/v1/datasources", json={
+            "name": "B 的知识来源", "type": "notion",
+            "credentials": {"token": "fixture-bob-token"},
+            "selected_resources": ["fixture-page"],
+        })
+        assert saved.status_code == 201, saved.text
+        source_b = saved.json()["id"]
+
+    with TestClient(main.app, client=("127.0.0.1", 50000)) as client:
+        logged_in = client.post("/api/auth/login", json={
+            "login_id": "Alice1", "password": "password123",
+        })
+        assert logged_in.status_code == 200, logged_in.text
+        assert client.get("/api/v1/llm-config").json()["llm"]["model"] == "alice-model"
+        servers = client.get("/api/v2/mcp/servers").json()["servers"]
+        assert [s["id"] for s in servers if not s["builtin"]] == ["alice"]
+        assert {s["status"] for s in servers if s["builtin"]} == {"configured"}
+        assert [s["id"] for s in client.get("/api/v1/datasources").json()] == [owned_source["id"]]
+        assert load_env(owner_a) == {"AMAP_API_KEY": "fixture-alice-amap"}
+        assert legacy_path.read_bytes() == legacy_bytes
+        assert Path(settings.rag_sqlite_db_path).is_file()
+
+        assert client.post("/api/auth/logout").status_code == 200
+        assert client.post("/api/auth/login", json={
+            "login_id": "Bob123", "password": "password123",
+        }).status_code == 200
+        assert client.get("/api/v1/llm-config").json()["llm"]["model"] == "bob-model"
+        assert [s["name"] for s in client.get("/api/v2/mcp/servers").json()["servers"]
+                if not s["builtin"]] == ["B 的 MCP"]
+        assert [s["id"] for s in client.get("/api/v1/datasources").json()] == [source_b]
+        assert load_env(owner_b) == {"AMAP_API_KEY": "fixture-bob-amap"}
+        assert client.delete("/api/v1/llm-config").status_code == 200
+        assert client.get("/api/v1/llm-config").json()["llm"]["model"] == ""
+        assert client.post("/api/auth/logout").status_code == 200
+        assert client.post("/api/auth/login", json={
+            "login_id": "Alice1", "password": "password123",
+        }).status_code == 200
+        assert client.get("/api/v1/llm-config").json()["llm"]["model"] == "alice-model"
 
 
 def test_main_app_data_routes_require_login(tmp_path: Path) -> None:

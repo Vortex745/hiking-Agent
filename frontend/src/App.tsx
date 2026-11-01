@@ -33,7 +33,7 @@ function OfflineScreen({
         <button
           type="button"
           onClick={() => void onRetry()}
-          className="mt-5 inline-flex items-center gap-2 rounded-xl bg-[#1a3c2a] px-4 py-2 text-xs font-medium text-white transition-colors hover:bg-[#23543c] dark:bg-[#c2e7ff] dark:text-[#001d35] dark:hover:bg-[#b3ddf7]"
+          className="mt-5 inline-flex items-center gap-2 rounded-xl bg-[#1a3c2a] px-4 py-2 text-xs font-medium text-white transition-[transform,background-color] duration-150 ease-[var(--ease-out)] hover:bg-[#23543c] active:scale-[0.97] dark:bg-[#c2e7ff] dark:text-[#001d35] dark:hover:bg-[#b3ddf7]"
         >
           <RefreshCw className="size-3.5" aria-hidden="true" />
           重试
