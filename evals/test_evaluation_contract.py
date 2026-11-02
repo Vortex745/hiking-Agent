@@ -299,6 +299,7 @@ def _clean_subprocess_env() -> dict[str, str]:
     env = dict(os.environ)
     env["PYTHONUTF8"] = "1"
     env.pop("PYTHONPATH", None)
+    env.pop("TYPESAFE_API_KEY", None)
     return env
 
 
@@ -350,6 +351,13 @@ spec.loader.exec_module(module)
 print("GOLDENS", len(module.DATASET.goldens))
 print("TRACED_CHAT", callable(getattr(module, "run_traced_chat", None)))
 print("SCRATCH_IN_PATH", any("hiking-ai-evals" in p for p in sys.path))
+from metrics import build_trace_metrics
+try:
+    build_trace_metrics()
+except RuntimeError as exc:
+    print("METRICS_REQUIRE_KEY", "TYPESAFE_API_KEY" in str(exc))
+else:
+    raise AssertionError("live metrics were constructed without a TypeSafe key")
 """
 
 
@@ -361,6 +369,7 @@ def test_deepeval_suite_imports_without_scratch(tmp_path: Path) -> None:
     assert "GOLDENS 4" in proc.stdout
     assert "TRACED_CHAT True" in proc.stdout
     assert "SCRATCH_IN_PATH False" in proc.stdout
+    assert "METRICS_REQUIRE_KEY True" in proc.stdout
 
 
 # ---------------------------------------------------------------------------

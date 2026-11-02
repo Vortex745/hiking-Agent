@@ -116,7 +116,10 @@ def _mount_tool(monkeypatch, seen: list[str]) -> None:
     monkeypatch.setattr("agent_v2.kernel_tools.build_chat_extra_tools", _fake_extra_tools)
 
 
-def _build_app(repo: RunRepository, checkpoints: KernelCheckpointStore) -> FastAPI:
+def _build_app(
+    repo: RunRepository, checkpoints: KernelCheckpointStore, monkeypatch
+) -> FastAPI:
+    monkeypatch.setattr(chat_v2_module.settings, "agent_v2_enabled", True)
     app = FastAPI()
     app.include_router(chat_v2_module.chat_v2_router, prefix="/api/v2")
     app.state.agent_v2_runtime = SimpleNamespace(
@@ -213,7 +216,7 @@ def test_tool_result_is_published_before_the_kernel_turn_ends(tmp_path: Path, mo
 
     monkeypatch.setattr(kernel, "build_chat_model", _fake_model)
 
-    app = _build_app(repo, checkpoints)
+    app = _build_app(repo, checkpoints, monkeypatch)
 
     def _on_event(event: dict[str, Any]) -> None:
         if event["type"] == "tool_result":
@@ -298,7 +301,7 @@ def test_parallel_same_tool_calls_pair_in_arrival_order(tmp_path: Path, monkeypa
         ])
 
     monkeypatch.setattr(kernel, "build_chat_model", _fake_model)
-    app = _build_app(repo, checkpoints)
+    app = _build_app(repo, checkpoints, monkeypatch)
 
     def _on_event(event: dict[str, Any]) -> None:
         if event["type"] == "tool_result":
@@ -417,7 +420,7 @@ def test_model_rounds_surround_the_tool_in_execution_order(tmp_path: Path, monke
         ])
 
     monkeypatch.setattr(kernel, "build_chat_model", _fake_model)
-    app = _build_app(repo, checkpoints)
+    app = _build_app(repo, checkpoints, monkeypatch)
 
     def _on_event(event: dict[str, Any]) -> None:
         if event["type"] == "tool_result":
@@ -484,7 +487,7 @@ def test_model_failure_still_closes_the_round_with_one_terminal(tmp_path: Path, 
         "build_chat_model",
         lambda _s: _BoomThenFail(messages=iter([_search_call()]), disable_streaming=True),
     )
-    app = _build_app(repo, checkpoints)
+    app = _build_app(repo, checkpoints, monkeypatch)
 
     async def _run(server: _LiveSseServer) -> list[dict[str, Any]]:
         return await asyncio.wait_for(

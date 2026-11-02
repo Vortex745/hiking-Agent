@@ -48,7 +48,7 @@ from hiking_evals.models import ActionSpec
 from hiking_evals.target import ASGITarget, extract_chat_outcome
 from hiking_evals.status import assert_gradable
 
-from metrics import TRACE_METRICS
+from metrics import build_trace_metrics
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("HIKING_EVAL_LIVE") != "1",
@@ -103,6 +103,11 @@ def run_traced_chat(prompt: str) -> str:
 @pytest.mark.parametrize(
     "golden", DATASET.goldens, ids=lambda golden: golden.name or golden.input[:24]
 )
-def test_hiking_agent_trace(golden: Golden) -> None:
+def test_hiking_agent_trace(golden: Golden, trace_metrics) -> None:
     run_traced_chat(golden.input)
-    assert_test(golden=golden, metrics=TRACE_METRICS)
+    assert_test(golden=golden, metrics=trace_metrics)
+
+
+@pytest.fixture(scope="module")
+def trace_metrics():
+    return build_trace_metrics()

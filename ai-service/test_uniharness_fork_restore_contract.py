@@ -300,6 +300,11 @@ def test_restore_script_restores_plain_checkout_to_the_pinned_tree(tmp_path: Pat
         target / "libs" / "uniharness" / "uniharness" / "prompts" / "fragments"
         / "tool_instruction_bash.md"
     ).is_file()
+    claude_source = VENDOR_TREE / "libs" / "uniharness" / "CLAUDE.md"
+    claude_target = target / "libs" / "uniharness" / "CLAUDE.md"
+    if claude_source.is_symlink():
+        assert claude_target.is_symlink()
+        assert claude_target.readlink() == claude_source.readlink()
     # And the read-only check agrees on the restored tree.
     assert _run_restore_script("--check", "--target", str(target)).returncode == 0
 

@@ -277,7 +277,23 @@ def restore(bundle: Path, provenance: Path, target: Path) -> None:
         if existed:
             # Hydrate the existing plain checkout in place: copy the complete
             # pinned tree over it (the checkout may lack .gitignore'd files),
-            # then graft the validated git metadata. Nothing is deleted.
+            # then graft the validated git metadata. Replace only file/symlink
+            # type collisions at paths from the staged tree; retain other files.
+            for source_path in staging.rglob("*"):
+                relative_path = source_path.relative_to(staging)
+                if relative_path.parts[0] == ".git":
+                    continue
+                target_path = target / relative_path
+                if source_path.is_symlink():
+                    if target_path.is_symlink() or target_path.is_file():
+                        target_path.unlink()
+                    elif target_path.exists():
+                        raise RestoreError(
+                            f"cannot restore symlink {relative_path}: "
+                            "target path is a directory"
+                        )
+                elif target_path.is_symlink():
+                    target_path.unlink()
             shutil.copytree(
                 staging,
                 target,
