@@ -11,7 +11,6 @@
 
 </div>
 
-![架构图占位](https://via.placeholder.com/800x200/009688/ffffff?text=Hiking+AI+Architecture)
 
 ## 简介
 
