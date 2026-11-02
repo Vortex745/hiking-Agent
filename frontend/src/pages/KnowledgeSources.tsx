@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import AlertTriangle from 'reicon-react/icons/AlertTriangle'
-import CheckCircle from 'reicon-react/icons/CheckCircle'
-import Database from 'reicon-react/icons/Database'
-import Loader from 'reicon-react/icons/Loader'
-import Refresh from 'reicon-react/icons/Refresh'
-import Trash2 from 'reicon-react/icons/Trash2'
-import X from 'reicon-react/icons/X'
+import {
+  CircleCheck as CheckCircle,
+  Database,
+  LoaderCircle as Loader,
+  RefreshCw as Refresh,
+  Trash2,
+  TriangleAlert as AlertTriangle,
+  X,
+} from 'lucide-react'
 import {
   createDatasource,
   deleteDatasource,

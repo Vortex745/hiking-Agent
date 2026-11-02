@@ -1,276 +1,123 @@
 <div align="center">
-<h1>Hiking AI</h1>
 
-<p><strong>智能登山规划助手</strong><br/>基于 LangGraph 与 RAG 的登山行程生成与安全评估</p>
+# Hiking AI
 
-[![](https://img.shields.io/badge/FastAPI-009688?style=flat&logo=fastapi&logoColor=ffffff)](./ai-service)
-[![](https://img.shields.io/badge/React_18-61DAFB?style=flat&logo=react&logoColor=000000)](./frontend)
-[![](https://img.shields.io/badge/Docker_Compose-2496ED?style=flat&logo=docker&logoColor=ffffff)](./docker-compose.yml)
+**徒步 AI 助手：把路线资料、天气、装备和风险信息整理成可核对的徒步计划。**
 
-[快速开始](#快速开始) · [技术栈](#技术栈) · [核心功能](#核心功能) · [配置说明](#配置说明)
+[快速开始](#快速开始) · [功能](#功能) · [技术结构](#技术结构) · [测试](#测试)
 
 </div>
 
+Hiking AI 面向日常徒步和多日徒步行程规划。你可以用自然语言描述目的地、日期、同行者和偏好；助手会结合路线资料、天气、装备建议与风险信息，帮助比较路线并整理行程。资料不足时会标出待确认项，不把缺失信息当成事实。
 
-## 简介
+它是徒步行程规划助手，不是登山向导，也不能替代官方公告、当地管理部门信息或现场判断。
 
-登山AI 是一个智能登山规划平台，将 **RAG 知识检索**、**LangGraph 智能体编排** 与 **沙盒化工具执行** 整合进统一对话界面。用户描述登山需求，智能体调用路线研究、天气查询、装备清单、风险评估等工具，生成带引用来源与可视化地图的行程方案。
+## 功能
 
-**核心特性**：类 ChatGPT 对话界面 · 流式推理展示 · 路线候选对比 · 高德地图展示 · PDF 行程导出 · 账号隔离 · MCP 工具扩展
+- **徒步路线比较**：汇总候选路线的里程、爬升、下撤点等可查事实，展示来源、证据缺口和风险状态。
+- **行程规划**：根据用户提供的日期、集合、交通、住宿和预算等信息整理计划；未提供的内容保留待确认。
+- **装备与风险建议**：按天数、季节、经验和露营需求生成清单，并结合路线与天气给出保守建议。
+- **天气与地图**：可接入高德 MCP 天气、地图和地点查询；地图展示需配置对应账号的 JSAPI 凭据。
+- **徒步知识检索**：从已配置的知识源检索相关内容，并在可用时展示引用来源。
+- **计划书导出**：将已确认的路线和行程内容导出为 PDF。
+- **对话与账号**：支持流式对话、执行过程查看、账号隔离配置和可选的长期偏好记忆。
 
-导航：[接口文档](./docs/api-reference.md) | [PDF 排版规范](./docs/plan-pdf-format.md) | [架构设计](./docs/)
-
----
-
-## 技术栈
-
-| 层 | 技术 |
-| --- | --- |
-| 前端 | React 18 · Vite 5 · TypeScript · assistant-ui · Tailwind CSS |
-| 后端 | FastAPI · LangGraph 1.2.6 · UniHarness（fork） |
-| 存储 | SQLite（默认）· PostgreSQL + pgvector（可选）· Redis |
-| 检索 | 向量检索 · 混合检索 · 重排模型 |
-| 工具 | 路线研究 · 高德天气/地图 MCP · 装备清单 · 风险评估 · PDF 生成 |
-| 沙盒 | E2B（生产）· 本地临时目录（开发） |
-| 部署 | Docker Compose |
+外部模型、地图和知识源能力取决于相应服务及账号配置。未配置时，对应功能不可用或结果会明确显示资料不足。
 
 ## 快速开始
 
-**前置要求**：Python 3.12、Node.js 18+、Docker Compose（可选）、兼容 OpenAI 接口的模型 API
+### 环境要求
 
-**1. 克隆代码**
+- Python 3.12
+- Node.js 18 或更高版本
+- 可调用的 OpenAI 兼容模型 API
+
+### 1. 获取代码并配置模型
 
 ```bash
 git clone https://github.com/Vortex745/hiking-Agent.git
-cd hiking-ai
-```
-
-**2. 配置环境**
-
-```bash
+cd hiking-Agent
 cp .env.example .env
 ```
 
-最少配置（填入 `.env`）：
+PowerShell 可用 `Copy-Item .env.example .env` 替代 `cp`。在 `.env` 中填写 `OPENAI_API_KEY`；并按所用服务填写 `OPENAI_BASE_URL` 和 `OPENAI_MODEL`。向量检索需要可用的 Embedding 服务。高德和其他 MCP 密钥在登录后按账号配置，不要提交真实密钥。
 
-```bash
-OPENAI_API_KEY=sk-...
-OPENAI_BASE_URL=https://api.openai.com/v1
-OPENAI_MODEL=gpt-4-turbo
-
-# 本地 MCP 管理需要 local_native 沙箱
-AGENT_V2_SANDBOX_TYPE=local_native
-```
-
-**3. 启动后端**
+### 2. 安装并启动后端
 
 ```bash
 cd ai-service
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1  # Windows
-# source .venv/bin/activate   # Linux/macOS
-
-pip install -r requirements.txt
-python main.py  # 监听 :8000
 ```
 
-**4. 启动前端**
+激活虚拟环境：
+
+```bash
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
+
+# macOS / Linux
+source .venv/bin/activate
+```
+
+安装后端和仓库附带的 UniHarness 依赖，再启动 API：
+
+```bash
+python -m pip install -r requirements.txt
+python -m pip install -e ../third_party/uniharness/libs/uniharness
+python main.py
+```
+
+后端默认监听 `http://localhost:8000`。
+
+### 3. 安装并启动前端
+
+在另一个终端，从仓库根目录运行：
 
 ```bash
 cd frontend
-npm install
-npm run dev  # 监听 :5173，代理 /api → :8000
+npm ci
+npm run dev
 ```
 
-浏览器打开 `http://localhost:5173`。
+打开 `http://localhost:5173`。Vite 开发服务器会将 `/api` 请求代理到本机后端。
 
-**5. Docker 部署（可选）**
+## 技术结构
 
-```bash
-docker compose up -d  # 仅 PostgreSQL + Redis
-# 完整应用栈见 docker-compose.prod.yml
-```
-
-> 💡 向量化与重排模型可复用 `OPENAI_*` 配置；知识库检索需可用的嵌入服务，未配置时对话可用但检索能力受限。
-
----
-
-## 核心功能
-
-### 智能体编排
-
-UniHarness + LangGraph 驱动的智能体内核（`ai-service/agent_v2/kernel.py`），根据用户请求调度工具、检索知识、执行代码，生成结构化回复。支持流式推理展示、执行步骤回放、断点恢复。
-
-**子智能体（实验性，默认关闭）**：三个固定角色可由根智能体派发处理复杂任务：
-- `researcher`：收集登山资料（知识检索、路线研究、网页抓取）
-- `route_planner`：生成路线方案（装备清单、高德天气/地图 MCP）
-- `artifact_writer`：产出结构化文档（沙盒文件操作、PDF 生成）
-
-子智能体采用单层架构、严格工具白名单与并发限制（每次运行最多 2 个），默认关闭（`.env` 中 `AGENT_V2_SUBAGENT_ENABLED=false`），本地开发可修改测试。
-
-### 工具生态
-
-**领域工具**：
-- `route_research`：路线候选搜索，提取里程、爬升、下撤点
-- `gear_checklist`：根据天数、季节、露营需求生成装备清单
-- `risk_assessment`：分析目的地、天气、经验等维度的风险等级
-- `hiking_knowledge_search`：检索登山知识库（向量/混合检索 + 重排）
-
-**MCP 服务（账号隔离）**：
-- `amap_weather`：高德天气查询
-- `amap_map`：路线规划、POI 检索、地理编码
-
-MCP 密钥按账号隔离存储（`data/users/{user_id}/mcp_builtin.json`），需登录后在前端配置，详见 [MCP 配置](#mcp-配置)。
-
-**沙盒工具**：
-- `sandbox_bash` / `sandbox_read` / `sandbox_write` / `sandbox_edit`：隔离沙盒内文件与脚本执行
-- `generate_pdf`：PDF 行程生成（含排版校验）
-
-### 知识检索
-
-`ai-service/rag/` 提供向量检索与混合检索（关键词 + 语义），接重排模型提升排序质量。知识库存储为 SQLite（默认）或 PostgreSQL + pgvector，切换嵌入模型需重建索引。
-
-### 产物交付
-
-- **路线对比**：候选路线评分与排序（LLM / TypeSafe System One / 离线演示数据）
-- **行程 PDF**：结构化行程导出，含目的地、路线、装备、风险评估与应急联系方式
-- **地图展示**：高德地图渲染路线与途经点（需配置 JSAPI 密钥）
-
-### 认证与多租户
-
-JWT 登录态（默认有效期 7 天），数据面接口需鉴权。账号配置（MCP 密钥、模型配置、知识源）隔离存储，支持单机匿名模式（遗留兼容）。
-
----
-
-## 配置说明
-
-### 环境变量
-
-关键配置见 `.env.example`（73 项），按用途分组：
-
-| 分组 | 关键变量 |
+| 模块 | 主要技术 |
 | --- | --- |
-| 对话模型 | `OPENAI_API_KEY` · `OPENAI_BASE_URL` · `OPENAI_MODEL` |
-| 向量化 | `EMBEDDING_MODEL` · `EMBEDDING_DIMENSIONS`（默认复用 `OPENAI_*`） |
-| 重排 | `RERANK_MODEL` · `RERANK_ENABLED`（可选，提升检索质量） |
-| 数据库 | `DATABASE_URL`（PostgreSQL）· `REDIS_URL`（默认本地） |
-| 认证 | `AUTH_JWT_SECRET`（未配置时自动生成）· `AUTH_TOKEN_TTL_SECONDS` |
-| 智能体 | `AGENT_V2_ENABLED` · `AGENT_V2_SANDBOX_TYPE` · `AGENT_V2_SUBAGENT_ENABLED` |
-| 可观测性 | `LANGFUSE_ENABLED` · `LOG_LEVEL` · `LOG_FORMAT` |
+| 前端 | React、TypeScript、Vite、assistant-ui、Tailwind CSS |
+| API 与智能体 | FastAPI、LangGraph、仓库维护的 UniHarness fork |
+| 知识检索 | SQLite 向量检索与混合检索；可选 PostgreSQL + pgvector |
+| 外部工具 | MCP、高德服务、路线研究、装备与风险工具 |
+| 导出 | 经过校验与审批的 PDF 计划书 |
 
-> ⚠️ `.env` 中的 `AMAP_API_KEY` 已废弃，MCP 密钥需在前端配置。
+本地前后端的启动入口分别是 `ai-service/main.py` 和 `frontend`。`docker-compose.yml` 提供 PostgreSQL 与 Redis 基础设施；它本身不启动完整应用。
 
-### MCP 配置
+## 配置
 
-高德地图 MCP 服务按账号隔离，需登录后在前端配置：
+- 模型和服务端环境变量模板：[.env.example](.env.example)
+- 高德 MCP 的 Web 服务 Key 与地图 JSAPI 凭据按账号配置，不要放入前端构建变量或提交到仓库。
+- 默认本地开发可使用 SQLite。需要 PostgreSQL、Redis 或远程沙盒时，再配置对应服务地址和凭据。
+- 仓库未提供 `LICENSE` 文件，当前没有声明开源许可。
 
-**密钥类型**：
-- **Web 服务 API Key**：智能体工具调用（天气、路线规划、POI）
-- **JSAPI Key + 安全密钥**：前端地图展示（可选）
-
-**配置步骤**：
-1. 启动应用并登录
-2. 前端右上角 → MCP 工具 → 找到「高德天气」或「高德地图」
-3. 填写密钥（申请地址：[高德开放平台](https://console.amap.com/dev/key/app)）
-4. 保存并验证状态变为「已配置」
-
-**限制**：
-- 本地开发限定（`AGENT_V2_SANDBOX_TYPE=local_native`）
-- 生产环境（`remote_e2b`）需服务端预置凭据
-- 密钥存储路径：`data/users/{user_id}/mcp_builtin.json`
-
-### 智能体定制
-
-- `ai-service/agent_v2/subagents.py`：增改子智能体角色与工具白名单
-- `ai-service/tools/`：注册新工具
-- `ai-service/agent_v2/profiles.py`：调整模型档位与工具面
-- `ai-service/config.py`：读取新增配置项
-
----
-
-## 测试与评估
-
-### 后端测试
+## 测试
 
 ```bash
-cd ai-service
-pytest -q  # 101 个测试用例
-```
-
-### 评测
-
-**离线契约评测**（不调用外部模型，CI 每次 PR 都会跑）：
-
-```bash
-pip install -r evals/deepeval/requirements.txt
-python -m pytest -q evals/test_evaluation_contract.py
-```
-
-**真实模型评测**（opt-in，消耗额度）：
-
-```bash
-HIKING_EVAL_LIVE=1 TYPESAFE_API_KEY="..." \
-  ./ai-service/.venv/Scripts/deepeval.exe test run evals/deepeval/test_hiking_agent.py
-```
-
-### 前端浏览器用例
-
-```bash
+# 前端类型检查与生产构建
 cd frontend
-npm run test:browser          # 会话切换
-npm run test:browser:plan     # 行程工作流
-npm run test:browser:auth     # 登录
+npm ci
+npm run build
+
+# 后端测试
+cd ../ai-service
+python -m pip install -r requirements-test.txt
+python -m pytest -q
 ```
 
----
+前端浏览器回归用例可在 `frontend` 目录运行，例如 `npm run test:browser:auth`、`npm run test:browser:map` 和 `npm run test:browser:plan`。GitHub Actions 还会验证 Gateway 与离线评测契约。
 
-## 部署
+## 相关文档
 
-### 生产部署
-
-`docker-compose.prod.yml` 使用预构建镜像：
-
-```bash
-export DOCKERHUB_IMAGE=zijinn123/ai-hiking
-export IMAGE_TAG=latest
-export FRONTEND_PORT=3000
-
-docker compose -f docker-compose.prod.yml up -d
-```
-
-编排包含四个服务：`postgres`（15432）、`ai-service`（容器内 8000）、`gateway`（容器内 8080）、`frontend`（3000 → 容器 80）。
-
-确保 `.env` 配置生产密钥（`AUTH_JWT_SECRET`、模型凭据）、数据库持久卷、Redis 密码。
-
----
-
-## 已知限制
-
-- 默认 SQLite 存储；Compose 提供 PostgreSQL + pgvector，两条路径需按需对齐
-- 切换嵌入模型必须重建知识库索引（维度绑定）
-- 远程沙盒默认 `remote_e2b`，需对应凭据；离线环境改为 `local_native`
-- `docker-compose.yml` 仅含基础设施（PostgreSQL + Redis），不含应用服务
-- Windows 长路径支持需 `git config --global core.longpaths true`
-
----
-
-## 参考资源
-
-- [接口文档](./docs/api-reference.md)
-- [行程 PDF 排版规范](./docs/plan-pdf-format.md)
-- [LangGraph 文档](https://langchain-ai.github.io/langgraph/)
-- [FastAPI 官方指南](https://fastapi.tiangolo.com/)
-
----
-
-## 许可证
-
-仓库当前未包含 `LICENSE` 文件。若计划开源分发，请补充许可证；在此之前默认保留所有权利。
-
----
-
-<div align="center">
-
-**如果这个项目对您有帮助，请给我们一个 ⭐️**
-
-</div>
+- [API 参考](docs/api-reference.md)
+- [PDF 计划书格式](docs/plan-pdf-format.md)
+- [路线比较演示说明](docs/route-comparison-demo.md)

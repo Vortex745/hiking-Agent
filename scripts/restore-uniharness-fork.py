@@ -282,6 +282,7 @@ def restore(bundle: Path, provenance: Path, target: Path) -> None:
                 staging,
                 target,
                 dirs_exist_ok=True,
+                symlinks=True,
                 ignore=shutil.ignore_patterns(".git"),
             )
             shutil.move(str(staging / ".git"), str(target / ".git"))
