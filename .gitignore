@@ -133,6 +133,29 @@ ai-service/hiking-review-inflight-*/
 .codebuddy/
 .vercel
 .neon
+/.codex/
+/.jev-readme-score/
+/.github/pull_request_template.md
+HANDOFF.md
+MEMORY.md
+TODO.md
+progress.md
+.scratch/
+.codegraph/
+.archify/
+.code-review-graph/
+.deepeval/
+.gstack/
+.omx/
+.qoder/
+.workbuddy/
+repo-context.md
+handoff-*.md
+progress.md
+
+# Keep agent guidance files eligible for version control.
+!AGENTS.md
+!**/AGENTS.md
 
 # ============================================================
 # Runtime State / Agent Scratch

@@ -1,427 +1,277 @@
-# AI Hiking _(ai-hiking)_
+<div align="center">
+<h1>登山AI Hiking AI</h1>
 
-[![standard-readme compliant](https://img.shields.io/badge/readme%20style-standard-brightgreen.svg?style=flat-square)](https://github.com/RichardLitt/standard-readme)
-![CI](https://img.shields.io/github/actions/workflow/status/Vortex745/hiking-ai/deploy.yml?label=CI&logo=githubactions&style=flat-square)
-![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=white&style=flat-square)
-![Vite](https://img.shields.io/badge/Vite-5-646CFF?logo=vite&logoColor=white&style=flat-square)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white&style=flat-square)
-![Go](https://img.shields.io/badge/Go-1.22-00ADD8?logo=go&logoColor=white&style=flat-square)
-![Docker Hub](https://img.shields.io/docker/pulls/zijinn123/ai-hiking?label=Docker%20Hub&logo=docker&style=flat-square)
+<p><strong>智能登山规划助手</strong><br/>基于 LangGraph 与 RAG 的登山行程生成与安全评估</p>
 
-面向户外徒步场景的 RAG 与 Agent 智能助手。
+[![](https://img.shields.io/badge/FastAPI-009688?style=flat&logo=fastapi&logoColor=ffffff)](./ai-service)
+[![](https://img.shields.io/badge/React_18-61DAFB?style=flat&logo=react&logoColor=000000)](./frontend)
+[![](https://img.shields.io/badge/Docker_Compose-2496ED?style=flat&logo=docker&logoColor=ffffff)](./docker-compose.yml)
 
-AI Hiking 将 React 前端、Go API Gateway 和 Python FastAPI AI Service 组合成一个本地优先的徒步助手。项目提供知识库问答（chat 内知识检索工具）、路线规划、天气适宜性判断、装备检查、风险提醒、SSE 流式输出、浏览器侧模型配置和会话记忆能力。
+[快速开始](#快速开始) · [技术栈](#技术栈) · [核心功能](#核心功能) · [配置说明](#配置说明)
 
-路线比较支持最多五条候选、默认 LLM 与可选外部决策 Provider、代码强制的证据/安全门、来源展开和审批后 PDF 导出。配置、离线评估及面试演示见 [路线比较演示](docs/route-comparison-demo.md)。
+</div>
 
-仓库名和目录名是 `ai-hiking`；前端 `package.json` 的包名是 `ai-hiking-frontend`，因为这是一个包含前端、网关和 AI 服务的多模块仓库。
+![架构图占位](https://via.placeholder.com/800x200/009688/ffffff?text=Hiking+AI+Architecture)
 
-## 目录
+## 简介
 
-- [安全](#安全)
-- [背景](#背景)
-- [安装](#安装)
-- [使用](#使用)
-- [架构](#架构)
-- [页面](#页面)
-- [测试](#测试)
-- [部署](#部署)
-- [排障](#排障)
-- [API](#api)
-- [维护者](#维护者)
-- [贡献](#贡献)
-- [许可证](#许可证)
+登山AI 是一个智能登山规划平台，将 **RAG 知识检索**、**LangGraph 智能体编排** 与 **沙盒化工具执行** 整合进统一对话界面。用户描述登山需求，智能体调用路线研究、天气查询、装备清单、风险评估等工具，生成带引用来源与可视化地图的行程方案。
 
-## 安全
+**核心特性**：类 ChatGPT 对话界面 · 流式推理展示 · 路线候选对比 · 高德地图展示 · PDF 行程导出 · 账号隔离 · MCP 工具扩展
 
-不要把 `.env`、API Key、SSH Key、Cookie 或第三方平台 Token 提交到仓库。模型、Embedding、Rerank、高德地图和 Feishu 等密钥应只存在于本地 `.env`、GitHub Secrets 或服务器运行环境中。
+导航：[接口文档](./docs/api-reference.md) | [PDF 排版规范](./docs/plan-pdf-format.md) | [架构设计](./docs/)
 
-`/llm-config` 仅用于临时测试模型列表和延迟。API Key 不会写入 localStorage，聊天请求使用 AI Service 的服务端环境变量配置。
+---
 
-## 背景
+## 技术栈
 
-徒步问答通常不只是一次普通聊天：用户可能需要结合知识库资料、天气、当前位置、路线、装备和风险判断。AI Hiking 因此把系统拆成三个清晰的运行层：
+| 层 | 技术 |
+| --- | --- |
+| 前端 | React 18 · Vite 5 · TypeScript · assistant-ui · Tailwind CSS |
+| 后端 | FastAPI · LangGraph 1.2.6 · UniHarness（fork） |
+| 存储 | SQLite（默认）· PostgreSQL + pgvector（可选）· Redis |
+| 检索 | 向量检索 · 混合检索 · 重排模型 |
+| 工具 | 路线研究 · 高德天气/地图 MCP · 装备清单 · 风险评估 · PDF 生成 |
+| 沙盒 | E2B（生产）· 本地临时目录（开发） |
+| 部署 | Docker Compose |
 
-- 前端负责聊天界面、模型配置、浏览器定位和 SSE 渲染。
-- Gateway 负责统一 `/api/v1/*`（models）与 `/api/v2/*`（Chat）入口、CORS、限流和流式代理。
-- AI Service 负责唯一编排内核（Agent v2，含 RAG 问答 profile）、检索基线和徒步领域工具。
+## 快速开始
 
-主要能力包括：
+**前置要求**：Python 3.12、Node.js 18+、Docker Compose（可选）、兼容 OpenAI 接口的模型 API
 
-- RAG：文档加载、向量检索、BM25 词法检索、RRF 融合、可选 rerank。
-- Agent（Chat v2）：UniHarness 内核、可恢复运行、工具审批、产物管理和记忆提交。
-- Memory（v2）：长期记忆服务与会话存储由 Agent v2 内核统一持有（旧版 memory 包已移除）。
-
-## 安装
-
-### 依赖
-
-需要本机具备：
-
-- Docker 和 Docker Compose
-- Node.js 20 或兼容版本
-- Python 3.12
-- Go 1.22
-- 可选：`lark-cli`，用于 Feishu 同步
-- 可选：高德地图 MCP Server，用于地理和天气工具
-- 会话与长期记忆由 Agent v2 的 SQLite 存储持有（旧版 Redis 聊天历史已随 memory 包移除）
-
-### 克隆仓库
+**1. 克隆代码**
 
 ```bash
-git clone https://github.com/Vortex745/hiking-ai.git
+git clone https://github.com/Vortex745/hiking-Agent.git
 cd hiking-ai
 ```
 
-### 配置环境变量
+**2. 配置环境**
 
 ```bash
 cp .env.example .env
 ```
 
-至少需要填写主模型和 Embedding 配置：
+最少配置（填入 `.env`）：
 
-```env
+```bash
+OPENAI_API_KEY=sk-...
 OPENAI_BASE_URL=https://api.openai.com/v1
-OPENAI_API_KEY=your-llm-api-key
-OPENAI_MODEL=deepseek-v4-flash
+OPENAI_MODEL=gpt-4-turbo
 
-EMBEDDING_BASE_URL=https://api.openai.com/v1
-EMBEDDING_API_KEY=your-embedding-api-key
-EMBEDDING_MODEL=text-embedding-3-small
-EMBEDDING_DIMENSIONS=1536
-
-MCP_SERVERS={"amap":{"command":"amap-mcp","args":["--stdio"]}}
-
-可选：配置 Langfuse 追踪 LLM 调用（未配置密钥时自动禁用）：
-
-```env
-LANGFUSE_PUBLIC_KEY=pk-lf-...
-LANGFUSE_SECRET_KEY=sk-lf-...
-LANGFUSE_BASE_URL=https://cloud.langfuse.com
-```
+# 本地 MCP 管理需要 local_native 沙箱
+AGENT_V2_SANDBOX_TYPE=local_native
 ```
 
-### Docker Compose 启动
-
-Docker Compose 当前仅用于启动基础设施（PostgreSQL 和 Redis，Redis 已不被应用消费，保留仅为兼容）。应用服务请在本地通过环境依赖启动。
-
-```bash
-docker compose up -d
-```
-
-默认端口：
-
-| 服务 | 地址 |
-|---|---|
-| PostgreSQL | `localhost:5432` |
-| Redis | `localhost:6379` |
-
-## 使用
-
-### 本地开发
-
-启动基础设施：
-
-```bash
-docker compose up -d
-```
-
-启动 AI Service：
+**3. 启动后端**
 
 ```bash
 cd ai-service
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1  # Windows
+# source .venv/bin/activate   # Linux/macOS
+
 pip install -r requirements.txt
-python main.py
+python main.py  # 监听 :8000
 ```
 
-启动 Gateway：
-
-```bash
-cd gateway
-go run main.go
-```
-
-启动 Frontend：
+**4. 启动前端**
 
 ```bash
 cd frontend
 npm install
-npm run dev
+npm run dev  # 监听 :5173，代理 /api → :8000
 ```
 
-开发模式访问：
+浏览器打开 `http://localhost:5173`。
 
-```text
-http://localhost:5173
-```
-
-### 账号与数据隔离
-
-首次打开会进入登录页，可直接注册一个本机账号。
-
-- 登录 ID 为 2–6 位字母、数字或下划线，区分大小写且唯一；密码 8–15 个字符。
-- JWT 保存在 HttpOnly Cookie 中（同时接受 `Authorization: Bearer`），`AUTH_JWT_SECRET` 未配置时自动生成 `data/auth.key`。
-- 会话记录、长期记忆、知识库、自定义 MCP 和模型配置都按登录账号隔离；高德天气/地图的内置定义共享，但 API Key 由各账号在 MCP 接入中自行填写（保存在 `agent_state/users/<user_id>/mcp_builtin.json`，普通 MCP 管理接口只返回是否已配置）。
-- 悬浮地图在「设置 → MCP 接入 → 高德地图」填写当前账号的 JSAPI Key 和安全密钥，Web 服务 API Key 供天气/地图工具使用。悬浮地图不再读取全局 `VITE_AMAP_KEY` / `VITE_AMAP_SECURITY_CODE`，也不自动迁移旧全局配置；未配置时提示「请配置高德地图 API」，不加载地图或触发该入口的定位。专用登录接口仅向当前账号返回浏览器所需配置，并禁止缓存；普通 MCP 列表与保存响应不回传密钥。
-- 规则前置：本机管理接口仍只接受本机来源，因此远程访问的账号只能聊天，不能管理知识源/MCP/模型。
-- 每个新账号（包括首个注册账号）的 MCP、知识库和模型配置均从空配置开始，需要自行配置；不自动认领旧版 `rag.sqlite`、`mcp_servers.json` 或未归属的知识来源。已有账号保存的配置和历史认领数据保留，切回该账号仍可使用。
-- 登录账号的模型配置完全自持：未配置即为空，不再继承 `ai-service/.env`；账号配置保存到 `data/users/<user_id>/llm_config.json`，API Key 加密落盘，接口只返回“已设置”而不回传任何密钥片段。`.env` 只服务无账号的旧单机模式与服务器自身配置。
-
-### 常用健康检查
+**5. Docker 部署（可选）**
 
 ```bash
-curl http://localhost:8000/health
-curl http://localhost:8080/health
-curl http://localhost:3000/
+docker compose up -d  # 仅 PostgreSQL + Redis
+# 完整应用栈见 docker-compose.prod.yml
 ```
 
-## 架构
+> 💡 向量化与重排模型可复用 `OPENAI_*` 配置；知识库检索需可用的嵌入服务，未配置时对话可用但检索能力受限。
 
-```text
-Browser
-  │ HTTP / SSE
-  ▼
-frontend/   React 18 + TypeScript + Vite + TailwindCSS
-  │ /api/v1/* (RAG / models) + /api/v2/* (Chat)
-  ▼
-gateway/    Go 1.22 + Gin + CORS + proxy
-  │ HTTP / SSE proxy
-  ▼
-ai-service/ Python 3.12 + FastAPI
-  ├─ Agent v2: UniHarness kernel — 唯一编排栈，5 个 profile
-  │    chat / route_plan / artifact / cowork / rag
-  │    durable runs, approvals, sandbox, conversation store
-  ├─ RAG: ingestion, SQLite hybrid retrieval (FTS5 + sqlite-vec + RRF),
-  │    rerank, Feishu/cloud-docs sync — 检索基线（无自有运行时）
-  └─ Tools: knowledge search（内嵌预算检索子图）, gear, risk,
-       route, web, PDF, sandbox tools
+---
 
-SQLite（agent_control / chat_checkpoints / agent_memory / kernel_checkpoints / rag）
-```
+## 核心功能
 
-目录结构：
+### 智能体编排
 
-```text
-ai-hiking/
-├── ai-service/              # FastAPI AI Service
-│   ├── agent_v2/            # UniHarness kernel — 唯一编排栈（runs/approvals/memory）
-│   ├── api/                 # FastAPI routers（chat v2 / memory / models）
-│   ├── rag/                 # 检索基线：摄入 / SQLite 混合检索 / 同步源（供知识工具调用）
-│   ├── tools/               # Base and hiking-domain tools
-│   └── tests/
-├── frontend/                # React + Vite frontend
-│   ├── src/
-│   └── tests/
-├── gateway/                 # Go API Gateway
-│   ├── handler/
-│   └── middleware/
-├── mcp-server/              # Optional MCP extensions
-├── docker-compose.yml
-├── docker-compose.prod.yml
-└── README.md
-```
+UniHarness + LangGraph 驱动的智能体内核（`ai-service/agent_v2/kernel.py`），根据用户请求调度工具、检索知识、执行代码，生成结构化回复。支持流式推理展示、执行步骤回放、断点恢复。
 
-## 页面
+**子智能体（实验性，默认关闭）**：三个固定角色可由根智能体派发处理复杂任务：
+- `researcher`：收集登山资料（知识检索、路线研究、网页抓取）
+- `route_planner`：生成路线方案（装备清单、高德天气/地图 MCP）
+- `artifact_writer`：产出结构化文档（沙盒文件操作、PDF 生成）
 
-| 路由 | 页面 | 用途 |
-|---|---|---|
-| `/` | Agent 模块 | 徒步助手对话、工具过程、路线/装备/风险任务 |
-| `/llm-config` | 模型配置 | 浏览器侧 LLM、Embedding、Rerank 参数配置 |
+子智能体采用单层架构、严格工具白名单与并发限制（每次运行最多 2 个），默认关闭（`.env` 中 `AGENT_V2_SUBAGENT_ENABLED=false`），本地开发可修改测试。
 
-## 测试
+### 工具生态
 
-CI 定义在 [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)，工作流名称为 `CI`。每次分支推送、PR、合并队列和手动触发都会运行。三个服务并行检查：
+**领域工具**：
+- `route_research`：路线候选搜索，提取里程、爬升、下撤点
+- `gear_checklist`：根据天数、季节、露营需求生成装备清单
+- `risk_assessment`：分析目的地、天气、经验等维度的风险等级
+- `hiking_knowledge_search`：检索登山知识库（向量/混合检索 + 重排）
 
-| 检查 | 内容 |
-|---|---|
-| Frontend build and browser regression | Node.js 22，`npm ci`、TypeScript 检查、Vite 生产构建、Chromium 会话切换回归 |
-| Gateway vet, test and build | 按 `gateway/go.mod` 设置 Go，依赖校验、`go vet`、`go test`、编译 |
-| Backend and evaluation contracts (offline) | Python 3.12，离线恢复并核验 fork、联合安装依赖、`pip check`、后端全量离线回归、评估契约 |
+**MCP 服务（账号隔离）**：
+- `amap_weather`：高德天气查询
+- `amap_map`：路线规划、POI 检索、地理编码
 
-`Validate services` 汇总三个检查，只有全部成功才通过；失败、取消或跳过均不能放行。可在 GitHub 分支保护中将其设为 required status check。新提交会取消同一 ref 上的旧运行，任务设有超时，并缓存 npm、Go 和 pip 下载。
+MCP 密钥按账号隔离存储（`data/users/{user_id}/mcp_builtin.json`），需登录后在前端配置，详见 [MCP 配置](#mcp-配置)。
 
-Actions 产物保留 7 天：`frontend-dist` 为前端构建，`frontend-browser-results` 包含浏览器日志、预览服务日志及成功截图，`backend-test-results` 包含后端与评估的 JUnit XML。后端回归失败时，已成功安装依赖的评估契约仍会执行并独立记录结果。
+**沙盒工具**：
+- `sandbox_bash` / `sandbox_read` / `sandbox_write` / `sandbox_edit`：隔离沙盒内文件与脚本执行
+- `generate_pdf`：PDF 行程生成（含排版校验）
 
-本地使用以下命令复现各服务检查。Python 测试先在终端设置离线测试环境（以下为 Bash；PowerShell 使用对应的 `$env:变量名 = "值"`）：
+### 知识检索
 
-```bash
-export OPENAI_API_KEY=ci-placeholder-not-a-credential
-export KERNEL_LIVE_E2E=0 HIKING_EVAL_LIVE=0
-export LANGFUSE_ENABLED=false DEEPEVAL_TELEMETRY_OPT_OUT=YES
-```
+`ai-service/rag/` 提供向量检索与混合检索（关键词 + 语义），接重排模型提升排序质量。知识库存储为 SQLite（默认）或 PostgreSQL + pgvector，切换嵌入模型需重建索引。
 
-1. 恢复受控 UniHarness fork（离线 bundle，无网络协议）：
+### 产物交付
 
-```bash
-python scripts/restore-uniharness-fork.py
-python scripts/restore-uniharness-fork.py --check
-```
+- **路线对比**：候选路线评分与排序（LLM / TypeSafe System One / 离线演示数据）
+- **行程 PDF**：结构化行程导出，含目的地、路线、装备、风险评估与应急联系方式
+- **地图展示**：高德地图渲染路线与途经点（需配置 JSAPI 密钥）
 
-2. 安装运行、测试与评估依赖（Python 3.12），并校验依赖一致性：
+### 认证与多租户
 
-```bash
-python -m pip install -r ai-service/requirements-test.txt -e third_party/uniharness/libs/uniharness -r evals/deepeval/requirements.txt
-python -m pip check
-```
+JWT 登录态（默认有效期 7 天），数据面接口需鉴权。账号配置（MCP 密钥、模型配置、知识源）隔离存储，支持单机匿名模式（遗留兼容）。
 
-3. AI Service 离线后端回归（服务目录内，包含 kernel 身份测试与失败注入自检）：
+---
+
+## 配置说明
+
+### 环境变量
+
+关键配置见 `.env.example`（73 项），按用途分组：
+
+| 分组 | 关键变量 |
+| --- | --- |
+| 对话模型 | `OPENAI_API_KEY` · `OPENAI_BASE_URL` · `OPENAI_MODEL` |
+| 向量化 | `EMBEDDING_MODEL` · `EMBEDDING_DIMENSIONS`（默认复用 `OPENAI_*`） |
+| 重排 | `RERANK_MODEL` · `RERANK_ENABLED`（可选，提升检索质量） |
+| 数据库 | `DATABASE_URL`（PostgreSQL）· `REDIS_URL`（默认本地） |
+| 认证 | `AUTH_JWT_SECRET`（未配置时自动生成）· `AUTH_TOKEN_TTL_SECONDS` |
+| 智能体 | `AGENT_V2_ENABLED` · `AGENT_V2_SANDBOX_TYPE` · `AGENT_V2_SUBAGENT_ENABLED` |
+| 可观测性 | `LANGFUSE_ENABLED` · `LOG_LEVEL` · `LOG_FORMAT` |
+
+> ⚠️ `.env` 中的 `AMAP_API_KEY` 已废弃，MCP 密钥需在前端配置。
+
+### MCP 配置
+
+高德地图 MCP 服务按账号隔离，需登录后在前端配置：
+
+**密钥类型**：
+- **Web 服务 API Key**：智能体工具调用（天气、路线规划、POI）
+- **JSAPI Key + 安全密钥**：前端地图展示（可选）
+
+**配置步骤**：
+1. 启动应用并登录
+2. 前端右上角 → MCP 工具 → 找到「高德天气」或「高德地图」
+3. 填写密钥（申请地址：[高德开放平台](https://console.amap.com/dev/key/app)）
+4. 保存并验证状态变为「已配置」
+
+**限制**：
+- 本地开发限定（`AGENT_V2_SANDBOX_TYPE=local_native`）
+- 生产环境（`remote_e2b`）需服务端预置凭据
+- 密钥存储路径：`data/users/{user_id}/mcp_builtin.json`
+
+### 智能体定制
+
+- `ai-service/agent_v2/subagents.py`：增改子智能体角色与工具白名单
+- `ai-service/tools/`：注册新工具
+- `ai-service/agent_v2/profiles.py`：调整模型档位与工具面
+- `ai-service/config.py`：读取新增配置项
+
+---
+
+## 测试与评估
+
+### 后端测试
 
 ```bash
 cd ai-service
-python -m pytest -q -rs
+pytest -q  # 101 个测试用例
 ```
 
-4. 评估契约（仓库根目录，纯离线，不调用外部模型或 Judge）：
+### 评测
+
+**离线契约评测**（不调用外部模型，CI 每次 PR 都会跑）：
 
 ```bash
+pip install -r evals/deepeval/requirements.txt
 python -m pytest -q evals/test_evaluation_contract.py
 ```
 
-Frontend：
+**真实模型评测**（opt-in，消耗额度）：
+
+```bash
+HIKING_EVAL_LIVE=1 TYPESAFE_API_KEY="..." \
+  ./ai-service/.venv/Scripts/deepeval.exe test run evals/deepeval/test_hiking_agent.py
+```
+
+### 前端浏览器用例
 
 ```bash
 cd frontend
-npm ci
-npm run build
-npx playwright install chromium
+npm run test:browser          # 会话切换
+npm run test:browser:plan     # 行程工作流
+npm run test:browser:auth     # 登录
 ```
 
-在一个终端启动生产预览：
-
-```bash
-npm run preview -- --host 127.0.0.1 --port 4173 --strictPort
-```
-
-在另一个终端的 `frontend/` 下执行浏览器回归（API/SSE 使用测试数据，无需启动后端）：
-
-```bash
-BASE_URL=http://127.0.0.1:4173 npm run test:browser
-```
-
-Gateway：
-
-```bash
-cd gateway
-go mod download
-go mod verify
-go vet ./...
-go test ./...
-go build -trimpath -o ../test-report/gateway .
-```
-
-### 评分状态与结论范围
-
-- 评估结果只有 `passed` / `failed` / `not_evaluated` 三种状态；未执行或无法判定的评估记为 `not_evaluated`，绝不按通过处理（语义见 `evals/deepeval/README.md`）。
-- 默认验证 job 完全离线：不请求外部模型，不需要 OPENAI / Jev 凭证；无凭证的在线契约以 recorded skip 呈现，不会被计为通过。
-- 在线模型契约与在线质量评估保留显式 opt-in：后端在线契约需 `KERNEL_LIVE_E2E=1` 加真实 `OPENAI_*` 凭证；在线质量评估需 `HIKING_EVAL_LIVE=1` 加 Jev 凭证（见 `evals/deepeval/README.md`）。
-- 离线契约通过只证明离线行为契约（远程副作用拒绝、事实门禁、真实 PDF 与非法下载拒绝、有界多轮历史、依赖可复现、评估状态如实上报），不代表线上模型质量已达标。
-- 本仓库不沿用其他工作树的历史通过计数；未实际执行远程 GitHub Actions 或在线质量评估时，不得宣称已完成对应验证。
+---
 
 ## 部署
 
-### GitHub Actions
+### 生产部署
 
-`.github/workflows/deploy.yml` 沿用历史文件名，目前执行上文的 CI 检查。运行 CI 无需配置 GitHub Secrets；其中的模型 Key 是构造测试对象用的占位值。生产发布通过下述部署方式单独进行。
-
-### 生产 Compose
+`docker-compose.prod.yml` 使用预构建镜像：
 
 ```bash
-DOCKERHUB_IMAGE=zijinn123/ai-hiking IMAGE_TAG=latest docker compose -f docker-compose.prod.yml up -d
+export DOCKERHUB_IMAGE=zijinn123/ai-hiking
+export IMAGE_TAG=latest
+export FRONTEND_PORT=3000
+
+docker compose -f docker-compose.prod.yml up -d
 ```
 
-生产 Compose 只包含应用服务和 Postgres。会话与长期记忆由 Agent v2 的 SQLite 存储持有（需要为实例配置持久卷），不再依赖外部 Redis。
+编排包含四个服务：`postgres`（15432）、`ai-service`（容器内 8000）、`gateway`（容器内 8080）、`frontend`（3000 → 容器 80）。
 
-生产默认开启 `AGENT_V2_ENABLED=true`，AI Service 使用 `/ready` 作为容器就绪探针。当前 `remote_e2b` 仍是明确标注的开发占位实现；需要真实多租户沙箱时，应接入 E2B 客户端后再开放 artifact/cowork 能力。
+确保 `.env` 配置生产密钥（`AUTH_JWT_SECRET`、模型凭据）、数据库持久卷、Redis 密码。
 
-本地演示知识库（无需 Embedding API）：
+---
 
-```bash
-cd ai-service
-python scripts/seed_rag.py
-```
+## 已知限制
 
-### CloudBase
+- 默认 SQLite 存储；Compose 提供 PostgreSQL + pgvector，两条路径需按需对齐
+- 切换嵌入模型必须重建知识库索引（维度绑定）
+- 远程沙盒默认 `remote_e2b`，需对应凭据；离线环境改为 `local_native`
+- `docker-compose.yml` 仅含基础设施（PostgreSQL + Redis），不含应用服务
+- Windows 长路径支持需 `git config --global core.longpaths true`
 
-前端生产环境默认 API 地址配置在 `frontend/src/api/config.ts`：
+---
 
-```text
-https://gateway-262534-6-1364947792.sh.run.tcloudbase.com/api/v1
-```
+## 参考资源
 
-当前 CloudBase 资源：
+- [接口文档](./docs/api-reference.md)
+- [行程 PDF 排版规范](./docs/plan-pdf-format.md)
+- [LangGraph 文档](https://langchain-ai.github.io/langgraph/)
+- [FastAPI 官方指南](https://fastapi.tiangolo.com/)
 
-| 服务 | 类型 | URL |
-|---|---|---|
-| Frontend | 静态托管 | `https://ai-hiking-d4gf29b4zcebc048d-1364947792.tcloudbaseapp.com/` |
-| Gateway | CloudRun | `https://gateway-262534-6-1364947792.sh.run.tcloudbase.com` |
-| AI Service | CloudRun | `https://ai-service-262534-6-1364947792.sh.run.tcloudbase.com` |
-
-## 排障
-
-### Agent 提示缺少 API Key
-
-检查仓库根目录 `.env` 中的 `OPENAI_API_KEY` 和 `OPENAI_BASE_URL`。`/llm-config` 的密钥只用于临时测速，不会改变服务端聊天配置。
-
-### RAG 没有检索结果
-
-检查：
-
-- `EMBEDDING_API_KEY` 是否可用。
-- PostgreSQL 是否运行。
-- 知识库中是否已经灌入文档（RAG 独立页已删除，前端不再有上传入口）。
-- `DATABASE_URL` 是否指向正确数据库。
-
-### 天气或位置工具不可用
-
-配置：
-
-```env
-MCP_SERVERS={"amap":{"command":"amap-mcp","args":["--stdio"]}}
-```
-
-### Feishu 同步不可用
-
-确认 `lark-cli` 已安装并可在 `PATH` 中访问；必要时设置 `FEISHU_DEFAULT_SPACE_ID` 和 `FEISHU_DEFAULT_FOLDER_TOKEN`。
-
-## API
-
-前端访问 Gateway 的 `/api/v1/*`（models）与 `/api/v2/*`（Chat，唯一 chat 链路）。
-RAG 能力经 chat 内的知识检索工具（`hiking_knowledge_search`）提供，没有独立 HTTP 接口（A11 删除）。
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| `GET` | `/health` | Gateway 健康检查 |
-| `POST` | `/api/v1/models/fetch` | 拉取模型列表 |
-| `POST` | `/api/v2/chat/sse` | SSE Chat v2 对话（唯一 chat 链路） |
-| `GET` | `/api/v2/chat/snapshot/:run_id` | 运行快照（刷新恢复） |
-| `POST` | `/api/v2/chat/cancel/:run_id` | 取消运行 |
-| `GET` | `/api/v2/chat/events/:run_id` | 增量事件拉取（from_seq） |
-| `POST` | `/api/v2/chat/resume/:run_id` | 恢复运行（审批后继续） |
-| `POST` | `/api/v2/approvals/:approval_id/decision` | 工具审批决策 |
-| `GET`/`PUT` | `/api/v2/memory/settings` | 记忆开关配置 |
-| `GET`/`DELETE` | `/api/v2/memories` | 长期记忆列表 / 清空 |
-| `GET` | `/api/v2/memories/export` | 导出长期记忆 |
-| `PATCH`/`DELETE` | `/api/v2/memories/:memory_id` | 编辑 / 删除单条记忆 |
-| `POST` | `/api/v2/memory/candidates/:candidate_id/decision` | 记忆候选确认 |
-| `GET` | `/api/v2/artifacts/:artifact_id` | 下载运行产物 |
-| `POST` | `/api/v2/subject/rotate` | 轮换匿名 subject 标识 |
-
-## 维护者
-
-[@Vortex745](https://github.com/Vortex745)
-
-## 贡献
-
-欢迎提交 Issue 和 Pull Request。贡献前请先运行相关模块测试，并避免提交密钥、生成文件、运行时数据或与变更无关的重构。
-
-问题反馈入口：
-
-- [GitHub Issues](https://github.com/Vortex745/hiking-ai/issues)
-- [Pull Requests](https://github.com/Vortex745/hiking-ai/pulls)
+---
 
 ## 许可证
 
-UNLICENSED © Vortex745
+仓库当前未包含 `LICENSE` 文件。若计划开源分发，请补充许可证；在此之前默认保留所有权利。
+
+---
+
+<div align="center">
+
+**如果这个项目对您有帮助，请给我们一个 ⭐️**
+
+</div>
