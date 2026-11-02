@@ -1,5 +1,5 @@
 <div align="center">
-<h1>登山AI Hiking AI</h1>
+<h1>Hiking AI</h1>
 
 <p><strong>智能登山规划助手</strong><br/>基于 LangGraph 与 RAG 的登山行程生成与安全评估</p>
 
