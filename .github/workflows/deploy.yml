@@ -180,7 +180,21 @@ jobs:
       # compilation is NOT a substitute for these behavior tests.
       - name: Offline backend regression
         working-directory: ai-service
-        run: python -m pytest -q -rs --junitxml="$RUNNER_TEMP/backend-ci/backend.xml"
+        # These two modules share app-level state and expect serial order;
+        # keep them in a separate process lane until their isolation is fixed.
+        run: |
+          set +e
+          python -m pytest -q -rs -n auto --dist=loadfile \
+            --ignore=test_artifact_versioned_generation.py \
+            --ignore=test_plan_entry_contract.py \
+            --junitxml="$RUNNER_TEMP/backend-ci/backend.xml"
+          bulk=$?
+          python -m pytest -q -rs \
+            test_artifact_versioned_generation.py \
+            test_plan_entry_contract.py \
+            --junitxml="$RUNNER_TEMP/backend-ci/backend-serial.xml"
+          serial=$?
+          [ "$bulk" -eq 0 ] && [ "$serial" -eq 0 ]
 
       # Stable offline evaluation entry: contract results are recorded as
       # passed/failed with semantic quality explicitly not_evaluated (no
