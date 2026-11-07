@@ -42,4 +42,6 @@ export const API = {
     `${V2_BASE}/memory/candidates/${encodeURIComponent(candidateId)}/decision`,
   chatV2Artifact: (artifactId: string) =>
     `${V2_BASE}/artifacts/${encodeURIComponent(artifactId)}`,
+
+  sessionLifecycle: `${V2_BASE}/sessions/lifecycle`,
 } as const

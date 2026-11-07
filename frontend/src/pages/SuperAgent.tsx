@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo, type Dispatch, type ReactNode, type SetStateAction } from 'react'
 import { API } from '../api/config'
+import { reportSessionEvent } from '../api/sessionLifecycle'
 import {
   createV2StreamConnection,
   cancelV2Run,
@@ -50,6 +51,23 @@ import Button from '../components/Button'
 import { GeminiSidebar } from '../components/assistant-ui/gemini/GeminiSidebar'
 import { useAuth } from '../auth/AuthContext'
 import { storageKey } from '../lib/userStorage'
+import {
+  createChatId,
+  generateId,
+  getTodayDate,
+  loadSessions,
+  pruneSessions,
+  restoreStoredMessages,
+  sanitizeStoredValue,
+  saveSessions,
+  snapshotBytes,
+  stripTransientMessageState,
+  upsertSnapshot,
+  type AgentTraceEvent,
+  type ChatSession,
+  type Message,
+  type SnapshotReason,
+} from '../lib/sessionSnapshots'
 import { CircleCheck, Clipboard, Database, Map, Plug, Settings2, SlidersHorizontal, TriangleAlert } from 'lucide-react'
 import { DropdownMenu } from '../components/ui/dropdown-menu'
 import { MemoryDialog } from '../components/MemoryDialog'
@@ -58,31 +76,7 @@ import KnowledgeSourcesDialog from './KnowledgeSources'
 import LlmConfigDialog from './LlmConfig'
 import ApprovalCard, { DEFAULT_APPROVAL_QUESTIONS } from '../components/ApprovalCard'
 
-interface Message {
-  role: 'user' | 'assistant'
-  content: string
-  time?: string
-  isStreaming?: boolean
-  /** Runtime-only marker so a fast SSE response still gets the word reveal. */
-  hasStreamed?: boolean
-  traceEvents?: AgentTraceEvent[]
-  artifacts?: AgentArtifact[]
-}
-
-interface ChatSession {
-  id: string
-  chatId: string
-  title: string
-  date: string
-  messages: Message[]
-}
-
 type AgentScenario = 'route_plan' | 'gear_check' | 'risk_assessment' | 'report_export'
-type AgentTraceEvent = {
-  type: string
-  content: string
-  metadata?: Record<string, unknown>
-}
 /** 从当前会话最近的 focus_map 工具调用中取唯一景点；没有则返回 null。 */
 function extractMapFocus(messages: Message[]): { name: string } | null {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
@@ -144,21 +138,6 @@ function appendTraceEvent(
     updated[updated.length - 1] = next
     return updated
   })
-}
-// A02: v2 artifact shape (payload of artifact.available). Download goes
-// through /api/v2/artifacts/{artifact_id} — no v1 download_url exists.
-type AgentArtifact = {
-  artifact_id: string
-  public_filename: string
-  mime_type: string
-  size_bytes: number
-  sha256?: string
-  expires_at?: string
-  // Ticket 10: the plan book's version relation, verbatim from
-  // ``artifact.available`` (``readArtifact`` keeps it only when the server sent
-  // a positive integer revision). Absent for anything that is not a generation.
-  plan_revision?: number
-  previous_artifact_id?: string
 }
 type BrowserLocation = {
   latitude: number
@@ -324,10 +303,8 @@ function isPlanArtifactUnavailable(version: PlanArtifactVersion): boolean {
 }
 
 const STORAGE_KEY = 'ai-hiking-agent-chat'
-const SESSIONS_KEY = 'ai-hiking-agent-sessions'
 const CHAT_ID_KEY = 'ai-hiking-agent-chat-id'
 const ACTIVE_SESSION_KEY = 'ai-hiking-agent-active-session'
-const SENSITIVE_LOCATION_FIELDS = new Set(['latitude', 'longitude', 'accuracy'])
 const USER_CANCELLED_MESSAGE = '用户主动取消回答，请补充内容或点击重试。'
 
 // A06: recovery polling. A running run cannot be re-attached (a duplicate
@@ -402,13 +379,6 @@ function saveV2PersistedRun(run: V2PersistedRun | null): void {
   } catch { /* ignore */ }
 }
 
-function createChatId() {
-  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
-    return `chat-${crypto.randomUUID()}`
-  }
-  return `chat-${Date.now()}-${Math.random().toString(36).slice(2)}`
-}
-
 function getOrCreateChatId() {
   try {
     const saved = localStorage.getItem(storageKey(CHAT_ID_KEY))
@@ -422,69 +392,8 @@ function getOrCreateChatId() {
   }
 }
 
-function sanitizeStoredValue(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map(sanitizeStoredValue)
-  }
-  if (value && typeof value === 'object') {
-    return Object.fromEntries(
-      Object.entries(value)
-        .filter(([key]) => !SENSITIVE_LOCATION_FIELDS.has(key))
-        .map(([key, item]) => [key, sanitizeStoredValue(item)]),
-    )
-  }
-  return value
-}
-
 function serializeMessages(messages: Message[]) {
   return JSON.stringify(sanitizeStoredValue(messages.map(stripTransientMessageState)))
-}
-
-function stripTransientMessageState(message: Message): Message {
-  const { hasStreamed: _hasStreamed, ...stored } = message
-  return stored
-}
-
-function restoreStoredMessages(value: unknown): Message[] {
-  if (!Array.isArray(value)) return []
-  return value
-    .filter((message): message is Message => Boolean(message && typeof message === 'object'))
-    .map(stripTransientMessageState)
-}
-
-function sanitizeSessionForStorage(session: ChatSession): ChatSession {
-  return {
-    ...session,
-    messages: sanitizeStoredValue(session.messages.map(stripTransientMessageState)) as Message[],
-  }
-}
-
-function generateId() {
-  return `session-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
-}
-
-function getTodayDate() {
-  const now = new Date()
-  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
-}
-
-function loadSessions(): ChatSession[] {
-  try {
-    const saved = localStorage.getItem(storageKey(SESSIONS_KEY))
-    const parsed = saved ? JSON.parse(saved) : []
-    if (!Array.isArray(parsed)) return []
-    return parsed.map((session: Partial<ChatSession>) => ({
-      id: session.id || generateId(),
-      chatId: session.chatId || createChatId(),
-      title: session.title || '新对话',
-      date: session.date || getTodayDate(),
-      messages: restoreStoredMessages(session.messages),
-    }))
-  } catch { return [] }
-}
-
-function saveSessions(sessions: ChatSession[]) {
-  try { localStorage.setItem(storageKey(SESSIONS_KEY), JSON.stringify(sessions.map(sanitizeSessionForStorage))) } catch { /* ignore */ }
 }
 
 function getBrowserLocation(timeout = 3000): Promise<BrowserLocation | null> {
@@ -608,6 +517,15 @@ function SessionRuntimeProvider({ adapter, children }: {
   return <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>
 }
 
+type SnapshotFlush = {
+  ok: boolean
+  reason?: 'quota_exceeded' | 'storage_unavailable'
+  sessionId: string | null
+  entry: ChatSession | null
+  supersededSnapshotId: string | null
+  bytes: number
+}
+
 function SuperAgent() {
   const { user, signOut } = useAuth()
   const [messages, setMessages] = useState<Message[]>(() => {
@@ -643,6 +561,13 @@ function SuperAgent() {
   const cleanupRef = useRef<(() => void) | null>(null)
   const chatIdRef = useRef(getOrCreateChatId())
   const lastLocationRef = useRef<BrowserLocation | null>(null)
+  // pagehide/visibilitychange handlers and snapshot flushes run outside
+  // React's render cycle, so they read refs instead of stale closures.
+  const messagesRef = useRef<Message[]>(messages)
+  const sessionsRef = useRef<ChatSession[]>(sessions)
+  const activeSessionIdRef = useRef<string | null>(activeSessionId)
+  const pruneReportedRef = useRef(false)
+  const closedReportedRef = useRef(false)
 
   // Chat v2 是唯一 chat 链路（v1 已移除）。The v2 run ref tracks the
   // active run_id + sequence cursor so refresh recovery can call
@@ -1675,6 +1600,10 @@ function SuperAgent() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  useEffect(() => { messagesRef.current = messages }, [messages])
+  useEffect(() => { sessionsRef.current = sessions }, [sessions])
+  useEffect(() => { activeSessionIdRef.current = activeSessionId }, [activeSessionId])
+
   // Persist
   useEffect(() => {
     try { localStorage.setItem(storageKey(STORAGE_KEY), serializeMessages(messages)) } catch { /* ignore */ }
@@ -1685,6 +1614,24 @@ function SuperAgent() {
     saveSessions(sessions)
   }, [sessions])
 
+  // Heal a damaged index once per mount, and audit it one time even though
+  // StrictMode invokes this effect twice.
+  useEffect(() => {
+    const { sessions: pruned, destroyedCount, firstRemovedId } = pruneSessions(sessionsRef.current)
+    if (destroyedCount === 0) return
+    sessionsRef.current = pruned
+    setSessions(pruned)
+    saveSessions(pruned)
+    if (pruneReportedRef.current) return
+    pruneReportedRef.current = true
+    reportSessionEvent({
+      event: 'session.pruned',
+      reason: 'mount',
+      session_id: firstRemovedId ?? undefined,
+      destroyed_count: destroyedCount,
+    })
+  }, [])
+
   useEffect(() => {
     if (activeSessionId) {
       try { localStorage.setItem(storageKey(ACTIVE_SESSION_KEY), activeSessionId) } catch { /* ignore */ }
@@ -1692,21 +1639,6 @@ function SuperAgent() {
       try { localStorage.removeItem(storageKey(ACTIVE_SESSION_KEY)) } catch { /* ignore */ }
     }
   }, [activeSessionId])
-
-  useEffect(() => {
-    if (!activeSessionId || messages.length === 0) return
-    const lastMsg = messages[messages.length - 1]
-    if (lastMsg?.isStreaming) return
-    const firstUserMsg = messages.find(m => m.role === 'user')
-    const title = firstUserMsg ? firstUserMsg.content.slice(0, 30) + (firstUserMsg.content.length > 30 ? '...' : '') : '新对话'
-    setSessions(prev => {
-      const existing = prev.find(s => s.id === activeSessionId)
-      if (existing) {
-        return prev.map(s => s.id === activeSessionId ? { ...s, chatId: chatIdRef.current, title, date: getTodayDate(), messages } : s)
-      }
-      return [{ id: activeSessionId, chatId: chatIdRef.current, title, date: getTodayDate(), messages }, ...prev].slice(0, 50)
-    })
-  }, [activeSessionId, messages])
 
   const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -1763,49 +1695,138 @@ function SuperAgent() {
     setIsSending(false)
   }, [])
 
+  const flushActiveSnapshot = useCallback((reason: SnapshotReason): SnapshotFlush => {
+    const sessionId = activeSessionIdRef.current
+    const liveMessages = messagesRef.current
+    if (!sessionId || liveMessages.length === 0) {
+      return { ok: true, sessionId, entry: null, supersededSnapshotId: null, bytes: 0 }
+    }
+    const existing = sessionsRef.current.find(session => session.id === sessionId)
+    const firstUserMsg = liveMessages.find(message => message.role === 'user')
+    const title = existing?.title
+      ?? (firstUserMsg ? firstUserMsg.content.slice(0, 30) + (firstUserMsg.content.length > 30 ? '...' : '') : '新对话')
+    const result = upsertSnapshot(sessionsRef.current, {
+      id: sessionId,
+      chatId: chatIdRef.current,
+      title,
+      date: existing?.date ?? getTodayDate(),
+      messages: liveMessages,
+    }, reason)
+    sessionsRef.current = result.sessions
+    setSessions(result.sessions)
+    const saved = saveSessions(result.sessions)
+    return {
+      ok: saved.ok,
+      reason: saved.reason,
+      sessionId,
+      entry: result.entry,
+      supersededSnapshotId: result.supersededSnapshotId,
+      bytes: snapshotBytes(result.entry),
+    }
+  }, [])
+
+  useEffect(() => {
+    const handlePageHide = () => {
+      if (closedReportedRef.current) return
+      if (!activeSessionIdRef.current || messagesRef.current.length === 0) return
+      closedReportedRef.current = true
+      const flush = flushActiveSnapshot('window_exit')
+      reportSessionEvent({
+        event: 'session.closed',
+        reason: 'window_exit',
+        session_id: flush.sessionId ?? undefined,
+        snapshot_id: flush.entry?.snapshotId,
+        superseded_snapshot_id: flush.supersededSnapshotId ?? undefined,
+        snapshot_bytes: flush.entry ? flush.bytes : undefined,
+      }, { exit: true })
+      if (!flush.ok) {
+        reportSessionEvent({
+          event: 'session.snapshot.failed',
+          reason: flush.reason,
+          session_id: flush.sessionId ?? undefined,
+        })
+      }
+    }
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== 'hidden') return
+      if (!activeSessionIdRef.current || messagesRef.current.length === 0) return
+      flushActiveSnapshot('tab_hidden')
+    }
+    window.addEventListener('pagehide', handlePageHide)
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    return () => {
+      window.removeEventListener('pagehide', handlePageHide)
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+    }
+  }, [flushActiveSnapshot])
+
   const createNewSession = useCallback(() => {
     teardownActiveStream()
-    if (messages.length > 0 && activeSessionId) {
-      const firstUserMsg = messages.find(m => m.role === 'user')
-      const title = firstUserMsg ? firstUserMsg.content.slice(0, 30) + (firstUserMsg.content.length > 30 ? '...' : '') : '新对话'
-      setSessions(prev => {
-        const existing = prev.find(s => s.id === activeSessionId)
-        if (existing) {
-          return prev.map(s => s.id === activeSessionId ? { ...s, chatId: chatIdRef.current, title, date: getTodayDate(), messages } : s)
-        }
-        return [{ id: activeSessionId, chatId: chatIdRef.current, title, date: getTodayDate(), messages }, ...prev].slice(0, 50)
-      })
-    }
+    const flush = flushActiveSnapshot('new_session')
     const newId = generateId()
     const next = createChatId()
     setActiveSessionId(newId)
+    activeSessionIdRef.current = newId
     setMessages([])
+    messagesRef.current = []
     localStorage.setItem(storageKey(CHAT_ID_KEY), next)
     chatIdRef.current = next
     try { localStorage.removeItem(storageKey(STORAGE_KEY)) } catch { /* ignore */ }
-  }, [messages, activeSessionId, teardownActiveStream])
+    reportSessionEvent({
+      event: 'session.created',
+      reason: 'new_session',
+      session_id: newId,
+      outgoing_session_id: flush.sessionId ?? undefined,
+      outgoing_snapshot_id: flush.entry?.snapshotId,
+      superseded_snapshot_id: flush.supersededSnapshotId ?? undefined,
+      snapshot_bytes: flush.entry ? flush.bytes : undefined,
+    })
+    if (!flush.ok) {
+      reportSessionEvent({
+        event: 'session.snapshot.failed',
+        reason: flush.reason,
+        session_id: newId,
+      })
+    }
+  }, [flushActiveSnapshot, teardownActiveStream])
 
   const loadSession = useCallback((session: ChatSession) => {
     teardownActiveStream()
-    const target = session.chatId ? session : { ...session, chatId: createChatId() }
-    if (activeSessionId && messages.length > 0) {
-      const firstUserMsg = messages.find(m => m.role === 'user')
-      const title = firstUserMsg ? firstUserMsg.content.slice(0, 30) + (firstUserMsg.content.length > 30 ? '...' : '') : '新对话'
-      setSessions(prev => {
-        const existing = prev.find(s => s.id === activeSessionId)
-        if (existing) {
-          return prev.map(s => s.id === activeSessionId ? { ...s, chatId: chatIdRef.current, title, date: getTodayDate(), messages } : s)
-        }
-        return [{ id: activeSessionId, chatId: chatIdRef.current, title, date: getTodayDate(), messages }, ...prev].slice(0, 50)
-      })
+    const flush = flushActiveSnapshot('switch')
+    const pruned = pruneSessions(sessionsRef.current)
+    if (pruned.destroyedCount > 0) {
+      sessionsRef.current = pruned.sessions
+      setSessions(pruned.sessions)
     }
+    const stored = pruned.sessions.find(item => item.id === session.id)
+    const target = stored ?? (session.chatId ? session : { ...session, chatId: createChatId() })
     setActiveSessionId(target.id)
+    activeSessionIdRef.current = target.id
     chatIdRef.current = target.chatId
     localStorage.setItem(storageKey(CHAT_ID_KEY), target.chatId)
     const restoredMessages = restoreStoredMessages(target.messages)
+    messagesRef.current = restoredMessages
     setMessages(restoredMessages)
     try { localStorage.setItem(storageKey(STORAGE_KEY), serializeMessages(restoredMessages)) } catch { /* ignore */ }
-  }, [activeSessionId, messages, teardownActiveStream])
+    reportSessionEvent({
+      event: 'session.restored',
+      reason: 'switch',
+      session_id: target.id,
+      snapshot_id: target.snapshotId,
+      outgoing_session_id: flush.sessionId ?? undefined,
+      outgoing_snapshot_id: flush.entry?.snapshotId,
+      superseded_snapshot_id: flush.supersededSnapshotId ?? undefined,
+      destroyed_count: pruned.destroyedCount,
+      snapshot_bytes: flush.entry ? flush.bytes : undefined,
+    })
+    if (!flush.ok) {
+      reportSessionEvent({
+        event: 'session.snapshot.failed',
+        reason: flush.reason,
+        session_id: target.id,
+      })
+    }
+  }, [flushActiveSnapshot, teardownActiveStream])
 
   const selectSession = useCallback((sessionId: string) => {
     const target = sessions.find(s => s.id === sessionId)
@@ -1813,12 +1834,25 @@ function SuperAgent() {
   }, [sessions, loadSession])
 
   const deleteSession = useCallback((sessionId: string) => {
-    setSessions(prev => prev.filter(s => s.id !== sessionId))
+    const entry = sessionsRef.current.find(item => item.id === sessionId) ?? null
+    const remaining = sessionsRef.current.filter(item => item.id !== sessionId)
+    sessionsRef.current = remaining
+    setSessions(remaining)
+    if (entry) {
+      reportSessionEvent({
+        event: 'session.deleted',
+        session_id: entry.id,
+        snapshot_id: entry.snapshotId,
+        snapshot_bytes: snapshotBytes(entry),
+      })
+    }
     if (activeSessionId === sessionId) {
       // 删除的是当前活跃会话：先拆除活动流,避免旧 run 的事件写入轮换后的新会话。
       teardownActiveStream()
       setActiveSessionId(null)
+      activeSessionIdRef.current = null
       setMessages([])
+      messagesRef.current = []
       const next = createChatId()
       localStorage.setItem(storageKey(CHAT_ID_KEY), next)
       chatIdRef.current = next
