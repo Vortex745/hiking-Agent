@@ -37,6 +37,7 @@
 | GET | `/api/v2/memories/export` | 导出记忆为 JSON artifact |
 | POST | `/api/v2/memory/candidates/{candidate_id}/decision` | 敏感记忆候选的同意 / 拒绝 |
 | POST | `/api/v2/subject/rotate` | 轮换匿名身份 token |
+| POST | `/api/v2/sessions/lifecycle` | 会话快照生命周期审计（仅日志） |
 | POST | `/api/v1/models/fetch` | 用给定 base_url + key 拉取上游模型列表 |
 | GET | `/api/v1/llm-config` | 读取 LLM / embedding / rerank 配置（密钥打码） |
 | PUT | `/api/v1/llm-config` | 写入 `.env` 并热更新运行时配置 |
@@ -475,7 +476,39 @@ v2 关闭时 `status` 为 `"disabled"`。
 
 轮换后无法再访问旧 subject 的 run / memory / artifact。
 
-### 4.18 `POST /api/v1/models/fetch`
+### 4.18 `POST /api/v2/sessions/lifecycle`
+
+前端上报会话快照的生命周期事件。需要登录。服务端只写一条结构化日志，不保存快照内容，也不读写聊天数据。
+
+```json
+{
+  "event": "session.created",
+  "reason": "new_session",
+  "session_id": "session-...",
+  "conversation_id": "chat-...",
+  "snapshot_id": "snap-...",
+  "outgoing_session_id": "session-...",
+  "outgoing_snapshot_id": "snap-...",
+  "superseded_snapshot_id": "snap-...",
+  "snapshot_bytes": 1234,
+  "destroyed_count": 0
+}
+```
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `event` | 是 | `session.created`、`session.restored`、`session.closed`、`session.deleted`、`session.pruned`、`session.snapshot.failed` |
+| `reason` | 是 | `new_session`、`switch`、`window_exit`、`tab_hidden`、`delete`、`startup_prune`、`quota_exceeded`、`storage_unavailable` |
+| `session_id` | 是 | 会话 id，1–128 字符，首字符为字母或数字，其余可为字母、数字、下划线或短横线 |
+| `conversation_id` / `snapshot_id` / `superseded_snapshot_id` / `outgoing_session_id` / `outgoing_snapshot_id` | 否 | 同一 id 规则 |
+| `destroyed_count` | 否 | 0–1000，默认 0 |
+| `snapshot_bytes` | 否 | 0–10000000 |
+
+未知字段返回 422。**响应 204**：空响应体。
+
+日志包含 `event`、`session_id`、`conversation_id`、`snapshot_id`、`superseded_snapshot_id`、`outgoing_session_id`、`outgoing_snapshot_id`、`snapshot_bytes`、`destroyed_count` 和当前 `subject_id`；不记录标题、消息正文或工具输出。
+
+### 4.19 `POST /api/v1/models/fetch`
 
 服务端代拉上游模型列表，客户端密钥只在本次请求使用，不落库。
 
@@ -491,7 +524,7 @@ v2 关闭时 `status` 为 `"disabled"`。
 | 4xx/5xx | 上游返回同状态码，`detail` 为 `Upstream returned <code>` |
 | 502 | 无法连接上游 |
 
-### 4.19 `GET /api/v1/llm-config`
+### 4.20 `GET /api/v1/llm-config`
 
 读取当前生效的模型配置。密钥只返回打码值与“是否已设置”，**永不返回明文**。
 
@@ -509,7 +542,7 @@ v2 关闭时 `status` 为 `"disabled"`。
 
 **本机限制**（三个 llm-config 接口共用）：仅允许 client IP 为 `127.0.0.1` / `::1`；带 `Origin` 时必须是本机 http(s) 来源；`VERCEL` 环境下直接 403（`{"detail":"llm-config ..."}`）。Gateway 未注册该路由。
 
-### 4.20 `PUT /api/v1/llm-config`
+### 4.21 `PUT /api/v1/llm-config`
 
 写入 `ai-service/.env` 并立即热更新运行时配置。**三段配置都必须提供**；`api_key` 省略或传空表示保留已存密钥。
 
@@ -538,7 +571,7 @@ v2 关闭时 `status` 为 `"disabled"`。
 
 请求体 `extra="forbid"`，未知字段 → 422。
 
-### 4.21 `POST /api/v1/llm-config/test`
+### 4.22 `POST /api/v1/llm-config/test`
 
 探测某一段配置的上游 `/models`，不落盘。`base_url` / `api_key` 为空时回退已存配置。
 
