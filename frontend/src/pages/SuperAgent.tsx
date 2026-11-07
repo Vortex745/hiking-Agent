@@ -1787,6 +1787,7 @@ function SuperAgent() {
   const createNewSession = useCallback(() => {
     teardownActiveStream()
     const flush = flushActiveSnapshot()
+    const outgoingChatId = chatIdRef.current
     const newId = generateId()
     const next = createChatId()
     setActiveSessionId(newId)
@@ -1806,12 +1807,12 @@ function SuperAgent() {
       superseded_snapshot_id: flush.supersededSnapshotId ?? undefined,
       snapshot_bytes: flush.entry ? flush.bytes : undefined,
     })
-    if (!flush.ok) {
+    if (!flush.ok && flush.sessionId) {
       reportSessionEvent({
         event: 'session.snapshot.failed',
         reason: flush.reason ?? 'storage_unavailable',
-        session_id: newId,
-        conversation_id: next,
+        session_id: flush.sessionId,
+        conversation_id: outgoingChatId,
       })
     }
   }, [flushActiveSnapshot, teardownActiveStream])
@@ -1819,6 +1820,7 @@ function SuperAgent() {
   const loadSession = useCallback((session: ChatSession) => {
     teardownActiveStream()
     const flush = flushActiveSnapshot()
+    const outgoingChatId = chatIdRef.current
     const pruned = pruneSessions(sessionsRef.current)
     if (pruned.destroyedCount > 0) {
       sessionsRef.current = pruned.sessions
@@ -1844,14 +1846,14 @@ function SuperAgent() {
       outgoing_snapshot_id: flush.entry?.snapshotId,
       superseded_snapshot_id: flush.supersededSnapshotId ?? undefined,
       destroyed_count: pruned.destroyedCount,
-      snapshot_bytes: flush.entry ? flush.bytes : undefined,
+      snapshot_bytes: target.snapshotId ? snapshotBytes(target) : undefined,
     })
-    if (!flush.ok) {
+    if (!flush.ok && flush.sessionId) {
       reportSessionEvent({
         event: 'session.snapshot.failed',
         reason: flush.reason ?? 'storage_unavailable',
-        session_id: target.id,
-        conversation_id: target.chatId,
+        session_id: flush.sessionId,
+        conversation_id: outgoingChatId,
       })
     }
   }, [flushActiveSnapshot, teardownActiveStream])

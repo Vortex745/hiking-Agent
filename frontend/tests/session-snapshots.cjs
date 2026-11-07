@@ -324,6 +324,11 @@ async function openPage(browser, {
         failSessionWrites: true,
         prefixed: true,
       });
+      const betaBytes = await page.evaluate(({ key, id }) => {
+        const list = JSON.parse(localStorage.getItem(key) || '[]');
+        const entry = list.find(item => item.id === id);
+        return new TextEncoder().encode(JSON.stringify(entry)).byteLength;
+      }, { key: SESSIONS_KEY, id: 'beta' });
       await page
         .getByRole('complementary', { name: '对话历史' })
         .getByText('Beta', { exact: true })
@@ -333,10 +338,15 @@ async function openPage(browser, {
         audits,
         item => item
           && item.event === 'session.snapshot.failed'
-          && item.session_id === 'beta',
-        'session.snapshot.failed for beta',
+          && item.session_id === 'alpha',
+        'session.snapshot.failed for the outgoing session',
       );
+      const restored = await waitForAudit(audits, 'session.restored');
       assert.equal(failed.reason, 'quota_exceeded');
+      assert.equal(failed.conversation_id, 'chat-alpha');
+      assert.equal(restored.session_id, 'beta');
+      assert.equal(restored.snapshot_id, 'snap-beta-old');
+      assert.equal(restored.snapshot_bytes, betaBytes);
       assert.deepEqual(errors, []);
       await page.close();
       console.log('6 storage failure isolation passed');
