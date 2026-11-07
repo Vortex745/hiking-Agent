@@ -73,6 +73,7 @@ func NewRouter(cfg *config.Config) *gin.Engine {
 		v2.POST("/memory/candidates/:candidate_id/decision", chatV2Handler.MemoryCandidateDecision)
 		v2.GET("/artifacts/:artifact_id", chatV2Handler.Artifact)
 		v2.POST("/subject/rotate", chatV2Handler.RotateSubject)
+		v2.POST("/sessions/lifecycle", chatV2Handler.SessionLifecycle)
 	}
 
 	return r

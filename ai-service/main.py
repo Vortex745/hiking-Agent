@@ -227,6 +227,14 @@ try:
 except ImportError as e:
     logger.warning(f"✗ Chat v2 router unavailable: {e}")
 
+# 会话生命周期审计路由：只记日志，不落库
+try:
+    from api.session_lifecycle import session_lifecycle_router
+    app.include_router(session_lifecycle_router, prefix="/api/v2", dependencies=_AUTH)
+    logger.info("✓ Session lifecycle router loaded")
+except ImportError as e:
+    logger.warning(f"✗ Session lifecycle router unavailable: {e}")
+
 # models 路由: 需要 openai, httpx
 try:
     from api.models_router import models_router
