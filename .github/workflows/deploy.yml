@@ -180,7 +180,9 @@ jobs:
       # compilation is NOT a substitute for these behavior tests.
       - name: Offline backend regression
         working-directory: ai-service
-        run: python -m pytest -q -rs --junitxml="$RUNNER_TEMP/backend-ci/backend.xml"
+        # loadfile keeps a module's tests on one worker, where they share
+        # process-level state; auto sizes the worker count to the runner's CPUs.
+        run: python -m pytest -q -rs -n auto --dist=loadfile --junitxml="$RUNNER_TEMP/backend-ci/backend.xml"
 
       # Stable offline evaluation entry: contract results are recorded as
       # passed/failed with semantic quality explicitly not_evaluated (no
