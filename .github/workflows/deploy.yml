@@ -18,8 +18,43 @@ defaults:
     shell: bash
 
 jobs:
+  changes:
+    name: Detect changed areas
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      # Only pull requests narrow the work; pushes, merge groups and manual
+      # runs keep the full suite.
+      frontend: ${{ github.event_name != 'pull_request' || steps.filter.outputs.frontend }}
+      gateway: ${{ github.event_name != 'pull_request' || steps.filter.outputs.gateway }}
+      backend: ${{ github.event_name != 'pull_request' || steps.filter.outputs.backend }}
+    steps:
+      - name: Filter pull request paths
+        if: github.event_name == 'pull_request'
+        id: filter
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        with:
+          filters: |
+            frontend:
+              - 'frontend/**'
+              - '.github/workflows/deploy.yml'
+            gateway:
+              - 'gateway/**'
+              - '.github/workflows/deploy.yml'
+            backend:
+              - 'ai-service/**'
+              - 'evals/**'
+              - 'scripts/**'
+              - 'third_party/uniharness/**'
+              - '.github/workflows/deploy.yml'
+
   frontend:
     name: Frontend build and browser regression
+    needs: changes
+    if: ${{ needs.changes.outputs.frontend == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -79,6 +114,8 @@ jobs:
 
   gateway:
     name: Gateway vet, test and build
+    needs: changes
+    if: ${{ needs.changes.outputs.gateway == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
@@ -113,6 +150,8 @@ jobs:
 
   backend:
     name: Backend and evaluation contracts (offline)
+    needs: changes
+    if: ${{ needs.changes.outputs.backend == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -218,17 +257,32 @@ jobs:
     # Keep the existing check name so branch protection can require one gate.
     name: Validate services
     if: ${{ always() }}
-    needs: [frontend, gateway, backend]
+    needs: [changes, frontend, gateway, backend]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
+      CHANGES_RESULT: ${{ needs.changes.result }}
       FRONTEND_RESULT: ${{ needs.frontend.result }}
       GATEWAY_RESULT: ${{ needs.gateway.result }}
       BACKEND_RESULT: ${{ needs.backend.result }}
+      FRONTEND_NEEDED: ${{ needs.changes.outputs.frontend }}
+      GATEWAY_NEEDED: ${{ needs.changes.outputs.gateway }}
+      BACKEND_NEEDED: ${{ needs.changes.outputs.backend }}
     steps:
-      - name: Require all service checks to pass
+      - name: Require every applicable service check to pass
         run: |
-          printf 'Frontend: %s\nGateway: %s\nBackend: %s\n' "$FRONTEND_RESULT" "$GATEWAY_RESULT" "$BACKEND_RESULT"
-          test "$FRONTEND_RESULT" = success
-          test "$GATEWAY_RESULT" = success
-          test "$BACKEND_RESULT" = success
+          printf 'Frontend: %s (needed: %s)\nGateway: %s (needed: %s)\nBackend: %s (needed: %s)\n' \
+            "$FRONTEND_RESULT" "$FRONTEND_NEEDED" \
+            "$GATEWAY_RESULT" "$GATEWAY_NEEDED" \
+            "$BACKEND_RESULT" "$BACKEND_NEEDED"
+          test "$CHANGES_RESULT" = success
+          require_result() {
+            if [ "$1" = "true" ]; then
+              test "$2" = success
+            else
+              test "$2" = skipped
+            fi
+          }
+          require_result "$FRONTEND_NEEDED" "$FRONTEND_RESULT"
+          require_result "$GATEWAY_NEEDED" "$GATEWAY_RESULT"
+          require_result "$BACKEND_NEEDED" "$BACKEND_RESULT"
