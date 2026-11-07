@@ -27,6 +27,7 @@ func v2TestRouter(upstream string) *gin.Engine {
 	router.POST("/candidates/:candidate_id/decision", h.MemoryCandidateDecision)
 	router.GET("/memories", h.Memories)
 	router.GET("/artifacts/:artifact_id", h.Artifact)
+	router.POST("/sessions/lifecycle", h.SessionLifecycle)
 	return router
 }
 
@@ -43,6 +44,7 @@ func TestV2ForwardingPreservesIdentityAndRecovery(t *testing.T) {
 		{"POST", "/candidates/c/decision", "/api/v2/memory/candidates/c/decision"},
 		{"GET", "/memories?limit=5", "/api/v2/memories?limit=5"},
 		{"GET", "/artifacts/pdf", "/api/v2/artifacts/pdf"},
+		{"POST", "/sessions/lifecycle", "/api/v2/sessions/lifecycle"},
 	} {
 		t.Run(tc.path, func(t *testing.T) {
 			body := `{"idempotency_key":"retry-key"}`

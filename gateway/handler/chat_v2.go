@@ -251,6 +251,14 @@ func (h *ChatV2Handler) MemoryExport(c *gin.Context) {
 	proxyV2Request(c, http.MethodGet, url, nil)
 }
 
+func (h *ChatV2Handler) SessionLifecycle(c *gin.Context) {
+	if !ensureSubjectCookie(c) {
+		return
+	}
+	url := fmt.Sprintf("%s/api/v2/sessions/lifecycle", h.aiServiceURL)
+	proxyV2Request(c, http.MethodPost, url, c.Request.Body)
+}
+
 func (h *ChatV2Handler) Artifact(c *gin.Context) {
 	if !ensureSubjectCookie(c) {
 		return
