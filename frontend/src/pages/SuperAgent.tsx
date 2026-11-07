@@ -62,11 +62,11 @@ import {
   saveSessions,
   snapshotBytes,
   stripTransientMessageState,
+  syncSessionMessages,
   upsertSnapshot,
   type AgentTraceEvent,
   type ChatSession,
   type Message,
-  type SnapshotReason,
 } from '../lib/sessionSnapshots'
 import { CircleCheck, Clipboard, Database, Map, Plug, Settings2, SlidersHorizontal, TriangleAlert } from 'lucide-react'
 import { DropdownMenu } from '../components/ui/dropdown-menu'
@@ -1626,11 +1626,28 @@ function SuperAgent() {
     pruneReportedRef.current = true
     reportSessionEvent({
       event: 'session.pruned',
-      reason: 'mount',
-      session_id: firstRemovedId ?? undefined,
+      reason: 'startup_prune',
+      session_id: firstRemovedId ?? 'session-pruned',
       destroyed_count: destroyedCount,
     })
   }, [])
+
+  useEffect(() => {
+    if (!activeSessionId || messages.length === 0) return
+    const lastMessage = messages[messages.length - 1]
+    if (lastMessage?.isStreaming) return
+    const firstUserMessage = messages.find(message => message.role === 'user')
+    const title = firstUserMessage
+      ? firstUserMessage.content.slice(0, 30) + (firstUserMessage.content.length > 30 ? '...' : '')
+      : '新对话'
+    setSessions(prev => syncSessionMessages(prev, {
+      id: activeSessionId,
+      chatId: chatIdRef.current,
+      title,
+      date: getTodayDate(),
+      messages,
+    }))
+  }, [activeSessionId, messages])
 
   useEffect(() => {
     if (activeSessionId) {
@@ -1695,7 +1712,7 @@ function SuperAgent() {
     setIsSending(false)
   }, [])
 
-  const flushActiveSnapshot = useCallback((reason: SnapshotReason): SnapshotFlush => {
+  const flushActiveSnapshot = useCallback((): SnapshotFlush => {
     const sessionId = activeSessionIdRef.current
     const liveMessages = messagesRef.current
     if (!sessionId || liveMessages.length === 0) {
@@ -1703,15 +1720,16 @@ function SuperAgent() {
     }
     const existing = sessionsRef.current.find(session => session.id === sessionId)
     const firstUserMsg = liveMessages.find(message => message.role === 'user')
-    const title = existing?.title
-      ?? (firstUserMsg ? firstUserMsg.content.slice(0, 30) + (firstUserMsg.content.length > 30 ? '...' : '') : '新对话')
+    const title = existing?.title && existing.title !== '新对话'
+      ? existing.title
+      : (firstUserMsg ? firstUserMsg.content.slice(0, 30) + (firstUserMsg.content.length > 30 ? '...' : '') : '新对话')
     const result = upsertSnapshot(sessionsRef.current, {
       id: sessionId,
       chatId: chatIdRef.current,
       title,
       date: existing?.date ?? getTodayDate(),
       messages: liveMessages,
-    }, reason)
+    })
     sessionsRef.current = result.sessions
     setSessions(result.sessions)
     const saved = saveSessions(result.sessions)
@@ -1730,11 +1748,12 @@ function SuperAgent() {
       if (closedReportedRef.current) return
       if (!activeSessionIdRef.current || messagesRef.current.length === 0) return
       closedReportedRef.current = true
-      const flush = flushActiveSnapshot('window_exit')
+      const flush = flushActiveSnapshot()
       reportSessionEvent({
         event: 'session.closed',
         reason: 'window_exit',
         session_id: flush.sessionId ?? undefined,
+        conversation_id: chatIdRef.current,
         snapshot_id: flush.entry?.snapshotId,
         superseded_snapshot_id: flush.supersededSnapshotId ?? undefined,
         snapshot_bytes: flush.entry ? flush.bytes : undefined,
@@ -1742,15 +1761,20 @@ function SuperAgent() {
       if (!flush.ok) {
         reportSessionEvent({
           event: 'session.snapshot.failed',
-          reason: flush.reason,
+          reason: flush.reason ?? 'storage_unavailable',
           session_id: flush.sessionId ?? undefined,
-        })
+          conversation_id: chatIdRef.current,
+        }, { exit: true })
       }
     }
     const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        closedReportedRef.current = false
+        return
+      }
       if (document.visibilityState !== 'hidden') return
       if (!activeSessionIdRef.current || messagesRef.current.length === 0) return
-      flushActiveSnapshot('tab_hidden')
+      flushActiveSnapshot()
     }
     window.addEventListener('pagehide', handlePageHide)
     document.addEventListener('visibilitychange', handleVisibilityChange)
@@ -1762,7 +1786,7 @@ function SuperAgent() {
 
   const createNewSession = useCallback(() => {
     teardownActiveStream()
-    const flush = flushActiveSnapshot('new_session')
+    const flush = flushActiveSnapshot()
     const newId = generateId()
     const next = createChatId()
     setActiveSessionId(newId)
@@ -1776,6 +1800,7 @@ function SuperAgent() {
       event: 'session.created',
       reason: 'new_session',
       session_id: newId,
+      conversation_id: next,
       outgoing_session_id: flush.sessionId ?? undefined,
       outgoing_snapshot_id: flush.entry?.snapshotId,
       superseded_snapshot_id: flush.supersededSnapshotId ?? undefined,
@@ -1784,15 +1809,16 @@ function SuperAgent() {
     if (!flush.ok) {
       reportSessionEvent({
         event: 'session.snapshot.failed',
-        reason: flush.reason,
+        reason: flush.reason ?? 'storage_unavailable',
         session_id: newId,
+        conversation_id: next,
       })
     }
   }, [flushActiveSnapshot, teardownActiveStream])
 
   const loadSession = useCallback((session: ChatSession) => {
     teardownActiveStream()
-    const flush = flushActiveSnapshot('switch')
+    const flush = flushActiveSnapshot()
     const pruned = pruneSessions(sessionsRef.current)
     if (pruned.destroyedCount > 0) {
       sessionsRef.current = pruned.sessions
@@ -1812,6 +1838,7 @@ function SuperAgent() {
       event: 'session.restored',
       reason: 'switch',
       session_id: target.id,
+      conversation_id: target.chatId,
       snapshot_id: target.snapshotId,
       outgoing_session_id: flush.sessionId ?? undefined,
       outgoing_snapshot_id: flush.entry?.snapshotId,
@@ -1822,8 +1849,9 @@ function SuperAgent() {
     if (!flush.ok) {
       reportSessionEvent({
         event: 'session.snapshot.failed',
-        reason: flush.reason,
+        reason: flush.reason ?? 'storage_unavailable',
         session_id: target.id,
+        conversation_id: target.chatId,
       })
     }
   }, [flushActiveSnapshot, teardownActiveStream])
@@ -1841,7 +1869,9 @@ function SuperAgent() {
     if (entry) {
       reportSessionEvent({
         event: 'session.deleted',
+        reason: 'delete',
         session_id: entry.id,
+        conversation_id: entry.chatId,
         snapshot_id: entry.snapshotId,
         snapshot_bytes: snapshotBytes(entry),
       })

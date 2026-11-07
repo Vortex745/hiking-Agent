@@ -12,7 +12,7 @@ export type AgentTraceEvent = {
 
 // A02: v2 artifact shape (payload of artifact.available). Download goes
 // through /api/v2/artifacts/{artifact_id} — no v1 download_url exists.
-export type AgentArtifact = {
+type AgentArtifact = {
   artifact_id: string
   public_filename: string
   mime_type: string
@@ -47,9 +47,7 @@ export interface ChatSession {
   savedAt?: string
 }
 
-export type SnapshotReason = 'new_session' | 'switch' | 'window_exit' | 'tab_hidden'
-
-export type SaveSessionsResult = {
+type SaveSessionsResult = {
   ok: boolean
   reason?: 'quota_exceeded' | 'storage_unavailable'
 }
@@ -103,7 +101,7 @@ export function restoreStoredMessages(value: unknown): Message[] {
     .map(stripTransientMessageState)
 }
 
-export function snapshotMessages(messages: Message[]): Message[] {
+function snapshotMessages(messages: Message[]): Message[] {
   const frozen = messages.map(message => ({ ...stripTransientMessageState(message), isStreaming: false }))
   return sanitizeStoredValue(frozen) as Message[]
 }
@@ -129,7 +127,7 @@ function savedAtOf(session: ChatSession): string {
   return session.savedAt ?? ''
 }
 
-export type PruneResult = {
+type PruneResult = {
   sessions: ChatSession[]
   destroyedCount: number
   firstRemovedId: string | null
@@ -171,7 +169,7 @@ export function pruneSessions(sessions: unknown): PruneResult {
   return { sessions: kept, destroyedCount, firstRemovedId }
 }
 
-export type UpsertSnapshotResult = {
+type UpsertSnapshotResult = {
   sessions: ChatSession[]
   entry: ChatSession
   supersededSnapshotId: string | null
@@ -181,7 +179,6 @@ export type UpsertSnapshotResult = {
 export function upsertSnapshot(
   sessions: ChatSession[],
   input: { id: string; chatId: string; title: string; date: string; messages: Message[] },
-  _reason: SnapshotReason,
 ): UpsertSnapshotResult {
   const existing = sessions.find(session => session.id === input.id)
   const entry: ChatSession = {
@@ -203,6 +200,34 @@ export function upsertSnapshot(
     supersededSnapshotId: existing?.snapshotId ?? null,
     destroyedCount: pruned.destroyedCount,
   }
+}
+
+export function syncSessionMessages(
+  sessions: ChatSession[],
+  input: { id: string; chatId: string; title: string; date: string; messages: Message[] },
+): ChatSession[] {
+  const existing = sessions.find(session => session.id === input.id)
+  const messages = snapshotMessages(input.messages)
+  const savedAt = new Date().toISOString()
+  if (!existing) {
+    return pruneSessions([
+      {
+        ...input,
+        messages,
+        snapshotId: createSnapshotId(),
+        savedAt,
+      },
+      ...sessions,
+    ]).sessions
+  }
+  const title = existing.title && existing.title !== '新对话' ? existing.title : input.title
+  return pruneSessions(
+    sessions.map(session =>
+      session.id === input.id
+        ? { ...session, chatId: input.chatId, title, date: input.date, messages, savedAt }
+        : session,
+    ),
+  ).sessions
 }
 
 function isQuotaExceeded(error: unknown): boolean {

@@ -13,13 +13,14 @@ export type SessionLifecycleReason =
   | 'switch'
   | 'window_exit'
   | 'tab_hidden'
-  | 'mount'
+  | 'delete'
+  | 'startup_prune'
   | 'quota_exceeded'
   | 'storage_unavailable'
 
 export interface SessionLifecyclePayload {
   event: SessionLifecycleEvent
-  reason?: SessionLifecycleReason
+  reason: SessionLifecycleReason
   session_id?: string
   conversation_id?: string
   snapshot_id?: string
@@ -41,7 +42,7 @@ export function reportSessionEvent(
   if (options.exit && typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
     try {
       if (navigator.sendBeacon(API.sessionLifecycle, new Blob([body], { type: 'application/json' }))) return
-    } catch { /* fall back to fetch */ }
+    } catch { /* fall through to fetch */ }
   }
   try {
     void fetch(API.sessionLifecycle, {
