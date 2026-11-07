@@ -984,7 +984,7 @@ def test_the_artifact_version_relation_reaches_every_frontend_home():
     # Read strictly: a non-positive or non-integer revision is no revision.
     assert "Number.isInteger(revision)" in reader and "revision > 0" in reader
 
-    mirrored = _ts("pages/SuperAgent.tsx")
+    mirrored = _ts("lib/sessionSnapshots.ts")
     assert "plan_revision?: number" in _interface_body(mirrored, "AgentArtifact")
     assert "previous_artifact_id?: string" in _interface_body(mirrored, "AgentArtifact")
 
